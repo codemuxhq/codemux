@@ -13,12 +13,5 @@ codemux-shared-kernel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-# Persistence (AD-7)
-rusqlite.workspace = true
-rusqlite_migration.workspace = true
-
-# PTY (AD-10)
-portable-pty.workspace = true
-
 [lints]
 workspace = true

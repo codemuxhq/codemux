@@ -188,26 +188,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cc"
-version = "1.2.60"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43c5703da9466b66a946814e1adf53ea2c90f10063b86290cc9eb67ce3478a20"
-dependencies = [
- "find-msvc-tools",
- "shlex",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
-name = "cfg_aliases"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
 
 [[package]]
 name = "cfg_aliases"
@@ -260,9 +244,6 @@ name = "codemux-session"
 version = "0.1.0"
 dependencies = [
  "codemux-shared-kernel",
- "portable-pty",
- "rusqlite",
- "rusqlite_migration",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -506,12 +487,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "downcast-rs"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -553,18 +528,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fallible-iterator"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
-
-[[package]]
-name = "fallible-streaming-iterator"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
-
-[[package]]
 name = "fancy-regex"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -584,12 +547,6 @@ dependencies = [
  "thiserror 1.0.69",
  "winapi",
 ]
-
-[[package]]
-name = "find-msvc-tools"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "finl_unicode"
@@ -687,15 +644,6 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
-
-[[package]]
-name = "hashlink"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea0b22561a9c04a7cb1a302c013e0259cd3b4bb619f145b32f72b8b4bcbed230"
-dependencies = [
- "hashbrown 0.16.1",
-]
 
 [[package]]
 name = "heck"
@@ -828,17 +776,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
-name = "libsqlite3-sys"
-version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
-dependencies = [
- "cc",
- "pkg-config",
- "vcpkg",
-]
-
-[[package]]
 name = "line-clipping"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -889,7 +826,7 @@ version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
- "nix 0.29.0",
+ "nix",
  "winapi",
 ]
 
@@ -952,25 +889,13 @@ dependencies = [
 
 [[package]]
 name = "nix"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
-dependencies = [
- "bitflags 2.11.1",
- "cfg-if",
- "cfg_aliases 0.1.1",
- "libc",
-]
-
-[[package]]
-name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
- "cfg_aliases 0.2.1",
+ "cfg_aliases",
  "libc",
  "memoffset",
 ]
@@ -1190,37 +1115,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pkg-config"
-version = "0.3.33"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
-
-[[package]]
 name = "portable-atomic"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
-
-[[package]]
-name = "portable-pty"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4a596a2b3d2752d94f51fac2d4a96737b8705dddd311a32b9af47211f08671e"
-dependencies = [
- "anyhow",
- "bitflags 1.3.2",
- "downcast-rs",
- "filedescriptor",
- "lazy_static",
- "libc",
- "log",
- "nix 0.28.0",
- "serial2",
- "shared_library",
- "shell-words",
- "winapi",
- "winreg",
-]
 
 [[package]]
 name = "powerfmt"
@@ -1407,41 +1305,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
-name = "rsqlite-vfs"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8a1f2315036ef6b1fbacd1972e8ee7688030b0a2121edfc2a6550febd41574d"
-dependencies = [
- "hashbrown 0.16.1",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "rusqlite"
-version = "0.39.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0d2b0146dd9661bf67bb107c0bb2a55064d556eeb3fc314151b957f313bcd4e"
-dependencies = [
- "bitflags 2.11.1",
- "fallible-iterator",
- "fallible-streaming-iterator",
- "hashlink",
- "libsqlite3-sys",
- "smallvec",
- "sqlite-wasm-rs",
-]
-
-[[package]]
-name = "rusqlite_migration"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "410e4d2d97ff816796ed012b789c7381ae42c09a809822a75d29a01022181184"
-dependencies = [
- "log",
- "rusqlite",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1537,17 +1400,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serial2"
-version = "0.2.36"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcdbc46aa3882ec3d48ec2b5abcb4f0d863a13d7599265f3faa6d851f23c12f3"
-dependencies = [
- "cfg-if",
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1566,28 +1418,6 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
-
-[[package]]
-name = "shared_library"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a9e7e0f2bfae24d8a5b5a66c5b257a83c7412304311512a0c054cd5e619da11"
-dependencies = [
- "lazy_static",
- "libc",
-]
-
-[[package]]
-name = "shell-words"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
-
-[[package]]
-name = "shlex"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "signal-hook"
@@ -1631,18 +1461,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "sqlite-wasm-rs"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b2c760607300407ddeaee518acf28c795661b7108c75421303dbefb237d3a36"
-dependencies = [
- "cc",
- "js-sys",
- "rsqlite-vfs",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "static_assertions"
@@ -1738,7 +1556,7 @@ dependencies = [
  "libc",
  "log",
  "memmem",
- "nix 0.29.0",
+ "nix",
  "num-derive",
  "num-traits",
  "ordered-float",
@@ -1986,12 +1804,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2237,15 +2049,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "winreg"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
-dependencies = [
- "winapi",
 ]
 
 [[package]]

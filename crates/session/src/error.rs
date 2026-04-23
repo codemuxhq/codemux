@@ -38,12 +38,6 @@ pub enum Error {
         #[source]
         source: BoxedSource,
     },
-
-    /// Returned by scaffold stubs during development. Lets the TUI render a
-    /// friendly popup instead of panicking on a `todo!()`. Real variants
-    /// replace usages of this one as each use case lands.
-    #[error("not yet implemented: {0}")]
-    NotImplemented(&'static str),
 }
 
 #[cfg(test)]
@@ -62,7 +56,6 @@ mod tests {
             Error::HostNotFound { id: "laptop".into() }.to_string(),
             "host not found: laptop",
         );
-        assert_eq!(Error::NotImplemented("foo").to_string(), "not yet implemented: foo");
     }
 
     #[test]
