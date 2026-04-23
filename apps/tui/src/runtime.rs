@@ -489,7 +489,7 @@ fn render_frame(
     let area = frame.area();
     match nav_style {
         NavStyle::LeftPane => render_left_pane(frame, area, agents, focused),
-        NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup),
+        NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup, bindings),
     }
     if let Some(modal) = spawn_modal {
         modal.render(frame, area);
@@ -529,6 +529,7 @@ fn render_popup_style(
     agents: &[RuntimeAgent],
     focused: usize,
     popup: PopupState,
+    bindings: &Bindings,
 ) {
     let [pty_area, status_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -548,7 +549,14 @@ fn render_popup_style(
             format!("[{}{}] {}", i + 1, marker, a.label)
         })
         .collect();
-    let status = format!("{}    Ctrl-B for menu", labels.join("  "));
+    // Render the actual prefix + help binding so the hint stays accurate
+    // regardless of what the user configured.
+    let status = format!(
+        "{}    {} {} for help",
+        labels.join("  "),
+        bindings.prefix,
+        bindings.on_prefix.help,
+    );
     frame.render_widget(Paragraph::new(status), status_area);
 
     if let PopupState::Open { selection } = popup {
