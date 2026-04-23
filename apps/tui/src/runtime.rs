@@ -1,8 +1,10 @@
-//! P0 walking skeleton: spawn `claude` in a single PTY, render its output into
-//! a single ratatui-managed window, forward keystrokes to it, exit on Ctrl-C.
+//! P0 + P1.1: spawn `claude` in a single PTY, render its output through a
+//! ratatui-managed window, forward keystrokes to it. P1.1 adds a tmux-style
+//! prefix key (Ctrl-B by default): Ctrl-B then `q` quits codemux, Ctrl-B
+//! twice forwards a literal Ctrl-B byte, anything else after the prefix is
+//! consumed and returns the state machine to idle.
 //!
-//! No chrome, no navigator, no persistence, no SSH, no diff panel. The whole
-//! window is the PTY. P1 onwards adds everything else.
+//! No multi-agent yet, no chrome, no persistence, no SSH. Those are later P1.
 
 use std::io::{self, Read, Write};
 use std::thread;
@@ -24,6 +26,7 @@ use vt100::Parser;
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const READ_BUFFER_SIZE: usize = 8 * 1024;
+const PREFIX_BYTE: u8 = 0x02; // ASCII STX, what Ctrl-B sends on the wire
 
 /// Drop guard: leaves the alternate screen and restores cooked mode no matter
 /// how the event loop returns (early `?`, panic, normal exit).
@@ -36,16 +39,29 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Tmux-style prefix-key state. `Idle` forwards every key to the PTY (modulo
+/// the prefix itself). `AwaitingCommand` interprets the next key as a codemux
+/// command, then returns to `Idle` regardless of whether the key matched.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PrefixState {
+    #[default]
+    Idle,
+    AwaitingCommand,
+}
+
+/// What the event loop should do after `handle_key` decides on a key event.
+#[derive(Debug, Eq, PartialEq)]
+enum KeyAction {
+    Forward(Vec<u8>),
+    Consume,
+    Exit,
+}
+
 pub fn run() -> Result<()> {
     tracing::info!("codemux starting");
 
     let (cols, rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
 
-    // Spawn the PTY in cooked mode: a failure here prints a real error to the
-    // user's terminal instead of vanishing behind the alt screen.
-    // portable-pty returns `anyhow::Result`, which does not implement
-    // `std::error::Error` and so cannot use `wrap_err` directly. Lift each
-    // call into an `eyre::Report` via `map_err`.
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -106,6 +122,8 @@ fn event_loop(
     writer: &mut (dyn Write + Send),
     child: &mut (dyn portable_pty::Child + Send + Sync),
 ) -> Result<()> {
+    let mut prefix_state = PrefixState::default();
+
     loop {
         while let Ok(bytes) = rx.try_recv() {
             parser.process(&bytes);
@@ -125,11 +143,12 @@ fn event_loop(
         if event::poll(FRAME_POLL).wrap_err("poll for input")? {
             match event::read().wrap_err("read input")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    if is_exit(&key) {
-                        return Ok(());
-                    }
-                    if let Some(bytes) = key_to_bytes(key.code, key.modifiers) {
-                        writer.write_all(&bytes).wrap_err("write to pty")?;
+                    match handle_key(&mut prefix_state, &key) {
+                        KeyAction::Forward(bytes) => {
+                            writer.write_all(&bytes).wrap_err("write to pty")?;
+                        }
+                        KeyAction::Consume => {}
+                        KeyAction::Exit => return Ok(()),
                     }
                 }
                 Event::Resize(cols, rows) => {
@@ -142,13 +161,41 @@ fn event_loop(
     }
 }
 
-fn is_exit(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+/// Drives the prefix-key state machine. Returns the action the event loop
+/// should perform: forward bytes to the PTY, consume (do nothing), or exit.
+fn handle_key(state: &mut PrefixState, key: &KeyEvent) -> KeyAction {
+    match *state {
+        PrefixState::Idle => {
+            if is_prefix(key) {
+                *state = PrefixState::AwaitingCommand;
+                KeyAction::Consume
+            } else if let Some(bytes) = key_to_bytes(key.code, key.modifiers) {
+                KeyAction::Forward(bytes)
+            } else {
+                KeyAction::Consume
+            }
+        }
+        PrefixState::AwaitingCommand => {
+            *state = PrefixState::Idle;
+            if is_prefix(key) {
+                KeyAction::Forward(vec![PREFIX_BYTE])
+            } else {
+                match key.code {
+                    KeyCode::Char('q') => KeyAction::Exit,
+                    _ => KeyAction::Consume,
+                }
+            }
+        }
+    }
+}
+
+fn is_prefix(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// Translate a crossterm key event into the bytes a terminal-mode child
-/// process expects. Minimal P0 mapping; does not yet handle alt/meta, function
-/// keys beyond F1-F4 hidden in `_`, or non-CSI tilde sequences.
+/// process expects. Minimal P0/P1 mapping; does not yet handle alt/meta or
+/// function keys beyond what the `_` arm drops.
 fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
     let bytes = match code {
         KeyCode::Char(c) => {
@@ -185,6 +232,10 @@ fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
 
     #[test]
     fn plain_ascii_char_passes_through_as_one_byte() {
@@ -253,15 +304,78 @@ mod tests {
         assert_eq!(key_to_bytes(KeyCode::F(12), KeyModifiers::NONE), None);
     }
 
+    // Prefix-key state machine.
+
     #[test]
-    fn ctrl_c_is_recognized_as_exit_intent() {
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(is_exit(&key));
+    fn idle_forwards_a_normal_char() {
+        let mut state = PrefixState::Idle;
+        let action = handle_key(&mut state, &key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Forward(vec![b'a']));
+        assert_eq!(state, PrefixState::Idle);
     }
 
     #[test]
-    fn plain_c_is_not_exit() {
-        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
-        assert!(!is_exit(&key));
+    fn idle_forwards_ctrl_c_to_pty_after_p11() {
+        // Ctrl-C is no longer codemux's exit key; it goes to claude.
+        let mut state = PrefixState::Idle;
+        let action = handle_key(&mut state, &key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(action, KeyAction::Forward(vec![0x03]));
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn ctrl_b_in_idle_arms_the_state_machine_without_forwarding() {
+        let mut state = PrefixState::Idle;
+        let action = handle_key(&mut state, &key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(action, KeyAction::Consume);
+        assert_eq!(state, PrefixState::AwaitingCommand);
+    }
+
+    #[test]
+    fn prefix_then_q_exits_codemux() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Exit);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn double_prefix_forwards_a_literal_prefix_byte() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(action, KeyAction::Forward(vec![PREFIX_BYTE]));
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn unknown_key_after_prefix_consumes_and_returns_to_idle() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Consume);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn esc_after_prefix_cancels() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Consume);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn typing_q_without_prefix_is_just_q() {
+        let mut state = PrefixState::Idle;
+        let action = handle_key(&mut state, &key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Forward(vec![b'q']));
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn unmapped_key_in_idle_state_is_consumed() {
+        let mut state = PrefixState::Idle;
+        let action = handle_key(&mut state, &key(KeyCode::F(12), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Consume);
+        assert_eq!(state, PrefixState::Idle);
     }
 }
