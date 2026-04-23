@@ -247,6 +247,13 @@ fn event_loop(
     let mut spawn_modal: Option<SpawnModal> = None;
     let mut focused: usize = 0;
     let mut spawn_counter: usize = agents.len();
+    // Status-bar hint is bindings-derived but bindings cannot change at
+    // runtime. Cache the formatted suffix so the render loop does not
+    // re-allocate it 20 times per second (per the FRAME_POLL cadence).
+    let status_hint = format!(
+        "{} {} for help",
+        bindings.prefix, bindings.on_prefix.help,
+    );
 
     loop {
         for agent in &mut agents {
@@ -277,6 +284,7 @@ fn event_loop(
                     help_state,
                     spawn_modal.as_ref(),
                     bindings,
+                    &status_hint,
                 );
             })
             .wrap_err("draw frame")?;
@@ -485,11 +493,12 @@ fn render_frame(
     help: HelpState,
     spawn_modal: Option<&SpawnModal>,
     bindings: &Bindings,
+    status_hint: &str,
 ) {
     let area = frame.area();
     match nav_style {
         NavStyle::LeftPane => render_left_pane(frame, area, agents, focused),
-        NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup, bindings),
+        NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup, status_hint),
     }
     if let Some(modal) = spawn_modal {
         modal.render(frame, area);
@@ -529,7 +538,7 @@ fn render_popup_style(
     agents: &[RuntimeAgent],
     focused: usize,
     popup: PopupState,
-    bindings: &Bindings,
+    status_hint: &str,
 ) {
     let [pty_area, status_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -549,19 +558,37 @@ fn render_popup_style(
             format!("[{}{}] {}", i + 1, marker, a.label)
         })
         .collect();
-    // Render the actual prefix + help binding so the hint stays accurate
-    // regardless of what the user configured.
-    let status = format!(
-        "{}    {} {} for help",
-        labels.join("  "),
-        bindings.prefix,
-        bindings.on_prefix.help,
-    );
-    frame.render_widget(Paragraph::new(status), status_area);
+    let status = format!("{}    {status_hint}", labels.join("  "));
+    // Status bar is a single row; truncate with an ellipsis if the labels
+    // plus the hint overflow the available width. Without this, long user
+    // chords (e.g. `ctrl+alt+pageup`) or many agent labels would clip
+    // silently at the right edge.
+    let display = clip_to_width(&status, status_area.width as usize);
+    frame.render_widget(Paragraph::new(display), status_area);
 
     if let PopupState::Open { selection } = popup {
         render_switcher_popup(frame, area, agents, selection);
     }
+}
+
+/// Truncate `s` to at most `max` terminal cells, appending an ellipsis when
+/// truncation actually happened. Counts Unicode code points (good enough for
+/// the ASCII-heavy status bar); CJK / emoji widths would need the
+/// `unicode-width` crate, which is not pulled in for one helper.
+fn clip_to_width(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    if max == 1 {
+        return "…".into();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
 }
 
 fn render_switcher_popup(
@@ -868,5 +895,36 @@ mod tests {
         use crate::keymap::KeyChord;
         assert_eq!(literal_byte_for(&KeyChord::plain(KeyCode::Char('q'))), None);
         assert_eq!(literal_byte_for(&KeyChord::ctrl(KeyCode::F(1))), None);
+    }
+
+    #[test]
+    fn clip_to_width_returns_input_unchanged_when_short_enough() {
+        assert_eq!(clip_to_width("hello", 10), "hello");
+        assert_eq!(clip_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn clip_to_width_truncates_with_ellipsis_when_overflowing() {
+        assert_eq!(clip_to_width("hello world", 8), "hello w…");
+        assert_eq!(clip_to_width("hello", 4), "hel…");
+    }
+
+    #[test]
+    fn clip_to_width_handles_max_zero_and_one() {
+        assert_eq!(clip_to_width("hello", 0), "");
+        assert_eq!(clip_to_width("hello", 1), "…");
+    }
+
+    #[test]
+    fn clip_to_width_handles_empty_input() {
+        assert_eq!(clip_to_width("", 10), "");
+        assert_eq!(clip_to_width("", 0), "");
+    }
+
+    #[test]
+    fn clip_to_width_counts_codepoints_not_bytes() {
+        // Multi-byte chars: "café" is 4 chars, 5 bytes.
+        assert_eq!(clip_to_width("café", 4), "café");
+        assert_eq!(clip_to_width("café bar", 5), "café…");
     }
 }
