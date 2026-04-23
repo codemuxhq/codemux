@@ -3,7 +3,6 @@ use color_eyre::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod runtime;
-mod ui;
 
 #[derive(Debug, Parser)]
 #[command(name = "codemux", version, about)]

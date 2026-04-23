@@ -4,7 +4,7 @@ A TUI multiplexer for Claude Code agent sessions, across local and SSH hosts.
 
 ## Status
 
-Pre-alpha. Nothing runs yet. See [`docs/roadmap.md`](docs/roadmap.md).
+P0 done. The walking skeleton runs: a single local `claude` session in a full-window TUI, keystrokes forwarded, Ctrl-C exits cleanly. No navigator, no persistence, no SSH yet — those are P1. See [`docs/roadmap.md`](docs/roadmap.md).
 
 ## What it is
 
@@ -14,7 +14,11 @@ Personal tool. Single-user. TUI-only. Claude Code only.
 
 ## Running it
 
-Nothing to run yet. Come back after P0 (see [`docs/roadmap.md`](docs/roadmap.md)).
+```
+cargo run
+```
+
+Requires `claude` on PATH. Ctrl-C exits.
 
 ## Docs
 
