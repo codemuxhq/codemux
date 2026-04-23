@@ -16,7 +16,10 @@ use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, eyre};
 use crossbeam_channel::{Receiver, unbounded};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -41,7 +44,9 @@ const READ_BUFFER_SIZE: usize = 8 * 1024;
 const NAV_PANE_WIDTH: u16 = 25;
 const STATUS_BAR_HEIGHT: u16 = 1;
 
-struct TerminalGuard;
+struct TerminalGuard {
+    enhanced_keyboard: bool,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -49,6 +54,9 @@ impl Drop for TerminalGuard {
         // and may be on a panic path); the user's terminal may already be in
         // a degraded state, and surfacing an error would clobber whatever the
         // panic backtrace was about to say.
+        if self.enhanced_keyboard {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
@@ -128,7 +136,25 @@ pub fn run(nav_style: NavStyle, config: &Config) -> Result<()> {
 
     enable_raw_mode().wrap_err("enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).wrap_err("enter alt screen")?;
-    let _guard = TerminalGuard;
+
+    // Auto-detect: enable the Kitty Keyboard Protocol only when the user has
+    // bound something to a SUPER (Cmd / Win) chord. Without this, terminals
+    // that support the protocol (Ghostty, Kitty, WezTerm, recent Alacritty,
+    // Foot) cannot deliver Cmd events to the application. Terminals that do
+    // not understand the negotiation simply ignore it; the help screen
+    // remains the escape hatch ("if my chord does not register, the
+    // terminal is the limit, not codemux").
+    let enhanced_keyboard = config.bindings.uses_super_modifier()
+        && execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        )
+        .is_ok();
+    if enhanced_keyboard {
+        tracing::debug!("Kitty Keyboard Protocol enabled (binding uses SUPER)");
+    }
+
+    let _guard = TerminalGuard { enhanced_keyboard };
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;

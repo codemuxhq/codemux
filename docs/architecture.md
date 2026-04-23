@@ -210,6 +210,18 @@ guidelines, silent fallback would be worse than refusing to start.
 The help screen (default `<prefix> ?`) is generated from the same `Bindings`
 POD — single source of truth for both behavior and documentation.
 
+**Cmd / Super support via auto-detected Kitty Keyboard Protocol.** macOS
+terminals swallow Cmd before any TUI can see it, unless the application
+negotiates the Kitty Keyboard Protocol with the terminal first. codemux
+walks every loaded `KeyChord` at startup; if any uses `KeyModifiers::SUPER`,
+it pushes `KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES` after
+entering raw mode and pops it in `TerminalGuard::drop`. Auto-detect rather
+than a separate config flag because the Bindings *are* the source of truth:
+write `prefix = "cmd+b"` and the protocol negotiation follows automatically.
+Terminals that do not understand the negotiation silently ignore it; the
+help screen is the user-visible escape hatch ("if my chord does not fire,
+the terminal is the limit").
+
 Rejected: a HashMap-based registry indexed by `(Scope, KeyChord)`. With ~7
 entries per scope, linear search through a fixed-size array is faster than
 a HashMap and the table reads as data declaration. Re-evaluate if scope

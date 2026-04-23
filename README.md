@@ -39,6 +39,17 @@ help = "?"
 
 A bad config exits non-zero with a readable error; it does not silently fall back.
 
+### macOS Cmd key
+
+`cmd+b` (or `super+b` / `win+b`) is parseable, and codemux auto-enables the Kitty Keyboard Protocol on startup whenever any of your bindings use the SUPER modifier — so the Cmd press actually arrives at the application.
+
+```toml
+[bindings]
+prefix = "cmd+b"
+```
+
+This works in **Ghostty, Kitty, WezTerm, recent Alacritty, Foot, and partially in iTerm2**. It does not work in **macOS Terminal.app** — that terminal swallows Cmd before any application can see it. If your chord doesn't fire after rebinding, your terminal is the limit, not codemux. Switch to a Kitty-protocol-aware terminal or fall back to a Ctrl-based prefix.
+
 ## Docs
 
 - [`docs/vision.md`](docs/vision.md) — what codemux is and why

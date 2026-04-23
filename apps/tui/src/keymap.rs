@@ -121,7 +121,10 @@ impl FromStr for KeyChord {
                 "ctrl" | "control" => KeyModifiers::CONTROL,
                 "alt" | "meta" => KeyModifiers::ALT,
                 "shift" => KeyModifiers::SHIFT,
-                "super" => KeyModifiers::SUPER,
+                // `cmd` is the macOS-native name for the same key crossterm
+                // calls SUPER. Both spellings parse to the same chord; the
+                // help screen renders `super` for consistency.
+                "super" | "cmd" | "win" => KeyModifiers::SUPER,
                 other => return Err(format!("unknown modifier: {other}")),
             };
         }
@@ -454,6 +457,41 @@ impl Default for Bindings {
     }
 }
 
+impl Bindings {
+    /// True if any loaded chord (prefix or any per-scope action) requires the
+    /// SUPER modifier. The runtime uses this to decide whether to negotiate
+    /// the Kitty Keyboard Protocol with the terminal — without it, terminals
+    /// usually swallow Cmd / Super before the application can see it.
+    ///
+    /// We only check what the user actually bound. Defaults never use SUPER,
+    /// so a user who never touches the config never pays the protocol cost.
+    pub fn uses_super_modifier(&self) -> bool {
+        let chords = [
+            self.prefix,
+            self.on_prefix.quit,
+            self.on_prefix.spawn_agent,
+            self.on_prefix.focus_next,
+            self.on_prefix.focus_prev,
+            self.on_prefix.toggle_nav,
+            self.on_prefix.open_switcher,
+            self.on_prefix.help,
+            self.on_popup.confirm,
+            self.on_popup.cancel,
+            self.on_popup.next,
+            self.on_popup.prev,
+            self.on_modal.confirm,
+            self.on_modal.cancel,
+            self.on_modal.swap_field,
+            self.on_modal.swap_to_host,
+            self.on_modal.next_completion,
+            self.on_modal.prev_completion,
+        ];
+        chords
+            .iter()
+            .any(|c| c.modifiers.contains(KeyModifiers::SUPER))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -511,6 +549,16 @@ mod tests {
         assert_eq!(chord.code, KeyCode::Char('x'));
         assert!(chord.modifiers.contains(KeyModifiers::CONTROL));
         assert!(chord.modifiers.contains(KeyModifiers::ALT));
+    }
+
+    #[test]
+    fn parse_cmd_aliases_to_super() {
+        let chord: KeyChord = "cmd+b".parse().unwrap();
+        assert_eq!(chord.code, KeyCode::Char('b'));
+        assert!(chord.modifiers.contains(KeyModifiers::SUPER));
+        // `super` and `win` are the other two spellings of the same modifier.
+        assert_eq!(chord, "super+b".parse::<KeyChord>().unwrap());
+        assert_eq!(chord, "win+b".parse::<KeyChord>().unwrap());
     }
 
     #[test]
@@ -656,5 +704,40 @@ mod tests {
             let event = KeyEvent::new(chord.code, chord.modifiers);
             assert_eq!(b.lookup(&event), Some(*action));
         }
+    }
+
+    // --- uses_super_modifier ---
+
+    #[test]
+    fn defaults_do_not_use_super_modifier() {
+        assert!(!Bindings::default().uses_super_modifier());
+    }
+
+    #[test]
+    fn cmd_prefix_in_config_triggers_super_detection() {
+        let toml_text = r#"prefix = "cmd+b""#;
+        let bindings: Bindings = toml::from_str(toml_text).unwrap();
+        assert!(bindings.uses_super_modifier());
+    }
+
+    #[test]
+    fn cmd_action_in_config_triggers_super_detection() {
+        let toml_text = r#"
+            [on_prefix]
+            quit = "cmd+q"
+        "#;
+        let bindings: Bindings = toml::from_str(toml_text).unwrap();
+        assert!(bindings.uses_super_modifier());
+    }
+
+    #[test]
+    fn ctrl_only_overrides_do_not_trigger_super_detection() {
+        let toml_text = r#"
+            prefix = "ctrl+a"
+            [on_prefix]
+            quit = "x"
+        "#;
+        let bindings: Bindings = toml::from_str(toml_text).unwrap();
+        assert!(!bindings.uses_super_modifier());
     }
 }
