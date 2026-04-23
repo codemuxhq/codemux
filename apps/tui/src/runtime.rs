@@ -1,10 +1,25 @@
-//! P0 + P1.1: spawn `claude` in a single PTY, render its output through a
-//! ratatui-managed window, forward keystrokes to it. P1.1 adds a tmux-style
-//! prefix key (Ctrl-B by default): Ctrl-B then `q` quits codemux, Ctrl-B
-//! twice forwards a literal Ctrl-B byte, anything else after the prefix is
-//! consumed and returns the state machine to idle.
+//! P0 + P1.1 + P1.2 (prototype): multi-agent with two togglable navigator
+//! styles for A/B comparison.
 //!
-//! No multi-agent yet, no chrome, no persistence, no SSH. Those are later P1.
+//! Two navigator chrome options are available simultaneously, switchable at
+//! runtime via Ctrl-B v:
+//!
+//! - `LeftPane` — always-visible 25-column navigator on the left, focused
+//!   PTY on the right. Constant glanceability.
+//! - `Popup` — full-screen focused PTY with a 1-row status bar at the
+//!   bottom; Ctrl-B w opens a centered switcher popup.
+//!
+//! Once the user picks one, the loser and the toggle plumbing come out in a
+//! follow-up commit.
+//!
+//! Prefix-key commands available in either navigator:
+//! - `c` spawn a new agent in the current cwd
+//! - `n` / `p` next / previous agent
+//! - `1`-`9` focus the agent at that index
+//! - `v` toggle navigator style
+//! - `w` open the switcher popup (Popup style only)
+//! - `q` exit codemux
+//! - prefix again forwards a literal Ctrl-B byte to the focused agent
 
 use std::io::{self, Read, Write};
 use std::thread;
@@ -18,18 +33,24 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const READ_BUFFER_SIZE: usize = 8 * 1024;
-const PREFIX_BYTE: u8 = 0x02; // ASCII STX, what Ctrl-B sends on the wire
+const PREFIX_BYTE: u8 = 0x02;
+const NAV_PANE_WIDTH: u16 = 25;
+const STATUS_BAR_HEIGHT: u16 = 1;
 
 /// Drop guard: leaves the alternate screen and restores cooked mode no matter
-/// how the event loop returns (early `?`, panic, normal exit).
+/// how the event loop returns.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
@@ -39,9 +60,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Tmux-style prefix-key state. `Idle` forwards every key to the PTY (modulo
-/// the prefix itself). `AwaitingCommand` interprets the next key as a codemux
-/// command, then returns to `Idle` regardless of whether the key matched.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PrefixState {
     #[default]
@@ -49,38 +67,67 @@ enum PrefixState {
     AwaitingCommand,
 }
 
-/// What the event loop should do after `handle_key` decides on a key event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavStyle {
+    LeftPane,
+    Popup,
+}
+
+impl NavStyle {
+    fn toggle(self) -> Self {
+        match self {
+            Self::LeftPane => Self::Popup,
+            Self::Popup => Self::LeftPane,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PopupState {
+    #[default]
+    Closed,
+    Open { selection: usize },
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum KeyAction {
     Forward(Vec<u8>),
     Consume,
     Exit,
+    SpawnAgent,
+    FocusNext,
+    FocusPrev,
+    FocusAt(usize),
+    ToggleNav,
+    OpenPopup,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PopupAction {
+    None,
+    ChangeSelection(usize),
+    Confirm,
+    Cancel,
+}
+
+struct RuntimeAgent {
+    label: String,
+    parser: Parser,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    rx: Receiver<Vec<u8>>,
 }
 
 pub fn run() -> Result<()> {
     tracing::info!("codemux starting");
 
-    let (cols, rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
+    let nav_style = NavStyle::LeftPane;
+    let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
+    let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols);
 
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| eyre!("open pty: {e}"))?;
-    let cmd = CommandBuilder::new("claude");
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| eyre!("spawn `claude` (is it on PATH?): {e}"))?;
-    drop(pair.slave);
-
-    let mut writer = pair.master.take_writer().map_err(|e| eyre!("take pty writer: {e}"))?;
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| eyre!("clone pty reader: {e}"))?;
-    drop(pair.master);
-
-    let rx = spawn_reader_thread(reader);
+    let initial = spawn_agent("agent-1".into(), pty_rows, pty_cols)?;
+    let agents = vec![initial];
 
     enable_raw_mode().wrap_err("enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).wrap_err("enter alt screen")?;
@@ -89,12 +136,38 @@ pub fn run() -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
 
-    let mut parser = Parser::new(rows, cols, 0);
-    let result = event_loop(&mut terminal, &mut parser, &rx, writer.as_mut(), &mut *child);
+    event_loop(&mut terminal, agents, nav_style)
+}
 
-    let _ = child.kill();
-    let _ = child.wait();
-    result
+fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16) -> (u16, u16) {
+    match style {
+        NavStyle::LeftPane => (term_rows, term_cols.saturating_sub(NAV_PANE_WIDTH)),
+        NavStyle::Popup => (term_rows.saturating_sub(STATUS_BAR_HEIGHT), term_cols),
+    }
+}
+
+fn spawn_agent(label: String, rows: u16, cols: u16) -> Result<RuntimeAgent> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| eyre!("open pty: {e}"))?;
+    let cmd = CommandBuilder::new("claude");
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| eyre!("spawn `claude` (is it on PATH?): {e}"))?;
+    drop(pair.slave);
+
+    let writer = pair.master.take_writer().map_err(|e| eyre!("take pty writer: {e}"))?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| eyre!("clone pty reader: {e}"))?;
+    let master = pair.master;
+
+    let rx = spawn_reader_thread(reader);
+    let parser = Parser::new(rows, cols, 0);
+    Ok(RuntimeAgent { label, parser, master, writer, child, rx })
 }
 
 fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
@@ -115,54 +188,242 @@ fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
     rx
 }
 
+fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
+    for a in agents {
+        let _ = a.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        a.parser.screen_mut().set_size(rows, cols);
+    }
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    parser: &mut Parser,
-    rx: &Receiver<Vec<u8>>,
-    writer: &mut (dyn Write + Send),
-    child: &mut (dyn portable_pty::Child + Send + Sync),
+    mut agents: Vec<RuntimeAgent>,
+    mut nav_style: NavStyle,
 ) -> Result<()> {
     let mut prefix_state = PrefixState::default();
+    let mut popup_state = PopupState::default();
+    let mut focused: usize = 0;
+    let mut spawn_counter: usize = agents.len();
 
     loop {
-        while let Ok(bytes) = rx.try_recv() {
-            parser.process(&bytes);
+        // Drain bytes from every agent's channel into its parser.
+        for agent in &mut agents {
+            while let Ok(bytes) = agent.rx.try_recv() {
+                agent.parser.process(&bytes);
+            }
+        }
+
+        // Reap any dead agents. If they all died, exit.
+        agents.retain_mut(|agent| !matches!(agent.child.try_wait(), Ok(Some(_))));
+        if agents.is_empty() {
+            return Ok(());
+        }
+        focused = focused.min(agents.len() - 1);
+        // Also clamp the popup selection if an agent disappeared.
+        if let PopupState::Open { selection } = popup_state
+            && selection >= agents.len()
+        {
+            popup_state = PopupState::Open { selection: agents.len() - 1 };
         }
 
         terminal
             .draw(|frame| {
-                let widget = PseudoTerminal::new(parser.screen());
-                frame.render_widget(widget, frame.area());
+                render_frame(frame, &agents, focused, nav_style, popup_state);
             })
             .wrap_err("draw frame")?;
 
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return Ok(());
+        if !event::poll(FRAME_POLL).wrap_err("poll for input")? {
+            continue;
         }
 
-        if event::poll(FRAME_POLL).wrap_err("poll for input")? {
-            match event::read().wrap_err("read input")? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match handle_key(&mut prefix_state, &key) {
-                        KeyAction::Forward(bytes) => {
-                            writer.write_all(&bytes).wrap_err("write to pty")?;
+        match event::read().wrap_err("read input")? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let PopupState::Open { selection } = popup_state {
+                    match handle_popup_key(&key, selection, agents.len()) {
+                        PopupAction::ChangeSelection(new) => {
+                            popup_state = PopupState::Open { selection: new };
                         }
-                        KeyAction::Consume => {}
-                        KeyAction::Exit => return Ok(()),
+                        PopupAction::Confirm => {
+                            focused = selection;
+                            popup_state = PopupState::Closed;
+                        }
+                        PopupAction::Cancel => {
+                            popup_state = PopupState::Closed;
+                        }
+                        PopupAction::None => {}
+                    }
+                    continue;
+                }
+
+                match handle_key(&mut prefix_state, &key) {
+                    KeyAction::Forward(bytes) => {
+                        if let Some(a) = agents.get_mut(focused) {
+                            a.writer.write_all(&bytes).wrap_err("write to pty")?;
+                        }
+                    }
+                    KeyAction::Consume => {}
+                    KeyAction::Exit => return Ok(()),
+                    KeyAction::SpawnAgent => {
+                        let (term_cols, term_rows) =
+                            crossterm::terminal::size().wrap_err("read terminal size")?;
+                        let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
+                        spawn_counter += 1;
+                        let label = format!("agent-{spawn_counter}");
+                        match spawn_agent(label, rows, cols) {
+                            Ok(agent) => {
+                                agents.push(agent);
+                                focused = agents.len() - 1;
+                            }
+                            Err(e) => {
+                                tracing::error!("spawn failed: {e}");
+                            }
+                        }
+                    }
+                    KeyAction::FocusNext => {
+                        focused = (focused + 1) % agents.len();
+                    }
+                    KeyAction::FocusPrev => {
+                        focused = if focused == 0 { agents.len() - 1 } else { focused - 1 };
+                    }
+                    KeyAction::FocusAt(idx) => {
+                        if idx < agents.len() {
+                            focused = idx;
+                        }
+                    }
+                    KeyAction::ToggleNav => {
+                        nav_style = nav_style.toggle();
+                        let (term_cols, term_rows) =
+                            crossterm::terminal::size().wrap_err("read terminal size")?;
+                        let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
+                        resize_agents(&mut agents, rows, cols);
+                    }
+                    KeyAction::OpenPopup => {
+                        popup_state = PopupState::Open { selection: focused };
                     }
                 }
-                Event::Resize(cols, rows) => {
-                    parser.screen_mut().set_size(rows, cols);
-                    // TODO(P1): also resize the PTY itself via master.resize()
-                }
-                _ => {}
             }
+            Event::Resize(cols, rows) => {
+                let (pty_rows, pty_cols) = pty_size_for(nav_style, rows, cols);
+                resize_agents(&mut agents, pty_rows, pty_cols);
+            }
+            _ => {}
         }
     }
 }
 
+fn render_frame(
+    frame: &mut Frame<'_>,
+    agents: &[RuntimeAgent],
+    focused: usize,
+    nav_style: NavStyle,
+    popup: PopupState,
+) {
+    let area = frame.area();
+    match nav_style {
+        NavStyle::LeftPane => render_left_pane(frame, area, agents, focused),
+        NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup),
+    }
+}
+
+fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], focused: usize) {
+    let [nav_area, pty_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(NAV_PANE_WIDTH), Constraint::Min(1)])
+        .areas(area);
+
+    let lines: Vec<Line> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let prefix = if i == focused { "> " } else { "  " };
+            Line::from(format!("{prefix}[{}] {}", i + 1, a.label))
+        })
+        .collect();
+    let nav = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" agents "));
+    frame.render_widget(nav, nav_area);
+
+    if let Some(agent) = agents.get(focused) {
+        let widget = PseudoTerminal::new(agent.parser.screen());
+        frame.render_widget(widget, pty_area);
+    }
+}
+
+fn render_popup_style(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agents: &[RuntimeAgent],
+    focused: usize,
+    popup: PopupState,
+) {
+    let [pty_area, status_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(STATUS_BAR_HEIGHT)])
+        .areas(area);
+
+    if let Some(agent) = agents.get(focused) {
+        let widget = PseudoTerminal::new(agent.parser.screen());
+        frame.render_widget(widget, pty_area);
+    }
+
+    let labels: Vec<String> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let marker = if i == focused { "*" } else { " " };
+            format!("[{}{}] {}", i + 1, marker, a.label)
+        })
+        .collect();
+    let status = format!("{}    Ctrl-B for menu", labels.join("  "));
+    frame.render_widget(Paragraph::new(status), status_area);
+
+    if let PopupState::Open { selection } = popup {
+        render_switcher_popup(frame, area, agents, selection);
+    }
+}
+
+fn render_switcher_popup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agents: &[RuntimeAgent],
+    selection: usize,
+) {
+    let popup_area = centered_rect(50, 60, area);
+    frame.render_widget(Clear, popup_area);
+    let lines: Vec<Line> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let prefix = if i == selection { "> " } else { "  " };
+            Line::from(format!("{prefix}[{}] {}", i + 1, a.label))
+        })
+        .collect();
+    let block = Block::default().borders(Borders::ALL).title(" switch agent ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let [_, vertical_middle, _] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .areas(r);
+    let [_, center, _] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .areas(vertical_middle);
+    center
+}
+
 /// Drives the prefix-key state machine. Returns the action the event loop
-/// should perform: forward bytes to the PTY, consume (do nothing), or exit.
+/// should perform.
 fn handle_key(state: &mut PrefixState, key: &KeyEvent) -> KeyAction {
     match *state {
         PrefixState::Idle => {
@@ -178,14 +439,42 @@ fn handle_key(state: &mut PrefixState, key: &KeyEvent) -> KeyAction {
         PrefixState::AwaitingCommand => {
             *state = PrefixState::Idle;
             if is_prefix(key) {
-                KeyAction::Forward(vec![PREFIX_BYTE])
-            } else {
-                match key.code {
-                    KeyCode::Char('q') => KeyAction::Exit,
-                    _ => KeyAction::Consume,
+                return KeyAction::Forward(vec![PREFIX_BYTE]);
+            }
+            match key.code {
+                KeyCode::Char('q') => KeyAction::Exit,
+                KeyCode::Char('c') => KeyAction::SpawnAgent,
+                KeyCode::Char('n') => KeyAction::FocusNext,
+                KeyCode::Char('p') => KeyAction::FocusPrev,
+                KeyCode::Char('v') => KeyAction::ToggleNav,
+                KeyCode::Char('w') => KeyAction::OpenPopup,
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(d) = c.to_digit(10)
+                        && d > 0
+                    {
+                        return KeyAction::FocusAt((d as usize) - 1);
+                    }
+                    KeyAction::Consume
                 }
+                _ => KeyAction::Consume,
             }
         }
+    }
+}
+
+fn handle_popup_key(key: &KeyEvent, selection: usize, count: usize) -> PopupAction {
+    if count == 0 {
+        return PopupAction::Cancel;
+    }
+    match key.code {
+        KeyCode::Up => {
+            let new = if selection == 0 { count - 1 } else { selection - 1 };
+            PopupAction::ChangeSelection(new)
+        }
+        KeyCode::Down => PopupAction::ChangeSelection((selection + 1) % count),
+        KeyCode::Enter => PopupAction::Confirm,
+        KeyCode::Esc => PopupAction::Cancel,
+        _ => PopupAction::None,
     }
 }
 
@@ -194,8 +483,8 @@ fn is_prefix(key: &KeyEvent) -> bool {
 }
 
 /// Translate a crossterm key event into the bytes a terminal-mode child
-/// process expects. Minimal P0/P1 mapping; does not yet handle alt/meta or
-/// function keys beyond what the `_` arm drops.
+/// process expects. Minimal mapping; alt/meta and most function keys land when
+/// needed.
 fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
     let bytes = match code {
         KeyCode::Char(c) => {
@@ -237,6 +526,8 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
+    // key_to_bytes
+
     #[test]
     fn plain_ascii_char_passes_through_as_one_byte() {
         assert_eq!(key_to_bytes(KeyCode::Char('A'), KeyModifiers::NONE), Some(vec![b'A']));
@@ -258,10 +549,7 @@ mod tests {
 
     #[test]
     fn ctrl_uppercase_collapses_to_the_lowercase_control_byte() {
-        assert_eq!(
-            key_to_bytes(KeyCode::Char('A'), KeyModifiers::CONTROL),
-            Some(vec![0x01]),
-        );
+        assert_eq!(key_to_bytes(KeyCode::Char('A'), KeyModifiers::CONTROL), Some(vec![0x01]));
     }
 
     #[test]
@@ -281,22 +569,10 @@ mod tests {
 
     #[test]
     fn arrow_keys_emit_csi_letter_sequences() {
-        assert_eq!(
-            key_to_bytes(KeyCode::Up, KeyModifiers::NONE),
-            Some(vec![0x1b, b'[', b'A']),
-        );
-        assert_eq!(
-            key_to_bytes(KeyCode::Down, KeyModifiers::NONE),
-            Some(vec![0x1b, b'[', b'B']),
-        );
-        assert_eq!(
-            key_to_bytes(KeyCode::Right, KeyModifiers::NONE),
-            Some(vec![0x1b, b'[', b'C']),
-        );
-        assert_eq!(
-            key_to_bytes(KeyCode::Left, KeyModifiers::NONE),
-            Some(vec![0x1b, b'[', b'D']),
-        );
+        assert_eq!(key_to_bytes(KeyCode::Up, KeyModifiers::NONE), Some(vec![0x1b, b'[', b'A']));
+        assert_eq!(key_to_bytes(KeyCode::Down, KeyModifiers::NONE), Some(vec![0x1b, b'[', b'B']));
+        assert_eq!(key_to_bytes(KeyCode::Right, KeyModifiers::NONE), Some(vec![0x1b, b'[', b'C']));
+        assert_eq!(key_to_bytes(KeyCode::Left, KeyModifiers::NONE), Some(vec![0x1b, b'[', b'D']));
     }
 
     #[test]
@@ -304,7 +580,7 @@ mod tests {
         assert_eq!(key_to_bytes(KeyCode::F(12), KeyModifiers::NONE), None);
     }
 
-    // Prefix-key state machine.
+    // Prefix state machine — basics
 
     #[test]
     fn idle_forwards_a_normal_char() {
@@ -315,8 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_forwards_ctrl_c_to_pty_after_p11() {
-        // Ctrl-C is no longer codemux's exit key; it goes to claude.
+    fn idle_forwards_ctrl_c_to_pty() {
         let mut state = PrefixState::Idle;
         let action = handle_key(&mut state, &key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(action, KeyAction::Forward(vec![0x03]));
@@ -332,26 +607,10 @@ mod tests {
     }
 
     #[test]
-    fn prefix_then_q_exits_codemux() {
-        let mut state = PrefixState::AwaitingCommand;
-        let action = handle_key(&mut state, &key(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert_eq!(action, KeyAction::Exit);
-        assert_eq!(state, PrefixState::Idle);
-    }
-
-    #[test]
     fn double_prefix_forwards_a_literal_prefix_byte() {
         let mut state = PrefixState::AwaitingCommand;
         let action = handle_key(&mut state, &key(KeyCode::Char('b'), KeyModifiers::CONTROL));
         assert_eq!(action, KeyAction::Forward(vec![PREFIX_BYTE]));
-        assert_eq!(state, PrefixState::Idle);
-    }
-
-    #[test]
-    fn unknown_key_after_prefix_consumes_and_returns_to_idle() {
-        let mut state = PrefixState::AwaitingCommand;
-        let action = handle_key(&mut state, &key(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert_eq!(action, KeyAction::Consume);
         assert_eq!(state, PrefixState::Idle);
     }
 
@@ -377,5 +636,126 @@ mod tests {
         let action = handle_key(&mut state, &key(KeyCode::F(12), KeyModifiers::NONE));
         assert_eq!(action, KeyAction::Consume);
         assert_eq!(state, PrefixState::Idle);
+    }
+
+    // Prefix state machine — multi-agent commands
+
+    #[test]
+    fn prefix_q_exits() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Exit);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn prefix_c_spawns_an_agent() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::SpawnAgent);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn prefix_n_focuses_the_next_agent() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::FocusNext);
+    }
+
+    #[test]
+    fn prefix_p_focuses_the_previous_agent() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::FocusPrev);
+    }
+
+    #[test]
+    fn prefix_digit_focuses_by_one_indexed_position() {
+        for d in 1..=9 {
+            let mut state = PrefixState::AwaitingCommand;
+            let c = char::from_digit(d, 10).unwrap();
+            let action = handle_key(&mut state, &key(KeyCode::Char(c), KeyModifiers::NONE));
+            assert_eq!(action, KeyAction::FocusAt(usize::try_from(d - 1).unwrap()));
+        }
+    }
+
+    #[test]
+    fn prefix_zero_is_consumed_no_focus() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('0'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::Consume);
+    }
+
+    #[test]
+    fn prefix_v_toggles_the_navigator_style() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::ToggleNav);
+    }
+
+    #[test]
+    fn prefix_w_opens_the_switcher_popup() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = handle_key(&mut state, &key(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(action, KeyAction::OpenPopup);
+    }
+
+    // NavStyle toggle
+
+    #[test]
+    fn nav_style_toggle_is_a_two_state_cycle() {
+        assert_eq!(NavStyle::LeftPane.toggle(), NavStyle::Popup);
+        assert_eq!(NavStyle::Popup.toggle(), NavStyle::LeftPane);
+    }
+
+    // Popup key handler
+
+    #[test]
+    fn popup_down_advances_selection_with_wrap() {
+        assert_eq!(
+            handle_popup_key(&key(KeyCode::Down, KeyModifiers::NONE), 0, 3),
+            PopupAction::ChangeSelection(1),
+        );
+        assert_eq!(
+            handle_popup_key(&key(KeyCode::Down, KeyModifiers::NONE), 2, 3),
+            PopupAction::ChangeSelection(0),
+        );
+    }
+
+    #[test]
+    fn popup_up_retreats_selection_with_wrap() {
+        assert_eq!(
+            handle_popup_key(&key(KeyCode::Up, KeyModifiers::NONE), 1, 3),
+            PopupAction::ChangeSelection(0),
+        );
+        assert_eq!(
+            handle_popup_key(&key(KeyCode::Up, KeyModifiers::NONE), 0, 3),
+            PopupAction::ChangeSelection(2),
+        );
+    }
+
+    #[test]
+    fn popup_enter_confirms_selection() {
+        assert_eq!(
+            handle_popup_key(&key(KeyCode::Enter, KeyModifiers::NONE), 1, 3),
+            PopupAction::Confirm,
+        );
+    }
+
+    #[test]
+    fn popup_esc_cancels() {
+        assert_eq!(
+            handle_popup_key(&key(KeyCode::Esc, KeyModifiers::NONE), 0, 3),
+            PopupAction::Cancel,
+        );
+    }
+
+    #[test]
+    fn popup_with_zero_agents_cancels_immediately() {
+        assert_eq!(
+            handle_popup_key(&key(KeyCode::Down, KeyModifiers::NONE), 0, 0),
+            PopupAction::Cancel,
+        );
     }
 }
