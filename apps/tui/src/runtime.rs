@@ -45,6 +45,10 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Best-effort cleanup. Failures here are unrecoverable (we are mid-drop
+        // and may be on a panic path); the user's terminal may already be in
+        // a degraded state, and surfacing an error would clobber whatever the
+        // panic backtrace was about to say.
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
@@ -191,6 +195,10 @@ fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
 
 fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
     for a in agents {
+        // PTY resize is best-effort: failure here means the child sees a
+        // stale size until next resize, which is a harmless cosmetic glitch
+        // (claude re-lays-out on the next paint cycle). Surfacing as an
+        // error would force callers to handle a non-actionable failure.
         let _ = a.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         a.parser.screen_mut().set_size(rows, cols);
     }

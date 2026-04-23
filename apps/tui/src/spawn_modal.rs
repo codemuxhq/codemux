@@ -22,6 +22,14 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::keymap::{ModalAction, ModalBindings};
 
 const MAX_COMPLETIONS: usize = 6;
+/// Cap on how many directory entries we scan before filtering. Refresh runs
+/// synchronously on every keystroke (the modal is on the render thread), so
+/// without this guard a path landing in a huge dir (e.g. `/usr/lib`,
+/// `node_modules`, mailbox) would block the loop. Tradeoff: in such a dir
+/// the completion list may miss alphabetically-late matches. Acceptable;
+/// the alternative is a real async lookup, which earns its keep only when
+/// this becomes a real complaint.
+const MAX_SCAN_ENTRIES: usize = 1024;
 const HOST_FIELD_WIDTH: u16 = 14;
 const PATH_FIELD_WIDTH: u16 = 44;
 const HOST_PLACEHOLDER: &str = "local";
@@ -172,6 +180,7 @@ impl SpawnModal {
         let Ok(entries) = std::fs::read_dir(&dir) else { return };
         let mut found: Vec<String> = entries
             .filter_map(Result::ok)
+            .take(MAX_SCAN_ENTRIES)
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
                 if !name.starts_with(&prefix) {
