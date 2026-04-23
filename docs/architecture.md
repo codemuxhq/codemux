@@ -26,6 +26,57 @@
 
 codemux is a single Rust binary. There is no daemon on any remote host, no server, no web frontend. Remote access is via `ssh` subprocesses whose stdio is a PTY. Local access is via a directly-spawned PTY.
 
+## Workspace layout
+
+codemux is a Cargo workspace. One thin binary in `apps/`, three library crates in `crates/` bounded by domain concern (not by technical layer).
+
+```
+codemux/
+├── Cargo.toml                       # [workspace], [workspace.dependencies], [workspace.lints]
+├── apps/
+│   └── tui/                         # crate: codemux-tui, binary: codemux
+│       └── src/
+│           ├── main.rs              # argv, tracing init, calls runtime::run()
+│           ├── runtime.rs           # wires adapters into ports, event loop, navigator view model
+│           └── ui/                  # ratatui chrome, term pane (tui-term), diff panel, keymap
+└── crates/
+    ├── session/                     # bounded context: agent lifecycle
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── domain.rs            # Agent, Host, Group, SessionState
+    │       ├── use_cases.rs         # spawn / focus / detach / kill / resume
+    │       ├── ports.rs             # AgentRepo, PtyTransport, NotificationSink
+    │       ├── error.rs             # thiserror, #[non_exhaustive]
+    │       └── infra/
+    │           ├── sqlite_store.rs  # ↦ AgentRepo
+    │           ├── pty_local.rs     # ↦ PtyTransport (direct fork)
+    │           ├── pty_ssh.rs       # ↦ PtyTransport (ssh + tmux new -A, AD-3)
+    │           └── notify_shell.rs  # ↦ NotificationSink
+    ├── diff/                        # bounded context: git diff probe + open-in-editor
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── domain.rs            # DiffSnapshot, Hunk
+    │       ├── use_cases.rs
+    │       ├── ports.rs             # GitProbe, EditorLauncher
+    │       ├── error.rs
+    │       └── infra/
+    │           └── git_subprocess.rs
+    └── shared-kernel/               # IDs and tracing only; zero vendor deps
+        └── src/lib.rs               # HostId, AgentId, GroupId
+```
+
+Allowed dependency edges:
+
+- `session` → `shared-kernel`
+- `diff` → `shared-kernel`, `session`
+- `apps/tui` → `session`, `diff`, `shared-kernel`, UI libs (`ratatui`, `tui-term`, `vt100`, `syntect`)
+
+Forbidden, enforced in CI via `cargo-deny [bans]`:
+
+- Any `crates/*` depending on `ratatui` / `tui-term` / `vt100` / `syntect`
+- Any `crates/*` depending on `apps/*`
+- Any cycle between component crates
+
 ## Data model
 
 ```
@@ -156,6 +207,99 @@ For P2 attention-needed events (agent finished, agent needs input), codemux shel
 - Linux: `notify-send`
 
 Rejected: linking platform-specific notification crates. Per-platform compile paths, more deps. The shell-out is small and easy to make conditional on `uname`.
+
+### AD-14 — Cargo workspace with apps/crates split
+
+codemux is delivered as a single binary but organized as a Cargo workspace with `apps/` (driving adapters) and `crates/` (libraries) directories. The binary at `apps/tui/` is thin: argv parsing, tracing init, and delegation to a library's `run()`. All meaningful logic lives in `crates/`.
+
+Rejected: single-crate `src/main.rs` + `src/lib.rs`. Works today, but every future split pays extraction cost later. Workspace-first is nearly free now and preserves that optionality — including the eventual ability to add a second delivery (P4 phone view) without restructuring.
+
+### AD-15 — Package by Component, not by technical layer
+
+Crates and modules are bounded by domain concern (`session`, `diff`), not by technical layer (`state-store`, `tui-chrome`, `pty-host`). A component crate owns its domain types, use cases, ports, *and* its adapters.
+
+Rejected: horizontal layering into `domain`, `state-store`, `pty-host`, `tui-chrome`, `notify`, `app-shell` crates. This is the Lasagna Architecture anti-pattern — small updates reverberate through every layer, proxy methods accumulate at boundaries, and the source tree tells you nothing about what the application *does*. Screaming Architecture wins: top-level folders under `crates/` name bounded contexts.
+
+### AD-16 — TUI binary at apps/tui/, crate codemux-tui, binary codemux
+
+Directory name describes the delivery shape, not the product. Cargo separates package name from binary name:
+
+```toml
+[package]
+name = "codemux-tui"
+
+[[bin]]
+name = "codemux"
+path = "src/main.rs"
+```
+
+A future P4 phone-view delivery becomes `apps/phone-view/` without renaming anything. Users still type `codemux` because that is the product.
+
+### AD-17 — Per-component error types via thiserror
+
+Each library crate defines its own `thiserror` enum, marked `#[non_exhaustive]`. The binary uses `color-eyre` (or `anyhow`) at the edge to wrap library errors for human-readable reporting.
+
+Rejected: a shared `Error` enum for the whole workspace. Ball-of-Mud trap — every crate must know every other crate's failure shape, and the enum grows until abstraction layers collapse. Per-crate errors keep each bounded context's failure vocabulary contained; the binary is the only place that needs to talk in "any error".
+
+### AD-18 — Infrastructure adapters are co-located with their component
+
+The infra module (`session/src/infra/`, `diff/src/infra/`) lives inside the crate that defines its ports. No separate `crates/infra/` crate.
+
+Rationale: cohesion. SQLite is how *session* persists; it is not a generic infrastructure concern. Keeping adapters with the component that owns their ports makes the component's full story — domain, use cases, ports, real-world wiring — live in one directory.
+
+Revisit: if a second binary ships that needs the session domain without PTY or SQLite, the adapters hide behind a Cargo feature (`adapters = [...]`). Not needed today.
+
+### AD-19 — shared-kernel carries IDs and tracing only
+
+The `shared-kernel` crate holds cross-cutting primitives every component needs: `HostId`, `AgentId`, `GroupId` newtypes, plus tracing-subscriber init. Zero vendor deps, zero error types, zero business logic.
+
+Per DDD, the shared kernel must be small and stable — changes to it ripple to every component. Anything domain-shaped that drifts into shared-kernel is mis-filed; it belongs in a specific component.
+
+### AD-20 — Ports-and-adapters inside each component crate
+
+Within a component crate:
+
+- `domain.rs` — pure types, zero vendor deps
+- `ports.rs` — traits (`AgentRepo`, `PtyTransport`, `GitProbe`, …) that use cases depend on
+- `use_cases.rs` — logic parameterized over the port traits
+- `infra/` — trait implementations using real tools
+
+The binary (`apps/tui/runtime.rs`) is the only place where concrete adapters are instantiated and injected into use cases. Tests substitute in-memory adapters without touching filesystem, database, or network. Adapter swaps (e.g., the `alacritty_terminal` fallback in AD-11) become a single-file change.
+
+### AD-21 — Workspace-wide dependencies and lints
+
+Shared dependencies are pinned exactly in `[workspace.dependencies]` at the root. Shared lints are declared in `[workspace.lints]`. Rust edition 2024, Cargo resolver 3.
+
+```toml
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+```
+
+Member crates inherit with `{ workspace = true }` on deps and `[lints] workspace = true` on lints.
+
+Rejected: `cargo-hakari`. Needed only in very large workspaces; edition 2024 + resolver 3 handle feature unification natively.
+
+### AD-22 — Navigator is a view model in apps/tui, not its own crate
+
+The navigator's *data* (agents with status, pwd, host) is owned by the `session` component. The navigator's *UI state* (selection index, filter string, collapse state, display mode) is presentation and lives in `apps/tui/runtime.rs` as a view model.
+
+Navigator state has no meaning outside the TUI delivery. Extracting it into its own crate would invent a bounded-context split where none exists. A future phone-view delivery would build its own view model over the same `session` read model — not reuse this one.
+
+### AD-23 — Fitness functions for extracting further crates
+
+The three-crate layout is the starting point, not the endpoint. A new crate is extracted when, and only when, one of these signals fires:
+
+1. **Compile pain.** Full workspace `cargo test` on warm cache exceeds ~15s. Extract the heaviest-deps component.
+2. **Feature isolation pain.** A component needs different feature flags on a shared dep and hits the unification wall.
+3. **Generic subdomain.** A component becomes Claude-Code-agnostic and is a credible OSS publication candidate (e.g., the PTY transport).
+4. **Second binary.** A delivery like the P4 phone view needs the session domain without the TUI adapters.
+
+Splitting before a signal fires is the anti-pattern. For a solo, single-binary, pre-alpha tool, three component crates is the right granularity.
 
 ### Navigator layout — OPEN
 
