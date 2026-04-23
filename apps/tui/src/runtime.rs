@@ -19,6 +19,7 @@
 //! - prefix again forwards a literal Ctrl-B byte to the focused agent
 
 use std::io::{self, Read, Write};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -40,6 +41,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
+
+use crate::spawn_modal::{ModalAction, SpawnModal};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -123,7 +126,7 @@ pub fn run(nav_style: NavStyle) -> Result<()> {
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols);
 
-    let initial = spawn_agent("agent-1".into(), pty_rows, pty_cols)?;
+    let initial = spawn_agent("agent-1".into(), None, pty_rows, pty_cols)?;
     let agents = vec![initial];
 
     enable_raw_mode().wrap_err("enable raw mode")?;
@@ -143,12 +146,20 @@ fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16) -> (u16, u16) {
     }
 }
 
-fn spawn_agent(label: String, rows: u16, cols: u16) -> Result<RuntimeAgent> {
+fn spawn_agent(
+    label: String,
+    cwd: Option<&Path>,
+    rows: u16,
+    cols: u16,
+) -> Result<RuntimeAgent> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| eyre!("open pty: {e}"))?;
-    let cmd = CommandBuilder::new("claude");
+    let mut cmd = CommandBuilder::new("claude");
+    if let Some(cwd) = cwd {
+        cmd.cwd(cwd);
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -197,8 +208,14 @@ fn event_loop(
     mut agents: Vec<RuntimeAgent>,
     mut nav_style: NavStyle,
 ) -> Result<()> {
+    // Long, but it is the central event loop and breaks naturally into
+    // sequential phases (drain / reap / render / dispatch). Pulling each
+    // arm into its own helper would require threading >5 mutable references
+    // through the helper and gain little.
+    #![allow(clippy::too_many_lines)]
     let mut prefix_state = PrefixState::default();
     let mut popup_state = PopupState::default();
+    let mut spawn_modal: Option<SpawnModal> = None;
     let mut focused: usize = 0;
     let mut spawn_counter: usize = agents.len();
 
@@ -225,7 +242,7 @@ fn event_loop(
 
         terminal
             .draw(|frame| {
-                render_frame(frame, &agents, focused, nav_style, popup_state);
+                render_frame(frame, &agents, focused, nav_style, popup_state, spawn_modal.as_ref());
             })
             .wrap_err("draw frame")?;
 
@@ -235,6 +252,48 @@ fn event_loop(
 
         match event::read().wrap_err("read input")? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Modal takes priority over both the popup switcher and the
+                // prefix-key state machine.
+                if let Some(modal) = spawn_modal.as_mut() {
+                    match modal.handle(&key) {
+                        ModalAction::None => {}
+                        ModalAction::Cancel => {
+                            spawn_modal = None;
+                        }
+                        ModalAction::Spawn { host, path } => {
+                            spawn_modal = None;
+                            if host == "local" {
+                                let (term_cols, term_rows) = crossterm::terminal::size()
+                                    .wrap_err("read terminal size")?;
+                                let (rows, cols) =
+                                    pty_size_for(nav_style, term_rows, term_cols);
+                                spawn_counter += 1;
+                                let label = format!("agent-{spawn_counter}");
+                                let cwd_path = if path.is_empty() {
+                                    None
+                                } else {
+                                    Some(Path::new(&path))
+                                };
+                                match spawn_agent(label, cwd_path, rows, cols) {
+                                    Ok(agent) => {
+                                        agents.push(agent);
+                                        focused = agents.len() - 1;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("spawn failed: {e}");
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "ssh transport not yet implemented; \
+                                     skipping spawn on host {host}",
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if let PopupState::Open { selection } = popup_state {
                     match handle_popup_key(&key, selection, agents.len()) {
                         PopupAction::ChangeSelection(new) => {
@@ -261,20 +320,7 @@ fn event_loop(
                     KeyAction::Consume => {}
                     KeyAction::Exit => return Ok(()),
                     KeyAction::SpawnAgent => {
-                        let (term_cols, term_rows) =
-                            crossterm::terminal::size().wrap_err("read terminal size")?;
-                        let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
-                        spawn_counter += 1;
-                        let label = format!("agent-{spawn_counter}");
-                        match spawn_agent(label, rows, cols) {
-                            Ok(agent) => {
-                                agents.push(agent);
-                                focused = agents.len() - 1;
-                            }
-                            Err(e) => {
-                                tracing::error!("spawn failed: {e}");
-                            }
-                        }
+                        spawn_modal = Some(SpawnModal::open());
                     }
                     KeyAction::FocusNext => {
                         focused = (focused + 1) % agents.len();
@@ -314,11 +360,15 @@ fn render_frame(
     focused: usize,
     nav_style: NavStyle,
     popup: PopupState,
+    spawn_modal: Option<&SpawnModal>,
 ) {
     let area = frame.area();
     match nav_style {
         NavStyle::LeftPane => render_left_pane(frame, area, agents, focused),
         NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup),
+    }
+    if let Some(modal) = spawn_modal {
+        modal.render(frame, area);
     }
 }
 

@@ -3,6 +3,7 @@ use color_eyre::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod runtime;
+mod spawn_modal;
 use runtime::NavStyle;
 
 #[derive(Debug, Parser)]
