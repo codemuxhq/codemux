@@ -29,5 +29,9 @@ portable-pty.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
 
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+
 [lints]
 workspace = true

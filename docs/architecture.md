@@ -181,6 +181,45 @@ genuinely-OK cases. Member crates inherit with `[lints] workspace = true`.
 Rejected: `cargo-hakari`. Needed only in very large workspaces; edition 2024 +
 resolver 3 handle feature unification natively.
 
+### AD-24 — Keymap registry as POD; config is a Plain Old Data structure
+
+Key bindings are typed action enums per scope (`PrefixAction`, `PopupAction`,
+`ModalAction`) plus `Bindings` POD structs that the runtime consults via
+`bindings.<scope>.lookup(KeyEvent) -> Option<Action>`. This is the TEA
+(Elm-style) dispatch pattern documented in the Ratatui guide: input → typed
+action → state mutation, with the keymap as the single source of truth.
+
+Configuration lives at `$XDG_CONFIG_HOME/codemux/config.toml` (resolved via
+the `directories` crate). It is loaded once at startup into a `Config` POD
+and passed by reference into `runtime::run`. There is **no port/trait** for
+config — direct quote from the architecture-guide review of this slice
+(NLM, 2026-04-23): *"For a personal pre-alpha tool, reading the config at
+startup and passing it as a Plain Old Data structure at construction time is
+the architecturally sound choice."* A port earns its keep only when config
+becomes dynamic (remote service); not now.
+
+Per the same review: mapping a key to an action is a presentation/delivery
+concern. Both `keymap` and `config` therefore live in `apps/tui/`, not in a
+separate crate. Extract per AD-23's fitness functions if/when a second
+delivery (e.g. a phone view) needs to share the keymap vocabulary.
+
+Failure mode: a missing config file is fine (defaults). A present-but-invalid
+config file fails loud with a readable error before the TUI starts. Per CLI
+guidelines, silent fallback would be worse than refusing to start.
+
+The help screen (default `<prefix> ?`) is generated from the same `Bindings`
+POD — single source of truth for both behavior and documentation.
+
+Rejected: a HashMap-based registry indexed by `(Scope, KeyChord)`. With ~7
+entries per scope, linear search through a fixed-size array is faster than
+a HashMap and the table reads as data declaration. Re-evaluate if scope
+sizes grow past ~30.
+
+Rejected: deriving `serde::Deserialize` directly on `crossterm::event::KeyEvent`.
+Hand-rolled `KeyChord` parser keeps the user-facing format independent of
+crossterm's internal representation (which has fields like `kind` and `state`
+the user never wants to think about).
+
 ## Deferred ideas
 
 Architecture decisions sketched in earlier drafts but not load-bearing for what

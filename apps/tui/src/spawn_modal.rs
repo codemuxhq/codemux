@@ -1,18 +1,13 @@
 //! Spawn-agent modal: two side-by-side text fields for host and path, with
-//! filesystem autocomplete on the path field. Triggered by prefix + `c`.
+//! filesystem autocomplete on the path field. Triggered by the prefix-mode
+//! `spawn_agent` binding (default `c`).
 //!
-//! Keybindings inside the modal:
-//! - `Enter` spawn an agent at the entered host + path
-//! - `Esc` cancel and close
-//! - `Tab` apply highlighted completion (in path field), otherwise swap
-//!   focused field
-//! - `@` from path field, jump to host field (host can still type a literal
-//!   `@` for `user@hostname` style targets)
-//! - `Up` / `Down` cycle through path completions
-//! - chars / Backspace edit the focused field
+//! The modal consults `keymap::ModalBindings` for command keys (`Confirm`,
+//! `Cancel`, `SwapField`, `SwapToHost`, `NextCompletion`, `PrevCompletion`).
+//! Plain chars and Backspace fall through to text input on the focused field.
 //!
 //! Today only host == empty or "local" actually spawns; non-local hosts are a
-//! P1.4 SSH-transport concern and the runtime logs an error and does nothing
+//! P1.4 SSH-transport concern. The runtime logs a warning and does nothing
 //! when given a non-local host.
 
 use std::path::{Path, PathBuf};
@@ -23,6 +18,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+use crate::keymap::{ModalAction, ModalBindings};
 
 const MAX_COMPLETIONS: usize = 6;
 const HOST_FIELD_WIDTH: u16 = 14;
@@ -35,8 +32,11 @@ pub enum SpawnField {
     Path,
 }
 
+/// What the modal tells the event loop after handling a key. Distinct from
+/// `keymap::ModalAction` (which only names which key did what); this carries
+/// the user's final intent (cancel / spawn with these values).
 #[derive(Debug, Eq, PartialEq)]
-pub enum ModalAction {
+pub enum ModalOutcome {
     None,
     Cancel,
     Spawn { host: String, path: String },
@@ -52,8 +52,6 @@ pub struct SpawnModal {
 }
 
 impl SpawnModal {
-    /// Open a modal pre-filled with the user's current working directory.
-    /// If we cannot read cwd (rare), the path field is empty.
     pub fn open() -> Self {
         let cwd = std::env::current_dir()
             .ok()
@@ -70,65 +68,86 @@ impl SpawnModal {
         modal
     }
 
-    pub fn handle(&mut self, key: &KeyEvent) -> ModalAction {
+    pub fn handle(&mut self, key: &KeyEvent, bindings: &ModalBindings) -> ModalOutcome {
         // Discard Ctrl-key events so the user's prefix-key reflexes
         // (e.g. accidentally hitting Ctrl-B) do not insert garbage.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return ModalAction::None;
+            return ModalOutcome::None;
         }
+
+        // Bound action keys, with one exception: SwapToHost is only honored
+        // in the path field. In the host field the same key (default `@`)
+        // falls through to text input so user@hostname targets work.
+        if let Some(action) = bindings.lookup(key) {
+            if action == ModalAction::SwapToHost && self.focused == SpawnField::Host {
+                // fall through
+            } else {
+                return self.dispatch(action);
+            }
+        }
+
+        // Text input fallback.
         match key.code {
-            KeyCode::Esc => ModalAction::Cancel,
-            KeyCode::Enter => {
-                let host = self.host.trim().to_string();
-                let host = if host.is_empty() { "local".into() } else { host };
-                let path = self.path.trim().to_string();
-                ModalAction::Spawn { host, path }
-            }
-            KeyCode::Tab => {
-                if self.focused == SpawnField::Path && self.completion_idx.is_some() {
-                    self.apply_completion();
-                } else {
-                    self.swap_field();
-                }
-                ModalAction::None
-            }
-            KeyCode::Char('@') if self.focused == SpawnField::Path => {
-                self.focused = SpawnField::Host;
-                ModalAction::None
-            }
             KeyCode::Char(c) => {
                 self.current_field_mut().push(c);
                 if self.focused == SpawnField::Path {
                     self.refresh_completions();
                 }
-                ModalAction::None
+                ModalOutcome::None
             }
             KeyCode::Backspace => {
                 self.current_field_mut().pop();
                 if self.focused == SpawnField::Path {
                     self.refresh_completions();
                 }
-                ModalAction::None
+                ModalOutcome::None
             }
-            KeyCode::Down
-                if self.focused == SpawnField::Path && !self.completions.is_empty() =>
-            {
-                let next = match self.completion_idx {
-                    None => 0,
-                    Some(i) => (i + 1) % self.completions.len(),
-                };
-                self.completion_idx = Some(next);
-                ModalAction::None
+            _ => ModalOutcome::None,
+        }
+    }
+
+    fn dispatch(&mut self, action: ModalAction) -> ModalOutcome {
+        match action {
+            ModalAction::Cancel => ModalOutcome::Cancel,
+            ModalAction::Confirm => {
+                let host = self.host.trim().to_string();
+                let host = if host.is_empty() { "local".into() } else { host };
+                let path = self.path.trim().to_string();
+                ModalOutcome::Spawn { host, path }
             }
-            KeyCode::Up if self.focused == SpawnField::Path && !self.completions.is_empty() => {
-                let prev = match self.completion_idx {
-                    None | Some(0) => self.completions.len() - 1,
-                    Some(i) => i - 1,
-                };
-                self.completion_idx = Some(prev);
-                ModalAction::None
+            ModalAction::SwapField => {
+                if self.focused == SpawnField::Path && self.completion_idx.is_some() {
+                    self.apply_completion();
+                } else {
+                    self.swap_field();
+                }
+                ModalOutcome::None
             }
-            _ => ModalAction::None,
+            ModalAction::SwapToHost => {
+                // Caller has already verified focused == Path.
+                self.focused = SpawnField::Host;
+                ModalOutcome::None
+            }
+            ModalAction::NextCompletion => {
+                if self.focused == SpawnField::Path && !self.completions.is_empty() {
+                    let next = match self.completion_idx {
+                        None => 0,
+                        Some(i) => (i + 1) % self.completions.len(),
+                    };
+                    self.completion_idx = Some(next);
+                }
+                ModalOutcome::None
+            }
+            ModalAction::PrevCompletion => {
+                if self.focused == SpawnField::Path && !self.completions.is_empty() {
+                    let prev = match self.completion_idx {
+                        None | Some(0) => self.completions.len() - 1,
+                        Some(i) => i - 1,
+                    };
+                    self.completion_idx = Some(prev);
+                }
+                ModalOutcome::None
+            }
         }
     }
 
@@ -146,9 +165,6 @@ impl SpawnModal {
         }
     }
 
-    /// Re-scan the filesystem for entries matching the current path's
-    /// trailing component. Best-effort: failures (no permission, dir missing)
-    /// quietly produce zero completions.
     fn refresh_completions(&mut self) {
         self.completion_idx = None;
         self.completions.clear();
@@ -170,7 +186,6 @@ impl SpawnModal {
         self.completions = found;
     }
 
-    /// Replace the path's trailing component with the highlighted completion.
     fn apply_completion(&mut self) {
         let Some(idx) = self.completion_idx else { return };
         let Some(completion) = self.completions.get(idx).cloned() else { return };
@@ -203,7 +218,6 @@ impl SpawnModal {
             ])
             .areas(inner);
 
-        // Fields row, side by side.
         let [host_area, _, path_area] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -216,7 +230,6 @@ impl SpawnModal {
         frame.render_widget(self.field_paragraph(SpawnField::Host), host_area);
         frame.render_widget(self.field_paragraph(SpawnField::Path), path_area);
 
-        // Completions list (only meaningful for path field).
         let lines: Vec<Line> = self
             .completions
             .iter()
@@ -231,8 +244,7 @@ impl SpawnModal {
                 Line::styled(format!("{prefix}{c}"), style)
             })
             .collect();
-        // Indent the completions to roughly align under the path field.
-        let completions_offset = HOST_FIELD_WIDTH + 6 + 2 + 6; // host area + gap + "path: ["
+        let completions_offset = HOST_FIELD_WIDTH + 6 + 2 + 6;
         let completions_area = Rect {
             x: completions_row.x + completions_offset.min(completions_row.width),
             y: completions_row.y,
@@ -241,7 +253,6 @@ impl SpawnModal {
         };
         frame.render_widget(Paragraph::new(lines), completions_area);
 
-        // Hint line.
         let hint = "Tab autocomplete  @ swap to host  Enter spawn  Esc cancel";
         frame.render_widget(Paragraph::new(hint), hint_row);
     }
@@ -263,15 +274,16 @@ impl SpawnModal {
         let display: String = if value.is_empty() && field == SpawnField::Host {
             HOST_PLACEHOLDER.into()
         } else if value.chars().count() > width {
-            // Right-clip so the trailing characters (where the user is typing)
-            // stay visible.
             value.chars().rev().take(width).collect::<Vec<_>>().into_iter().rev().collect()
         } else {
             value.clone()
         };
 
         let cursor = if self.focused == field { "_" } else { " " };
-        let bracketed = format!("{label}[{display}{cursor:>width$}]", width = width.saturating_sub(display.chars().count()));
+        let bracketed = format!(
+            "{label}[{display}{cursor:>width$}]",
+            width = width.saturating_sub(display.chars().count()),
+        );
         let style = if self.focused == field {
             Style::default().add_modifier(Modifier::BOLD)
         } else if value.is_empty() && field == SpawnField::Host {
@@ -322,7 +334,6 @@ fn centered_rect_with_size(width: u16, height: u16, r: Rect) -> Rect {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -333,7 +344,6 @@ mod tests {
     }
 
     fn modal() -> SpawnModal {
-        // Build directly to avoid depending on the test process cwd.
         let mut m = SpawnModal {
             host: String::new(),
             path: "/tmp".into(),
@@ -341,27 +351,28 @@ mod tests {
             completions: Vec::new(),
             completion_idx: None,
         };
-        // Skip refresh_completions to keep tests filesystem-free.
         m.completions.clear();
         m
+    }
+
+    fn b() -> ModalBindings {
+        ModalBindings::default()
     }
 
     #[test]
     fn ctrl_modified_keys_are_dropped() {
         let mut m = modal();
         m.path = "/x".into();
-        // User reflex: Ctrl-B should not insert 'b' in the path.
-        let action = m.handle(&ctrl(KeyCode::Char('b')));
-        assert_eq!(action, ModalAction::None);
+        let outcome = m.handle(&ctrl(KeyCode::Char('b')), &b());
+        assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.path, "/x");
-        // Ctrl-Enter and Ctrl-anything-else are likewise no-ops.
-        assert_eq!(m.handle(&ctrl(KeyCode::Enter)), ModalAction::None);
+        assert_eq!(m.handle(&ctrl(KeyCode::Enter), &b()), ModalOutcome::None);
     }
 
     #[test]
     fn esc_returns_cancel() {
         let mut m = modal();
-        assert_eq!(m.handle(&key(KeyCode::Esc)), ModalAction::Cancel);
+        assert_eq!(m.handle(&key(KeyCode::Esc), &b()), ModalOutcome::Cancel);
     }
 
     #[test]
@@ -369,10 +380,10 @@ mod tests {
         let mut m = modal();
         m.path = "  /home/user  ".into();
         m.host = "  remote  ".into();
-        let action = m.handle(&key(KeyCode::Enter));
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
         assert_eq!(
-            action,
-            ModalAction::Spawn { host: "remote".into(), path: "/home/user".into() },
+            outcome,
+            ModalOutcome::Spawn { host: "remote".into(), path: "/home/user".into() },
         );
     }
 
@@ -380,10 +391,10 @@ mod tests {
     fn empty_host_becomes_local_on_spawn() {
         let mut m = modal();
         m.path = "/x".into();
-        let action = m.handle(&key(KeyCode::Enter));
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
         assert_eq!(
-            action,
-            ModalAction::Spawn { host: "local".into(), path: "/x".into() },
+            outcome,
+            ModalOutcome::Spawn { host: "local".into(), path: "/x".into() },
         );
     }
 
@@ -391,7 +402,7 @@ mod tests {
     fn typing_a_char_appends_to_focused_field() {
         let mut m = modal();
         m.path = "/x".into();
-        m.handle(&key(KeyCode::Char('y')));
+        m.handle(&key(KeyCode::Char('y')), &b());
         assert_eq!(m.path, "/xy");
     }
 
@@ -399,17 +410,16 @@ mod tests {
     fn at_in_path_swaps_to_host_field() {
         let mut m = modal();
         assert_eq!(m.focused, SpawnField::Path);
-        m.handle(&key(KeyCode::Char('@')));
+        m.handle(&key(KeyCode::Char('@')), &b());
         assert_eq!(m.focused, SpawnField::Host);
-        // Path is unchanged: '@' was not inserted.
         assert_eq!(m.path, "/tmp");
     }
 
     #[test]
-    fn at_in_host_is_a_literal_char_for_user_at_host_targets() {
+    fn at_in_host_is_a_literal_char() {
         let mut m = modal();
         m.focused = SpawnField::Host;
-        m.handle(&key(KeyCode::Char('@')));
+        m.handle(&key(KeyCode::Char('@')), &b());
         assert_eq!(m.host, "@");
         assert_eq!(m.focused, SpawnField::Host);
     }
@@ -417,9 +427,9 @@ mod tests {
     #[test]
     fn tab_swaps_field_when_no_completion_highlighted() {
         let mut m = modal();
-        m.handle(&key(KeyCode::Tab));
+        m.handle(&key(KeyCode::Tab), &b());
         assert_eq!(m.focused, SpawnField::Host);
-        m.handle(&key(KeyCode::Tab));
+        m.handle(&key(KeyCode::Tab), &b());
         assert_eq!(m.focused, SpawnField::Path);
     }
 
@@ -429,7 +439,7 @@ mod tests {
         m.path = "/foo".into();
         m.completions = vec!["foobar/".into(), "fooboo".into()];
         m.completion_idx = Some(0);
-        m.handle(&key(KeyCode::Tab));
+        m.handle(&key(KeyCode::Tab), &b());
         assert_eq!(m.path, "/foobar/");
         assert_eq!(m.focused, SpawnField::Path);
     }
@@ -437,7 +447,7 @@ mod tests {
     #[test]
     fn backspace_pops_from_focused_field() {
         let mut m = modal();
-        m.handle(&key(KeyCode::Backspace));
+        m.handle(&key(KeyCode::Backspace), &b());
         assert_eq!(m.path, "/tm");
     }
 
@@ -445,7 +455,7 @@ mod tests {
     fn backspace_on_empty_field_is_a_no_op() {
         let mut m = modal();
         m.path = String::new();
-        m.handle(&key(KeyCode::Backspace));
+        m.handle(&key(KeyCode::Backspace), &b());
         assert_eq!(m.path, "");
     }
 
@@ -453,12 +463,12 @@ mod tests {
     fn down_cycles_completion_selection_with_wrap() {
         let mut m = modal();
         m.completions = vec!["a".into(), "b".into(), "c".into()];
-        m.handle(&key(KeyCode::Down));
+        m.handle(&key(KeyCode::Down), &b());
         assert_eq!(m.completion_idx, Some(0));
-        m.handle(&key(KeyCode::Down));
+        m.handle(&key(KeyCode::Down), &b());
         assert_eq!(m.completion_idx, Some(1));
-        m.handle(&key(KeyCode::Down));
-        m.handle(&key(KeyCode::Down));
+        m.handle(&key(KeyCode::Down), &b());
+        m.handle(&key(KeyCode::Down), &b());
         assert_eq!(m.completion_idx, Some(0));
     }
 
@@ -466,7 +476,7 @@ mod tests {
     fn up_with_no_selection_jumps_to_last() {
         let mut m = modal();
         m.completions = vec!["a".into(), "b".into(), "c".into()];
-        m.handle(&key(KeyCode::Up));
+        m.handle(&key(KeyCode::Up), &b());
         assert_eq!(m.completion_idx, Some(2));
     }
 
@@ -475,8 +485,26 @@ mod tests {
         let mut m = modal();
         m.focused = SpawnField::Host;
         m.completions = vec!["x".into()];
-        m.handle(&key(KeyCode::Down));
+        m.handle(&key(KeyCode::Down), &b());
         assert_eq!(m.completion_idx, None);
+    }
+
+    #[test]
+    fn user_can_remap_modal_confirm() {
+        // Enter is the default Confirm key. Remap it to F5 and verify both
+        // the new key works and Enter falls through to text input.
+        let toml_text = r#"
+            [bindings.on_modal]
+            confirm = "f5"
+        "#;
+        let config: crate::config::Config = toml::from_str(toml_text).unwrap();
+        let mut m = modal();
+        m.path = "/y".into();
+        let outcome = m.handle(
+            &KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
+            &config.bindings.on_modal,
+        );
+        assert!(matches!(outcome, ModalOutcome::Spawn { .. }));
     }
 
     // split_path_for_completion

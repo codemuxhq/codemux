@@ -2,6 +2,8 @@ use clap::Parser;
 use color_eyre::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod config;
+mod keymap;
 mod runtime;
 mod spawn_modal;
 use runtime::NavStyle;
@@ -9,7 +11,7 @@ use runtime::NavStyle;
 #[derive(Debug, Parser)]
 #[command(name = "codemux", version, about)]
 struct Cli {
-    /// Initial navigator style. Toggle at runtime with Ctrl-B v.
+    /// Initial navigator style. Toggle at runtime with the prefix-key + v.
     #[arg(long, value_enum, env = "CODEMUX_NAV", default_value = "popup")]
     nav: NavStyle,
 }
@@ -18,7 +20,10 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     init_tracing();
     let cli = Cli::parse();
-    runtime::run(cli.nav)
+    // Load config (or defaults if missing) before touching the terminal so a
+    // malformed config file fails loud instead of corrupting raw mode.
+    let config = config::load()?;
+    runtime::run(cli.nav, &config)
 }
 
 fn init_tracing() {
