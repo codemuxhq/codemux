@@ -3,16 +3,21 @@ use color_eyre::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod runtime;
+use runtime::NavStyle;
 
 #[derive(Debug, Parser)]
 #[command(name = "codemux", version, about)]
-struct Cli {}
+struct Cli {
+    /// Initial navigator style. Toggle at runtime with Ctrl-B v.
+    #[arg(long, value_enum, env = "CODEMUX_NAV", default_value = "popup")]
+    nav: NavStyle,
+}
 
 fn main() -> Result<()> {
     color_eyre::install()?;
     init_tracing();
-    let _cli = Cli::parse();
-    runtime::run()
+    let cli = Cli::parse();
+    runtime::run(cli.nav)
 }
 
 fn init_tracing() {

@@ -1,16 +1,13 @@
-//! P0 + P1.1 + P1.2 (prototype): multi-agent with two togglable navigator
-//! styles for A/B comparison.
+//! P0 + P1.1 + P1.2: multi-agent with two navigator styles.
 //!
-//! Two navigator chrome options are available simultaneously, switchable at
-//! runtime via Ctrl-B v:
+//! Both navigator chrome options stay in the binary. The default is set via
+//! `--nav <left-pane|popup>` (or the `CODEMUX_NAV` env var); the user can
+//! toggle at runtime with Ctrl-B v.
 //!
 //! - `LeftPane` — always-visible 25-column navigator on the left, focused
 //!   PTY on the right. Constant glanceability.
 //! - `Popup` — full-screen focused PTY with a 1-row status bar at the
 //!   bottom; Ctrl-B w opens a centered switcher popup.
-//!
-//! Once the user picks one, the loser and the toggle plumbing come out in a
-//! follow-up commit.
 //!
 //! Prefix-key commands available in either navigator:
 //! - `c` spawn a new agent in the current cwd
@@ -25,6 +22,7 @@ use std::io::{self, Read, Write};
 use std::thread;
 use std::time::Duration;
 
+use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, eyre};
 use crossbeam_channel::{Receiver, unbounded};
@@ -67,8 +65,8 @@ enum PrefixState {
     AwaitingCommand,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NavStyle {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum NavStyle {
     LeftPane,
     Popup,
 }
@@ -119,10 +117,9 @@ struct RuntimeAgent {
     rx: Receiver<Vec<u8>>,
 }
 
-pub fn run() -> Result<()> {
-    tracing::info!("codemux starting");
+pub fn run(nav_style: NavStyle) -> Result<()> {
+    tracing::info!("codemux starting (nav={nav_style:?})");
 
-    let nav_style = NavStyle::LeftPane;
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols);
 

@@ -235,13 +235,28 @@ Spawn / attach / detach / reattach-after-death / kill / resurrect — the full
 state model lives in the original P1 design notes. P0 needs only spawn (one
 local PTY) and exit (Ctrl-C cleanly drops the PTY).
 
-### Navigator layout — OPEN
+### Navigator layout — RESOLVED (Popup default; LeftPane opt-in)
 
-Decided during P1 with a running prototype to compare against:
+Both navigator chromes ship in the binary. The selection is configurable per
+launch via `--nav <left-pane|popup>` or the `CODEMUX_NAV` env var, and can be
+toggled at runtime with the prefix key + `v`. Default is **Popup**.
 
-- **Option A** — two-pane, left navigator with expand-on-focus per row, right
-  is the focused PTY.
-- **Option B** — full-screen PTY + popup switcher invoked via prefix key.
+- **Popup** (default) — full-screen focused PTY plus a one-row status bar
+  listing agents and the focused index. Prefix + `w` opens a centered
+  switcher (arrows + Enter, Esc to dismiss). Maximizes screen real estate
+  for claude.
+- **LeftPane** — always-visible 25-column navigator on the left, focused
+  PTY on the right. Constant glanceability of what is running. Useful when
+  watching multiple agents complete unattended work.
+
+Both styles share the same prefix-key vocabulary (`c` spawn, `n`/`p` next/prev,
+`1`-`9` focus by index, `v` toggle, `q` quit). The PTY is resized via SIGWINCH
+on every layout transition so claude re-lays-out in place.
+
+Why both stayed: after living with both prototypes, Popup felt clearly better
+for focused work, but LeftPane has real value for "watch many agents" sessions.
+Per the vision's "the navigator is the map" principle, neither is wrong; it
+depends on what the user is doing in the moment. The toggle is one keystroke.
 
 ## Open questions
 
