@@ -1,0 +1,68 @@
+# Self-contained workspace manifest for the codemuxd bootstrap.
+#
+# This file replaces the parent workspace's `Cargo.toml` when the
+# tarball is unpacked on a remote host. Why a separate manifest:
+#
+# - The remote tarball contains only `apps/daemon` and `crates/wire`
+#   (the daemon and the wire crate it depends on). The original
+#   workspace also lists `apps/tui`, `crates/session`, and
+#   `crates/shared-kernel` — none of which the daemon needs and most
+#   of which would force the remote to pull `ratatui`, `vt100`, etc.
+# - `apps/daemon/Cargo.toml` and `crates/wire/Cargo.toml` use
+#   `workspace = true` for everything; they can't be built without a
+#   workspace root that supplies the same dep names + versions.
+# - We can't reuse the live workspace `Cargo.toml` because it
+#   path-references crates we don't ship.
+#
+# Versions here are mirrored from the workspace `Cargo.toml`. When you
+# bump a workspace dep, bump it here too. CI catches drift only at
+# bootstrap-time (a remote `cargo build` would fail to resolve), so
+# the safer protocol is to grep-replace.
+#
+# `path = "crates/wire"` works because the bootstrap tarball stages
+# `apps/daemon` and `crates/wire` at the same relative paths the
+# original workspace uses.
+
+[workspace]
+resolver = "3"
+members = [
+    "apps/daemon",
+    "crates/wire",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94.1"
+license = "UNLICENSED"
+publish = false
+repository = "https://github.com/codemuxhq/codemux"
+
+[workspace.dependencies]
+codemux-wire = { path = "crates/wire" }
+
+# Mirrors of the parent workspace's [workspace.dependencies] — only the
+# subset apps/daemon and crates/wire actually use is listed here.
+thiserror = "2.0.18"
+color-eyre = "0.6.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+portable-pty = "0.9.0"
+crossbeam-channel = "0.5.15"
+clap = { version = "4.6.1", features = ["derive", "env"] }
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

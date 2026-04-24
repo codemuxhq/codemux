@@ -362,11 +362,13 @@ mod tests {
         Ok(())
     }
 
-    /// Placeholder dispatch handlers (Resize/Signal/Ping/Pong) must not
-    /// close the connection — the next `PtyData` frame still flows.
+    /// Inbound non-PtyData frames must not close the connection — the next
+    /// `PtyData` frame still flows. Stage 4 turned `Resize`/`Signal`/`Ping`
+    /// into real handlers, but each is still designed to leave the conn
+    /// alive (best-effort resize, no-op for non-Kill signals, Pong reply
+    /// for Ping). This test guards that contract end-to-end.
     #[test]
-    fn inbound_placeholder_frames_do_not_close_connection() -> Result<(), Box<dyn std::error::Error>>
-    {
+    fn inbound_non_data_frames_do_not_close_connection() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("placeholders.sock");
         let mut supervisor = supervisor_for(&socket)?;
@@ -400,7 +402,7 @@ mod tests {
         let count = count_occurrences(&got, b"after-placeholders");
         assert!(
             count >= 2,
-            "connection must survive placeholder frames; got {count} occurrences in {got:?}",
+            "connection must survive non-data frames; got {count} occurrences in {got:?}",
         );
 
         drop(stream);
@@ -410,6 +412,131 @@ mod tests {
             panic!("serve thread panicked");
         };
         serve_result?;
+        Ok(())
+    }
+
+    /// `Resize` frames now actually reach the master PTY. We exercise this
+    /// end-to-end by spawning a shell child, sending a Resize, then
+    /// inspecting `$LINES x $COLUMNS` via `stty size`. Hooks into the
+    /// existing handshake/echo plumbing — the `stty size\n` keystroke is
+    /// echoed by the PTY (line discipline) and produces `R C` on stdout.
+    #[test]
+    fn inbound_resize_applies_to_master() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("resize.sock");
+        // `bash -i` so $LINES/$COLUMNS stay populated when stty queries
+        // them in a TTY context. Foreground the daemon (no pid file).
+        let resources = bootstrap::bring_up_with(
+            &socket,
+            None,
+            SupervisorConfig {
+                command: "bash".to_string(),
+                args: vec!["--noprofile".into(), "--norc".into()],
+                cwd: None,
+                rows: 24,
+                cols: 80,
+            },
+        )?;
+        let mut supervisor = Supervisor::new(resources);
+
+        let serve = thread::spawn(move || supervisor.serve_one());
+
+        let mut stream = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+        client_handshake(&mut stream, 24, 80, "resize-agent")?;
+
+        // Resize to a distinctive geometry, then ask the shell what it
+        // thinks the size is. `stty size` prints "rows cols\n".
+        stream.write_all(
+            &Message::Resize {
+                rows: 47,
+                cols: 137,
+            }
+            .encode()?,
+        )?;
+        // Small pause to let the resize propagate to the child before
+        // it queries — without this, stty can race the SIGWINCH delivery.
+        thread::sleep(Duration::from_millis(100));
+        send_pty_data(&mut stream, b"stty size\n")?;
+
+        let got = drain_pty_data_until(&mut stream, b"47 137", 1, Duration::from_secs(2));
+        assert!(
+            got.windows(b"47 137".len()).any(|w| w == b"47 137"),
+            "expected `47 137` from `stty size` after resize; got {:?}",
+            String::from_utf8_lossy(&got),
+        );
+
+        drop(stream);
+        let _ = serve.join();
+        Ok(())
+    }
+
+    /// `Signal::Kill` reaches the child via `child.kill()`. The child is
+    /// `cat` (idle on PTY input); after the kill the rx channel
+    /// disconnects and the daemon emits `ChildExited` with the real
+    /// exit code (the SIGKILL exit code, not the placeholder zero
+    /// Stage 1/2 used).
+    #[test]
+    fn inbound_signal_kill_terminates_child() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("sigkill.sock");
+        let mut supervisor = supervisor_for(&socket)?;
+
+        let serve = thread::spawn(move || supervisor.serve_one());
+
+        let mut stream = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+        client_handshake(&mut stream, 24, 80, "kill-agent")?;
+        stream.write_all(&Message::Signal(wire::Signal::Kill).encode()?)?;
+
+        // Drain frames until ChildExited shows up. The exit code from
+        // SIGKILL is platform-dependent — we just assert it's non-zero
+        // (real exit, not the placeholder).
+        let exit_code = await_child_exited(&mut stream, Duration::from_secs(2))?;
+        assert_ne!(
+            exit_code, 0,
+            "SIGKILL should produce a non-zero exit code, not the Stage 1/2 placeholder",
+        );
+
+        let _ = serve.join();
+        Ok(())
+    }
+
+    /// `Ping { nonce }` triggers a `Pong { nonce }` reply, with the same
+    /// nonce. Locks down the inbound→socket-write path that Stage 4
+    /// added (and the socket-write Mutex that serializes it with
+    /// outbound's `PtyData` writes).
+    #[test]
+    fn inbound_ping_replies_with_pong() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("ping.sock");
+        let mut supervisor = supervisor_for(&socket)?;
+
+        let serve = thread::spawn(move || supervisor.serve_one());
+
+        let mut stream = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+        client_handshake(&mut stream, 24, 80, "ping-agent")?;
+
+        let nonce = 0xCAFE_F00D_u32;
+        stream.write_all(&Message::Ping { nonce }.encode()?)?;
+
+        let pong = await_specific_frame(&mut stream, Duration::from_secs(2), |msg| {
+            matches!(msg, Message::Pong { .. })
+        })?;
+        let Message::Pong { nonce: got_nonce } = pong else {
+            panic!("expected Pong, got {pong:?}");
+        };
+        assert_eq!(
+            got_nonce, nonce,
+            "Pong nonce must echo the Ping nonce exactly",
+        );
+
+        drop(stream);
+        let _ = serve.join();
         Ok(())
     }
 
@@ -642,6 +769,73 @@ mod tests {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(_) => return,
+            }
+        }
+    }
+
+    /// Drain frames until a `ChildExited` arrives, return its exit code.
+    /// Errors on timeout or transport close.
+    fn await_child_exited(
+        stream: &mut UnixStream,
+        timeout: Duration,
+    ) -> Result<i32, Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let deadline = Instant::now() + timeout;
+        loop {
+            loop {
+                match wire::try_decode(&buf)? {
+                    Some((Message::ChildExited { exit_code }, consumed)) => {
+                        buf.drain(..consumed);
+                        return Ok(exit_code);
+                    }
+                    Some((_, consumed)) => {
+                        buf.drain(..consumed);
+                    }
+                    None => break,
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for ChildExited".into());
+            }
+            match stream.read(&mut tmp) {
+                Ok(0) => return Err("transport closed before ChildExited".into()),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+    }
+
+    /// Drain frames until one matching the predicate arrives. Used by the
+    /// Pong test to ignore any incidental `PtyData` / log frames.
+    fn await_specific_frame(
+        stream: &mut UnixStream,
+        timeout: Duration,
+        predicate: impl Fn(&Message) -> bool,
+    ) -> Result<Message, Box<dyn std::error::Error>> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let deadline = Instant::now() + timeout;
+        loop {
+            while let Some((msg, consumed)) = wire::try_decode(&buf)? {
+                buf.drain(..consumed);
+                if predicate(&msg) {
+                    return Ok(msg);
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for matching frame".into());
+            }
+            match stream.read(&mut tmp) {
+                Ok(0) => return Err("transport closed before matching frame".into()),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => return Err(Box::new(e)),
             }
         }
     }

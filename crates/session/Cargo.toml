@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+# Stage 4: the build script assembles the codemuxd-bootstrap tarball
+# into OUT_DIR. See `build.rs` and `src/bootstrap.rs`. The build script
+# rewrites the archive whenever apps/daemon, crates/wire, Cargo.lock,
+# rust-toolchain.toml, or bootstrap-root/Cargo.toml change.
+build = "build.rs"
 
 [dependencies]
 codemux-shared-kernel.workspace = true
@@ -20,6 +25,22 @@ tracing.workspace = true
 # pulls in.
 portable-pty.workspace = true
 crossbeam-channel.workspace = true
+
+[build-dependencies]
+# Pure-Rust tar + gzip. Used only by build.rs to assemble the
+# codemuxd-bootstrap tarball that `src/bootstrap.rs` embeds via
+# include_bytes!. `flate2` defaults to its pure-Rust backend
+# (`miniz_oxide`) so the build does not need any system libraries.
+tar = "0.4"
+flate2 = "1.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+# Tests in `src/bootstrap.rs` decompress and inspect the embedded
+# tarball produced by `build.rs`. Same crates as `[build-dependencies]`
+# but Cargo doesn't share those with `cfg(test)` — re-declare here.
+tar = "0.4"
+flate2 = "1.0"
 
 [lints]
 workspace = true

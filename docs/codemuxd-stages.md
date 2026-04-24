@@ -13,7 +13,7 @@ Commit style: `feat(p1): subject`. No AI trailers.
 - ✅ **Stage 1** — Wire protocol with Hello/HelloAck handshake (`1452c4f`)
 - ✅ **Stage 2** — Filesystem layout, exclusivity, log redirection
 - ✅ **Stage 3** — `AgentTransport` enum + `LocalPty` (refactor only)
-- ⏳ **Stage 4** — `SshDaemonPty` adapter + bootstrap
+- ✅ **Stage 4** — `SshDaemonPty` adapter + bootstrap
 - ⏳ **Stage 5** — Wire SSH transport into the spawn modal
 
 End-to-end ship test (after Stage 5) is in **Verification** below.
@@ -154,6 +154,40 @@ implemented") avoids later mutation of the type.
 
 The hard stage. Auto-installs the daemon on first SSH connect and tunnels
 the local TUI to the remote socket.
+
+### Deviations from plan (as shipped)
+
+- **Bootstrap module lives in `crates/session/src/bootstrap.rs`**, not
+  `apps/tui/src/bootstrap.rs` as originally planned. Reason:
+  `AgentTransport::spawn_ssh` is in the session crate, and putting the
+  bootstrap next to its only caller eliminated an `apps/tui → session`
+  callback dance for the same payoff. Public surface:
+  `bootstrap::bootstrap(runner, host, agent_id, cwd, local_socket_dir)`,
+  `bootstrap::CommandRunner` trait, `bootstrap::RealRunner`,
+  `bootstrap::default_local_socket_dir`. Re-exported from
+  `crates/session/src/lib.rs`.
+- **Daemon-side `Resize`/`Signal::Kill`/`Ping`/`Pong` and real
+  `ChildExited` exit codes were wired in this stage** (Stage 2 left them
+  as `tracing::warn!("Stage 2 will apply") and `exit_code: 0`
+  placeholders). Without them an SSH session spawned via Stage 5 would
+  have known UX bugs (terminal resize lost, Ctrl-C → Kill silently
+  dropped, exit code always 0). Out-of-scope per the original plan but
+  in-scope here so Stage 5 isn't shipping known-broken UX.
+- **Tarball assembly via `build.rs` + `include_bytes!(OUT_DIR)`** rather
+  than runtime tar generation. The build script walks `apps/daemon` and
+  `crates/wire`, bundles `Cargo.lock`/`rust-toolchain.toml`, and stamps
+  in `crates/session/bootstrap-root/Cargo.toml` (a self-contained
+  workspace manifest with concrete dep versions) as the tarball's root
+  `Cargo.toml`. Cache-invalidation key is a SipHash of the tarball
+  bytes (`bootstrap_version()`), so any source change auto-bumps the
+  remote-installed version.
+- **`local_socket_dir` is an explicit parameter** of `bootstrap()` (with
+  a `default_local_socket_dir() -> Result<PathBuf>` helper that reads
+  `$HOME`). This avoids `unsafe { std::env::set_var }` in tests
+  (workspace `unsafe_code = "forbid"`).
+- **`SshDaemonPty::attach` accepts an `Option<Child>` for the tunnel**.
+  Production passes `Some(child)` from `bootstrap()`; tests pass `None`
+  to attach against an in-process socket without spinning up `ssh -L`.
 
 ### Scope
 

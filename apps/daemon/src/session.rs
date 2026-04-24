@@ -30,7 +30,9 @@ pub struct Session {
     rx: Receiver<Vec<u8>>,
     // Held to keep the master fd open across attaches. Closing it would
     // make the child see EOF on stdin and exit, breaking continuity.
-    _master: Box<dyn MasterPty + Send>,
+    // Stage 4: also used by `conn` to apply inbound Resize frames; the
+    // underscore prefix is gone now that we read it.
+    master: Box<dyn MasterPty + Send>,
 }
 
 impl Session {
@@ -51,7 +53,7 @@ impl Session {
             child,
             writer,
             rx,
-            _master: master,
+            master,
         })
     }
 
@@ -59,7 +61,13 @@ impl Session {
     /// disconnects, the child exits, or an I/O error occurs. **The PTY
     /// child survives** — call again with a fresh stream to re-attach.
     pub fn attach(&mut self, stream: UnixStream) -> Result<(), Error> {
-        conn::run(stream, &mut *self.writer, &self.rx)
+        conn::run(
+            stream,
+            &mut *self.writer,
+            &self.rx,
+            &mut *self.master,
+            &mut *self.child,
+        )
     }
 
     /// True if the child has exited. Best-effort: an I/O error from

@@ -3,7 +3,7 @@
 //! The runtime renders bytes and forwards keystrokes; whether those bytes
 //! come from a child spawned in a *local* PTY or tunneled from a
 //! *remote* `codemuxd` is the transport's concern, not the runtime's.
-//! Stage 3 introduces this enum and ports the local variant — Stage 4
+//! Stage 3 introduced this enum and ported the local variant; Stage 4
 //! lights up the SSH variant in place.
 //!
 //! ## Why an enum and not a trait
@@ -17,25 +17,36 @@
 //! exhaustive, and inlinable.
 //!
 //! The enum is `#[non_exhaustive]` so external callers must add a
-//! catch-all arm when matching. Both variants are declared from day
-//! one — even though `SshDaemonPty` is unconstructible in Stage 3 —
-//! so Stage 4 grows a body without forcing every match site to
-//! re-check exhaustiveness.
+//! catch-all arm when matching.
 
 use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::Child as ProcessChild;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-use codemux_wire::Signal;
+use codemux_wire::{self as wire, Message, Signal};
 use crossbeam_channel::{Receiver, unbounded};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::error::Error;
+use crate::bootstrap;
+use crate::error::{BootstrapStage, Error};
 
 /// PTY read chunk size. Mirrors `apps/daemon/src/pty.rs::READ_BUFFER_SIZE`
 /// — 8 KiB balances syscall overhead against burst output from a
 /// terminal-mode child.
 const READ_BUFFER_SIZE: usize = 8 * 1024;
+
+/// Socket read chunk size for the SSH framed reader. Same 8 KiB choice
+/// as the daemon's `inbound_loop` for symmetry.
+const SOCKET_READ_BUF: usize = 8 * 1024;
+
+/// How long [`SshDaemonPty::attach`] waits for the daemon's `HelloAck`
+/// before declaring the handshake stalled. Longer than the daemon's
+/// matching timeout because the SSH tunnel adds first-byte latency.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where an agent's PTY actually lives. The runtime owns one of these
 /// per agent and only ever talks to it through the inherent methods on
@@ -46,7 +57,8 @@ pub enum AgentTransport {
     /// runtime. The default and only Stage 3 variant.
     Local(LocalPty),
     /// Tunneled connection to a `codemuxd` running on a remote host.
-    /// Stage 3 stub; Stage 4 implements bootstrap + tunnel.
+    /// Stage 4 lights this up via [`bootstrap::bootstrap`] +
+    /// [`SshDaemonPty::attach`].
     SshDaemon(SshDaemonPty),
 }
 
@@ -57,6 +69,11 @@ impl AgentTransport {
     ///
     /// `label` is purely advisory; it appears in tracing breadcrumbs so
     /// a multi-agent log is easy to follow.
+    ///
+    /// # Errors
+    /// Returns [`Error::Pty`] when the kernel can't allocate a PTY, or
+    /// [`Error::Spawn`] when `claude` (or whatever command was given)
+    /// can't be launched (typically "not on PATH").
     pub fn spawn_local(
         label: String,
         cwd: Option<&Path>,
@@ -66,21 +83,31 @@ impl AgentTransport {
         LocalPty::spawn("claude", &[], label, cwd, rows, cols).map(Self::Local)
     }
 
-    /// Spawn the agent against a `codemuxd` reachable over SSH. **Stage 3
-    /// stub** — bootstrap + tunnel land in Stage 4. The signature is
-    /// fixed now so the spawn-modal call site (Stage 5) compiles
-    /// against the final shape; the body just returns
-    /// [`Error::NotImplemented`].
+    /// Spawn the agent against a `codemuxd` reachable over SSH. Runs
+    /// the full bootstrap (probe → tarball → scp → build → daemon spawn
+    /// → tunnel → connect → handshake). Hardcodes the production
+    /// [`bootstrap::RealRunner`] and [`bootstrap::default_local_socket_dir`]
+    /// — tests bypass this by constructing [`SshDaemonPty::attach`]
+    /// directly against an in-process socket.
+    ///
+    /// # Errors
+    /// Returns [`Error::Bootstrap`] for any bootstrap-stage failure,
+    /// [`Error::Wire`] for protocol-level failures during the
+    /// `Hello`/`HelloAck` handshake, or [`Error::Pty`] for
+    /// transport-level failures while attaching.
     pub fn spawn_ssh(
-        _host: &str,
-        _agent_id: &str,
-        _cwd: &Path,
-        _rows: u16,
-        _cols: u16,
+        host: &str,
+        agent_id: &str,
+        cwd: &Path,
+        rows: u16,
+        cols: u16,
     ) -> Result<Self, Error> {
-        Err(Error::NotImplemented {
-            feature: "SSH agent transport",
-        })
+        let runner = bootstrap::RealRunner;
+        let local_socket_dir = bootstrap::default_local_socket_dir()?;
+        let (stream, tunnel) =
+            bootstrap::bootstrap(&runner, host, agent_id, cwd, &local_socket_dir)?;
+        let label = format!("{host}:{agent_id}");
+        SshDaemonPty::attach(stream, label, agent_id, rows, cols, Some(tunnel)).map(Self::SshDaemon)
     }
 
     /// Drain whatever bytes the transport has buffered since the last
@@ -99,6 +126,12 @@ impl AgentTransport {
         }
     }
 
+    /// Forward `data` to the agent's stdin (local PTY) or the remote
+    /// daemon (which writes it to the remote PTY).
+    ///
+    /// # Errors
+    /// Returns [`Error::Pty`] for local transport, [`Error::Wire`] or
+    /// [`Error::Pty`] for SSH transport.
     pub fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         match self {
             Self::Local(p) => p.write(data),
@@ -111,6 +144,10 @@ impl AgentTransport {
     /// harmless cosmetic glitch (claude re-lays-out on the next paint).
     /// The runtime currently logs and continues — see
     /// `apps/tui/src/runtime.rs::resize_agents`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Pty`] for local transport, [`Error::Wire`] or
+    /// [`Error::Pty`] for SSH transport.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Error> {
         match self {
             Self::Local(p) => p.resize(rows, cols),
@@ -118,6 +155,15 @@ impl AgentTransport {
         }
     }
 
+    /// Forward `sig` to the agent's child. Both transports only
+    /// implement [`Signal::Kill`] today; other signals reach the child
+    /// as the byte `0x03` via [`Self::write`] for Ctrl-C, or surface
+    /// [`Error::SignalNotSupported`] for the rest.
+    ///
+    /// # Errors
+    /// Returns [`Error::SignalNotSupported`] for non-Kill signals on
+    /// either transport, [`Error::Pty`] for local kill failure, or
+    /// [`Error::Wire`]/[`Error::Pty`] for SSH transport failures.
     pub fn signal(&mut self, sig: Signal) -> Result<(), Error> {
         match self {
             Self::Local(p) => p.signal(sig),
@@ -137,6 +183,11 @@ impl AgentTransport {
         }
     }
 
+    /// Kill the agent's child. Equivalent to `signal(Signal::Kill)` on
+    /// both transports.
+    ///
+    /// # Errors
+    /// Same envelope as [`Self::signal`].
     pub fn kill(&mut self) -> Result<(), Error> {
         match self {
             Self::Local(p) => p.kill(),
@@ -148,10 +199,10 @@ impl AgentTransport {
 /// A child process spawned inside a local PTY.
 ///
 /// Owns the same shape the previous `RuntimeAgent` had inline
-/// (`master + writer + child + rx`). The `_master` is held only to keep
-/// the master fd open — closing it would make the child see EOF on its
+/// (`master + writer + child + rx`). The `master` is held to keep the
+/// master fd open — closing it would make the child see EOF on its
 /// tty and exit immediately. Same invariant as
-/// `apps/daemon/src/session.rs::Session._master`; if you find yourself
+/// `apps/daemon/src/session.rs::Session::master`; if you find yourself
 /// tempted to drop it earlier, don't.
 pub struct LocalPty {
     label: String,
@@ -168,6 +219,11 @@ impl LocalPty {
     /// Public so tests can spawn `cat` instead of the production
     /// `claude` binary; the runtime always reaches this through
     /// [`AgentTransport::spawn_local`].
+    ///
+    /// # Errors
+    /// Returns [`Error::Pty`] when the kernel can't allocate a PTY or
+    /// the PTY's reader/writer can't be cloned, and [`Error::Spawn`]
+    /// when `command` itself can't be launched.
     pub fn spawn(
         command: &str,
         args: &[String],
@@ -213,7 +269,7 @@ impl LocalPty {
             source: Box::new(std::io::Error::other(format!("clone pty reader: {e}"))),
         })?;
         let master = pair.master;
-        let rx = spawn_reader_thread(reader);
+        let rx = spawn_pty_reader_thread(reader);
         Ok(Self {
             label,
             writer,
@@ -302,68 +358,382 @@ impl Drop for LocalPty {
     }
 }
 
-/// Stage 3 placeholder for the SSH transport. Stage 4 grows the body
-/// (bootstrap, scp, remote build, daemon spawn, socket tunnel,
-/// `Hello`/`HelloAck` handshake).
+/// Tunnels the agent's PTY through `codemuxd` running on a remote host.
 ///
-/// The struct is unconstructible from outside this module — its only
-/// private field forbids `SshDaemonPty { ... }` syntax — and
-/// [`AgentTransport::spawn_ssh`] returns [`Error::NotImplemented`]
-/// before any code can reach the methods below. They exist to make
-/// the enum's match arms compile, not as runtime behaviour.
+/// Owns four pieces:
+/// - `socket_writer`: the local end of the unix-socket tunnel; all
+///   outbound frames (`PtyData`/`Resize`/`Signal`) are encoded and
+///   written here.
+/// - `rx`: PTY chunks the framed reader thread drained from the
+///   socket. Other inbound frames (`Pong`, `Error`) are absorbed
+///   silently; `ChildExited` sets `exit_code` and ends the reader.
+/// - `exit_code`: shared with the reader thread. `None` while the
+///   remote child is alive; `Some(code)` once `ChildExited` arrives or
+///   the socket EOFs.
+/// - `tunnel`: the `ssh -N -L` subprocess. Killed on `Drop` so we
+///   don't leak ssh processes when an agent is removed. Optional so
+///   tests can attach against a local socket without spinning up a
+///   tunnel.
 pub struct SshDaemonPty {
-    _private: (),
+    label: String,
+    socket_writer: UnixStream,
+    rx: Receiver<Vec<u8>>,
+    exit_code: Arc<Mutex<Option<i32>>>,
+    /// Diagnostic only — the daemon's pid on the remote host. Logged
+    /// from `attach`; not otherwise consumed.
+    daemon_pid: u32,
+    tunnel: Option<ProcessChild>,
 }
 
 impl SshDaemonPty {
-    // `unused_self`: Stage 4 grows real fields here (the SSH child,
-    // tunnel handle, framed wire-protocol reader) and these methods
-    // start using them. Quieting the lint at the impl level keeps the
-    // stub's signatures honest about what Stage 4 will look like.
-    #[allow(clippy::unused_self)]
+    /// Take an established [`UnixStream`] (post-bootstrap), perform the
+    /// `Hello`/`HelloAck` handshake, spawn the framed reader thread,
+    /// and return the constructed transport.
+    ///
+    /// `tunnel` is the `ssh -N -L` subprocess from
+    /// [`bootstrap::bootstrap`] in production; tests pass `None` to
+    /// attach against an in-process socket without a tunnel.
+    ///
+    /// # Errors
+    /// Returns [`Error::Bootstrap`] with stage [`BootstrapStage::Handshake`]
+    /// for any handshake failure (timeouts, oversized frames, version
+    /// mismatch, framing errors). The tunnel subprocess (if Some) is
+    /// killed before returning so a failed attach doesn't leak it.
+    pub fn attach(
+        stream: UnixStream,
+        label: String,
+        agent_id: &str,
+        rows: u16,
+        cols: u16,
+        tunnel: Option<ProcessChild>,
+    ) -> Result<Self, Error> {
+        // `set_read_timeout(Some(_))` bounds the handshake; the framed
+        // reader clears it back to `None` (blocking) once it owns its
+        // clone of the stream. Failures are best-effort — macOS can
+        // EINVAL if the peer closed mid-call; the next read will detect
+        // EOF on its own.
+        if let Err(e) = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+            tracing::debug!(label, "set_read_timeout(Some) failed pre-handshake: {e}");
+        }
+
+        let result = perform_handshake(&stream, agent_id, rows, cols);
+        let daemon_pid = match result {
+            Ok(pid) => pid,
+            Err(e) => {
+                if let Some(mut t) = tunnel {
+                    let _ = t.kill();
+                    let _ = t.wait();
+                }
+                return Err(e);
+            }
+        };
+
+        // Clear the timeout so the framed reader blocks indefinitely
+        // on the next `read`. Best-effort; same caveat as above.
+        if let Err(e) = stream.set_read_timeout(None) {
+            tracing::debug!(label, "set_read_timeout(None) post-handshake failed: {e}");
+        }
+
+        let read_stream = stream.try_clone().map_err(|e| Error::Bootstrap {
+            stage: BootstrapStage::Handshake,
+            source: Box::new(e),
+        })?;
+        let exit_code = Arc::new(Mutex::new(None));
+        let rx = spawn_framed_reader_thread(read_stream, Arc::clone(&exit_code));
+
+        tracing::info!(
+            label = %label,
+            daemon_pid,
+            "SSH transport attached to remote codemuxd",
+        );
+        Ok(Self {
+            label,
+            socket_writer: stream,
+            rx,
+            exit_code,
+            daemon_pid,
+            tunnel,
+        })
+    }
+
     fn try_read(&mut self) -> Vec<Vec<u8>> {
-        Vec::new()
+        let mut chunks = Vec::new();
+        while let Ok(bytes) = self.rx.try_recv() {
+            chunks.push(bytes);
+        }
+        chunks
     }
 
-    #[allow(clippy::unused_self)]
-    fn write(&mut self, _data: &[u8]) -> Result<(), Error> {
-        Err(Error::NotImplemented {
-            feature: "SSH agent transport",
-        })
+    fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        let frame = Message::PtyData(data.to_vec()).encode()?;
+        self.write_frame(&frame)
     }
 
-    #[allow(clippy::unused_self)]
-    fn resize(&mut self, _rows: u16, _cols: u16) -> Result<(), Error> {
-        Err(Error::NotImplemented {
-            feature: "SSH agent transport",
-        })
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Error> {
+        let frame = Message::Resize { rows, cols }.encode()?;
+        self.write_frame(&frame)
     }
 
-    #[allow(clippy::unused_self)]
-    fn signal(&mut self, _sig: Signal) -> Result<(), Error> {
-        Err(Error::NotImplemented {
-            feature: "SSH agent transport",
-        })
+    fn signal(&mut self, sig: Signal) -> Result<(), Error> {
+        // The remote daemon's `handle_inbound::Signal` arm only kills
+        // on `Signal::Kill` (workspace forbids `unsafe libc::kill`).
+        // Mirror that constraint locally so a non-Kill signal surfaces
+        // here rather than being silently dropped over the wire.
+        if sig != Signal::Kill {
+            return Err(Error::SignalNotSupported { signal: sig });
+        }
+        let frame = Message::Signal(sig).encode()?;
+        self.write_frame(&frame)
     }
 
-    #[allow(clippy::unused_self)]
     fn try_wait(&mut self) -> Option<i32> {
-        None
+        // Lock failure means a thread panicked while holding the
+        // exit_code mutex — extremely unlikely (the framed reader only
+        // takes the lock for trivial assignments). If it happens, the
+        // poisoned-data convention is to read the inner value anyway.
+        *self
+            .exit_code
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    #[allow(clippy::unused_self)]
     fn kill(&mut self) -> Result<(), Error> {
-        Err(Error::NotImplemented {
-            feature: "SSH agent transport",
+        self.signal(Signal::Kill)
+    }
+
+    /// Write an already-encoded frame to the socket. Centralizes the
+    /// `Pty`-error mapping so each public method stays one line.
+    fn write_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.socket_writer
+            .write_all(frame)
+            .map_err(|e| Error::Pty {
+                source: Box::new(e),
+            })?;
+        self.socket_writer.flush().map_err(|e| Error::Pty {
+            source: Box::new(e),
         })
     }
+}
+
+impl Drop for SshDaemonPty {
+    fn drop(&mut self) {
+        // Closing the socket EOFs the framed reader; the thread exits
+        // naturally without further coordination.
+        if let Some(mut tunnel) = self.tunnel.take() {
+            if let Err(e) = tunnel.kill() {
+                tracing::debug!(
+                    label = %self.label,
+                    "drop: tunnel.kill failed: {e}",
+                );
+            }
+            if let Err(e) = tunnel.wait() {
+                tracing::debug!(
+                    label = %self.label,
+                    "drop: tunnel.wait failed: {e}",
+                );
+            }
+        }
+        tracing::debug!(label = %self.label, daemon_pid = self.daemon_pid, "SSH transport dropped");
+    }
+}
+
+/// Send `Hello`, read `HelloAck`, validate the version, return the
+/// daemon's pid. All errors map to [`Error::Bootstrap`] with stage
+/// [`BootstrapStage::Handshake`] so the TUI surfaces a stage-specific
+/// hint.
+fn perform_handshake(
+    mut stream: &UnixStream,
+    agent_id: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<u32, Error> {
+    let hello = Message::Hello {
+        protocol_version: wire::PROTOCOL_VERSION,
+        rows,
+        cols,
+        agent_id: agent_id.to_string(),
+    };
+    let hello_bytes = hello.encode().map_err(|source| Error::Bootstrap {
+        stage: BootstrapStage::Handshake,
+        source: Box::new(source),
+    })?;
+    stream
+        .write_all(&hello_bytes)
+        .map_err(|source| Error::Bootstrap {
+            stage: BootstrapStage::Handshake,
+            source: Box::new(source),
+        })?;
+    stream.flush().map_err(|source| Error::Bootstrap {
+        stage: BootstrapStage::Handshake,
+        source: Box::new(source),
+    })?;
+
+    let mut buf = Vec::with_capacity(64);
+    let mut tmp = [0u8; 256];
+    loop {
+        match wire::try_decode(&buf).map_err(|source| Error::Bootstrap {
+            stage: BootstrapStage::Handshake,
+            source: Box::new(source),
+        })? {
+            Some((
+                Message::HelloAck {
+                    protocol_version,
+                    daemon_pid,
+                },
+                _consumed,
+            )) => {
+                if protocol_version != wire::PROTOCOL_VERSION {
+                    return Err(Error::Bootstrap {
+                        stage: BootstrapStage::Handshake,
+                        source: format!(
+                            "protocol version mismatch: client v{}, daemon v{}",
+                            wire::PROTOCOL_VERSION,
+                            protocol_version,
+                        )
+                        .into(),
+                    });
+                }
+                return Ok(daemon_pid);
+            }
+            Some((Message::Error { code, message }, _)) => {
+                return Err(Error::Bootstrap {
+                    stage: BootstrapStage::Handshake,
+                    source: format!("daemon rejected handshake: {code:?}: {message}").into(),
+                });
+            }
+            Some((other, _)) => {
+                return Err(Error::Bootstrap {
+                    stage: BootstrapStage::Handshake,
+                    source: format!("expected HelloAck, got tag 0x{:02X}", other.tag(),).into(),
+                });
+            }
+            None => {}
+        }
+        let n = stream.read(&mut tmp).map_err(|source| Error::Bootstrap {
+            stage: BootstrapStage::Handshake,
+            source: Box::new(source),
+        })?;
+        if n == 0 {
+            return Err(Error::Bootstrap {
+                stage: BootstrapStage::Handshake,
+                source: "EOF before HelloAck".into(),
+            });
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// Background reader: drains the unix socket, decodes wire frames, and
+/// dispatches each. `PtyData` chunks go to the channel; `ChildExited`
+/// records the exit code and ends the reader; other inbound frames
+/// (`Pong`, daemon-emitted `Error`) are absorbed at debug level.
+///
+/// On EOF or read error, sets `exit_code` to `-1` if not already set,
+/// so [`SshDaemonPty::try_wait`] reports liveness loss even when the
+/// daemon never sent `ChildExited` (e.g. SSH tunnel died mid-session).
+fn spawn_framed_reader_thread(
+    mut read_stream: UnixStream,
+    exit_code: Arc<Mutex<Option<i32>>>,
+) -> Receiver<Vec<u8>> {
+    let (tx, rx) = unbounded::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = vec![0u8; SOCKET_READ_BUF];
+        'outer: loop {
+            // Drain every complete frame currently in `buf` before
+            // reading more. Mirrors the daemon's `inbound_loop` shape.
+            loop {
+                match wire::try_decode(&buf) {
+                    Ok(Some((msg, consumed))) => {
+                        buf.drain(..consumed);
+                        match msg {
+                            Message::PtyData(bytes) => {
+                                if tx.send(bytes).is_err() {
+                                    break 'outer;
+                                }
+                            }
+                            Message::ChildExited { exit_code: code } => {
+                                let mut guard = exit_code
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if guard.is_none() {
+                                    *guard = Some(code);
+                                }
+                                break 'outer;
+                            }
+                            Message::Pong { nonce } => {
+                                tracing::debug!("inbound Pong nonce={nonce}");
+                            }
+                            Message::Error { code, message } => {
+                                tracing::warn!("daemon sent Error frame: {code:?}: {message}",);
+                                let mut guard = exit_code
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if guard.is_none() {
+                                    *guard = Some(-1);
+                                }
+                                break 'outer;
+                            }
+                            // Other variants (Hello, HelloAck, Resize,
+                            // Signal, Ping) shouldn't reach this loop:
+                            // Hello/HelloAck are handshake-only;
+                            // Resize/Signal/Ping are client-to-daemon.
+                            // Log and absorb rather than break — a
+                            // future protocol revision might legitimately
+                            // start sending more server-to-client frames.
+                            other => {
+                                tracing::debug!(
+                                    "framed reader absorbed unexpected frame tag=0x{:02X}",
+                                    other.tag(),
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("framed reader decode failed: {e}");
+                        let mut guard = exit_code
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if guard.is_none() {
+                            *guard = Some(-1);
+                        }
+                        break 'outer;
+                    }
+                }
+            }
+            match read_stream.read(&mut tmp) {
+                Ok(0) => {
+                    let mut guard = exit_code
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if guard.is_none() {
+                        *guard = Some(-1);
+                    }
+                    break;
+                }
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) => {
+                    tracing::debug!("framed reader read failed: {e}");
+                    let mut guard = exit_code
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if guard.is_none() {
+                        *guard = Some(-1);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    rx
 }
 
 /// Background reader: drains the PTY master and pushes chunks into a
 /// crossbeam channel. Exits on EOF or read error (including the master
 /// being dropped). Same shape as `apps/daemon/src/pty.rs` and the prior
 /// `apps/tui/src/runtime.rs::spawn_reader_thread`.
-fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
+fn spawn_pty_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
     let (tx, rx) = unbounded::<Vec<u8>>();
     thread::spawn(move || {
         let mut buf = vec![0u8; READ_BUFFER_SIZE];
@@ -384,6 +754,7 @@ fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -447,34 +818,6 @@ mod tests {
         }
     }
 
-    /// SSH transport is a stub in Stage 3; constructing one must report
-    /// `NotImplemented` rather than silently succeeding. Catches the
-    /// regression where Stage 4's wiring partially lands without the
-    /// body — the spawn-modal call site (Stage 5) keys off this Err to
-    /// keep emitting `tracing::warn`.
-    #[test]
-    fn ssh_transport_spawn_returns_not_implemented() {
-        let result = AgentTransport::spawn_ssh(
-            "devpod.example",
-            "agent-1",
-            Path::new("/home/me/repo"),
-            24,
-            80,
-        );
-        let Err(err) = result else {
-            unreachable!("ssh transport must error in Stage 3");
-        };
-        assert!(
-            matches!(
-                err,
-                Error::NotImplemented {
-                    feature: "SSH agent transport"
-                }
-            ),
-            "expected NotImplemented, got {err:?}",
-        );
-    }
-
     /// Local transport rejects non-Kill signals with a precise variant
     /// rather than silently dropping them. Future work (stage where
     /// `nix` arrives or unsafe is permitted) will replace this with
@@ -508,6 +851,305 @@ mod tests {
                 "cat did not die within 2s of signal(Kill)",
             );
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// SSH transport's `signal` rejects non-Kill variants without
+    /// touching the wire. Mirrors the local transport and the daemon's
+    /// `handle_inbound::Signal` arm.
+    #[test]
+    fn ssh_transport_signal_only_supports_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::default());
+        let stream = wait_for_connect(&sock_path);
+        let mut pty =
+            SshDaemonPty::attach(stream, "test-sig".into(), "agent-0", 24, 80, None).unwrap();
+
+        for sig in [Signal::Hup, Signal::Int, Signal::Term] {
+            let Err(err) = pty.signal(sig) else {
+                unreachable!("non-Kill signal {sig:?} must error on SSH transport");
+            };
+            assert!(
+                matches!(err, Error::SignalNotSupported { signal: s } if s == sig),
+                "expected SignalNotSupported({sig:?}), got {err:?}",
+            );
+        }
+    }
+
+    /// Full handshake against an in-process daemon: client sends Hello,
+    /// daemon sends `HelloAck`, attach succeeds and reports the daemon's
+    /// pid via tracing.
+    #[test]
+    fn ssh_transport_handshake_completes_against_in_process_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::default());
+        let stream = wait_for_connect(&sock_path);
+        let pty =
+            SshDaemonPty::attach(stream, "test-handshake".into(), "agent-0", 24, 80, None).unwrap();
+        // Daemon's HelloAck carries `daemon_pid = 0xDEAD_BEEF` per the
+        // FakeDaemon default. Confirm we wired that through.
+        assert_eq!(pty.daemon_pid, 0xDEAD_BEEF);
+    }
+
+    /// Round-trip write / read / resize against a fake daemon that
+    /// echoes every `PtyData` payload back as `PtyData`. Confirms the full
+    /// outbound encode + inbound decode pipeline.
+    #[test]
+    fn ssh_transport_round_trips_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::echo());
+        let stream = wait_for_connect(&sock_path);
+        let mut pty =
+            SshDaemonPty::attach(stream, "test-rt".into(), "agent-0", 24, 80, None).unwrap();
+
+        pty.write(b"hello over ssh").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = Vec::new();
+        loop {
+            for chunk in pty.try_read() {
+                got.extend_from_slice(&chunk);
+            }
+            if got == b"hello over ssh" {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "echo daemon should round-trip within 2s, got {got:?}",
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Sending `Signal::Kill` reaches the fake daemon which responds
+    /// with `ChildExited`; `try_wait` then reports the exit code.
+    #[test]
+    fn ssh_transport_kill_marks_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::kill_yields_exit(137));
+        let stream = wait_for_connect(&sock_path);
+        let mut pty =
+            SshDaemonPty::attach(stream, "test-kill".into(), "agent-0", 24, 80, None).unwrap();
+
+        assert!(pty.try_wait().is_none(), "alive immediately after attach");
+        pty.kill().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(code) = pty.try_wait() {
+                assert_eq!(code, 137);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected ChildExited within 2s of kill()",
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `Resize` frames reach the daemon. The fake daemon records the
+    /// most recent resize and the test asserts on it after a brief
+    /// settle window.
+    #[test]
+    fn ssh_transport_resize_reaches_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let recorded_resize: Arc<Mutex<Option<(u16, u16)>>> = Arc::new(Mutex::new(None));
+        let script = FakeDaemonScript::record_resize(Arc::clone(&recorded_resize));
+        let _daemon = FakeDaemon::spawn(&sock_path, script);
+        let stream = wait_for_connect(&sock_path);
+        let mut pty =
+            SshDaemonPty::attach(stream, "test-resize".into(), "agent-0", 24, 80, None).unwrap();
+
+        pty.resize(50, 200).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = recorded_resize
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((rows, cols)) = *snap {
+                assert_eq!((rows, cols), (50, 200));
+                return;
+            }
+            drop(snap);
+            assert!(
+                Instant::now() < deadline,
+                "fake daemon should observe Resize within 2s",
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Transport closure (peer EOF) marks the agent as exited even
+    /// when the daemon never sent `ChildExited`. Models the
+    /// "SSH tunnel died mid-session" path.
+    #[test]
+    fn ssh_transport_eof_marks_exit_code_minus_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::handshake_then_close());
+        let stream = wait_for_connect(&sock_path);
+        let mut pty =
+            SshDaemonPty::attach(stream, "test-eof".into(), "agent-0", 24, 80, None).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(code) = pty.try_wait() {
+                assert_eq!(code, -1);
+                return;
+            }
+            assert!(Instant::now() < deadline, "expected exit-on-EOF within 2s",);
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // ----- Test helpers -----
+
+    /// Hand-rolled in-process daemon for SSH transport tests. Plays
+    /// just enough of the wire protocol for [`SshDaemonPty`]'s tests
+    /// to exercise their paths — we don't pull in a `codemux-daemon`
+    /// dev-dep because the workspace's allowed-edges policy
+    /// (CLAUDE.md) keeps `crates/session` deliberately thin.
+    struct FakeDaemon {
+        // Held only for its `Drop`: joining cleans up the listener
+        // thread when the test ends.
+        _handle: thread::JoinHandle<()>,
+    }
+
+    impl FakeDaemon {
+        fn spawn(sock_path: &Path, script: FakeDaemonScript) -> Self {
+            let listener = UnixListener::bind(sock_path).unwrap();
+            let handle = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                Self::run_handshake(&mut stream);
+                script.run(stream);
+            });
+            Self { _handle: handle }
+        }
+
+        /// Read Hello, send `HelloAck` with `daemon_pid = 0xDEAD_BEEF`.
+        fn run_handshake(stream: &mut UnixStream) {
+            let mut buf = Vec::with_capacity(64);
+            let mut tmp = [0u8; 256];
+            let _hello = loop {
+                if let Some((msg, consumed)) = wire::try_decode(&buf).unwrap() {
+                    buf.drain(..consumed);
+                    break msg;
+                }
+                let n = stream.read(&mut tmp).unwrap();
+                assert!(n != 0, "FakeDaemon: client closed before Hello");
+                buf.extend_from_slice(&tmp[..n]);
+            };
+            let ack = Message::HelloAck {
+                protocol_version: wire::PROTOCOL_VERSION,
+                daemon_pid: 0xDEAD_BEEF,
+            }
+            .encode()
+            .unwrap();
+            stream.write_all(&ack).unwrap();
+            stream.flush().unwrap();
+        }
+    }
+
+    /// Post-handshake behaviour for the [`FakeDaemon`]. Each variant is
+    /// a closure-bag because the cases need different daemon-side state.
+    enum FakeDaemonScript {
+        /// Read frames and discard them.
+        Default,
+        /// Echo every `PtyData` payload back as `PtyData`.
+        Echo,
+        /// On `Signal::Kill`, reply `ChildExited` with the given code.
+        KillYieldsExit(i32),
+        /// Record the most recent Resize geometry.
+        RecordResize(Arc<Mutex<Option<(u16, u16)>>>),
+        /// Close the connection immediately (test EOF handling).
+        HandshakeThenClose,
+    }
+
+    impl FakeDaemonScript {
+        fn default() -> Self {
+            Self::Default
+        }
+        fn echo() -> Self {
+            Self::Echo
+        }
+        fn kill_yields_exit(code: i32) -> Self {
+            Self::KillYieldsExit(code)
+        }
+        fn record_resize(slot: Arc<Mutex<Option<(u16, u16)>>>) -> Self {
+            Self::RecordResize(slot)
+        }
+        fn handshake_then_close() -> Self {
+            Self::HandshakeThenClose
+        }
+
+        fn run(self, mut stream: UnixStream) {
+            if matches!(self, Self::HandshakeThenClose) {
+                drop(stream);
+                return;
+            }
+            let mut buf = Vec::new();
+            let mut tmp = vec![0u8; 4096];
+            'outer: loop {
+                while let Some((msg, consumed)) = match wire::try_decode(&buf) {
+                    Ok(v) => v,
+                    Err(_) => break 'outer,
+                } {
+                    buf.drain(..consumed);
+                    match (&self, msg) {
+                        (Self::Echo, Message::PtyData(bytes)) => {
+                            let frame = Message::PtyData(bytes).encode().unwrap();
+                            if stream.write_all(&frame).is_err() {
+                                break 'outer;
+                            }
+                            let _ = stream.flush();
+                        }
+                        (Self::KillYieldsExit(code), Message::Signal(Signal::Kill)) => {
+                            let frame = Message::ChildExited { exit_code: *code }.encode().unwrap();
+                            if stream.write_all(&frame).is_err() {
+                                break 'outer;
+                            }
+                            let _ = stream.flush();
+                            // After ChildExited the conn is over.
+                            break 'outer;
+                        }
+                        (Self::RecordResize(slot), Message::Resize { rows, cols }) => {
+                            let mut guard = slot
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            *guard = Some((rows, cols));
+                        }
+                        // Other (script, frame) pairs: silently absorb.
+                        _ => {}
+                    }
+                }
+                match stream.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+        }
+    }
+
+    /// Connect to a unix socket with a brief retry loop; the daemon
+    /// thread races with the test's connect, so the bind may race past
+    /// us by a few ms.
+    fn wait_for_connect(sock_path: &Path) -> UnixStream {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match UnixStream::connect(sock_path) {
+                Ok(s) => return s,
+                Err(_) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("could not connect to {sock_path:?}: {e}"),
+            }
         }
     }
 }

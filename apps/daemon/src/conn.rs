@@ -1,36 +1,42 @@
 //! Per-connection wire-protocol handler.
 //!
-//! Stage 1 layers `codemux-wire` over the Stage 0 byte shuttle:
+//! Stage 1 layered `codemux-wire` over the Stage 0 byte shuttle. Stage 4
+//! makes the inbound dispatch real: `Resize` actually resizes the master
+//! PTY, `Signal::Kill` actually reaps the child, `Ping` actually replies
+//! with `Pong`, and the outbound `ChildExited` carries the real exit
+//! code from `child.try_wait()` instead of a placeholder zero.
 //!
-//! 1. **Handshake.** Read a `Hello` frame from the client (with timeout),
-//!    validate version, send `HelloAck`. A version mismatch sends an
-//!    `Error{VersionMismatch}` frame and closes.
-//! 2. **Inbound loop** (background thread). Decode frames as they arrive.
-//!    `PtyData` payloads go to the PTY writer; `Resize`, `Signal`, `Ping`,
-//!    `Pong` are decoded but not yet acted on (Stage 2 plumbs resize and
-//!    signal through to the `Session`; Ping/Pong wires up).
-//! 3. **Outbound loop** (calling thread). Wraps each PTY chunk from the
-//!    channel as a `PtyData` frame and writes to the socket. On channel
-//!    disconnect (child died), sends a `ChildExited` frame with a
-//!    placeholder exit code (real code wires up in Stage 2 when the
-//!    `Session` plumbs `try_wait` results across).
+//! Both threads now write to the socket: outbound emits `PtyData` /
+//! `ChildExited` per the existing pattern, inbound emits `Pong`. To
+//! keep frames atomic we serialize all socket writes through a small
+//! `Mutex<&UnixStream>` shared via `thread::scope`. Critical sections
+//! are one frame each — no perf concern, and impossible to interleave
+//! frame bytes in the wire output.
+//!
+//! `child` and `master` are reborrowed from the [`Session`] across the
+//! same scope. Inbound owns `master` exclusively (resize is the only
+//! caller); `child` is shared via `Mutex` because both inbound
+//! (`Signal::Kill`) and outbound (`try_wait` on disconnect) reach it.
 //!
 //! `std::thread::scope` is load-bearing in two ways: the PTY writer and
-//! rx channel belong to the `Session` (which outlives any single
-//! connection), and the `UnixStream` itself is shared between threads as
-//! `&UnixStream` borrows rather than via `try_clone()` (saves two fds and
-//! a syscall per connection).
+//! rx channel belong to the [`Session`] (which outlives any single
+//! connection), and the `UnixStream` itself is shared between threads
+//! as `&UnixStream` borrows rather than via `try_clone()` (saves two
+//! fds and a syscall per connection).
+//!
+//! [`Session`]: crate::session::Session
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use codemux_wire::{self as wire, ErrorCode, Message};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
+use portable_pty::{Child, MasterPty, PtySize};
 
 use crate::error::Error;
 
@@ -63,10 +69,10 @@ pub struct HelloInfo {
 }
 
 /// Drive a single client connection through handshake and bidirectional
-/// framed I/O. Borrows `writer` and `rx` from the caller (the `Session`)
-/// so both survive across re-attaches. `stream` is taken by value because
-/// `run` semantically owns the connection for its lifetime: when the
-/// function returns, the socket is closed.
+/// framed I/O. Borrows `writer`, `rx`, `master`, and `child` from the
+/// caller (the `Session`) so all four survive across re-attaches. `stream`
+/// is taken by value because `run` semantically owns the connection for
+/// its lifetime: when the function returns, the socket is closed.
 ///
 /// # Errors
 /// Returns the handshake error if version negotiation or framing fails;
@@ -77,6 +83,8 @@ pub fn run(
     stream: UnixStream,
     writer: &mut (dyn Write + Send),
     rx: &Receiver<Vec<u8>>,
+    master: &mut (dyn MasterPty + Send),
+    child: &mut (dyn Child + Send + Sync),
 ) -> Result<(), Error> {
     let mut handshake_buf = Vec::with_capacity(256);
     let hello = match perform_handshake(&stream, &mut handshake_buf) {
@@ -98,13 +106,44 @@ pub fn run(
         "handshake complete",
     );
 
+    // The client's `Hello` advertised an initial geometry. Apply it now so
+    // the child sees the right `winsize` from the first byte instead of
+    // the bootstrap default the daemon was started with.
+    if let Err(e) = master.resize(PtySize {
+        rows: hello.rows,
+        cols: hello.cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        tracing::warn!("initial resize from Hello geometry failed: {e}");
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
+    // `Mutex<&UnixStream>` serializes socket writes so inbound's `Pong`
+    // frames can't interleave with outbound's `PtyData`. The mutex is
+    // scoped to `thread::scope`; it never escapes.
+    let socket_writer: Mutex<&UnixStream> = Mutex::new(&stream);
+    // `Mutex<&mut dyn Child + Send + Sync>` lets inbound (`Signal::Kill`)
+    // and outbound (end-of-life `try_wait`) share the child reborrow.
+    // Critical sections are nanoseconds; contention is impossible in
+    // practice (inbound only locks on Signal frames; outbound only on
+    // disconnect).
+    let child_lock: Mutex<&mut (dyn Child + Send + Sync)> = Mutex::new(child);
 
     thread::scope(|s| -> Result<(), Error> {
         let stop_for_bg = Arc::clone(&stop);
         let stream_ref: &UnixStream = &stream;
+        let socket_writer_ref = &socket_writer;
+        let child_lock_ref = &child_lock;
         let bg = s.spawn(move || {
-            let result = inbound_loop(stream_ref, handshake_buf, writer);
+            let result = inbound_loop(
+                stream_ref,
+                handshake_buf,
+                writer,
+                master,
+                child_lock_ref,
+                socket_writer_ref,
+            );
             // Release: we publish the flag; the outbound loop's Acquire
             // load pairs with this. No other shared data is being
             // synchronized, so a fence-only ordering is correct.
@@ -112,7 +151,7 @@ pub fn run(
             result
         });
 
-        outbound_loop(stream_ref, rx, &stop);
+        outbound_loop(&socket_writer, rx, &stop, &child_lock);
 
         // Outbound loop ended: wake the inbound thread (which may still
         // be blocked on `read`). NotConnected is expected if the peer
@@ -235,6 +274,9 @@ fn inbound_loop(
     mut stream: &UnixStream,
     mut buf: Vec<u8>,
     writer: &mut (dyn Write + Send),
+    master: &mut (dyn MasterPty + Send),
+    child_lock: &Mutex<&mut (dyn Child + Send + Sync)>,
+    socket_writer: &Mutex<&UnixStream>,
 ) -> Result<(), Error> {
     let mut tmp = vec![0u8; SOCKET_READ_BUF];
     loop {
@@ -242,7 +284,7 @@ fn inbound_loop(
             match wire::try_decode(&buf) {
                 Ok(Some((msg, consumed))) => {
                     buf.drain(..consumed);
-                    if !handle_inbound(msg, writer) {
+                    if !handle_inbound(msg, writer, master, child_lock, socket_writer) {
                         return Ok(());
                     }
                 }
@@ -269,7 +311,13 @@ fn inbound_loop(
 /// Apply one inbound message. Returns `false` to signal the inbound
 /// loop should end (peer requested close, error frame received, child
 /// already exited, etc.).
-fn handle_inbound(msg: Message, writer: &mut (dyn Write + Send)) -> bool {
+fn handle_inbound(
+    msg: Message,
+    writer: &mut (dyn Write + Send),
+    master: &mut (dyn MasterPty + Send),
+    child_lock: &Mutex<&mut (dyn Child + Send + Sync)>,
+    socket_writer: &Mutex<&UnixStream>,
+) -> bool {
     match msg {
         Message::PtyData(bytes) => {
             if let Err(e) = writer.write_all(&bytes) {
@@ -282,15 +330,59 @@ fn handle_inbound(msg: Message, writer: &mut (dyn Write + Send)) -> bool {
             true
         }
         Message::Resize { rows, cols } => {
-            tracing::debug!("inbound Resize {rows}x{cols} (Stage 2 will apply)");
+            // Best-effort: a failed resize means the child sees a stale
+            // winsize until the next resize. Same convention as the
+            // local transport; matches the runtime's `resize_agents`.
+            if let Err(e) = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                tracing::warn!("inbound Resize {rows}x{cols} failed: {e}");
+            }
             true
         }
         Message::Signal(sig) => {
-            tracing::debug!("inbound Signal {sig:?} (Stage 2 will forward)");
+            // `portable_pty::Child` only exposes `kill()` (SIGKILL).
+            // Other signals would need `unsafe libc::kill` or a `nix`
+            // dep — both forbidden by the workspace's `unsafe_code =
+            // "forbid"`. Matches `LocalPty::signal` exactly. Ctrl-C
+            // reaches the child as the byte 0x03 via PtyData (the
+            // right interactive-terminal semantics anyway), not via a
+            // Signal frame.
+            if matches!(sig, codemux_wire::Signal::Kill) {
+                let mut guard = child_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Err(e) = guard.kill() {
+                    tracing::debug!("inbound Signal::Kill failed: {e}");
+                }
+            } else {
+                tracing::debug!(
+                    "inbound Signal {sig:?} ignored — only Kill is supported on this transport",
+                );
+            }
             true
         }
         Message::Ping { nonce } => {
-            tracing::debug!("inbound Ping nonce={nonce} (Stage 2 will Pong)");
+            let pong = match (Message::Pong { nonce }).encode() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!("Pong encode failed: {e}");
+                    return true;
+                }
+            };
+            let mut guard = socket_writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(e) = guard.write_all(&pong) {
+                tracing::debug!("Pong write failed: {e}");
+                return false;
+            }
+            if let Err(e) = guard.flush() {
+                tracing::debug!("Pong flush failed: {e}");
+            }
             true
         }
         Message::Pong { nonce } => {
@@ -323,11 +415,19 @@ fn handle_inbound(msg: Message, writer: &mut (dyn Write + Send)) -> bool {
 /// Wrap each PTY chunk in a `PtyData` frame and write it to the socket.
 /// Sends `ChildExited` when the PTY rx channel disconnects (the
 /// `Session`'s reader thread has hung up — child is dead). The exit
-/// code is a placeholder until Stage 2 plumbs the real value across.
+/// code comes from a real `child.try_wait()`; if the child hasn't been
+/// reaped yet (race between rx-disconnect and SIGCHLD delivery) we
+/// report `-1` so the client distinguishes "exited cleanly" from
+/// "exited but we don't know with what code".
 ///
 /// The frame buffer is reused across iterations; only the per-chunk
 /// `Vec<u8>` from the channel is allocation-fresh.
-fn outbound_loop(mut stream: &UnixStream, rx: &Receiver<Vec<u8>>, stop: &Arc<AtomicBool>) {
+fn outbound_loop(
+    socket_writer: &Mutex<&UnixStream>,
+    rx: &Receiver<Vec<u8>>,
+    stop: &Arc<AtomicBool>,
+    child_lock: &Mutex<&mut (dyn Child + Send + Sync)>,
+) {
     let mut frame_buf = Vec::with_capacity(SOCKET_READ_BUF + 16);
     while !stop.load(Ordering::Acquire) {
         match rx.recv_timeout(POLL_INTERVAL) {
@@ -337,29 +437,52 @@ fn outbound_loop(mut stream: &UnixStream, rx: &Receiver<Vec<u8>>, stop: &Arc<Ato
                     tracing::warn!("PtyData encode failed: {e}");
                     return;
                 }
-                if let Err(e) = stream.write_all(&frame_buf) {
+                let mut guard = socket_writer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Err(e) = guard.write_all(&frame_buf) {
                     tracing::debug!("socket write failed: {e}");
                     return;
                 }
-                if let Err(e) = stream.flush() {
+                if let Err(e) = guard.flush() {
                     tracing::debug!("socket flush failed: {e}");
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                // Child died. Send ChildExited as the last frame so the
-                // client renders a clean exit instead of a transport
-                // error. Placeholder code; Stage 2 will source the real
-                // value from `Session::child.try_wait()`.
+                // Child died. Source the real exit code from try_wait.
+                // A `try_wait` error or `Ok(None)` (child not yet
+                // reaped — possible if rx disconnect arrived before
+                // SIGCHLD) becomes -1: the client knows the child is
+                // gone but not why.
+                let exit_code = {
+                    let mut guard = child_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match guard.try_wait() {
+                        Ok(Some(status)) => {
+                            // ExitStatus exit_code is u32; cast saturating
+                            // to i32 so a hypothetical >2^31 code doesn't
+                            // wrap into a negative (which would lie to
+                            // callers who treat negative as "killed by
+                            // signal").
+                            i32::try_from(status.exit_code()).unwrap_or(i32::MAX)
+                        }
+                        _ => -1,
+                    }
+                };
                 frame_buf.clear();
-                if (Message::ChildExited { exit_code: 0 })
+                if (Message::ChildExited { exit_code })
                     .encode_to(&mut frame_buf)
                     .is_ok()
                 {
-                    if let Err(e) = stream.write_all(&frame_buf) {
+                    let mut guard = socket_writer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Err(e) = guard.write_all(&frame_buf) {
                         tracing::debug!("ChildExited write failed: {e}");
                     }
-                    if let Err(e) = stream.flush() {
+                    if let Err(e) = guard.flush() {
                         tracing::debug!("ChildExited flush failed: {e}");
                     }
                 }
