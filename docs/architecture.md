@@ -92,6 +92,83 @@ Consequence: whatever Claude Code can do in a terminal, codemux supports for
 free. Whatever codemux wants to *show beside* Claude Code, it derives from
 out-of-band sources (git for diffs, host probes for liveness).
 
+### AD-3 — Remote PTY container is `codemuxd`, behind an `AgentTransport` enum
+
+P1 SSH transport. A small Rust daemon (`codemuxd`) holds the remote PTY across
+SSH disconnects. Local codemux ships a per-target binary, deploys it on first
+connect to a host, and attaches/reattaches over a unix socket.
+
+Workspace placement: `apps/daemon/`, crate `codemux-daemon`, binary `codemuxd`
+— sibling to `apps/tui/`, per AD-16's pattern.
+
+`codemuxd` is a pure byte shuttle: PTY ownership, unix socket, signal and
+resize forwarding. It knows nothing about Claude Code (AD-1 still holds — no
+semantic parsing anywhere).
+
+`crates/session` defines `AgentTransport` as an **enum**, not a trait —
+variants are closed and known at compile time, and the Rust style guide
+prefers enum dispatch over `Box<dyn>` for closed sets:
+
+    enum AgentTransport {
+        Local(LocalPty),
+        SshDaemon(SshDaemonPty),
+    }
+
+`apps/tui` consults the transport via the enum; the runtime is
+transport-agnostic.
+
+Wire protocol: length-prefixed binary frames (PTY data is binary; JSON would
+force base64 on 99% of traffic). Message types: HELLO/HELLO_ACK (with
+version), PTY_DATA, RESIZE, SIGNAL, CHILD_EXITED, PING/PONG, ERROR. Strict
+version negotiation — mismatch disconnects; local re-deploys the matching
+daemon. No shimming. The protocol is the artifact to design carefully; the
+implementation is replaceable.
+
+Bootstrap: bundled daemon binaries for known targets; on first SSH connect,
+detect target via `uname`, check `~/.cache/codemuxd/agent.version`, scp if
+absent or stale. Subsequent connects are zero-cost.
+
+Filesystem per host:
+`~/.cache/codemuxd/{sockets,pids,logs}/{agent-id}.{sock,pid,log}`, sockets at
+mode 0600. Single attached client per agent.
+
+Rejected — `tmux new -A -s ccmux-<id>` (the original AD-3 sketch): wrapping a
+multiplexer with a multiplexer is more than aesthetic. tmux's behavioural
+surface (signal handling, terminfo, scriptable UI) is large enough that it
+leaks into our error modes.
+
+Rejected — `dtach`: small, well-understood C; would ship faster. Disqualified
+by abandoned upstream (no release since 2016) — when a PTY/signal edge case
+bites a load-bearing dependency, no path to a fix exists.
+
+Rejected — multi-attach (multiple clients per agent socket): codemux is
+single-user; "second observer" is not on any roadmap. Single client keeps the
+daemon state model trivial.
+
+Rejected — PTY output replay buffer in v1: reattach renders blank until the
+next paint; user types a key, claude redraws. A bounded ring buffer (~256 KB)
+is a tempting v1.5 if blank-screen is annoying enough — ship without first.
+
+### AD-5 — Local codemux is a single Rust process; SSH outward, `codemuxd` inward
+
+The local codemux binary is single-process — no client/server split, no local
+daemon. All TUI, navigation, transport, and persistence live in one process.
+SSH is the outbound transport for remote PTYs.
+
+A small per-host daemon (`codemuxd`, AD-3) holds remote PTYs. The original
+formulation of this AD said "no daemon on remote hosts"; that constraint is
+**retired**. It was true for the P0 single-local-PTY world but became a
+fiction the moment SSH transport was specified — *something* must hold the
+PTY across an SSH disconnect, and Claude Code is a TTY-attached interactive
+process that dies on SIGHUP. The honest framing: no codemux daemon *locally*;
+one minimal codemux-owned daemon per remote host.
+
+Naming: the daemon is `codemuxd`, not `codemux-agent`. The domain type
+`Agent` already means "a Claude Code workspace"
+(`crates/session/src/domain.rs`); overloading "agent" to also mean the
+host-side daemon would force lifetime disambiguation in every doc, log line,
+and conversation.
+
 ### AD-10 — PTY library: `portable-pty`
 
 Pure-Rust PTY spawning, cross-platform, works for both local fork and (later)
@@ -246,10 +323,6 @@ phase ships.
 - **AD-2 — One PTY per agent, recoverable via Claude session ID.** P1 reattach
   story: store Claude session ID, reattach with `claude --resume <id>` on focus
   if the PTY died.
-- **AD-3 — Wrap remote `claude` in `tmux new -A -s ccmux-<id>`.** P1 SSH
-  transport. Survives a dropped SSH connection; no tmux UI shown to the user.
-- **AD-5 — Single Rust process, SSH outward.** No daemon on remote hosts; SSH
-  subprocess provides the PTY for remote agents.
 - **AD-6 — Edits panel is `git diff`, read-only.** P2. Inline `syntect` peek;
   one-keystroke "open in `$EDITOR`" for deep review. No staging, no
   annotations.
@@ -272,9 +345,11 @@ phase ships.
   not in a separate `crates/infra/`.
 - **AD-19 — `shared-kernel` carries IDs and tracing only.** Already in place.
   `HostId`, `AgentId`, `GroupId` newtypes; zero vendor deps.
-- **AD-20 — Ports-and-adapters inside each component crate.** Re-introduced
-  per component when a real second adapter arrives (e.g. when SSH transport
-  joins local PTY transport in P1, the port/adapter split earns its keep).
+- **AD-20 — Ports-and-adapters inside each component crate.** First trigger
+  fired in P1: SSH transport joining local PTY transport (see AD-3). The
+  Rust shape is enum dispatch (`AgentTransport` enum with one variant per
+  adapter), not trait objects — closed variant set, no need for `Box<dyn>`.
+  Re-introduce per component when the next real second adapter arrives.
 - **AD-22 — Navigator is a view model in `apps/tui`, not its own crate.** P1.
   The navigator's *data* belongs to `session`; its *UI state* (selection
   index, filter, collapse) belongs in the TUI delivery.
