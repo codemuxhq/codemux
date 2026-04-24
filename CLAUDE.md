@@ -1,54 +1,29 @@
 # codemux
 
-Personal TUI multiplexer for Claude Code agent sessions. Single-user, Rust, ratatui + portable-pty + tui-term. See `docs/vision.md` for the full pitch and `docs/roadmap.md` for the phase sequencing.
-
-Currently in **P1.3** — multi-agent local works, config-driven keymap, two navigator styles (Popup / LeftPane), spawn minibuffer (`@host : path` structured prompt with SSH-config autocomplete). SSH transport and persistence are next (P1.4+).
+Personal TUI multiplexer for Claude Code agent sessions. Single-user, Rust, ratatui + portable-pty + tui-term. See `docs/vision.md` for the full pitch and `docs/roadmap.md` for current phase and sequencing.
 
 ## Workflow conventions
 
 - **No worktrees, no feature branches.** Personal repo — commit directly to `main`.
 - **No AI trailers** in commit messages (no `Co-Authored-By: Claude`, no "Generated with").
-- **Reproducible builds**: caret-range in `Cargo.toml`, exact resolution in `Cargo.lock`. Never `=X.Y.Z` in the manifest (blocks `cargo update` security patches).
+- **Commit style**: `type(scope): subject`. Types: `fix`, `feat`, `chore`, `docs`, `refactor`. Scope is the phase tag (e.g. `p1`); omit for cross-cutting `chore`/`docs`.
 - Lints are strict: `unwrap_used` and `expect_used` are deny; `clippy::pedantic` is warn. Use `#[allow(...)]` on the genuinely-OK cases.
 
 ## Just commands
 
-`just --list` shows them all. The ones you'll use:
+`just --list` shows them all. **There is no CI** — `just check` (fmt --check + lint + test) is the only gate. Run it before every commit.
 
-| Command | What it does |
-|---|---|
-| `just` | List recipes |
-| `just run` | `cargo run` — launch with defaults |
-| `just run -- --nav left-pane` | Pass args through to the binary |
-| `just fmt` | `cargo fmt --all` |
-| `just lint` | `cargo clippy --workspace --all-targets -- -D warnings` |
-| `just test` | `cargo test --workspace` |
-| `just check` | **Pre-push gate**: fmt --check + lint + test. Run this before any commit. |
-
-Use `just check` (not the individual recipes) before committing — it catches the same things CI would if there were CI.
+For verbose tracing: `RUST_LOG=codemux=debug just run` (the `EnvFilter` is scoped to the `codemux` target).
 
 ## Repo layout
 
-Cargo workspace, edition 2024, resolver 3. Architecture rationale lives in `docs/architecture.md` (AD-1 through AD-24).
+Cargo workspace, edition 2024, resolver 3. Three crates:
 
-```
-codemux/
-├── Cargo.toml                  # [workspace.dependencies], [workspace.lints]
-├── apps/
-│   └── tui/                    # crate: codemux-tui, binary: codemux
-│       └── src/
-│           ├── main.rs         # CLI parsing, tracing init, calls runtime::run
-│           ├── runtime.rs      # event loop; owns PTYs, dispatches keys, renders chrome
-│           ├── keymap.rs       # KeyChord parser + per-scope action enums + Bindings POD
-│           ├── config.rs       # XDG config loader (~/.config/codemux/config.toml)
-│           └── spawn.rs        # spawn-agent minibuffer (single concrete SpawnMinibuffer;
-│                               # see top-of-file note before adding more variants)
-└── crates/
-    ├── session/                # bounded context: agent lifecycle (mostly P1.4+ scope)
-    └── shared-kernel/          # IDs only (HostId, AgentId, GroupId); zero vendor deps
-```
+- `apps/tui` — binary `codemux`. Owns PTYs, runs the event loop, renders chrome.
+- `crates/session` — agent lifecycle bounded context (mostly P1.4+ scope).
+- `crates/shared-kernel` — IDs only (`HostId`, `AgentId`, `GroupId`); zero vendor deps.
 
-Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term/vt100/crossterm`. `session → shared-kernel`. **Never** the other direction; **never** any TUI dep in `crates/*`.
+Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term/vt100/crossterm`. `session → shared-kernel`. **Never** the other direction; **never** any TUI dep in `crates/*`. Architecture rationale lives in `docs/architecture.md` (AD-1 through AD-24).
 
 ## Where things live
 
