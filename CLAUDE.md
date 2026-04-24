@@ -51,3 +51,4 @@ Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term
 - [`docs/use-cases.md`](docs/use-cases.md) — the four concrete workflows it's designed for
 - [`docs/architecture.md`](docs/architecture.md) — stack, data model, all architecture decisions
 - [`docs/roadmap.md`](docs/roadmap.md) — phased plan, ship criteria, explicit non-milestones
+- [`docs/codemuxd-stages.md`](docs/codemuxd-stages.md) — live tracker for the AD-3 daemon build-out (Stages 0–5)
