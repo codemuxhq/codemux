@@ -18,7 +18,7 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
-# Stage 1 will add codemux-wire here. Stage 0 is raw bytes only.
+codemux-wire.workspace = true
 portable-pty.workspace = true
 crossbeam-channel.workspace = true
 clap.workspace = true

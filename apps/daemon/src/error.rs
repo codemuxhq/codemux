@@ -42,6 +42,30 @@ pub enum Error {
     #[error("agent already attached")]
     AlreadyAttached,
 
+    /// The peer announced a wire-protocol version this daemon does not
+    /// speak. The daemon sends an `Error{VersionMismatch}` frame and
+    /// closes the connection; the client redeploys.
+    #[error("wire version mismatch: client sent v{client}, daemon speaks v{daemon}")]
+    VersionMismatch { client: u8, daemon: u8 },
+
+    /// The peer's first frame after connect was not `Hello`. The
+    /// handshake is mandatory before any other traffic.
+    #[error("expected Hello as first frame, got tag 0x{got_tag:02X}")]
+    HandshakeMissing { got_tag: u8 },
+
+    /// The peer closed the socket before sending a complete `Hello`.
+    #[error("peer disconnected before completing handshake")]
+    HandshakeIncomplete,
+
+    /// Wire-level encode/decode failure. Wraps the structured
+    /// [`codemux_wire::Error`] so callers can inspect the kind without
+    /// string parsing.
+    #[error("wire frame error")]
+    Wire {
+        #[from]
+        source: codemux_wire::Error,
+    },
+
     #[error("io")]
     Io {
         #[from]

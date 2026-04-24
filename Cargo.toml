@@ -5,6 +5,7 @@ members = [
     "apps/daemon",
     "crates/session",
     "crates/shared-kernel",
+    "crates/wire",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ repository = "https://github.com/codemuxhq/codemux"
 # Internal crates
 codemux-session = { path = "crates/session" }
 codemux-shared-kernel = { path = "crates/shared-kernel" }
+codemux-wire = { path = "crates/wire" }
 
 # Error handling (AD-17)
 thiserror = "2.0.18"

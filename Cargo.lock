@@ -250,6 +250,7 @@ name = "codemux-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "codemux-wire",
  "color-eyre",
  "crossbeam-channel",
  "portable-pty",
@@ -292,6 +293,13 @@ dependencies = [
  "tracing-subscriber",
  "tui-term",
  "vt100",
+]
+
+[[package]]
+name = "codemux-wire"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]
