@@ -1,0 +1,41 @@
+[package]
+name = "codemuxd-bootstrap"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+# `build.rs` assembles the codemuxd-bootstrap tarball into OUT_DIR; the
+# crate embeds it via include_bytes!. The build script rewrites the
+# archive whenever apps/daemon, crates/wire, Cargo.lock,
+# rust-toolchain.toml, or bootstrap-root/Cargo.toml change.
+build = "build.rs"
+
+[dependencies]
+# `establish_ssh_transport` constructs `AgentTransport::SshDaemon(...)`
+# directly — the session crate is the application core; this crate is
+# the SSH adapter that drives it.
+codemux-session.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+# Pure-Rust tar + gzip. Used only by build.rs to assemble the
+# codemuxd-bootstrap tarball that `src/lib.rs` embeds via
+# include_bytes!. flate2 defaults to its pure-Rust backend
+# (`miniz_oxide`) so the build does not need any system libraries.
+tar = "0.4"
+flate2 = "1.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+# Tests in `src/lib.rs` decompress and inspect the embedded tarball
+# produced by `build.rs`. Same crates as `[build-dependencies]` but
+# Cargo doesn't share those with `cfg(test)` — re-declare here.
+tar = "0.4"
+flate2 = "1.0"
+
+[lints]
+workspace = true

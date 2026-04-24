@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Child as ProcessChild;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -31,8 +31,7 @@ use codemux_wire::{self as wire, Message, Signal};
 use crossbeam_channel::{Receiver, unbounded};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::bootstrap;
-use crate::error::{BootstrapStage, Error};
+use crate::error::Error;
 
 /// PTY read chunk size. Mirrors `apps/daemon/src/pty.rs::READ_BUFFER_SIZE`
 /// — 8 KiB balances syscall overhead against burst output from a
@@ -57,8 +56,8 @@ pub enum AgentTransport {
     /// runtime. The default and only Stage 3 variant.
     Local(LocalPty),
     /// Tunneled connection to a `codemuxd` running on a remote host.
-    /// Stage 4 lights this up via [`bootstrap::bootstrap`] +
-    /// [`SshDaemonPty::attach`].
+    /// Stage 4 lights this up via the `codemuxd-bootstrap` adapter
+    /// crate (which calls `bootstrap` then [`SshDaemonPty::attach`]).
     SshDaemon(SshDaemonPty),
 }
 
@@ -81,33 +80,6 @@ impl AgentTransport {
         cols: u16,
     ) -> Result<Self, Error> {
         LocalPty::spawn("claude", &[], label, cwd, rows, cols).map(Self::Local)
-    }
-
-    /// Spawn the agent against a `codemuxd` reachable over SSH. Runs
-    /// the full bootstrap (probe → tarball → scp → build → daemon spawn
-    /// → tunnel → connect → handshake). Hardcodes the production
-    /// [`bootstrap::RealRunner`] and [`bootstrap::default_local_socket_dir`]
-    /// — tests bypass this by constructing [`SshDaemonPty::attach`]
-    /// directly against an in-process socket.
-    ///
-    /// # Errors
-    /// Returns [`Error::Bootstrap`] for any bootstrap-stage failure,
-    /// [`Error::Wire`] for protocol-level failures during the
-    /// `Hello`/`HelloAck` handshake, or [`Error::Pty`] for
-    /// transport-level failures while attaching.
-    pub fn spawn_ssh(
-        host: &str,
-        agent_id: &str,
-        cwd: &Path,
-        rows: u16,
-        cols: u16,
-    ) -> Result<Self, Error> {
-        let runner = bootstrap::RealRunner;
-        let local_socket_dir = bootstrap::default_local_socket_dir()?;
-        let (stream, tunnel) =
-            bootstrap::bootstrap(&runner, host, agent_id, cwd, &local_socket_dir)?;
-        let label = format!("{host}:{agent_id}");
-        SshDaemonPty::attach(stream, label, agent_id, rows, cols, Some(tunnel)).map(Self::SshDaemon)
     }
 
     /// Drain whatever bytes the transport has buffered since the last
@@ -367,9 +339,11 @@ impl Drop for LocalPty {
 /// - `rx`: PTY chunks the framed reader thread drained from the
 ///   socket. Other inbound frames (`Pong`, `Error`) are absorbed
 ///   silently; `ChildExited` sets `exit_code` and ends the reader.
-/// - `exit_code`: shared with the reader thread. `None` while the
-///   remote child is alive; `Some(code)` once `ChildExited` arrives or
-///   the socket EOFs.
+/// - `exit_code`: a single-set cell shared with the reader thread.
+///   Empty while the remote child is alive; populated once
+///   `ChildExited` arrives or the socket EOFs. [`OnceLock`] gives us
+///   write-once semantics without the lock-and-poison plumbing a
+///   `Mutex<Option<i32>>` would impose.
 /// - `tunnel`: the `ssh -N -L` subprocess. Killed on `Drop` so we
 ///   don't leak ssh processes when an agent is removed. Optional so
 ///   tests can attach against a local socket without spinning up a
@@ -378,7 +352,7 @@ pub struct SshDaemonPty {
     label: String,
     socket_writer: UnixStream,
     rx: Receiver<Vec<u8>>,
-    exit_code: Arc<Mutex<Option<i32>>>,
+    exit_code: Arc<OnceLock<i32>>,
     /// Diagnostic only — the daemon's pid on the remote host. Logged
     /// from `attach`; not otherwise consumed.
     daemon_pid: u32,
@@ -390,15 +364,15 @@ impl SshDaemonPty {
     /// `Hello`/`HelloAck` handshake, spawn the framed reader thread,
     /// and return the constructed transport.
     ///
-    /// `tunnel` is the `ssh -N -L` subprocess from
-    /// [`bootstrap::bootstrap`] in production; tests pass `None` to
-    /// attach against an in-process socket without a tunnel.
+    /// `tunnel` is the `ssh -N -L` subprocess from the
+    /// `codemuxd-bootstrap` adapter in production; tests pass `None`
+    /// to attach against an in-process socket without a tunnel.
     ///
     /// # Errors
-    /// Returns [`Error::Bootstrap`] with stage [`BootstrapStage::Handshake`]
-    /// for any handshake failure (timeouts, oversized frames, version
-    /// mismatch, framing errors). The tunnel subprocess (if Some) is
-    /// killed before returning so a failed attach doesn't leak it.
+    /// Returns [`Error::Handshake`] for any handshake failure
+    /// (timeouts, oversized frames, version mismatch, framing
+    /// errors). The tunnel subprocess (if Some) is killed before
+    /// returning so a failed attach doesn't leak it.
     pub fn attach(
         stream: UnixStream,
         label: String,
@@ -410,8 +384,8 @@ impl SshDaemonPty {
         // `set_read_timeout(Some(_))` bounds the handshake; the framed
         // reader clears it back to `None` (blocking) once it owns its
         // clone of the stream. Failures are best-effort — macOS can
-        // EINVAL if the peer closed mid-call; the next read will detect
-        // EOF on its own.
+        // EINVAL if the peer closed mid-call; the next read will
+        // detect EOF on its own.
         if let Err(e) = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
             tracing::debug!(label, "set_read_timeout(Some) failed pre-handshake: {e}");
         }
@@ -434,11 +408,10 @@ impl SshDaemonPty {
             tracing::debug!(label, "set_read_timeout(None) post-handshake failed: {e}");
         }
 
-        let read_stream = stream.try_clone().map_err(|e| Error::Bootstrap {
-            stage: BootstrapStage::Handshake,
+        let read_stream = stream.try_clone().map_err(|e| Error::Handshake {
             source: Box::new(e),
         })?;
-        let exit_code = Arc::new(Mutex::new(None));
+        let exit_code = Arc::new(OnceLock::new());
         let rx = spawn_framed_reader_thread(read_stream, Arc::clone(&exit_code));
 
         tracing::info!(
@@ -487,14 +460,10 @@ impl SshDaemonPty {
     }
 
     fn try_wait(&mut self) -> Option<i32> {
-        // Lock failure means a thread panicked while holding the
-        // exit_code mutex — extremely unlikely (the framed reader only
-        // takes the lock for trivial assignments). If it happens, the
-        // poisoned-data convention is to read the inner value anyway.
-        *self
-            .exit_code
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        // `OnceLock::get` is a non-blocking, lock-free read. Returns
+        // `None` while the framed reader hasn't seen `ChildExited`
+        // (or transport EOF) yet, `Some(code)` once it has.
+        self.exit_code.get().copied()
     }
 
     fn kill(&mut self) -> Result<(), Error> {
@@ -538,9 +507,8 @@ impl Drop for SshDaemonPty {
 }
 
 /// Send `Hello`, read `HelloAck`, validate the version, return the
-/// daemon's pid. All errors map to [`Error::Bootstrap`] with stage
-/// [`BootstrapStage::Handshake`] so the TUI surfaces a stage-specific
-/// hint.
+/// daemon's pid. All errors map to [`Error::Handshake`] so the TUI
+/// surfaces a handshake-specific hint.
 fn perform_handshake(
     mut stream: &UnixStream,
     agent_id: &str,
@@ -553,26 +521,22 @@ fn perform_handshake(
         cols,
         agent_id: agent_id.to_string(),
     };
-    let hello_bytes = hello.encode().map_err(|source| Error::Bootstrap {
-        stage: BootstrapStage::Handshake,
+    let hello_bytes = hello.encode().map_err(|source| Error::Handshake {
         source: Box::new(source),
     })?;
     stream
         .write_all(&hello_bytes)
-        .map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::Handshake,
+        .map_err(|source| Error::Handshake {
             source: Box::new(source),
         })?;
-    stream.flush().map_err(|source| Error::Bootstrap {
-        stage: BootstrapStage::Handshake,
+    stream.flush().map_err(|source| Error::Handshake {
         source: Box::new(source),
     })?;
 
     let mut buf = Vec::with_capacity(64);
     let mut tmp = [0u8; 256];
     loop {
-        match wire::try_decode(&buf).map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::Handshake,
+        match wire::try_decode(&buf).map_err(|source| Error::Handshake {
             source: Box::new(source),
         })? {
             Some((
@@ -583,8 +547,7 @@ fn perform_handshake(
                 _consumed,
             )) => {
                 if protocol_version != wire::PROTOCOL_VERSION {
-                    return Err(Error::Bootstrap {
-                        stage: BootstrapStage::Handshake,
+                    return Err(Error::Handshake {
                         source: format!(
                             "protocol version mismatch: client v{}, daemon v{}",
                             wire::PROTOCOL_VERSION,
@@ -596,26 +559,22 @@ fn perform_handshake(
                 return Ok(daemon_pid);
             }
             Some((Message::Error { code, message }, _)) => {
-                return Err(Error::Bootstrap {
-                    stage: BootstrapStage::Handshake,
+                return Err(Error::Handshake {
                     source: format!("daemon rejected handshake: {code:?}: {message}").into(),
                 });
             }
             Some((other, _)) => {
-                return Err(Error::Bootstrap {
-                    stage: BootstrapStage::Handshake,
+                return Err(Error::Handshake {
                     source: format!("expected HelloAck, got tag 0x{:02X}", other.tag(),).into(),
                 });
             }
             None => {}
         }
-        let n = stream.read(&mut tmp).map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::Handshake,
+        let n = stream.read(&mut tmp).map_err(|source| Error::Handshake {
             source: Box::new(source),
         })?;
         if n == 0 {
-            return Err(Error::Bootstrap {
-                stage: BootstrapStage::Handshake,
+            return Err(Error::Handshake {
                 source: "EOF before HelloAck".into(),
             });
         }
@@ -633,7 +592,7 @@ fn perform_handshake(
 /// daemon never sent `ChildExited` (e.g. SSH tunnel died mid-session).
 fn spawn_framed_reader_thread(
     mut read_stream: UnixStream,
-    exit_code: Arc<Mutex<Option<i32>>>,
+    exit_code: Arc<OnceLock<i32>>,
 ) -> Receiver<Vec<u8>> {
     let (tx, rx) = unbounded::<Vec<u8>>();
     thread::spawn(move || {
@@ -653,12 +612,11 @@ fn spawn_framed_reader_thread(
                                 }
                             }
                             Message::ChildExited { exit_code: code } => {
-                                let mut guard = exit_code
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if guard.is_none() {
-                                    *guard = Some(code);
-                                }
+                                // First set wins; subsequent
+                                // `EOF -> -1` writes from the read
+                                // loop below are silently ignored
+                                // by `OnceLock::set`.
+                                let _ = exit_code.set(code);
                                 break 'outer;
                             }
                             Message::Pong { nonce } => {
@@ -666,12 +624,7 @@ fn spawn_framed_reader_thread(
                             }
                             Message::Error { code, message } => {
                                 tracing::warn!("daemon sent Error frame: {code:?}: {message}",);
-                                let mut guard = exit_code
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                if guard.is_none() {
-                                    *guard = Some(-1);
-                                }
+                                let _ = exit_code.set(-1);
                                 break 'outer;
                             }
                             // Other variants (Hello, HelloAck, Resize,
@@ -692,35 +645,20 @@ fn spawn_framed_reader_thread(
                     Ok(None) => break,
                     Err(e) => {
                         tracing::warn!("framed reader decode failed: {e}");
-                        let mut guard = exit_code
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if guard.is_none() {
-                            *guard = Some(-1);
-                        }
+                        let _ = exit_code.set(-1);
                         break 'outer;
                     }
                 }
             }
             match read_stream.read(&mut tmp) {
                 Ok(0) => {
-                    let mut guard = exit_code
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if guard.is_none() {
-                        *guard = Some(-1);
-                    }
+                    let _ = exit_code.set(-1);
                     break;
                 }
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
                 Err(e) => {
                     tracing::debug!("framed reader read failed: {e}");
-                    let mut guard = exit_code
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if guard.is_none() {
-                        *guard = Some(-1);
-                    }
+                    let _ = exit_code.set(-1);
                     break;
                 }
             }
@@ -755,6 +693,7 @@ fn spawn_pty_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>
 #[allow(clippy::unwrap_used)]
 mod tests {
     use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use super::*;

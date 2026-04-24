@@ -267,9 +267,7 @@ dependencies = [
  "codemux-shared-kernel",
  "codemux-wire",
  "crossbeam-channel",
- "flate2",
  "portable-pty",
- "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -304,6 +302,18 @@ name = "codemux-wire"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codemuxd-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "codemux-session",
+ "flate2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

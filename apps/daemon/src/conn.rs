@@ -7,16 +7,24 @@
 //! code from `child.try_wait()` instead of a placeholder zero.
 //!
 //! Both threads now write to the socket: outbound emits `PtyData` /
-//! `ChildExited` per the existing pattern, inbound emits `Pong`. To
-//! keep frames atomic we serialize all socket writes through a small
-//! `Mutex<&UnixStream>` shared via `thread::scope`. Critical sections
-//! are one frame each — no perf concern, and impossible to interleave
-//! frame bytes in the wire output.
+//! `ChildExited` per the existing pattern, inbound emits `Pong` in
+//! reply to `Ping`. To preserve frame integrity we serialize **only
+//! socket writes** through a small `Mutex<&UnixStream>` shared via
+//! `thread::scope`; reads bypass the mutex entirely and operate on
+//! `&UnixStream` directly. Full-duplex is preserved — the inbound
+//! thread reads concurrently with the outbound thread's writes — and
+//! the mutex exists solely so the two writers don't interleave bytes
+//! from different frames (unix `SOCK_STREAM` makes no such atomicity
+//! guarantee for concurrent writes that exceed pipe-buffer size).
+//! Critical sections are one frame each — no perf concern.
 //!
 //! `child` and `master` are reborrowed from the [`Session`] across the
 //! same scope. Inbound owns `master` exclusively (resize is the only
 //! caller); `child` is shared via `Mutex` because both inbound
 //! (`Signal::Kill`) and outbound (`try_wait` on disconnect) reach it.
+//! These two paths are mutually exclusive in time — kill triggers child
+//! death, which triggers rx disconnect, which triggers the outbound
+//! `try_wait` — so contention is impossible in practice.
 //!
 //! `std::thread::scope` is load-bearing in two ways: the PTY writer and
 //! rx channel belong to the [`Session`] (which outlives any single
@@ -119,15 +127,18 @@ pub fn run(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    // `Mutex<&UnixStream>` serializes socket writes so inbound's `Pong`
-    // frames can't interleave with outbound's `PtyData`. The mutex is
-    // scoped to `thread::scope`; it never escapes.
+    // `Mutex<&UnixStream>` serializes socket WRITES so inbound's `Pong`
+    // frames can't interleave with outbound's `PtyData`. Reads do NOT
+    // go through this mutex — `inbound_loop` reads `&UnixStream`
+    // directly — so full-duplex (concurrent read + write) is preserved.
+    // The mutex is scoped to `thread::scope`; it never escapes.
     let socket_writer: Mutex<&UnixStream> = Mutex::new(&stream);
     // `Mutex<&mut dyn Child + Send + Sync>` lets inbound (`Signal::Kill`)
     // and outbound (end-of-life `try_wait`) share the child reborrow.
     // Critical sections are nanoseconds; contention is impossible in
-    // practice (inbound only locks on Signal frames; outbound only on
-    // disconnect).
+    // practice — the two access paths are mutually exclusive in time
+    // (kill -> child dies -> rx disconnects -> outbound takes the lock
+    // exactly once).
     let child_lock: Mutex<&mut (dyn Child + Send + Sync)> = Mutex::new(child);
 
     thread::scope(|s| -> Result<(), Error> {

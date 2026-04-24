@@ -157,15 +157,22 @@ the local TUI to the remote socket.
 
 ### Deviations from plan (as shipped)
 
-- **Bootstrap module lives in `crates/session/src/bootstrap.rs`**, not
-  `apps/tui/src/bootstrap.rs` as originally planned. Reason:
-  `AgentTransport::spawn_ssh` is in the session crate, and putting the
-  bootstrap next to its only caller eliminated an `apps/tui → session`
-  callback dance for the same payoff. Public surface:
+- **Bootstrap module lives in its own adapter crate `crates/codemuxd-bootstrap`,
+  not `crates/session/src/bootstrap.rs` (initial implementation) and not
+  `apps/tui/src/bootstrap.rs` (original plan).** The first deviation
+  put it next to `AgentTransport::spawn_ssh` for the cleanest call
+  site; review then flagged that as a Hexagonal violation (the
+  `session` crate is the application core and should not own SSH/scp
+  orchestration). The fix carved off `crates/codemuxd-bootstrap` as a
+  Secondary/Driven Adapter that depends on `session` (correct
+  direction). Public surface:
   `bootstrap::bootstrap(runner, host, agent_id, cwd, local_socket_dir)`,
-  `bootstrap::CommandRunner` trait, `bootstrap::RealRunner`,
-  `bootstrap::default_local_socket_dir`. Re-exported from
-  `crates/session/src/lib.rs`.
+  `bootstrap::establish_ssh_transport(...)` (composes bootstrap +
+  `SshDaemonPty::attach`), `bootstrap::CommandRunner`,
+  `bootstrap::RealRunner`, `bootstrap::default_local_socket_dir`,
+  `bootstrap::Error`, `bootstrap::Stage`. The session crate keeps
+  `Error::Handshake` for post-bootstrap wire-handshake failures
+  (formerly bundled under `Error::Bootstrap{Handshake}`).
 - **Daemon-side `Resize`/`Signal::Kill`/`Ping`/`Pong` and real
   `ChildExited` exit codes were wired in this stage** (Stage 2 left them
   as `tracing::warn!("Stage 2 will apply") and `exit_code: 0`

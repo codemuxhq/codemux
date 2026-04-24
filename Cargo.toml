@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "apps/tui",
     "apps/daemon",
+    "crates/codemuxd-bootstrap",
     "crates/session",
     "crates/shared-kernel",
     "crates/wire",
@@ -17,6 +18,7 @@ repository = "https://github.com/codemuxhq/codemux"
 
 [workspace.dependencies]
 # Internal crates
+codemuxd-bootstrap = { path = "crates/codemuxd-bootstrap" }
 codemux-session = { path = "crates/session" }
 codemux-shared-kernel = { path = "crates/shared-kernel" }
 codemux-wire = { path = "crates/wire" }

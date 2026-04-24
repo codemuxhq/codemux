@@ -9,48 +9,6 @@ use thiserror::Error;
 /// boundary, so the application core never depends on a specific tool's types.
 type BoxedSource = Box<dyn StdError + Send + Sync + 'static>;
 
-/// Which step of the SSH bootstrap pipeline produced a failure. Carried in
-/// [`Error::Bootstrap`] so the TUI can surface a stage-specific message
-/// (each stage has a distinct actionable hint — "ssh refused", "scp failed",
-/// "cargo not found on remote", etc.).
-///
-/// `#[non_exhaustive]` because future bootstrap variants (HTTP-based
-/// installer, pre-built per-arch binaries) will add their own stages without
-/// breaking match arms in callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum BootstrapStage {
-    /// `ssh host 'cat ~/.cache/codemuxd/agent.version'` — the cheap probe
-    /// that decides whether to skip steps 2-4. Failure here usually means
-    /// "ssh can't reach the host" or "auth refused".
-    VersionProbe,
-    /// Local-side: write the embedded tarball bytes to a tempfile we can
-    /// then `scp`. Failure means a filesystem error in `$TMPDIR`.
-    TarballStage,
-    /// `scp local-tarball host:~/.cache/codemuxd/src/...`. Failure usually
-    /// means transient network or remote disk full.
-    Scp,
-    /// `ssh host 'cargo build --release ...'`. Long-running. Failure
-    /// usually means "cargo not on remote PATH" (actionable) or a real
-    /// compilation error (rare unless the source is broken).
-    RemoteBuild,
-    /// `ssh host 'setsid -f ~/.cache/codemuxd/bin/codemuxd ...'`. Failure
-    /// usually means the daemon CLI rejected its arguments (e.g. `cwd`
-    /// not found) — surfaces as a single line of the daemon's stderr.
-    DaemonSpawn,
-    /// `ssh -N -L /tmp/...:~/.cache/.../sock host`. Failure usually means
-    /// the OpenSSH version on either side doesn't support unix-socket
-    /// forwarding (older than 6.7) or the local tunnel path is in use.
-    SocketTunnel,
-    /// `UnixStream::connect` against the local end of the tunnel. Failure
-    /// after a short retry loop means the daemon never bound its socket
-    /// — likely a remote crash mid-spawn.
-    SocketConnect,
-    /// `Hello`/`HelloAck` exchange over the connected socket. Failure
-    /// means a protocol-version mismatch or a corrupted frame.
-    Handshake,
-}
-
 /// Errors raised by the session bounded context.
 ///
 /// Per AD-17, marked `#[non_exhaustive]` so variants can be added without
@@ -94,12 +52,12 @@ pub enum Error {
     },
 
     /// Stage 3 sentinel for transport surface that exists in the type
-    /// signature but does not yet have a body. Returned today by
-    /// `AgentTransport::spawn_ssh` and the `SshDaemonPty` method stubs;
-    /// Stage 4 replaces those bodies and this variant becomes unused
-    /// for that path. Kept on the enum because future seams (e.g. a
-    /// remote-host transport other than SSH) will reach for the same
-    /// sentinel during their own walking-skeleton stage.
+    /// signature but does not yet have a body. Returned today by the
+    /// `SshDaemonPty` method stubs that haven't been wired; Stage 4
+    /// retired the SSH-spawn path's use of this variant. Kept on the
+    /// enum because future seams (e.g. a remote-host transport other
+    /// than SSH) will reach for the same sentinel during their own
+    /// walking-skeleton stage.
     #[error("not yet implemented: {feature}")]
     NotImplemented { feature: &'static str },
 
@@ -113,14 +71,15 @@ pub enum Error {
     #[error("signal {signal:?} is not supported on local transport")]
     SignalNotSupported { signal: Signal },
 
-    /// SSH bootstrap failed. The `stage` field tells the caller which step
-    /// of the pipeline tripped — the TUI uses this to render a
-    /// stage-specific actionable message rather than a generic "ssh
-    /// failed". The boxed `source` carries the underlying `io::Error` (or
-    /// scripted error from a `FakeRunner` in tests).
-    #[error("bootstrap failed at stage {stage:?}")]
-    Bootstrap {
-        stage: BootstrapStage,
+    /// `Hello`/`HelloAck` exchange over an established socket failed —
+    /// timeout, oversized frame, version mismatch, or framing error.
+    /// Raised by [`SshDaemonPty::attach`](crate::transport::SshDaemonPty::attach).
+    /// Bootstrap-stage errors (probe, scp, build, etc.) live in the
+    /// `codemuxd-bootstrap` crate's own error type; this is the
+    /// session-side handshake failure that follows a successful
+    /// transport bring-up.
+    #[error("handshake failed")]
+    Handshake {
         #[source]
         source: BoxedSource,
     },
@@ -204,21 +163,18 @@ mod tests {
         );
     }
 
-    /// `Error::Bootstrap` includes the stage in its display string and
-    /// preserves the underlying source for caller inspection. Each
-    /// stage rendering is stable across releases (the TUI keys
-    /// stage-specific messages off the Debug repr).
+    /// `Error::Handshake` carries the underlying source (timeout,
+    /// EOF-before-HelloAck, oversized frame) for caller inspection.
     #[test]
-    fn bootstrap_display_includes_stage_and_preserves_source() {
-        let err = Error::Bootstrap {
-            stage: BootstrapStage::RemoteBuild,
-            source: Box::new(io::Error::other("cargo: command not found")),
+    fn handshake_display_and_source_chain() {
+        let err = Error::Handshake {
+            source: Box::new(io::Error::other("EOF before HelloAck")),
         };
-        assert_eq!(err.to_string(), "bootstrap failed at stage RemoteBuild");
+        assert_eq!(err.to_string(), "handshake failed");
         let Some(source) = err.source() else {
-            unreachable!("Bootstrap variant must have a source")
+            unreachable!("Handshake variant must have a source")
         };
-        assert_eq!(source.to_string(), "cargo: command not found");
+        assert_eq!(source.to_string(), "EOF before HelloAck");
     }
 
     /// `Error::Wire` converts from `codemux_wire::Error` via `#[from]` so

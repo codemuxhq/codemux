@@ -1,17 +1,22 @@
-//! Stage 4: SSH bootstrap of `codemuxd` on a remote host.
+//! SSH bootstrap of `codemuxd` on a remote host.
 //!
-//! This module is the *orchestration* side of the SSH transport. It
-//! takes a host + `agent_id` + cwd, ensures `codemuxd` is installed on
-//! the remote (re-installing if version is stale), spawns it under
-//! `setsid -f` so it survives the SSH session that launched it,
-//! tunnels its unix socket back to the local host, and returns a
-//! connected [`UnixStream`] + the tunnel subprocess handle.
+//! This crate is the **adapter** side of the SSH transport. Per the
+//! workspace's hexagonal split, `crates/session` is the application
+//! core (it owns the [`AgentTransport`] and its wire-protocol speakers
+//! `LocalPty` / `SshDaemonPty`); this crate drives the infrastructure
+//! steps (ssh, scp, file system, subprocess) that bring an
+//! [`AgentTransport::SshDaemon`] into existence.
 //!
-//! [`AgentTransport::spawn_ssh`](crate::transport::AgentTransport::spawn_ssh)
-//! is the only production caller; it hands the `(stream, tunnel)` pair
-//! to [`SshDaemonPty::attach`](crate::transport::SshDaemonPty::attach)
-//! which performs the wire handshake and starts the framed-reader
-//! thread.
+//! Public surface:
+//! - [`bootstrap`] — runs the 7-step pipeline and returns a connected
+//!   [`UnixStream`] + the tunnel subprocess `Child`.
+//! - [`establish_ssh_transport`] — convenience that bootstraps then
+//!   performs the wire handshake via `SshDaemonPty::attach`, returning
+//!   a ready-to-use [`AgentTransport`].
+//! - [`CommandRunner`] / [`RealRunner`] — pluggable shim around
+//!   `std::process::Command` so failure modes are unit-testable
+//!   without touching the network.
+//! - [`Error`] / [`Stage`] — the error envelope.
 //!
 //! # The 7 steps
 //!
@@ -27,9 +32,9 @@
 //!    `setsid -f` invocation detaches the daemon from the SSH session
 //!    so it survives when the SSH connection closes.
 //! 6. **Tunnel**: `ssh -N -L /local.sock:/remote.sock host` in a
-//!    background subprocess. Uses OpenSSH unix-socket forwarding (≥6.7
-//!    on both ends). The handle is returned so the caller can kill it
-//!    on Drop.
+//!    background subprocess. Uses OpenSSH unix-socket forwarding
+//!    (≥6.7 on both ends). The handle is returned so the caller can
+//!    kill it on Drop.
 //! 7. **Connect**: `UnixStream::connect` against the local end of the
 //!    tunnel, with a short retry loop while the daemon's `bind()` and
 //!    the tunnel's first-packet warmup converge.
@@ -42,6 +47,8 @@
 //! this module use a `FakeRunner` that maps `(program, args_prefix)`
 //! pairs to canned [`CommandOutput`] / [`std::io::Error`] values.
 
+pub mod error;
+
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -51,11 +58,13 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::error::{BootstrapStage, Error};
+use codemux_session::{AgentTransport, SshDaemonPty};
+
+pub use crate::error::{Error, Stage};
 
 /// The embedded codemuxd source tarball, assembled by `build.rs`. This
 /// constant is what the bootstrap scp's to remote hosts. See
-/// `crates/session/build.rs` for the assembly logic.
+/// `crates/codemuxd-bootstrap/build.rs` for the assembly logic.
 const BOOTSTRAP_TARBALL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/codemuxd-bootstrap.tar.gz"));
 
@@ -77,9 +86,9 @@ const PROBE_TIMEOUT_SECS: u32 = 5;
 /// after a successful build; the next bootstrap probes that file and
 /// skips steps 2-4 if it matches.
 ///
-/// We use [`std::hash::DefaultHasher`] (`SipHash`) over the tarball bytes
-/// rather than the cargo package version because the package version
-/// is only meaningful when *we* remember to bump it; a hash is
+/// We use [`std::hash::DefaultHasher`] (`SipHash`) over the tarball
+/// bytes rather than the cargo package version because the package
+/// version is only meaningful when *we* remember to bump it; a hash is
 /// automatic and catches any source change.
 ///
 /// Cached after first call — the hash doesn't change at runtime.
@@ -133,8 +142,8 @@ pub trait CommandRunner: Send + Sync {
     fn spawn_detached(&self, program: &str, args: &[&str]) -> std::io::Result<Child>;
 }
 
-/// Production [`CommandRunner`] backed by `std::process::Command`. Zero
-/// state — instantiate inline.
+/// Production [`CommandRunner`] backed by `std::process::Command`.
+/// Zero state — instantiate inline.
 pub struct RealRunner;
 
 impl CommandRunner for RealRunner {
@@ -143,12 +152,13 @@ impl CommandRunner for RealRunner {
         Ok(CommandOutput {
             // ExitStatus's `code()` is None when the process was killed
             // by a signal; we encode that as -signum below in the same
-            // place an `i32` exit code would live. Matches the ChildExited
-            // wire-protocol convention.
+            // place an `i32` exit code would live. Matches the
+            // ChildExited wire-protocol convention.
             status: output.status.code().unwrap_or_else(|| {
-                // On UNIX, signal-killed processes have `signal()` Some.
-                // We can't pull in `std::os::unix::process::ExitStatusExt`
-                // for `signal()` without cfg-gating, but the daemon only
+                // On UNIX, signal-killed processes have `signal()`
+                // Some. We can't pull in
+                // `std::os::unix::process::ExitStatusExt` for
+                // `signal()` without cfg-gating, but the daemon only
                 // runs on UNIX so that's fine.
                 use std::os::unix::process::ExitStatusExt;
                 output.status.signal().map_or(-1, |s| -s)
@@ -217,7 +227,7 @@ impl Drop for TunnelGuard {
 /// pass a tempdir to avoid mutating `$HOME`.
 ///
 /// # Errors
-/// Any failure surfaces as [`Error::Bootstrap`] with the [`BootstrapStage`]
+/// Any failure surfaces as [`Error::Bootstrap`] with the [`Stage`]
 /// that tripped. The TUI uses `stage` to render an actionable message.
 pub fn bootstrap(
     runner: &dyn CommandRunner,
@@ -246,16 +256,46 @@ pub fn bootstrap(
     Ok((stream, tunnel_guard.into_inner()))
 }
 
+/// Bootstrap the remote daemon, then perform the
+/// [`SshDaemonPty::attach`] handshake, returning a fully constructed
+/// [`AgentTransport`] ready for the runtime.
+///
+/// This is the convenience entry point Stage 5 (TUI spawn modal) uses;
+/// it composes [`bootstrap`] with the session crate's wire handshake
+/// so callers don't have to know about the intermediate `(UnixStream,
+/// Child)` pair.
+///
+/// # Errors
+/// Returns [`Error::Bootstrap`] for any of the 7 bootstrap stages, or
+/// [`Error::Session`] when the post-bootstrap wire handshake fails.
+pub fn establish_ssh_transport(
+    runner: &dyn CommandRunner,
+    host: &str,
+    agent_id: &str,
+    cwd: &Path,
+    local_socket_dir: &Path,
+    rows: u16,
+    cols: u16,
+) -> Result<AgentTransport, Error> {
+    let (stream, tunnel) = bootstrap(runner, host, agent_id, cwd, local_socket_dir)?;
+    let label = format!("{host}:{agent_id}");
+    SshDaemonPty::attach(stream, label, agent_id, rows, cols, Some(tunnel))
+        .map(AgentTransport::SshDaemon)
+        .map_err(|source| Error::Session {
+            source: Box::new(source),
+        })
+}
+
 /// Default `local_socket_dir` for production callers:
 /// `$HOME/.cache/codemux/local-sockets/`. Per-user without needing
 /// `libc::getuid` (workspace forbids `unsafe`).
 ///
 /// # Errors
-/// Returns [`Error::Bootstrap`] with stage [`BootstrapStage::SocketTunnel`]
-/// if `$HOME` is unset (very unusual on a UNIX login session).
+/// Returns [`Error::Bootstrap`] with stage [`Stage::SocketTunnel`] if
+/// `$HOME` is unset (very unusual on a UNIX login session).
 pub fn default_local_socket_dir() -> Result<PathBuf, Error> {
     let home = std::env::var_os("HOME").ok_or_else(|| Error::Bootstrap {
-        stage: BootstrapStage::SocketTunnel,
+        stage: Stage::SocketTunnel,
         source: "HOME env var unset; cannot derive default local socket dir".into(),
     })?;
     Ok(PathBuf::from(home)
@@ -271,7 +311,7 @@ pub fn default_local_socket_dir() -> Result<PathBuf, Error> {
 fn validate_agent_id(agent_id: &str) -> Result<(), Error> {
     if agent_id.is_empty() || agent_id.len() > 64 {
         return Err(Error::Bootstrap {
-            stage: BootstrapStage::DaemonSpawn,
+            stage: Stage::DaemonSpawn,
             source: format!("agent_id length {} not in [1, 64]", agent_id.len()).into(),
         });
     }
@@ -280,7 +320,7 @@ fn validate_agent_id(agent_id: &str) -> Result<(), Error> {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'));
     if !ok {
         return Err(Error::Bootstrap {
-            stage: BootstrapStage::DaemonSpawn,
+            stage: Stage::DaemonSpawn,
             source: format!("agent_id {agent_id:?} must be [A-Za-z0-9._-] (shell-safe)").into(),
         });
     }
@@ -307,7 +347,7 @@ fn probe_remote_version(runner: &dyn CommandRunner, host: &str) -> Result<Option
             ],
         )
         .map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::VersionProbe,
+            stage: Stage::VersionProbe,
             source: Box::new(source),
         })?;
     if output.status != 0 {
@@ -330,18 +370,18 @@ fn stage_tarball() -> Result<PathBuf, Error> {
     }
     let tmp_dir = std::env::temp_dir().join("codemux-bootstrap");
     std::fs::create_dir_all(&tmp_dir).map_err(|source| Error::Bootstrap {
-        stage: BootstrapStage::TarballStage,
+        stage: Stage::TarballStage,
         source: Box::new(source),
     })?;
     let path = tmp_dir.join(format!("{}.tar.gz", bootstrap_version()));
     if !path.exists() {
         let mut f = std::fs::File::create(&path).map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::TarballStage,
+            stage: Stage::TarballStage,
             source: Box::new(source),
         })?;
         f.write_all(BOOTSTRAP_TARBALL)
             .map_err(|source| Error::Bootstrap {
-                stage: BootstrapStage::TarballStage,
+                stage: Stage::TarballStage,
                 source: Box::new(source),
             })?;
     }
@@ -362,7 +402,7 @@ fn scp_tarball(
     version: &str,
 ) -> Result<(), Error> {
     let local_str = local.to_str().ok_or_else(|| Error::Bootstrap {
-        stage: BootstrapStage::Scp,
+        stage: Stage::Scp,
         source: format!("local tarball path not UTF-8: {}", local.display()).into(),
     })?;
     let remote = format!("{host}:.cache/codemuxd/src/{version}.tar.gz");
@@ -373,12 +413,12 @@ fn scp_tarball(
     let mkdir_out = runner
         .run("ssh", &["-o", "BatchMode=yes", host, mkdir_cmd])
         .map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::Scp,
+            stage: Stage::Scp,
             source: Box::new(source),
         })?;
     if mkdir_out.status != 0 {
         return Err(Error::Bootstrap {
-            stage: BootstrapStage::Scp,
+            stage: Stage::Scp,
             source: format!(
                 "remote mkdir failed (status {}): {}",
                 mkdir_out.status,
@@ -390,12 +430,12 @@ fn scp_tarball(
     let scp_out = runner
         .run("scp", &["-B", local_str, &remote])
         .map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::Scp,
+            stage: Stage::Scp,
             source: Box::new(source),
         })?;
     if scp_out.status != 0 {
         return Err(Error::Bootstrap {
-            stage: BootstrapStage::Scp,
+            stage: Stage::Scp,
             source: format!(
                 "scp exit {}: {}",
                 scp_out.status,
@@ -426,7 +466,7 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
     let out = runner
         .run("ssh", &["-o", "BatchMode=yes", host, &cmd])
         .map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::RemoteBuild,
+            stage: Stage::RemoteBuild,
             source: Box::new(source),
         })?;
     if out.status != 0 {
@@ -442,7 +482,7 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
             format!("remote build exit {}: {}", out.status, stderr_text.trim(),)
         };
         return Err(Error::Bootstrap {
-            stage: BootstrapStage::RemoteBuild,
+            stage: Stage::RemoteBuild,
             source: hint.into(),
         });
     }
@@ -460,12 +500,12 @@ fn spawn_remote_daemon(
     cwd: &Path,
 ) -> Result<(), Error> {
     let cwd_str = cwd.to_str().ok_or_else(|| Error::Bootstrap {
-        stage: BootstrapStage::DaemonSpawn,
+        stage: Stage::DaemonSpawn,
         source: format!("cwd not UTF-8: {}", cwd.display()).into(),
     })?;
     if cwd_str.contains('\'') {
         return Err(Error::Bootstrap {
-            stage: BootstrapStage::DaemonSpawn,
+            stage: Stage::DaemonSpawn,
             source: format!("cwd contains a single quote, refusing to shell-escape: {cwd_str:?}")
                 .into(),
         });
@@ -481,12 +521,12 @@ fn spawn_remote_daemon(
     let out = runner
         .run("ssh", &["-o", "BatchMode=yes", host, &cmd])
         .map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::DaemonSpawn,
+            stage: Stage::DaemonSpawn,
             source: Box::new(source),
         })?;
     if out.status != 0 {
         return Err(Error::Bootstrap {
-            stage: BootstrapStage::DaemonSpawn,
+            stage: Stage::DaemonSpawn,
             source: format!(
                 "daemon spawn exit {}: {}",
                 out.status,
@@ -507,7 +547,7 @@ fn spawn_remote_daemon(
 /// the retry loop converge).
 fn local_socket_path(dir: &Path, agent_id: &str) -> Result<PathBuf, Error> {
     std::fs::create_dir_all(dir).map_err(|source| Error::Bootstrap {
-        stage: BootstrapStage::SocketTunnel,
+        stage: Stage::SocketTunnel,
         source: Box::new(source),
     })?;
     let path = dir.join(format!("{agent_id}.sock"));
@@ -525,7 +565,7 @@ fn open_ssh_tunnel(
     local: &Path,
 ) -> Result<Child, Error> {
     let local_str = local.to_str().ok_or_else(|| Error::Bootstrap {
-        stage: BootstrapStage::SocketTunnel,
+        stage: Stage::SocketTunnel,
         source: format!("local socket path not UTF-8: {}", local.display()).into(),
     })?;
     let forward = format!("{local_str}:.cache/codemuxd/sockets/{agent_id}.sock");
@@ -544,7 +584,7 @@ fn open_ssh_tunnel(
             ],
         )
         .map_err(|source| Error::Bootstrap {
-            stage: BootstrapStage::SocketTunnel,
+            stage: Stage::SocketTunnel,
             source: Box::new(source),
         })
 }
@@ -573,7 +613,7 @@ fn connect_socket(path: &Path, timeout: Duration) -> Result<UnixStream, Error> {
         .into(),
     };
     Err(Error::Bootstrap {
-        stage: BootstrapStage::SocketConnect,
+        stage: Stage::SocketConnect,
         source,
     })
 }
@@ -790,7 +830,7 @@ mod tests {
         let Error::Bootstrap { stage, .. } = err else {
             panic!("expected Error::Bootstrap, got {err:?}");
         };
-        assert_eq!(stage, BootstrapStage::VersionProbe);
+        assert_eq!(stage, Stage::VersionProbe);
     }
 
     /// The probe step returns the trimmed remote `agent.version`
@@ -819,7 +859,7 @@ mod tests {
         let Error::Bootstrap { stage, .. } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
-        assert_eq!(stage, BootstrapStage::Scp);
+        assert_eq!(stage, Stage::Scp);
     }
 
     /// `remote_build` formats the `cargo not found` hint specifically.
@@ -835,7 +875,7 @@ mod tests {
         let Error::Bootstrap { stage, source } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
-        assert_eq!(stage, BootstrapStage::RemoteBuild);
+        assert_eq!(stage, Stage::RemoteBuild);
         let msg = source.to_string();
         assert!(
             msg.contains("rustup.rs"),
@@ -861,7 +901,7 @@ mod tests {
         let Error::Bootstrap { stage, .. } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
-        assert_eq!(stage, BootstrapStage::RemoteBuild);
+        assert_eq!(stage, Stage::RemoteBuild);
     }
 
     /// `spawn_remote_daemon` propagates the remote stderr verbatim
@@ -879,7 +919,7 @@ mod tests {
         let Error::Bootstrap { stage, source } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
-        assert_eq!(stage, BootstrapStage::DaemonSpawn);
+        assert_eq!(stage, Stage::DaemonSpawn);
         assert!(
             source.to_string().contains("does not exist"),
             "remote stderr should surface in source, got {source}",
@@ -897,7 +937,7 @@ mod tests {
         let Error::Bootstrap { stage, source } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
-        assert_eq!(stage, BootstrapStage::DaemonSpawn);
+        assert_eq!(stage, Stage::DaemonSpawn);
         assert!(
             source.to_string().contains("single quote"),
             "should mention single quote, got {source}",
@@ -914,7 +954,7 @@ mod tests {
         let Error::Bootstrap { stage, .. } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
-        assert_eq!(stage, BootstrapStage::SocketConnect);
+        assert_eq!(stage, Stage::SocketConnect);
     }
 
     /// `connect_socket` succeeds against a freshly bound socket.
