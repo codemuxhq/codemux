@@ -17,7 +17,9 @@
 //! - **path** (default focus) — live `read_dir` scan as you type, like shell
 //!   tab completion. Wildmenu shows full paths.
 //! - **host** — autocompletes against `~/.ssh/config` `Host` entries
-//!   (wildcards skipped). Empty host → spawns locally.
+//!   (wildcards skipped). `Include` directives are followed recursively
+//!   with glob and `~/` expansion, so layouts like Uber's
+//!   `Include config.d/*` work out of the box. Empty host → spawns locally.
 //!
 //! Zone navigation:
 //! - `@` typed in the path zone jumps the cursor to the host zone.
@@ -52,6 +54,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::keymap::{ModalAction, ModalBindings};
+use crate::ssh_config::load_ssh_hosts;
 
 const WILDMENU_ROWS: u16 = 4;
 const STRIP_ROWS: u16 = WILDMENU_ROWS + 1;
@@ -206,31 +209,24 @@ impl SpawnMinibuffer {
         }
     }
 
-    /// Enter the host zone, pre-filling `host` with the first SSH config
-    /// entry if it is currently empty. Mirrors how the path zone is
-    /// pre-filled with cwd at modal open — without this, `@` would land
-    /// the cursor on a placeholder string ("local") that can't be edited
-    /// with backspace, and the user would just see typing replace the
-    /// placeholder wholesale on the first keystroke.
+    /// Enter the host zone without preselecting a host. Empty `host` keeps
+    /// showing the dim `local` placeholder; the wildmenu lists every SSH
+    /// entry because `host_completions("", _)` returns the full pool.
     ///
-    /// Architecture note: the architecture-guide review (NLM 2026-04-24)
-    /// flagged this mutation as a Fragility smell because focus toggling
-    /// silently changes business state. The smell is real in general, but
-    /// this is the *exact* behavior the user requested for autocomplete
-    /// parity with the path zone — the pre-fill IS the UX. If you ever
-    /// want to revisit, the alternative is a "ghost suggestion" that's
-    /// rendered inline but lives outside `self.host` (e.g. fish-shell's
-    /// autosuggest) — accepted via a dedicated key. Significantly more
-    /// code; not worth it for a single-user tool.
-    ///
-    /// User who wants to spawn local: backspace it out (host falls back
-    /// to "local" on confirm) or hit Esc and skip the `@` jump entirely.
+    /// Don't add prefill back: committing to a specific host before the
+    /// user has expressed intent makes `@ Enter` silently spawn on
+    /// whichever host happens to sort first, with the prompt showing that
+    /// host while the user thinks they're just opening the picker.
     fn enter_host_zone(&mut self) {
-        if self.host.is_empty() && !self.ssh_hosts.is_empty() {
-            self.host.clone_from(&self.ssh_hosts[0]);
-        }
         self.focused = Zone::Host;
         self.refresh();
+    }
+
+    fn current_field(&self) -> &str {
+        match self.focused {
+            Zone::Host => &self.host,
+            Zone::Path => &self.path,
+        }
     }
 
     fn current_field_mut(&mut self) -> &mut String {
@@ -269,7 +265,12 @@ impl SpawnMinibuffer {
             Zone::Path => path_completions(&self.path),
             Zone::Host => host_completions(&self.host, &self.ssh_hosts),
         };
-        self.selected = if self.filtered.is_empty() {
+        // No implicit selection when the focused field is empty: the user
+        // hasn't expressed a choice, so auto-highlighting the first wildmenu
+        // entry would silently commit it on Enter. Once they type a prefix,
+        // the first match is highlighted as you'd expect from any
+        // autocomplete.
+        self.selected = if self.filtered.is_empty() || self.current_field().is_empty() {
             None
         } else {
             Some(0)
@@ -322,7 +323,7 @@ impl SpawnMinibuffer {
                 Zone::Path => " (no matches — Enter spawns at literal path)",
                 Zone::Host => {
                     if self.ssh_hosts.is_empty() {
-                        " (no hosts in ~/.ssh/config — type a name; SSH lands in P1.4)"
+                        " (no hosts found via ~/.ssh/config + Includes — type a name; SSH lands in P1.4)"
                     } else {
                         " (no matching SSH host — Enter spawns on this literal name)"
                     }
@@ -600,61 +601,6 @@ fn score(haystack: &str, needle: &str) -> Option<usize> {
     })
 }
 
-/// Read `~/.ssh/config` and return the list of `Host` entries with wildcards
-/// (`*`, `?`, `!`) skipped. Returns an empty Vec if the file is missing or
-/// unreadable; the host zone falls back to free-text input in that case.
-///
-/// Missing config is normal (a fresh user account has no `~/.ssh/config`),
-/// so failures degrade quietly to "empty list" but emit a `tracing::debug!`
-/// event for `RUST_LOG=codemux=debug` debugging.
-fn load_ssh_hosts() -> Vec<String> {
-    let Ok(home) = std::env::var("HOME") else {
-        tracing::debug!("HOME unset; SSH host autocomplete disabled");
-        return Vec::new();
-    };
-    let path = PathBuf::from(home).join(".ssh/config");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        tracing::debug!(
-            "read {} failed; SSH host autocomplete disabled",
-            path.display(),
-        );
-        return Vec::new();
-    };
-    parse_ssh_hosts(&content)
-}
-
-fn parse_ssh_hosts(content: &str) -> Vec<String> {
-    let mut hosts: Vec<String> = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let Some(keyword) = parts.next() else {
-            continue;
-        };
-        if !keyword.eq_ignore_ascii_case("host") {
-            continue;
-        }
-        let Some(rest) = parts.next() else {
-            continue;
-        };
-        for entry in rest.split_whitespace() {
-            // Wildcards (`Host *`, `Host *.foo`, `Host !bar`) are too generic
-            // for autocomplete — skip them rather than offering them as
-            // candidates the user cannot actually SSH to.
-            if entry.contains('*') || entry.contains('?') || entry.contains('!') {
-                continue;
-            }
-            hosts.push(entry.to_string());
-        }
-    }
-    hosts.sort();
-    hosts.dedup();
-    hosts
-}
-
 fn clip_middle(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -760,15 +706,18 @@ mod tests {
     }
 
     #[test]
-    fn at_prefills_host_with_first_ssh_entry() {
+    fn at_in_path_zone_enters_empty_host_with_full_wildmenu() {
+        // After dropping the prefill, `@` no longer commits to a specific
+        // host. The field stays empty (placeholder shows "local"), the
+        // wildmenu lists every SSH host so the user can browse, and
+        // `selected = None` so a stray Enter spawns local rather than
+        // silently picking the first host.
         let mut m = mb("", "/tmp", Zone::Path, &["alpha", "bravo"]);
         m.handle(&key(KeyCode::Char('@')), &b());
         assert_eq!(m.focused, Zone::Host);
-        assert_eq!(m.host, "alpha");
-        // After the prefill the wildmenu narrows to entries matching
-        // "alpha" — i.e. just "alpha" itself — and the user can backspace
-        // to widen it again.
-        assert_eq!(m.filtered, vec!["alpha".to_string()]);
+        assert_eq!(m.host, "");
+        assert_eq!(m.filtered, vec!["alpha".to_string(), "bravo".to_string()]);
+        assert_eq!(m.selected, None);
     }
 
     #[test]
@@ -780,24 +729,58 @@ mod tests {
     }
 
     #[test]
-    fn tab_to_host_also_prefills() {
-        // The `@`-jump and Tab-toggle share the same entry semantics; if
-        // they diverged, Tab users would not get the autocomplete UX.
+    fn tab_to_host_does_not_prefill() {
+        // The `@`-jump and Tab-toggle share entry semantics; both must
+        // leave the host field empty so the user explicitly picks.
         let mut m = mb("", "/tmp", Zone::Path, &["devpod-1"]);
         m.handle(&key(KeyCode::Tab), &b());
         assert_eq!(m.focused, Zone::Host);
-        assert_eq!(m.host, "devpod-1");
+        assert_eq!(m.host, "");
+        assert_eq!(m.selected, None);
     }
 
     #[test]
-    fn backspace_after_prefill_shrinks_host() {
-        let mut m = mb("", "/tmp", Zone::Path, &["devpod-1"]);
+    fn typing_in_host_zone_auto_selects_first_match() {
+        // Once the user has expressed a prefix, the wildmenu's first match
+        // is highlighted — that's normal autocomplete UX. The "no
+        // selection" rule only applies when the field is empty.
+        let mut m = mb("", "/tmp", Zone::Host, &["devpod-go", "devpod-web"]);
+        assert_eq!(m.selected, None);
+        m.handle(&key(KeyCode::Char('d')), &b());
+        assert_eq!(m.host, "d");
+        assert_eq!(
+            m.filtered,
+            vec!["devpod-go".to_string(), "devpod-web".to_string()]
+        );
+        assert_eq!(m.selected, Some(0));
+    }
+
+    #[test]
+    fn backspace_to_empty_host_clears_selection() {
+        // Going back to an empty field must drop the implicit selection;
+        // otherwise an empty prompt + auto-highlighted wildmenu commits on
+        // Enter.
+        let mut m = mb("d", "/tmp", Zone::Host, &["devpod-go"]);
+        assert_eq!(m.selected, Some(0));
+        m.handle(&key(KeyCode::Backspace), &b());
+        assert_eq!(m.host, "");
+        assert_eq!(m.selected, None);
+    }
+
+    #[test]
+    fn enter_with_empty_host_and_no_selection_spawns_local() {
+        // `@` then `Enter` — the user opened the host picker but didn't
+        // pick. Should spawn local, NOT the first SSH host.
+        let mut m = mb("", "/work", Zone::Path, &["devpod-go", "devpod-web"]);
         m.handle(&key(KeyCode::Char('@')), &b());
-        assert_eq!(m.host, "devpod-1");
-        m.handle(&key(KeyCode::Backspace), &b());
-        assert_eq!(m.host, "devpod-");
-        m.handle(&key(KeyCode::Backspace), &b());
-        assert_eq!(m.host, "devpod");
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "local".into(),
+                path: "/work".into(),
+            },
+        );
     }
 
     #[test]
@@ -890,7 +873,11 @@ mod tests {
     #[test]
     fn down_cycles_with_wrap() {
         let mut m = mb("", "", Zone::Host, &["a", "b", "c"]);
-        // refresh() seeds selected to Some(0).
+        // Empty field → no implicit selection. First Down advances from
+        // None to Some(0), then it cycles normally with wrap-around.
+        assert_eq!(m.selected, None);
+        m.handle(&key(KeyCode::Down), &b());
+        assert_eq!(m.selected, Some(0));
         m.handle(&key(KeyCode::Down), &b());
         assert_eq!(m.selected, Some(1));
         m.handle(&key(KeyCode::Down), &b());
@@ -913,55 +900,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_ssh_hosts_returns_empty_for_empty_file() {
-        assert!(parse_ssh_hosts("").is_empty());
-    }
-
-    #[test]
-    fn parse_ssh_hosts_returns_a_single_named_host() {
-        assert_eq!(parse_ssh_hosts("Host foo"), vec!["foo".to_string()]);
-    }
-
-    #[test]
-    fn parse_ssh_hosts_returns_multiple_hosts_per_line() {
-        let mut got = parse_ssh_hosts("Host alpha bravo charlie");
-        got.sort();
-        assert_eq!(got, vec!["alpha", "bravo", "charlie"]);
-    }
-
-    #[test]
-    fn parse_ssh_hosts_skips_wildcards() {
-        let got = parse_ssh_hosts(
-            "Host *\nHost *.uber.com\nHost real-host\nHost !excluded\nHost q?stion",
+    fn typed_prefix_with_no_matches_keeps_selection_unset_and_spawns_literal() {
+        // User types "unknown-host" — zero SSH matches. selected must stay
+        // None so Enter resolves to the literal typed string, not to some
+        // fallback host.
+        let mut m = mb("", "/work", Zone::Host, &["devpod-go", "devpod-web"]);
+        for c in "unknown-host".chars() {
+            m.handle(&key(KeyCode::Char(c)), &b());
+        }
+        assert_eq!(m.host, "unknown-host");
+        assert!(m.filtered.is_empty());
+        assert_eq!(m.selected, None);
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "unknown-host".into(),
+                path: "/work".into(),
+            },
         );
-        assert_eq!(got, vec!["real-host".to_string()]);
     }
 
     #[test]
-    fn parse_ssh_hosts_skips_comments_and_blank_lines() {
-        let got = parse_ssh_hosts("# comment\n\n  Host  foo  \n");
-        assert_eq!(got, vec!["foo".to_string()]);
-    }
-
-    #[test]
-    fn parse_ssh_hosts_is_case_insensitive_on_keyword() {
-        // `host`, `Host`, `HOST` all valid per the SSH config grammar.
-        assert_eq!(parse_ssh_hosts("host foo"), vec!["foo".to_string()]);
-        assert_eq!(parse_ssh_hosts("HOST bar"), vec!["bar".to_string()]);
-    }
-
-    #[test]
-    fn parse_ssh_hosts_ignores_other_directives() {
-        let got = parse_ssh_hosts(
-            "User daniel\nHostName example.com\nHost actual\nIdentityFile ~/.ssh/id_rsa",
+    fn toggling_back_to_host_preserves_prefix_and_re_highlights_first_match() {
+        // Type "dev" in host, Tab to path, Tab back. The prefix must
+        // survive the round-trip (otherwise the user's typing is wasted)
+        // and the wildmenu must re-narrow + re-highlight the first match
+        // since the field is non-empty.
+        let mut m = mb("", "/tmp", Zone::Host, &["devpod-go", "devpod-web"]);
+        for c in "dev".chars() {
+            m.handle(&key(KeyCode::Char(c)), &b());
+        }
+        assert_eq!(m.host, "dev");
+        assert_eq!(m.selected, Some(0));
+        m.handle(&key(KeyCode::Tab), &b());
+        assert_eq!(m.focused, Zone::Path);
+        m.handle(&key(KeyCode::Tab), &b());
+        assert_eq!(m.focused, Zone::Host);
+        assert_eq!(m.host, "dev");
+        assert_eq!(
+            m.filtered,
+            vec!["devpod-go".to_string(), "devpod-web".to_string()],
         );
-        assert_eq!(got, vec!["actual".to_string()]);
-    }
-
-    #[test]
-    fn parse_ssh_hosts_dedups() {
-        let got = parse_ssh_hosts("Host foo\nHost foo\nHost bar");
-        assert_eq!(got, vec!["bar".to_string(), "foo".to_string()]);
+        assert_eq!(m.selected, Some(0));
     }
 
     #[test]

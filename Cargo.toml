@@ -50,6 +50,13 @@ serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9"
 directories = "6"
 
+# Filesystem glob expansion. Used by the spawn-modal SSH host loader to
+# resolve `Include config.d/*` style directives in `~/.ssh/config`.
+glob = "0.3"
+
+# Test-only: scratch directories for filesystem integration tests.
+tempfile = "3"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

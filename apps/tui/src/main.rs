@@ -6,6 +6,7 @@ mod config;
 mod keymap;
 mod runtime;
 mod spawn;
+mod ssh_config;
 use runtime::NavStyle;
 
 #[derive(Debug, Parser)]
