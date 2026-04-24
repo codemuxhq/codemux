@@ -38,8 +38,8 @@ pub fn load() -> Result<Config> {
     }
     let text = std::fs::read_to_string(&path)
         .wrap_err_with(|| format!("read config at {}", path.display()))?;
-    let config: Config = toml::from_str(&text)
-        .wrap_err_with(|| format!("parse config at {}", path.display()))?;
+    let config: Config =
+        toml::from_str(&text).wrap_err_with(|| format!("parse config at {}", path.display()))?;
     tracing::debug!("loaded config from {}", path.display());
     Ok(config)
 }

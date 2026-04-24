@@ -4,7 +4,7 @@ A TUI multiplexer for Claude Code agent sessions, across local and SSH hosts.
 
 ## Status
 
-P1.3 in progress. Multi-agent local works with a config-driven keymap (`Ctrl-B ?` shows the live binding list). `Ctrl-B c` opens a spawn modal with host + path fields and filesystem autocomplete. Two navigator styles: **Popup** (default, full-screen claude + 1-row status bar + `Ctrl-B w` switcher) and **LeftPane** (always-visible left navigator). Toggle with `Ctrl-B v`. No SSH, no persistence yet — those are next. See [`docs/roadmap.md`](docs/roadmap.md).
+P1.3 in progress. Multi-agent local works with a config-driven keymap (`Ctrl-B ?` shows the live binding list). `Ctrl-B c` opens the spawn minibuffer — a one-row prompt at the bottom of the screen with a `@host : path` structure, Tab to toggle zones, SSH-config autocomplete on the host zone, live filesystem completion on the path zone. Two navigator styles: **Popup** (default, full-screen claude + 1-row status bar + `Ctrl-B w` switcher) and **LeftPane** (always-visible left navigator). Toggle with `Ctrl-B v`. No SSH transport, no persistence yet — those are next. See [`docs/roadmap.md`](docs/roadmap.md).
 
 ## What it is
 
@@ -21,6 +21,26 @@ CODEMUX_NAV=left-pane cargo run # same, via env var
 ```
 
 Requires `claude` on PATH. `Ctrl-B q` exits. `Ctrl-B ?` opens help.
+
+A `justfile` wraps the common cargo invocations — `just run`, `just lint`, `just check` (fmt + lint + test). Run `just --list` to see them.
+
+### Spawn minibuffer
+
+`Ctrl-B c` opens the prompt at the bottom of the screen:
+
+```
+  ▸ /home/user/workbench/repositories/codemux
+    /home/user/workbench/repositories/codemux/apps/
+    /home/user/workbench/repositories/codemux/crates/
+  ──────────────────────────────────────────────────
+  spawn: @local : /home/user/workbench/repositories/co█    [tab toggle · …]
+```
+
+- The prompt is structured: `@<host> : <path>`. Default focus is the **path** zone.
+- Type `@` (or press `Tab`) to jump to the **host** zone; `Tab` again toggles back. In the host zone, `@` is a literal character so `user@hostname` works.
+- Wildmenu shows live candidates for the focused zone — directory listing for the path, `~/.ssh/config` `Host` entries for the host (wildcards skipped).
+- `↓ / ↑` highlight a wildmenu item; `Enter` spawns at the highlighted candidate (or the literal text you typed if nothing is highlighted). `Esc` cancels.
+- Empty host → spawns locally. Empty path → spawns in cwd.
 
 ## Configuration
 

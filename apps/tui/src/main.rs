@@ -5,7 +5,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod config;
 mod keymap;
 mod runtime;
-mod spawn_modal;
+mod spawn;
 use runtime::NavStyle;
 
 #[derive(Debug, Parser)]
@@ -27,7 +27,7 @@ fn main() -> Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("codemux=info,warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("codemux=info,warn"));
     fmt().with_env_filter(filter).with_target(false).init();
 }

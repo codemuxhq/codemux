@@ -14,8 +14,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
 
 // ---------- KeyChord ----------
 
@@ -28,11 +28,17 @@ pub struct KeyChord {
 
 impl KeyChord {
     pub const fn plain(code: KeyCode) -> Self {
-        Self { code, modifiers: KeyModifiers::NONE }
+        Self {
+            code,
+            modifiers: KeyModifiers::NONE,
+        }
     }
 
     pub const fn ctrl(code: KeyCode) -> Self {
-        Self { code, modifiers: KeyModifiers::CONTROL }
+        Self {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+        }
     }
 
     /// Compare against a `KeyEvent`. Crossterm reports SHIFT alongside an
@@ -162,9 +168,7 @@ fn parse_key_code(raw: &str) -> Result<KeyCode, String> {
         // unambiguous; the chord-matcher folds SHIFT for char keys.
         _ => {
             let mut chars = raw.chars();
-            let c = chars
-                .next()
-                .ok_or_else(|| "empty key code".to_string())?;
+            let c = chars.next().ok_or_else(|| "empty key code".to_string())?;
             if chars.next().is_some() {
                 return Err(format!("unknown key code: {raw}"));
             }
@@ -238,8 +242,7 @@ pub enum PopupAction {
 }
 
 impl PopupAction {
-    pub const ALL: &'static [PopupAction] =
-        &[Self::Next, Self::Prev, Self::Confirm, Self::Cancel];
+    pub const ALL: &'static [PopupAction] = &[Self::Next, Self::Prev, Self::Confirm, Self::Cancel];
 
     pub const fn description(self) -> &'static str {
         match self {
@@ -322,10 +325,7 @@ impl PrefixBindings {
             (self.open_switcher, PrefixAction::OpenSwitcher),
             (self.help, PrefixAction::Help),
         ];
-        table
-            .iter()
-            .find(|(c, _)| c.matches(key))
-            .map(|(_, a)| *a)
+        table.iter().find(|(c, _)| c.matches(key)).map(|(_, a)| *a)
     }
 
     pub fn binding_for(&self, action: PrefixAction) -> KeyChord {
@@ -369,10 +369,7 @@ impl PopupBindings {
             (self.confirm, PopupAction::Confirm),
             (self.cancel, PopupAction::Cancel),
         ];
-        table
-            .iter()
-            .find(|(c, _)| c.matches(key))
-            .map(|(_, a)| *a)
+        table.iter().find(|(c, _)| c.matches(key)).map(|(_, a)| *a)
     }
 
     pub fn binding_for(&self, action: PopupAction) -> KeyChord {
@@ -419,10 +416,7 @@ impl ModalBindings {
             (self.next_completion, ModalAction::NextCompletion),
             (self.prev_completion, ModalAction::PrevCompletion),
         ];
-        table
-            .iter()
-            .find(|(c, _)| c.matches(key))
-            .map(|(_, a)| *a)
+        table.iter().find(|(c, _)| c.matches(key)).map(|(_, a)| *a)
     }
 
     pub fn binding_for(&self, action: ModalAction) -> KeyChord {
@@ -586,8 +580,17 @@ mod tests {
     #[test]
     fn display_roundtrips_for_common_chords() {
         for raw in [
-            "q", "ctrl+b", "ctrl+alt+x", "enter", "esc", "tab", "f5", "?",
-            "up", "down", "space",
+            "q",
+            "ctrl+b",
+            "ctrl+alt+x",
+            "enter",
+            "esc",
+            "tab",
+            "f5",
+            "?",
+            "up",
+            "down",
+            "space",
         ] {
             let chord: KeyChord = raw.parse().unwrap();
             let rendered = chord.to_string();

@@ -53,7 +53,10 @@ mod tests {
             "agent not found: alpha",
         );
         assert_eq!(
-            Error::HostNotFound { id: "laptop".into() }.to_string(),
+            Error::HostNotFound {
+                id: "laptop".into()
+            }
+            .to_string(),
             "host not found: laptop",
         );
     }
@@ -61,7 +64,9 @@ mod tests {
     #[test]
     fn source_chain_preserves_underlying_error() {
         let io_err = io::Error::other("spawn failed");
-        let err = Error::Pty { source: Box::new(io_err) };
+        let err = Error::Pty {
+            source: Box::new(io_err),
+        };
 
         assert_eq!(err.to_string(), "pty transport error");
 

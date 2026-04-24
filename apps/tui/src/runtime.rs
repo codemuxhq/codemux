@@ -37,7 +37,7 @@ use vt100::Parser;
 
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
-use crate::spawn_modal::{ModalOutcome, SpawnModal};
+use crate::spawn::{ModalOutcome, SpawnMinibuffer};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -88,7 +88,9 @@ impl NavStyle {
 enum PopupState {
     #[default]
     Closed,
-    Open { selection: usize },
+    Open {
+        selection: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -169,15 +171,15 @@ fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16) -> (u16, u16) {
     }
 }
 
-fn spawn_agent(
-    label: String,
-    cwd: Option<&Path>,
-    rows: u16,
-    cols: u16,
-) -> Result<RuntimeAgent> {
+fn spawn_agent(label: String, cwd: Option<&Path>, rows: u16, cols: u16) -> Result<RuntimeAgent> {
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| eyre!("open pty: {e}"))?;
     let mut cmd = CommandBuilder::new("claude");
     if let Some(cwd) = cwd {
@@ -189,7 +191,10 @@ fn spawn_agent(
         .map_err(|e| eyre!("spawn `claude` (is it on PATH?): {e}"))?;
     drop(pair.slave);
 
-    let writer = pair.master.take_writer().map_err(|e| eyre!("take pty writer: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| eyre!("take pty writer: {e}"))?;
     let reader = pair
         .master
         .try_clone_reader()
@@ -198,7 +203,14 @@ fn spawn_agent(
 
     let rx = spawn_reader_thread(reader);
     let parser = Parser::new(rows, cols, 0);
-    Ok(RuntimeAgent { label, parser, master, writer, child, rx })
+    Ok(RuntimeAgent {
+        label,
+        parser,
+        master,
+        writer,
+        child,
+        rx,
+    })
 }
 
 fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
@@ -225,7 +237,12 @@ fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
         // stale size until next resize, which is a harmless cosmetic glitch
         // (claude re-lays-out on the next paint cycle). Surfacing as an
         // error would force callers to handle a non-actionable failure.
-        let _ = a.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        let _ = a.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
         a.parser.screen_mut().set_size(rows, cols);
     }
 }
@@ -244,16 +261,13 @@ fn event_loop(
     let mut prefix_state = PrefixState::default();
     let mut popup_state = PopupState::default();
     let mut help_state = HelpState::default();
-    let mut spawn_modal: Option<SpawnModal> = None;
+    let mut spawn_ui: Option<SpawnMinibuffer> = None;
     let mut focused: usize = 0;
     let mut spawn_counter: usize = agents.len();
     // Status-bar hint is bindings-derived but bindings cannot change at
     // runtime. Cache the formatted suffix so the render loop does not
     // re-allocate it 20 times per second (per the FRAME_POLL cadence).
-    let status_hint = format!(
-        "{} {} for help",
-        bindings.prefix, bindings.on_prefix.help,
-    );
+    let status_hint = format!("{} {} for help", bindings.prefix, bindings.on_prefix.help,);
 
     loop {
         for agent in &mut agents {
@@ -270,7 +284,9 @@ fn event_loop(
         if let PopupState::Open { selection } = popup_state
             && selection >= agents.len()
         {
-            popup_state = PopupState::Open { selection: agents.len() - 1 };
+            popup_state = PopupState::Open {
+                selection: agents.len() - 1,
+            };
         }
 
         terminal
@@ -282,7 +298,7 @@ fn event_loop(
                     nav_style,
                     popup_state,
                     help_state,
-                    spawn_modal.as_ref(),
+                    spawn_ui.as_ref(),
                     bindings,
                     &status_hint,
                 );
@@ -303,19 +319,18 @@ fn event_loop(
                     continue;
                 }
 
-                if let Some(modal) = spawn_modal.as_mut() {
-                    match modal.handle(&key, &bindings.on_modal) {
+                if let Some(ui) = spawn_ui.as_mut() {
+                    match ui.handle(&key, &bindings.on_modal) {
                         ModalOutcome::None => {}
                         ModalOutcome::Cancel => {
-                            spawn_modal = None;
+                            spawn_ui = None;
                         }
                         ModalOutcome::Spawn { host, path } => {
-                            spawn_modal = None;
+                            spawn_ui = None;
                             if host == "local" {
-                                let (term_cols, term_rows) = crossterm::terminal::size()
-                                    .wrap_err("read terminal size")?;
-                                let (rows, cols) =
-                                    pty_size_for(nav_style, term_rows, term_cols);
+                                let (term_cols, term_rows) =
+                                    crossterm::terminal::size().wrap_err("read terminal size")?;
+                                let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
                                 spawn_counter += 1;
                                 let label = format!("agent-{spawn_counter}");
                                 let cwd_path = if path.is_empty() {
@@ -379,13 +394,17 @@ fn event_loop(
                     KeyDispatch::Consume => {}
                     KeyDispatch::Exit => return Ok(()),
                     KeyDispatch::SpawnAgent => {
-                        spawn_modal = Some(SpawnModal::open());
+                        spawn_ui = Some(SpawnMinibuffer::open());
                     }
                     KeyDispatch::FocusNext => {
                         focused = (focused + 1) % agents.len();
                     }
                     KeyDispatch::FocusPrev => {
-                        focused = if focused == 0 { agents.len() - 1 } else { focused - 1 };
+                        focused = if focused == 0 {
+                            agents.len() - 1
+                        } else {
+                            focused - 1
+                        };
                     }
                     KeyDispatch::FocusAt(idx) => {
                         if idx < agents.len() {
@@ -472,7 +491,9 @@ fn literal_byte_for(chord: &crate::keymap::KeyChord) -> Option<u8> {
     if !chord.modifiers.contains(KeyModifiers::CONTROL) {
         return None;
     }
-    let KeyCode::Char(c) = chord.code else { return None };
+    let KeyCode::Char(c) = chord.code else {
+        return None;
+    };
     let lower = c.to_ascii_lowercase();
     if lower.is_ascii_alphabetic() {
         Some((lower as u8) - b'a' + 1)
@@ -480,8 +501,6 @@ fn literal_byte_for(chord: &crate::keymap::KeyChord) -> Option<u8> {
         None
     }
 }
-
-// ---------- Rendering ----------
 
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
@@ -491,7 +510,7 @@ fn render_frame(
     nav_style: NavStyle,
     popup: PopupState,
     help: HelpState,
-    spawn_modal: Option<&SpawnModal>,
+    spawn_ui: Option<&SpawnMinibuffer>,
     bindings: &Bindings,
     status_hint: &str,
 ) {
@@ -500,8 +519,8 @@ fn render_frame(
         NavStyle::LeftPane => render_left_pane(frame, area, agents, focused),
         NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup, status_hint),
     }
-    if let Some(modal) = spawn_modal {
-        modal.render(frame, area);
+    if let Some(ui) = spawn_ui {
+        ui.render(frame, area, &bindings.on_modal);
     }
     if matches!(help, HelpState::Open) {
         render_help(frame, area, bindings);
@@ -522,8 +541,7 @@ fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], 
             Line::from(format!("{prefix}[{}] {}", i + 1, a.label))
         })
         .collect();
-    let nav = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" agents "));
+    let nav = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" agents "));
     frame.render_widget(nav, nav_area);
 
     if let Some(agent) = agents.get(focused) {
@@ -607,7 +625,9 @@ fn render_switcher_popup(
             Line::from(format!("{prefix}[{}] {}", i + 1, a.label))
         })
         .collect();
-    let block = Block::default().borders(Borders::ALL).title(" switch agent ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" switch agent ");
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
@@ -623,25 +643,40 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, bindings: &Bindings) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let header_style = Style::default().add_modifier(Modifier::BOLD);
 
-    lines.push(Line::styled(format!("prefix:  {}", bindings.prefix), header_style));
+    lines.push(Line::styled(
+        format!("prefix:  {}", bindings.prefix),
+        header_style,
+    ));
     lines.push(Line::raw(""));
 
     lines.push(Line::styled("in prefix mode:", header_style));
     for action in PrefixAction::ALL {
-        lines.push(binding_line(bindings.on_prefix.binding_for(*action), action.description()));
+        lines.push(binding_line(
+            bindings.on_prefix.binding_for(*action),
+            action.description(),
+        ));
     }
-    lines.push(binding_line_static("1-9", "focus agent by one-indexed position"));
+    lines.push(binding_line_static(
+        "1-9",
+        "focus agent by one-indexed position",
+    ));
     lines.push(Line::raw(""));
 
     lines.push(Line::styled("in agent switcher popup:", header_style));
     for action in PopupAction::ALL {
-        lines.push(binding_line(bindings.on_popup.binding_for(*action), action.description()));
+        lines.push(binding_line(
+            bindings.on_popup.binding_for(*action),
+            action.description(),
+        ));
     }
     lines.push(Line::raw(""));
 
-    lines.push(Line::styled("in spawn modal:", header_style));
+    lines.push(Line::styled("in spawn minibuffer:", header_style));
     for action in ModalAction::ALL {
-        lines.push(binding_line(bindings.on_modal.binding_for(*action), action.description()));
+        lines.push(binding_line(
+            bindings.on_modal.binding_for(*action),
+            action.description(),
+        ));
     }
     lines.push(Line::raw(""));
     lines.push(Line::raw("press any key to close"));
@@ -735,7 +770,10 @@ mod tests {
 
     #[test]
     fn plain_ascii_char_passes_through_as_one_byte() {
-        assert_eq!(key_to_bytes(KeyCode::Char('A'), KeyModifiers::NONE), Some(vec![b'A']));
+        assert_eq!(
+            key_to_bytes(KeyCode::Char('A'), KeyModifiers::NONE),
+            Some(vec![b'A'])
+        );
     }
 
     #[test]
@@ -749,13 +787,22 @@ mod tests {
 
     #[test]
     fn enter_is_a_carriage_return() {
-        assert_eq!(key_to_bytes(KeyCode::Enter, KeyModifiers::NONE), Some(vec![b'\r']));
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
+            Some(vec![b'\r'])
+        );
     }
 
     #[test]
     fn arrow_keys_emit_csi_letter_sequences() {
-        assert_eq!(key_to_bytes(KeyCode::Up, KeyModifiers::NONE), Some(vec![0x1b, b'[', b'A']));
-        assert_eq!(key_to_bytes(KeyCode::Down, KeyModifiers::NONE), Some(vec![0x1b, b'[', b'B']));
+        assert_eq!(
+            key_to_bytes(KeyCode::Up, KeyModifiers::NONE),
+            Some(vec![0x1b, b'[', b'A'])
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Down, KeyModifiers::NONE),
+            Some(vec![0x1b, b'[', b'B'])
+        );
     }
 
     #[test]
@@ -772,7 +819,11 @@ mod tests {
     #[test]
     fn idle_forwards_a_normal_char() {
         let mut state = PrefixState::Idle;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('a'), KeyModifiers::NONE), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('a'), KeyModifiers::NONE),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::Forward(vec![b'a']));
         assert_eq!(state, PrefixState::Idle);
     }
@@ -780,14 +831,22 @@ mod tests {
     #[test]
     fn idle_forwards_ctrl_c_to_pty() {
         let mut state = PrefixState::Idle;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('c'), KeyModifiers::CONTROL), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::Forward(vec![0x03]));
     }
 
     #[test]
     fn ctrl_b_in_idle_arms_the_state_machine() {
         let mut state = PrefixState::Idle;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('b'), KeyModifiers::CONTROL), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::Consume);
         assert_eq!(state, PrefixState::AwaitingCommand);
     }
@@ -795,21 +854,33 @@ mod tests {
     #[test]
     fn double_prefix_forwards_a_literal_prefix_byte() {
         let mut state = PrefixState::AwaitingCommand;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('b'), KeyModifiers::CONTROL), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::Forward(vec![0x02]));
     }
 
     #[test]
     fn prefix_q_exits() {
         let mut state = PrefixState::AwaitingCommand;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('q'), KeyModifiers::NONE), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('q'), KeyModifiers::NONE),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::Exit);
     }
 
     #[test]
     fn prefix_c_opens_spawn_modal() {
         let mut state = PrefixState::AwaitingCommand;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('c'), KeyModifiers::NONE), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('c'), KeyModifiers::NONE),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::SpawnAgent);
     }
 
@@ -817,7 +888,11 @@ mod tests {
     fn prefix_question_mark_opens_help() {
         let mut state = PrefixState::AwaitingCommand;
         // Crossterm sends `?` as Char('?') with SHIFT (varies by platform).
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('?'), KeyModifiers::SHIFT), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::OpenHelp);
     }
 
@@ -826,7 +901,11 @@ mod tests {
         for d in 1..=9_u8 {
             let mut state = PrefixState::AwaitingCommand;
             let c = char::from_digit(u32::from(d), 10).unwrap();
-            let action = dispatch_key(&mut state, &key(KeyCode::Char(c), KeyModifiers::NONE), &defaults());
+            let action = dispatch_key(
+                &mut state,
+                &key(KeyCode::Char(c), KeyModifiers::NONE),
+                &defaults(),
+            );
             assert_eq!(action, KeyDispatch::FocusAt(usize::from(d - 1)));
         }
     }
@@ -834,14 +913,22 @@ mod tests {
     #[test]
     fn prefix_zero_is_consumed_no_focus() {
         let mut state = PrefixState::AwaitingCommand;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('0'), KeyModifiers::NONE), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('0'), KeyModifiers::NONE),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::Consume);
     }
 
     #[test]
     fn unbound_key_after_prefix_is_consumed() {
         let mut state = PrefixState::AwaitingCommand;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('z'), KeyModifiers::NONE), &defaults());
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('z'), KeyModifiers::NONE),
+            &defaults(),
+        );
         assert_eq!(action, KeyDispatch::Consume);
         assert_eq!(state, PrefixState::Idle);
     }
@@ -856,11 +943,19 @@ mod tests {
         "#;
         let config: crate::config::Config = toml::from_str(toml_text).unwrap();
         let mut state = PrefixState::AwaitingCommand;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('x'), KeyModifiers::NONE), &config.bindings);
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &config.bindings,
+        );
         assert_eq!(action, KeyDispatch::Exit);
         // The old key (q) is no longer bound to anything in prefix mode.
         let mut state2 = PrefixState::AwaitingCommand;
-        let action2 = dispatch_key(&mut state2, &key(KeyCode::Char('q'), KeyModifiers::NONE), &config.bindings);
+        let action2 = dispatch_key(
+            &mut state2,
+            &key(KeyCode::Char('q'), KeyModifiers::NONE),
+            &config.bindings,
+        );
         assert_eq!(action2, KeyDispatch::Consume);
     }
 
@@ -872,12 +967,20 @@ mod tests {
         "#;
         let config: crate::config::Config = toml::from_str(toml_text).unwrap();
         let mut state = PrefixState::Idle;
-        let action = dispatch_key(&mut state, &key(KeyCode::Char('a'), KeyModifiers::CONTROL), &config.bindings);
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &config.bindings,
+        );
         assert_eq!(action, KeyDispatch::Consume);
         assert_eq!(state, PrefixState::AwaitingCommand);
         // And the old prefix is now just a normal forwarded byte.
         let mut state2 = PrefixState::Idle;
-        let action2 = dispatch_key(&mut state2, &key(KeyCode::Char('b'), KeyModifiers::CONTROL), &config.bindings);
+        let action2 = dispatch_key(
+            &mut state2,
+            &key(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &config.bindings,
+        );
         assert_eq!(action2, KeyDispatch::Forward(vec![0x02]));
     }
 
@@ -886,8 +989,14 @@ mod tests {
     #[test]
     fn literal_byte_for_ctrl_letters() {
         use crate::keymap::KeyChord;
-        assert_eq!(literal_byte_for(&KeyChord::ctrl(KeyCode::Char('b'))), Some(0x02));
-        assert_eq!(literal_byte_for(&KeyChord::ctrl(KeyCode::Char('a'))), Some(0x01));
+        assert_eq!(
+            literal_byte_for(&KeyChord::ctrl(KeyCode::Char('b'))),
+            Some(0x02)
+        );
+        assert_eq!(
+            literal_byte_for(&KeyChord::ctrl(KeyCode::Char('a'))),
+            Some(0x01)
+        );
     }
 
     #[test]
