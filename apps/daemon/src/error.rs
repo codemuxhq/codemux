@@ -3,6 +3,7 @@
 //! source so the daemon's surface never leaks specific tool types.
 
 use std::error::Error as StdError;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -41,6 +42,20 @@ pub enum Error {
     /// Per AD-3, single-attach is enforced; the late client is rejected.
     #[error("agent already attached")]
     AlreadyAttached,
+
+    /// Another live daemon already holds the pid file. Stage 2 promotes
+    /// supervisor exclusivity from "first to bind wins" (Stage 0) to
+    /// "first to acquire the pid file wins". The held-pid is included so
+    /// users can inspect or kill the offending process without grepping.
+    #[error("pid file {} already locked by live process pid {pid}", path.display())]
+    PidFileLocked { pid: u32, path: PathBuf },
+
+    /// `--cwd` was supplied but the directory does not exist on this
+    /// host. Surfaced before any side effects (no socket, no pid file)
+    /// per vision principle 6: never silently fall back. Stage 4's
+    /// bootstrap wraps this as `Bootstrap { stage: DaemonSpawn, .. }`.
+    #[error("cwd {} does not exist", path.display())]
+    CwdNotFound { path: PathBuf },
 
     /// The peer announced a wire-protocol version this daemon does not
     /// speak. The daemon sends an `Error{VersionMismatch}` frame and
@@ -125,5 +140,25 @@ mod tests {
             unreachable!("Io variant must have a source")
         };
         assert_eq!(source.to_string(), "boom");
+    }
+
+    #[test]
+    fn pid_file_locked_display_includes_pid_and_path() {
+        let err = Error::PidFileLocked {
+            pid: 12345,
+            path: PathBuf::from("/tmp/codemuxd/agent.pid"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "pid file /tmp/codemuxd/agent.pid already locked by live process pid 12345",
+        );
+    }
+
+    #[test]
+    fn cwd_not_found_display_includes_path() {
+        let err = Error::CwdNotFound {
+            path: PathBuf::from("/no/such/dir"),
+        };
+        assert_eq!(err.to_string(), "cwd /no/such/dir does not exist");
     }
 }

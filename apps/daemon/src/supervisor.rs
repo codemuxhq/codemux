@@ -1,27 +1,44 @@
 //! Supervisor: owns the unix-socket listener and runs the accept loop.
 //!
-//! Stage 0: at most one `Session` per supervisor, lazily spawned on first
-//! accept. Sessions persist across client disconnects — the whole point
-//! of the daemon is session continuity. If the child has exited between
+//! The supervisor's single responsibility is the runtime: accept a
+//! client, attach it to the (lazily-spawned) [`Session`], handle a
+//! disconnect, repeat. It owns nothing it didn't get handed by the
+//! [`bootstrap`] module — [`Supervisor::new`] takes a
+//! [`DaemonResources`] of already-bound listener, validated config, and
+//! pid file guard.
+//!
+//! Sessions persist across client disconnects — the whole point of the
+//! daemon is session continuity. If the child has exited between
 //! attaches, the next accept respawns. Single-attach is implicit (the
 //! accept loop is sequential, so a second client blocks in `connect`
-//! until the first ends); Stage 1 will replace this with a protocol-level
-//! `AlreadyAttached` rejection.
+//! until the first ends); a future stage may replace this with a
+//! protocol-level `AlreadyAttached` rejection.
 //!
-//! Drop on the `Session` (which happens when the supervisor is dropped at
-//! daemon shutdown) kills the child. Without that, the child would become
-//! a zombie outliving the daemon.
+//! Drop on the held [`Session`] kills the child; drop on the held
+//! [`PidFile`] (inside [`DaemonResources`]) removes the pid file. Both
+//! happen on a graceful supervisor shutdown.
+//!
+//! [`bootstrap`]: crate::bootstrap
+//! [`DaemonResources`]: crate::bootstrap::DaemonResources
+//! [`PidFile`]: crate::bootstrap::PidFile
 
+use std::convert::Infallible;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
+use crate::bootstrap::{DaemonResources, PidFile};
 use crate::cli::Cli;
 use crate::error::Error;
 use crate::session::Session;
 
 /// What the supervisor needs to know about the child it spawns per
-/// session. Extracted from `Cli` so callers (notably tests) can build it
-/// without going through clap.
+/// session. Built from a [`Cli`] in production, or constructed
+/// directly by tests.
+///
+/// Pure runtime concern: paths the supervisor doesn't read at runtime
+/// (pid file, socket) live in [`DaemonResources`] instead.
+///
+/// [`DaemonResources`]: crate::bootstrap::DaemonResources
 #[derive(Clone, Debug)]
 pub struct SupervisorConfig {
     pub command: String,
@@ -49,46 +66,34 @@ pub struct Supervisor {
     listener: UnixListener,
     config: SupervisorConfig,
     session: Option<Session>,
+    /// Held purely for its `Drop` — removes the pid file on daemon
+    /// exit. Underscore prefix tells the linter we never read this;
+    /// it's a liveness guard, not a value.
+    _pid_file: Option<PidFile>,
 }
 
 impl Supervisor {
-    /// Bind the unix-socket listener at `cli.socket` and prepare a
-    /// supervisor that will spawn a `Session` lazily on first accept.
+    /// Construct from already-prepared [`DaemonResources`]. Does no
+    /// I/O. Pair with [`bootstrap::bring_up`] in production or
+    /// [`bootstrap::bring_up_with`] in tests.
     ///
-    /// If a stale socket file exists at the path, it is removed before
-    /// binding. Stage 2 will replace this with a real liveness check (read
-    /// the pid file, send signal 0, only unlink if the process is gone).
-    pub fn bind(cli: &Cli) -> Result<Self, Error> {
-        let _ = std::fs::remove_file(&cli.socket);
-        let listener = UnixListener::bind(&cli.socket).map_err(|e| Error::Bind {
-            path: cli.socket.display().to_string(),
-            source: e,
-        })?;
-        Ok(Self {
-            listener,
-            config: SupervisorConfig::from_cli(cli),
+    /// [`bootstrap::bring_up`]: crate::bootstrap::bring_up
+    /// [`bootstrap::bring_up_with`]: crate::bootstrap::bring_up_with
+    #[must_use]
+    pub fn new(resources: DaemonResources) -> Self {
+        Self {
+            listener: resources.listener,
+            config: resources.config,
             session: None,
-        })
-    }
-
-    /// Bind with an explicit `SupervisorConfig`. Used by tests that want
-    /// to supply a custom command without constructing a full `Cli`.
-    pub fn bind_with(socket: &std::path::Path, config: SupervisorConfig) -> Result<Self, Error> {
-        let _ = std::fs::remove_file(socket);
-        let listener = UnixListener::bind(socket).map_err(|e| Error::Bind {
-            path: socket.display().to_string(),
-            source: e,
-        })?;
-        Ok(Self {
-            listener,
-            config,
-            session: None,
-        })
+            _pid_file: resources.pid_file,
+        }
     }
 
     /// Accept-loop forever. Each accepted connection runs to completion
-    /// before the next is accepted; the underlying session persists.
-    pub fn serve(&mut self) -> Result<(), Error> {
+    /// before the next is accepted; the underlying session persists. The
+    /// `Infallible` Ok type encodes the operational invariant: this
+    /// function only ever returns on error.
+    pub fn serve(&mut self) -> Result<Infallible, Error> {
         loop {
             self.serve_one()?;
         }
@@ -111,32 +116,26 @@ impl Supervisor {
     }
 
     /// Return a mutable reference to a live session, spawning one (or
-    /// replacing a dead one) if necessary. Computing `dead` separately
-    /// keeps the borrow checker happy when we reassign `self.session`.
+    /// replacing a dead one) if necessary. `Option::take` releases the
+    /// borrow on `self.session` so we can either re-`insert` the same
+    /// value (live) or replace it with a freshly-spawned one (dead).
+    /// Without `take`, NLL still extends the original mutable borrow
+    /// across the spawn branch.
     fn session_mut(&mut self) -> Result<&mut Session, Error> {
-        let dead = match &mut self.session {
-            Some(s) => s.child_exited(),
-            None => true,
-        };
-        if dead {
-            if self.session.is_some() {
-                tracing::info!("previous session ended; spawning fresh session");
+        if let Some(mut existing) = self.session.take() {
+            if !existing.child_exited() {
+                return Ok(self.session.insert(existing));
             }
-            let new_session = Session::spawn(
-                &self.config.command,
-                &self.config.args,
-                self.config.cwd.as_deref(),
-                self.config.rows,
-                self.config.cols,
-            )?;
-            return Ok(self.session.insert(new_session));
+            tracing::info!("previous session ended; spawning fresh session");
         }
-        // Else: session is Some and alive (we just checked). Anything
-        // other than Some here is a logic bug, not a runtime error.
-        match self.session.as_mut() {
-            Some(s) => Ok(s),
-            None => unreachable!("session must be Some when not respawning"),
-        }
+        let new_session = Session::spawn(
+            &self.config.command,
+            &self.config.args,
+            self.config.cwd.as_deref(),
+            self.config.rows,
+            self.config.cols,
+        )?;
+        Ok(self.session.insert(new_session))
     }
 }
 
@@ -148,28 +147,35 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use clap::Parser;
     use codemux_wire::{self as wire, ErrorCode, Message};
 
     use super::*;
+    use crate::bootstrap;
 
-    /// End-to-end smoke for Stage 1: handshake completes, then a typed
-    /// `PtyData` frame echoes back through the cat child as `PtyData`
-    /// frames. We re-use Stage 0's "appears twice" trick (PTY echo +
-    /// cat reply) on the accumulated `PtyData` payloads.
-    #[test]
-    fn echo_through_cat_pty() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let socket = dir.path().join("test.sock");
-
-        let config = SupervisorConfig {
+    fn cat_config() -> SupervisorConfig {
+        SupervisorConfig {
             command: "cat".to_string(),
             args: Vec::new(),
             cwd: None,
             rows: 24,
             cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        }
+    }
+
+    fn supervisor_for(socket: &Path) -> Result<Supervisor, Box<dyn std::error::Error>> {
+        let resources = bootstrap::bring_up_with(socket, None, cat_config())?;
+        Ok(Supervisor::new(resources))
+    }
+
+    /// End-to-end smoke for the wire protocol: handshake completes,
+    /// then a typed `PtyData` frame echoes back through the cat child
+    /// as `PtyData` frames. We use the "appears twice" trick (PTY echo
+    /// + cat reply) on the accumulated `PtyData` payloads.
+    #[test]
+    fn echo_through_cat_pty() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("test.sock");
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || supervisor.serve_one());
 
@@ -198,23 +204,16 @@ mod tests {
     }
 
     /// **The reason this daemon exists.** Handshake, write, disconnect.
-    /// Reattach (new handshake), write again. The second `PtyData` reaching
-    /// `cat` and being echoed back proves the PTY child survived the
-    /// first disconnect — session continuity at the supervisor level,
-    /// now also exercising the wire protocol re-handshake path.
+    /// Reattach (new handshake), write again. The second `PtyData`
+    /// reaching `cat` and being echoed back proves the PTY child
+    /// survived the first disconnect — session continuity at the
+    /// supervisor level, exercising the wire protocol re-handshake
+    /// path.
     #[test]
     fn session_survives_client_disconnect_and_reattach() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("survive.sock");
-
-        let config = SupervisorConfig {
-            command: "cat".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || -> Result<(), Error> {
             supervisor.serve_one()?;
@@ -222,7 +221,6 @@ mod tests {
             Ok(())
         });
 
-        // First attach.
         {
             let mut s1 = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
             s1.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -237,8 +235,6 @@ mod tests {
             );
         }
 
-        // Second attach: cat should still be the same process. Its echo
-        // reply to "second\n" is the proof.
         {
             let mut s2 = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
             s2.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -269,22 +265,13 @@ mod tests {
     fn handshake_version_mismatch_returns_error_frame() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("vermismatch.sock");
-
-        let config = SupervisorConfig {
-            command: "cat".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || supervisor.serve_one());
 
         let mut stream = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
         stream.set_read_timeout(Some(Duration::from_secs(1)))?;
 
-        // Pick a version the daemon definitely doesn't speak.
         let bogus = wire::PROTOCOL_VERSION.wrapping_add(99);
         let hello = Message::Hello {
             protocol_version: bogus,
@@ -315,28 +302,19 @@ mod tests {
         Ok(())
     }
 
-    /// A client whose first frame is something other than `Hello` triggers
-    /// `Error::HandshakeMissing` carrying the offending tag, and the
-    /// supervisor surfaces it from `serve_one`.
+    /// A client whose first frame is something other than `Hello`
+    /// triggers `Error::HandshakeMissing` carrying the offending tag,
+    /// and the supervisor surfaces it from `serve_one`.
     #[test]
     fn handshake_with_non_hello_first_frame_returns_handshake_missing()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("nonhello.sock");
-
-        let config = SupervisorConfig {
-            command: "cat".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || supervisor.serve_one());
 
         let mut stream = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
-        // PtyData (tag 0x10) instead of Hello — the daemon must reject.
         let bogus = Message::PtyData(b"i'm not Hello".to_vec()).encode()?;
         stream.write_all(&bogus)?;
         drop(stream);
@@ -355,27 +333,19 @@ mod tests {
         Ok(())
     }
 
-    /// A client that disconnects before sending a complete `Hello` triggers
-    /// `Error::HandshakeIncomplete` rather than a generic transport error.
+    /// A client that disconnects before sending a complete `Hello`
+    /// triggers `Error::HandshakeIncomplete` rather than a generic
+    /// transport error.
     #[test]
     fn handshake_with_eof_before_hello_returns_handshake_incomplete()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("eof.sock");
-
-        let config = SupervisorConfig {
-            command: "cat".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || supervisor.serve_one());
 
         let stream = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
-        // Connect, send nothing, drop. Daemon should report HandshakeIncomplete.
         drop(stream);
 
         let join_result = serve.join();
@@ -392,24 +362,14 @@ mod tests {
         Ok(())
     }
 
-    /// Stage 2 placeholder dispatch handlers (Resize/Signal/Ping/Pong) must
-    /// not close the connection — the next `PtyData` frame still flows.
-    /// Exercising the placeholders now ensures Stage 2's plumbing changes
-    /// don't accidentally drop frames the wire decodes today.
+    /// Placeholder dispatch handlers (Resize/Signal/Ping/Pong) must not
+    /// close the connection — the next `PtyData` frame still flows.
     #[test]
     fn inbound_placeholder_frames_do_not_close_connection() -> Result<(), Box<dyn std::error::Error>>
     {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("placeholders.sock");
-
-        let config = SupervisorConfig {
-            command: "cat".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || supervisor.serve_one());
 
@@ -418,8 +378,6 @@ mod tests {
 
         client_handshake(&mut stream, 24, 80, "test-agent")?;
 
-        // Send each placeholder frame, then send a real PtyData frame and
-        // verify cat still echoes it — proves the connection survived.
         for frame in [
             Message::Resize {
                 rows: 50,
@@ -455,23 +413,16 @@ mod tests {
         Ok(())
     }
 
-    /// A client sending a server-only frame (`Hello`/`HelloAck`/`ChildExited`)
-    /// post-handshake is a protocol violation — the daemon closes the
-    /// connection cleanly without erroring `serve_one`.
+    /// A client sending a server-only frame (`Hello`/`HelloAck`/
+    /// `ChildExited`) post-handshake is a protocol violation — the
+    /// daemon closes the connection cleanly without erroring
+    /// `serve_one`.
     #[test]
     fn inbound_server_only_frame_closes_connection_cleanly()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("server-only.sock");
-
-        let config = SupervisorConfig {
-            command: "cat".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || supervisor.serve_one());
 
@@ -480,7 +431,6 @@ mod tests {
 
         client_handshake(&mut stream, 24, 80, "test-agent")?;
 
-        // Replay a Hello — meaningless from the client side, must close.
         let bogus = Message::Hello {
             protocol_version: wire::PROTOCOL_VERSION,
             rows: 24,
@@ -504,22 +454,14 @@ mod tests {
         Ok(())
     }
 
-    /// A client sending an `Error` frame (e.g. signalling its own bad state)
-    /// causes the daemon to close the connection cleanly.
+    /// A client sending an `Error` frame causes the daemon to close
+    /// the connection cleanly.
     #[test]
     fn inbound_error_frame_from_client_closes_connection_cleanly()
     -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let socket = dir.path().join("client-error.sock");
-
-        let config = SupervisorConfig {
-            command: "cat".to_string(),
-            args: Vec::new(),
-            cwd: None,
-            rows: 24,
-            cols: 80,
-        };
-        let mut supervisor = Supervisor::bind_with(&socket, config)?;
+        let mut supervisor = supervisor_for(&socket)?;
 
         let serve = thread::spawn(move || supervisor.serve_one());
 
@@ -547,52 +489,6 @@ mod tests {
         };
         serve_result?;
         Ok(())
-    }
-
-    /// `bind` consumes a `Cli` (clap-built) and exercises the full
-    /// `from_cli` path that `bind_with` skips.
-    #[test]
-    fn bind_via_cli_succeeds_and_exposes_config() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempfile::tempdir()?;
-        let socket = dir.path().join("via-cli.sock");
-        let socket_str = socket.to_string_lossy().into_owned();
-        let cli = Cli::parse_from([
-            "codemuxd",
-            "--socket",
-            &socket_str,
-            "--rows",
-            "30",
-            "--cols",
-            "100",
-            "--",
-            "cat",
-        ]);
-        let supervisor = Supervisor::bind(&cli)?;
-        assert_eq!(supervisor.config.command, "cat");
-        assert_eq!(supervisor.config.rows, 30);
-        assert_eq!(supervisor.config.cols, 100);
-        assert!(
-            supervisor.session.is_none(),
-            "session must be lazily spawned"
-        );
-        assert!(socket.exists(), "bind should create the socket file");
-        Ok(())
-    }
-
-    /// Binding to an unwritable directory surfaces `Error::Bind` with the
-    /// path embedded in the Display string.
-    #[test]
-    fn bind_to_unwritable_path_returns_bind_error() {
-        let path =
-            std::path::PathBuf::from("/this-directory-does-not-exist-on-any-machine/codemuxd.sock");
-        let cli = Cli::parse_from(["codemuxd", "--socket", path.to_str().unwrap_or("/no.sock")]);
-        let Err(err) = Supervisor::bind(&cli) else {
-            unreachable!("bind to a nonexistent directory must fail");
-        };
-        assert!(
-            matches!(err, Error::Bind { .. }),
-            "expected Error::Bind, got {err:?}",
-        );
     }
 
     fn wait_for_unix_socket(
@@ -669,19 +565,16 @@ mod tests {
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // Loop and check the deadline.
-                }
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => return Err(Box::new(e)),
             }
         }
     }
 
-    /// Read frames from `stream`, accumulate each `PtyData` payload, and
-    /// stop once `needle` appears `target` times in the accumulated bytes
-    /// (or the timeout / EOF hits). Non-`PtyData` frames are silently
-    /// drained.
+    /// Read frames from `stream`, accumulate each `PtyData` payload,
+    /// and stop once `needle` appears `target` times in the
+    /// accumulated bytes (or the timeout / EOF hits). Non-`PtyData`
+    /// frames are silently drained.
     fn drain_pty_data_until(
         stream: &mut UnixStream,
         needle: &[u8],
@@ -693,7 +586,6 @@ mod tests {
         let mut tmp = [0u8; 1024];
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            // Drain any complete frames before reading more bytes.
             loop {
                 match wire::try_decode(&buf) {
                     Ok(Some((Message::PtyData(bytes), consumed))) => {
@@ -735,9 +627,9 @@ mod tests {
             .count()
     }
 
-    /// Block until the daemon closes the stream (`read` returns 0) or the
-    /// deadline elapses. Discards any frames the daemon sends in the
-    /// meantime — used by tests that only care that the close happens.
+    /// Block until the daemon closes the stream (`read` returns 0) or
+    /// the deadline elapses. Discards any frames the daemon sends
+    /// meanwhile — used by tests that only care that the close happens.
     fn await_clean_close(stream: &mut UnixStream, timeout: Duration, msg: &'static str) {
         let mut sink = [0u8; 256];
         let deadline = Instant::now() + timeout;
