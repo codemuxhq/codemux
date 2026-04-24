@@ -265,6 +265,9 @@ name = "codemux-session"
 version = "0.1.0"
 dependencies = [
  "codemux-shared-kernel",
+ "codemux-wire",
+ "crossbeam-channel",
+ "portable-pty",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -281,10 +284,8 @@ dependencies = [
  "codemux-session",
  "codemux-shared-kernel",
  "color-eyre",
- "crossbeam-channel",
  "crossterm",
  "glob",
- "portable-pty",
  "ratatui",
  "serde",
  "tempfile",

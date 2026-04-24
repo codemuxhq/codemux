@@ -24,10 +24,7 @@ tui-term.workspace = true
 vt100.workspace = true
 crossterm.workspace = true
 
-portable-pty.workspace = true
-
 clap.workspace = true
-crossbeam-channel.workspace = true
 
 serde.workspace = true
 toml.workspace = true

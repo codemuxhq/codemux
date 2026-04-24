@@ -6,16 +6,20 @@
 //! struct per scope and translates the matched action into a state mutation.
 //! `Ctrl-B ?` (default) opens a help popup that lists every binding for every
 //! scope, generated from the same Bindings POD.
+//!
+//! Per-agent PTY ownership lives behind [`AgentTransport`] in the
+//! `codemux-session` crate; the runtime holds only the renderable
+//! [`Parser`] alongside it. Stage 3 of the codemuxd build-out introduced
+//! that seam — see `docs/codemuxd-stages.md`.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::Path;
-use std::thread;
 use std::time::Duration;
 
 use clap::ValueEnum;
+use codemux_session::AgentTransport;
 use color_eyre::Result;
-use color_eyre::eyre::{WrapErr, eyre};
-use crossbeam_channel::{Receiver, unbounded};
+use color_eyre::eyre::WrapErr;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -24,7 +28,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -40,7 +43,6 @@ use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
 use crate::spawn::{ModalOutcome, SpawnMinibuffer};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
-const READ_BUFFER_SIZE: usize = 8 * 1024;
 const NAV_PANE_WIDTH: u16 = 25;
 const STATUS_BAR_HEIGHT: u16 = 1;
 
@@ -121,10 +123,7 @@ enum KeyDispatch {
 struct RuntimeAgent {
     label: String,
     parser: Parser,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
-    rx: Receiver<Vec<u8>>,
+    transport: AgentTransport,
 }
 
 pub fn run(nav_style: NavStyle, config: &Config) -> Result<()> {
@@ -133,7 +132,7 @@ pub fn run(nav_style: NavStyle, config: &Config) -> Result<()> {
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols);
 
-    let initial = spawn_agent("agent-1".into(), None, pty_rows, pty_cols)?;
+    let initial = spawn_local_agent("agent-1".into(), None, pty_rows, pty_cols)?;
     let agents = vec![initial];
 
     enable_raw_mode().wrap_err("enable raw mode")?;
@@ -171,64 +170,24 @@ fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16) -> (u16, u16) {
     }
 }
 
-fn spawn_agent(label: String, cwd: Option<&Path>, rows: u16, cols: u16) -> Result<RuntimeAgent> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| eyre!("open pty: {e}"))?;
-    let mut cmd = CommandBuilder::new("claude");
-    if let Some(cwd) = cwd {
-        cmd.cwd(cwd);
-    }
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| eyre!("spawn `claude` (is it on PATH?): {e}"))?;
-    drop(pair.slave);
-
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| eyre!("take pty writer: {e}"))?;
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| eyre!("clone pty reader: {e}"))?;
-    let master = pair.master;
-
-    let rx = spawn_reader_thread(reader);
+/// Construct a [`RuntimeAgent`] backed by a local PTY. The transport
+/// owns the PTY shape (master + child + reader thread); the runtime
+/// keeps the renderable [`Parser`] alongside, since rendering is the
+/// runtime's job (AD-1) and not the transport's.
+fn spawn_local_agent(
+    label: String,
+    cwd: Option<&Path>,
+    rows: u16,
+    cols: u16,
+) -> Result<RuntimeAgent> {
+    let transport = AgentTransport::spawn_local(label.clone(), cwd, rows, cols)
+        .wrap_err("spawn local agent")?;
     let parser = Parser::new(rows, cols, 0);
     Ok(RuntimeAgent {
         label,
         parser,
-        master,
-        writer,
-        child,
-        rx,
+        transport,
     })
-}
-
-fn spawn_reader_thread(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
-    let (tx, rx) = unbounded::<Vec<u8>>();
-    thread::spawn(move || {
-        let mut buf = vec![0u8; READ_BUFFER_SIZE];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    rx
 }
 
 fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
@@ -237,12 +196,7 @@ fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
         // stale size until next resize, which is a harmless cosmetic glitch
         // (claude re-lays-out on the next paint cycle). Surfacing as an
         // error would force callers to handle a non-actionable failure.
-        let _ = a.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        });
+        let _ = a.transport.resize(rows, cols);
         a.parser.screen_mut().set_size(rows, cols);
     }
 }
@@ -271,12 +225,12 @@ fn event_loop(
 
     loop {
         for agent in &mut agents {
-            while let Ok(bytes) = agent.rx.try_recv() {
+            for bytes in agent.transport.try_read() {
                 agent.parser.process(&bytes);
             }
         }
 
-        agents.retain_mut(|agent| !matches!(agent.child.try_wait(), Ok(Some(_))));
+        agents.retain_mut(|agent| agent.transport.try_wait().is_none());
         if agents.is_empty() {
             return Ok(());
         }
@@ -338,7 +292,7 @@ fn event_loop(
                                 } else {
                                     Some(Path::new(&path))
                                 };
-                                match spawn_agent(label, cwd_path, rows, cols) {
+                                match spawn_local_agent(label, cwd_path, rows, cols) {
                                     Ok(agent) => {
                                         agents.push(agent);
                                         focused = agents.len() - 1;
@@ -388,7 +342,7 @@ fn event_loop(
                 match dispatch_key(&mut prefix_state, &key, bindings) {
                     KeyDispatch::Forward(bytes) => {
                         if let Some(a) = agents.get_mut(focused) {
-                            a.writer.write_all(&bytes).wrap_err("write to pty")?;
+                            a.transport.write(&bytes).wrap_err("write to pty")?;
                         }
                     }
                     KeyDispatch::Consume => {}

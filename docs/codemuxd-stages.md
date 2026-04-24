@@ -12,7 +12,7 @@ Commit style: `feat(p1): subject`. No AI trailers.
 - ✅ **Stage 0** — Daemon walking skeleton (`8dbf805`)
 - ✅ **Stage 1** — Wire protocol with Hello/HelloAck handshake (`1452c4f`)
 - ✅ **Stage 2** — Filesystem layout, exclusivity, log redirection
-- ⏳ **Stage 3** — `AgentTransport` enum + `LocalPty` (refactor only)
+- ✅ **Stage 3** — `AgentTransport` enum + `LocalPty` (refactor only)
 - ⏳ **Stage 4** — `SshDaemonPty` adapter + bootstrap
 - ⏳ **Stage 5** — Wire SSH transport into the spawn modal
 

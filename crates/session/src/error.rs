@@ -1,5 +1,6 @@
 use std::error::Error as StdError;
 
+use codemux_wire::Signal;
 use thiserror::Error;
 
 /// Boxed source error for infrastructure-level failures. Infra adapters map
@@ -38,6 +39,37 @@ pub enum Error {
         #[source]
         source: BoxedSource,
     },
+
+    /// Failed to spawn an agent's child process. Distinct from
+    /// [`Error::Pty`] (which covers PTY-system failures like `openpty`)
+    /// so callers can tell "the binary is missing / `claude` not on PATH"
+    /// apart from "the kernel ran out of pty fds".
+    #[error("spawn child {command}")]
+    Spawn {
+        command: String,
+        #[source]
+        source: BoxedSource,
+    },
+
+    /// Stage 3 sentinel for transport surface that exists in the type
+    /// signature but does not yet have a body. Returned today by
+    /// `AgentTransport::spawn_ssh` and the `SshDaemonPty` method stubs;
+    /// Stage 4 replaces those bodies and this variant becomes unused
+    /// for that path. Kept on the enum because future seams (e.g. a
+    /// remote-host transport other than SSH) will reach for the same
+    /// sentinel during their own walking-skeleton stage.
+    #[error("not yet implemented: {feature}")]
+    NotImplemented { feature: &'static str },
+
+    /// The local PTY transport accepts the full [`Signal`] surface for
+    /// symmetry with the SSH path, but only [`Signal::Kill`] can be
+    /// delivered without unsafe libc calls (`Child::kill` is the only
+    /// signal `portable-pty` exposes). Other signals on a local
+    /// transport surface this error rather than silently misroute —
+    /// the runtime tunnels Ctrl-C as the byte `0x03` instead, which is
+    /// the right interactive-terminal semantics anyway.
+    #[error("signal {signal:?} is not supported on local transport")]
+    SignalNotSupported { signal: Signal },
 }
 
 #[cfg(test)]
@@ -74,5 +106,37 @@ mod tests {
             unreachable!("Pty variant must have a source")
         };
         assert_eq!(source.to_string(), "spawn failed");
+    }
+
+    #[test]
+    fn spawn_display_includes_command_and_preserves_source() {
+        let err = Error::Spawn {
+            command: "claude".into(),
+            source: Box::new(io::Error::other("not found on PATH")),
+        };
+        assert_eq!(err.to_string(), "spawn child claude");
+        let Some(source) = err.source() else {
+            unreachable!("Spawn variant must have a source")
+        };
+        assert_eq!(source.to_string(), "not found on PATH");
+    }
+
+    #[test]
+    fn not_implemented_display_includes_feature() {
+        let err = Error::NotImplemented {
+            feature: "SSH agent transport",
+        };
+        assert_eq!(err.to_string(), "not yet implemented: SSH agent transport",);
+    }
+
+    #[test]
+    fn signal_not_supported_display_includes_signal_variant() {
+        let err = Error::SignalNotSupported {
+            signal: Signal::Int,
+        };
+        assert_eq!(
+            err.to_string(),
+            "signal Int is not supported on local transport",
+        );
     }
 }

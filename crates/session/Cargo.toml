@@ -9,9 +9,17 @@ repository.workspace = true
 
 [dependencies]
 codemux-shared-kernel.workspace = true
+codemux-wire.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true
+
+# AgentTransport surface (Stage 3): owns the per-agent PTY plus the
+# crossbeam channel that drains the reader thread. The session crate
+# stays vendor-light intentionally — these are the only infra deps it
+# pulls in.
+portable-pty.workspace = true
+crossbeam-channel.workspace = true
 
 [lints]
 workspace = true
