@@ -189,8 +189,13 @@ Key bindings are typed action enums per scope (`PrefixAction`, `PopupAction`,
 (Elm-style) dispatch pattern documented in the Ratatui guide: input → typed
 action → state mutation, with the keymap as the single source of truth.
 
-Configuration lives at `$XDG_CONFIG_HOME/codemux/config.toml` (resolved via
-the `directories` crate). It is loaded once at startup into a `Config` POD
+Configuration lives at `$XDG_CONFIG_HOME/codemux/config.toml`, falling back
+to `$HOME/.config/codemux/config.toml`. XDG on every Unix, including macOS:
+the `directories`/`dirs` crates default to `~/Library/Application Support/`
+on macOS, which is the Apple GUI convention and the wrong place for a CLI
+tool — modern CLIs (gh, git, helix, kubectl, alacritty, ripgrep) all settled
+on `~/.config/` regardless of platform; we follow suit. The config is loaded
+once at startup into a `Config` POD
 and passed by reference into `runtime::run`. There is **no port/trait** for
 config — direct quote from the architecture-guide review of this slice
 (NLM, 2026-04-23): *"For a personal pre-alpha tool, reading the config at

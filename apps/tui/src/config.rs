@@ -1,6 +1,12 @@
 //! TOML config loader. The user file lives at
-//! `$XDG_CONFIG_HOME/codemux/config.toml` (resolved by the `directories`
-//! crate; falls back to `~/.config/codemux/config.toml` on Linux).
+//! `$XDG_CONFIG_HOME/codemux/config.toml`, falling back to
+//! `$HOME/.config/codemux/config.toml`.
+//!
+//! XDG on every Unix, including macOS. The `directories`/`dirs` crates default
+//! to `~/Library/Application Support/codemux/` on macOS — that's the Apple
+//! convention for GUI apps and the wrong place for a CLI tool. Modern CLIs
+//! (gh, git, helix, kubectl, alacritty, ripgrep, ruff, nushell) all settled on
+//! `~/.config/` regardless of platform; we follow suit.
 //!
 //! Per the architecture-guide review (P1.3 NLM session): config is
 //! infrastructure. We load it once at startup and pass the resulting POD into
@@ -12,11 +18,11 @@
 //! readable error and exit non-zero before touching the terminal. A typo
 //! silently breaking your bindings would be much worse than refusing to start.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, eyre};
-use directories::ProjectDirs;
 use serde::Deserialize;
 
 use crate::keymap::Bindings;
@@ -46,10 +52,28 @@ pub fn load() -> Result<Config> {
 
 /// Resolve the path codemux looks at. Public so the `--help` text and any
 /// "where is my config" UX can show the same location the loader uses.
+///
+/// Resolution order:
+/// 1. `$XDG_CONFIG_HOME/codemux/config.toml` if `$XDG_CONFIG_HOME` is set
+/// 2. `$HOME/.config/codemux/config.toml` otherwise
 pub fn config_path() -> Result<PathBuf> {
-    let proj = ProjectDirs::from("", "", "codemux")
-        .ok_or_else(|| eyre!("could not resolve a config directory for this user"))?;
-    Ok(proj.config_dir().join("config.toml"))
+    resolve_config_path(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+fn resolve_config_path(xdg: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
+    if let Some(xdg) = xdg.filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(xdg).join("codemux").join("config.toml"));
+    }
+    let home = home
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| eyre!("$HOME is not set; cannot resolve config path"))?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("codemux")
+        .join("config.toml"))
 }
 
 #[cfg(test)]
@@ -113,6 +137,37 @@ mod tests {
             quit = "ctrl+nonsense"
         "#;
         let result: Result<Config, _> = toml::from_str(toml_text);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn xdg_config_home_wins_when_set() {
+        let path = resolve_config_path(
+            Some(OsString::from("/tmp/xdg")),
+            Some(OsString::from("/home/me")),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/xdg/codemux/config.toml"));
+    }
+
+    #[test]
+    fn falls_back_to_home_dot_config_on_macos_and_linux() {
+        // The whole point of this fallback: macOS users without XDG_CONFIG_HOME
+        // must still land in ~/.config/codemux, not ~/Library/Application Support.
+        let path = resolve_config_path(None, Some(OsString::from("/home/me"))).unwrap();
+        assert_eq!(path, PathBuf::from("/home/me/.config/codemux/config.toml"));
+    }
+
+    #[test]
+    fn empty_xdg_is_treated_as_unset() {
+        let path = resolve_config_path(Some(OsString::from("")), Some(OsString::from("/home/me")))
+            .unwrap();
+        assert_eq!(path, PathBuf::from("/home/me/.config/codemux/config.toml"));
+    }
+
+    #[test]
+    fn errors_when_neither_xdg_nor_home_is_set() {
+        let result = resolve_config_path(None, None);
         assert!(result.is_err());
     }
 }

@@ -31,7 +31,6 @@ crossbeam-channel.workspace = true
 
 serde.workspace = true
 toml.workspace = true
-directories.workspace = true
 glob.workspace = true
 
 [dev-dependencies]

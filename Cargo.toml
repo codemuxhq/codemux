@@ -48,7 +48,6 @@ crossbeam-channel = "0.5.15"
 # Config (P1.3 keymap registry)
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9"
-directories = "6"
 
 # Filesystem glob expansion. Used by the spawn-modal SSH host loader to
 # resolve `Include config.d/*` style directives in `~/.ssh/config`.
