@@ -61,6 +61,7 @@ const MAX_COMPLETIONS: usize = 8;
 /// (`/usr/lib`, `node_modules`, mailbox) would block the render loop.
 const MAX_SCAN_ENTRIES: usize = 1024;
 const HOST_PLACEHOLDER: &str = "local";
+const PATH_PLACEHOLDER: &str = "<cwd>";
 
 /// What the spawn UI tells the event loop after handling a key.
 #[derive(Debug, Eq, PartialEq)]
@@ -362,46 +363,31 @@ impl SpawnMinibuffer {
         let label_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        let dim = Style::default().add_modifier(Modifier::DIM);
-        let separator_style = dim;
-
-        let host_text = if self.host.is_empty() {
-            HOST_PLACEHOLDER.to_string()
-        } else {
-            self.host.clone()
-        };
-        let path_text = if self.path.is_empty() {
-            "<cwd>".to_string()
-        } else {
-            self.path.clone()
-        };
-
-        let host_zone_style = zone_style(self.focused == Zone::Host, self.host.is_empty());
-        let path_zone_style = zone_style(self.focused == Zone::Path, self.path.is_empty());
+        let placeholder_style = Style::default().add_modifier(Modifier::DIM);
+        let separator_style = placeholder_style;
+        let cursor_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::SLOW_BLINK);
 
         let mut spans = vec![
             Span::styled("spawn: ", label_style),
             Span::styled("@", host_marker_style(self.focused == Zone::Host)),
-            Span::styled(host_text, host_zone_style),
         ];
-        if self.focused == Zone::Host {
-            spans.push(Span::styled(
-                "█",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ));
-        }
+        spans.extend(zone_spans(
+            self.focused == Zone::Host,
+            &self.host,
+            HOST_PLACEHOLDER,
+            placeholder_style,
+            cursor_style,
+        ));
         spans.push(Span::styled(" : ", separator_style));
-        spans.push(Span::styled(path_text, path_zone_style));
-        if self.focused == Zone::Path {
-            spans.push(Span::styled(
-                "█",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ));
-        }
+        spans.extend(zone_spans(
+            self.focused == Zone::Path,
+            &self.path,
+            PATH_PLACEHOLDER,
+            placeholder_style,
+            cursor_style,
+        ));
 
         let hint = format!(
             "  [{} toggle · {} pick · {} spawn · {} cancel]",
@@ -410,7 +396,7 @@ impl SpawnMinibuffer {
             bindings.binding_for(ModalAction::Confirm),
             bindings.binding_for(ModalAction::Cancel),
         );
-        spans.push(Span::styled(hint, dim));
+        spans.push(Span::styled(hint, placeholder_style));
         Paragraph::new(Line::from(spans))
     }
 
@@ -434,13 +420,60 @@ impl SpawnMinibuffer {
     }
 }
 
-fn zone_style(focused: bool, empty: bool) -> Style {
-    match (focused, empty) {
-        (true, _) => Style::default()
+/// Build the spans for one zone of the prompt.
+///
+/// Placeholder semantics: when `value` is empty, render `placeholder` in
+/// dim style. When focused, the cursor overlays the FIRST character of the
+/// placeholder — like a terminal block cursor sits ON the next character
+/// to be typed (vim, emacs, the standard `█` in shells), not beside it.
+/// So `local` becomes `█ocal` with a cyan block where the `l` would be.
+/// Real input gets the focused/non-focused value style and the cursor at
+/// the end, where typing extends it.
+///
+/// Lifetime note: `value` and `placeholder` share `'a` so the returned
+/// `Span`s can borrow from both. ratatui is immediate-mode and redraws on
+/// every event/tick, so we deliberately avoid `to_string()` /
+/// `chars().collect()` allocations on the render path.
+fn zone_spans<'a>(
+    focused: bool,
+    value: &'a str,
+    placeholder: &'a str,
+    placeholder_style: Style,
+    cursor_style: Style,
+) -> Vec<Span<'a>> {
+    const CURSOR: &str = "█";
+    let mut out = Vec::with_capacity(2);
+    if value.is_empty() {
+        if focused {
+            out.push(Span::styled(CURSOR, cursor_style));
+            // Drop the first char without allocating: advance the iterator
+            // and re-borrow what's left as a `&str` slice. Direct
+            // `&placeholder[1..]` would panic on multi-byte first chars.
+            let mut chars = placeholder.chars();
+            chars.next();
+            let rest = chars.as_str();
+            if !rest.is_empty() {
+                out.push(Span::styled(rest, placeholder_style));
+            }
+        } else {
+            out.push(Span::styled(placeholder, placeholder_style));
+        }
+    } else {
+        out.push(Span::styled(value, value_style(focused)));
+        if focused {
+            out.push(Span::styled(CURSOR, cursor_style));
+        }
+    }
+    out
+}
+
+fn value_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
             .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-        (false, true) => Style::default().add_modifier(Modifier::DIM),
-        (false, false) => Style::default(),
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
     }
 }
 
@@ -1038,20 +1071,71 @@ mod tests {
     }
 
     #[test]
-    fn zone_style_focused_overrides_empty() {
-        let s = zone_style(true, true);
+    fn value_style_focused_is_cyan_bold() {
+        let s = value_style(true);
         assert_eq!(s.fg, Some(Color::Cyan));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn zone_style_unfocused_empty_is_dim() {
-        let s = zone_style(false, true);
-        assert!(s.add_modifier.contains(Modifier::DIM));
+    fn value_style_unfocused_is_default() {
+        assert_eq!(value_style(false), Style::default());
+    }
+
+    /// Empty + focused: cursor overlays the FIRST char of the placeholder
+    /// (`local` → `█ocal`), and the remainder renders dim. This is the bug
+    /// fix from the user report — previously the placeholder rendered in
+    /// cyan/bold (focused style) with the cursor at the end, making
+    /// "local" look like real typed input.
+    #[test]
+    fn zone_spans_empty_focused_overlays_cursor_on_first_placeholder_char() {
+        let placeholder_style = Style::default().add_modifier(Modifier::DIM);
+        let cursor_style = Style::default().fg(Color::Cyan);
+        let spans = zone_spans(true, "", "local", placeholder_style, cursor_style);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "█");
+        // First char of "local" is consumed by the cursor; "ocal" remains.
+        assert_eq!(spans[1].content, "ocal");
+        assert!(spans[1].style.add_modifier.contains(Modifier::DIM));
+        // Critically, the remainder is NOT rendered in the focused
+        // (cyan + bold) style.
+        assert!(!spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(spans[1].style.fg, Some(Color::Cyan));
+    }
+
+    /// A 1-char placeholder is fully consumed by the cursor; no remainder
+    /// span is emitted (otherwise we'd push an empty `Span` and ratatui
+    /// would still allocate a row cell for it).
+    #[test]
+    fn zone_spans_empty_focused_with_single_char_placeholder_omits_remainder() {
+        let spans = zone_spans(true, "", "x", Style::default(), Style::default());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "█");
     }
 
     #[test]
-    fn zone_style_unfocused_non_empty_is_default() {
-        let s = zone_style(false, false);
-        assert_eq!(s, Style::default());
+    fn zone_spans_empty_unfocused_renders_full_placeholder_no_cursor() {
+        let placeholder_style = Style::default().add_modifier(Modifier::DIM);
+        let cursor_style = Style::default();
+        let spans = zone_spans(false, "", "local", placeholder_style, cursor_style);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "local");
+    }
+
+    #[test]
+    fn zone_spans_non_empty_focused_puts_cursor_after_value() {
+        let placeholder_style = Style::default();
+        let cursor_style = Style::default().fg(Color::Cyan);
+        let spans = zone_spans(true, "alpha", "local", placeholder_style, cursor_style);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "alpha");
+        assert_eq!(spans[1].content, "█");
+    }
+
+    #[test]
+    fn zone_spans_non_empty_unfocused_omits_cursor() {
+        let spans = zone_spans(false, "alpha", "local", Style::default(), Style::default());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "alpha");
     }
 }
