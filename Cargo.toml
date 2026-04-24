@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "apps/tui",
+    "apps/daemon",
     "crates/session",
     "crates/shared-kernel",
 ]
