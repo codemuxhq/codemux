@@ -11,9 +11,17 @@
 //! `codemux-session` crate; the runtime holds only the renderable
 //! [`Parser`] alongside it. Stage 3 of the codemuxd build-out introduced
 //! that seam — see `docs/codemuxd-stages.md`.
+//!
+//! Stage 5 added [`AgentState`] so an SSH agent can sit in a
+//! `Bootstrapping` placeholder while [`crate::bootstrap_worker`] drives
+//! the install/scp/build/spawn pipeline on a worker thread. The event
+//! loop polls the worker each tick and flips the placeholder into a
+//! `Ready` state with a real [`AgentTransport`] once the bootstrap
+//! returns.
 
+use std::error::Error as StdError;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::ValueEnum;
@@ -32,12 +40,13 @@ use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
 
+use crate::bootstrap_worker::BootstrapHandle;
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
 use crate::spawn::{ModalOutcome, SpawnMinibuffer};
@@ -122,8 +131,85 @@ enum KeyDispatch {
 
 struct RuntimeAgent {
     label: String,
-    parser: Parser,
-    transport: AgentTransport,
+    /// Cell width/height the agent's pane is currently allocated.
+    /// Tracked separately because a `Bootstrapping` agent has no
+    /// transport/parser to ask, and on transition to `Ready` the new
+    /// transport must be created (and the new parser sized) at the
+    /// current geometry — not whatever was passed when the bootstrap
+    /// started.
+    rows: u16,
+    cols: u16,
+    state: AgentState,
+}
+
+/// Per-agent state. `Bootstrapping` is the placeholder a SSH spawn
+/// occupies while [`crate::bootstrap_worker`] drives the install on a
+/// worker thread; `Ready` is the steady state for both local and SSH
+/// transports once they have an [`AgentTransport`] and a renderable
+/// [`Parser`].
+///
+/// Transitions: a `Bootstrapping` agent flips to `Ready` once the
+/// worker reports success, or stays in `Bootstrapping` with `error =
+/// Some(_)` on failure (visible to the user until they exit the TUI —
+/// no per-agent dismiss key yet, that lands with future agent
+/// lifecycle work).
+enum AgentState {
+    /// SSH agent waiting for [`crate::bootstrap_worker`] to finish.
+    Bootstrapping {
+        /// Hostname rendered in the placeholder pane. Stored
+        /// separately from `label` so the placeholder text stays
+        /// readable even if `label` ends up encoding more than the
+        /// host (e.g. `host:agent-3`).
+        host: String,
+        handle: BootstrapHandle,
+        /// Set when the worker reports an error. Rendered in the
+        /// placeholder pane in red until the user exits.
+        error: Option<String>,
+    },
+    /// Live agent with an attached PTY (local or SSH-tunneled).
+    Ready {
+        /// Boxed because `vt100::Parser` carries a screen-sized cell
+        /// grid (~720 bytes), which dwarfs the `Bootstrapping`
+        /// variant. Without the box, every `RuntimeAgent` pays the
+        /// `Ready`-sized footprint regardless of state, and clippy
+        /// fires `large_enum_variant`. The pointer indirection is
+        /// invisible against the per-frame parser/render work.
+        parser: Box<Parser>,
+        transport: AgentTransport,
+    },
+}
+
+impl RuntimeAgent {
+    fn ready(label: String, transport: AgentTransport, rows: u16, cols: u16) -> Self {
+        Self {
+            label,
+            rows,
+            cols,
+            state: AgentState::Ready {
+                parser: Box::new(Parser::new(rows, cols, 0)),
+                transport,
+            },
+        }
+    }
+
+    fn bootstrapping(
+        label: String,
+        host: String,
+        handle: BootstrapHandle,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        Self {
+            label,
+            rows,
+            cols,
+            state: AgentState::Bootstrapping {
+                host,
+                handle,
+                error: None,
+            },
+        }
+    }
 }
 
 pub fn run(nav_style: NavStyle, config: &Config) -> Result<()> {
@@ -182,22 +268,25 @@ fn spawn_local_agent(
 ) -> Result<RuntimeAgent> {
     let transport = AgentTransport::spawn_local(label.clone(), cwd, rows, cols)
         .wrap_err("spawn local agent")?;
-    let parser = Parser::new(rows, cols, 0);
-    Ok(RuntimeAgent {
-        label,
-        parser,
-        transport,
-    })
+    Ok(RuntimeAgent::ready(label, transport, rows, cols))
 }
 
 fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
     for a in agents {
-        // PTY resize is best-effort: failure here means the child sees a
-        // stale size until next resize, which is a harmless cosmetic glitch
-        // (claude re-lays-out on the next paint cycle). Surfacing as an
-        // error would force callers to handle a non-actionable failure.
-        let _ = a.transport.resize(rows, cols);
-        a.parser.screen_mut().set_size(rows, cols);
+        // Keep the geometry on the agent itself so a Bootstrapping
+        // agent that flips to Ready later still gets sized correctly
+        // (its parser/transport are constructed at transition time).
+        a.rows = rows;
+        a.cols = cols;
+        if let AgentState::Ready { parser, transport } = &mut a.state {
+            // PTY resize is best-effort: failure here means the child
+            // sees a stale size until next resize, which is a harmless
+            // cosmetic glitch (claude re-lays-out on the next paint
+            // cycle). Surfacing as an error would force callers to
+            // handle a non-actionable failure.
+            let _ = transport.resize(rows, cols);
+            parser.screen_mut().set_size(rows, cols);
+        }
     }
 }
 
@@ -225,12 +314,53 @@ fn event_loop(
 
     loop {
         for agent in &mut agents {
-            for bytes in agent.transport.try_read() {
-                agent.parser.process(&bytes);
+            // Two-phase to satisfy the borrow checker: the
+            // Bootstrapping arm needs to read fields of `agent.state`
+            // while a successful poll wants to *replace* `agent.state`.
+            // Compute the transition first, then apply it in a
+            // separate statement that has exclusive access.
+            let transition = match &mut agent.state {
+                AgentState::Ready { parser, transport } => {
+                    for bytes in transport.try_read() {
+                        parser.process(&bytes);
+                    }
+                    None
+                }
+                AgentState::Bootstrapping { handle, error, .. } => match handle.try_recv() {
+                    Some(Ok(transport)) => Some(transport),
+                    Some(Err(e)) => {
+                        let msg = format_bootstrap_error(&e);
+                        tracing::error!(label = %agent.label, "bootstrap failed: {e}");
+                        *error = Some(msg);
+                        None
+                    }
+                    None => None,
+                },
+            };
+            if let Some(mut transport) = transition {
+                // Geometry may have changed during the bootstrap; the
+                // wire `Hello` was sized at start-of-bootstrap, so the
+                // remote daemon may need an immediate Resize before
+                // any frames flow.
+                let _ = transport.resize(agent.rows, agent.cols);
+                tracing::info!(label = %agent.label, "bootstrap completed; transport ready");
+                agent.state = AgentState::Ready {
+                    parser: Box::new(Parser::new(agent.rows, agent.cols, 0)),
+                    transport,
+                };
             }
         }
 
-        agents.retain_mut(|agent| agent.transport.try_wait().is_none());
+        agents.retain_mut(|agent| match &mut agent.state {
+            AgentState::Ready { transport, .. } => transport.try_wait().is_none(),
+            // Bootstrapping agents (including the post-error sticky
+            // state) are kept until the user exits — there's no
+            // per-agent dismiss key yet, so auto-reaping a failed
+            // bootstrap would erase the only place the user sees the
+            // error message. Future P2 work (agent lifecycle keys)
+            // can revisit.
+            AgentState::Bootstrapping { .. } => true,
+        });
         if agents.is_empty() {
             return Ok(());
         }
@@ -281,11 +411,11 @@ fn event_loop(
                         }
                         ModalOutcome::Spawn { host, path } => {
                             spawn_ui = None;
+                            let (term_cols, term_rows) =
+                                crossterm::terminal::size().wrap_err("read terminal size")?;
+                            let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
+                            spawn_counter += 1;
                             if host == "local" {
-                                let (term_cols, term_rows) =
-                                    crossterm::terminal::size().wrap_err("read terminal size")?;
-                                let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
-                                spawn_counter += 1;
                                 let label = format!("agent-{spawn_counter}");
                                 let cwd_path = if path.is_empty() {
                                     None
@@ -302,10 +432,31 @@ fn event_loop(
                                     }
                                 }
                             } else {
-                                tracing::warn!(
-                                    "ssh transport not yet implemented; \
-                                     skipping spawn on host {host}",
+                                // SSH branch: kick off the bootstrap on
+                                // a worker thread and drop a placeholder
+                                // agent into the navigator. The event
+                                // loop's drain phase polls the worker
+                                // each tick and flips the placeholder to
+                                // Ready when the transport arrives.
+                                let label = format!("{host}:agent-{spawn_counter}");
+                                let agent_id = format!("agent-{spawn_counter}");
+                                let cwd_path = PathBuf::from(&path);
+                                let handle = crate::bootstrap_worker::start(
+                                    host.clone(),
+                                    agent_id,
+                                    cwd_path,
+                                    rows,
+                                    cols,
                                 );
+                                tracing::info!(
+                                    %host,
+                                    label = %label,
+                                    "started SSH bootstrap worker",
+                                );
+                                agents.push(RuntimeAgent::bootstrapping(
+                                    label, host, handle, rows, cols,
+                                ));
+                                focused = agents.len() - 1;
                             }
                         }
                     }
@@ -342,7 +493,23 @@ fn event_loop(
                 match dispatch_key(&mut prefix_state, &key, bindings) {
                     KeyDispatch::Forward(bytes) => {
                         if let Some(a) = agents.get_mut(focused) {
-                            a.transport.write(&bytes).wrap_err("write to pty")?;
+                            match &mut a.state {
+                                AgentState::Ready { transport, .. } => {
+                                    transport.write(&bytes).wrap_err("write to pty")?;
+                                }
+                                // Drop the bytes — the placeholder pane
+                                // can't accept input. tracing::trace
+                                // because this is high-volume during
+                                // typing if the user mistakes a
+                                // bootstrapping pane for a live one.
+                                AgentState::Bootstrapping { .. } => {
+                                    tracing::trace!(
+                                        label = %a.label,
+                                        n = bytes.len(),
+                                        "dropped key bytes (still bootstrapping)",
+                                    );
+                                }
+                            }
                         }
                     }
                     KeyDispatch::Consume => {}
@@ -481,6 +648,112 @@ fn render_frame(
     }
 }
 
+/// Render an agent's main pane based on its current [`AgentState`]. A
+/// `Ready` agent shows the live PTY through `tui-term`'s
+/// [`PseudoTerminal`]; a `Bootstrapping` agent shows a static
+/// placeholder so the user knows the slot exists and what stage it's
+/// at (or what error tripped the bootstrap).
+fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
+    match &agent.state {
+        AgentState::Ready { parser, .. } => {
+            let widget = PseudoTerminal::new(parser.screen());
+            frame.render_widget(widget, area);
+        }
+        AgentState::Bootstrapping { host, error, .. } => {
+            render_bootstrap_placeholder(frame, area, host, error.as_deref());
+        }
+    }
+}
+
+/// Static placeholder shown in the agent pane while a SSH bootstrap
+/// is in flight, or to surface the bootstrap error after a failure.
+fn render_bootstrap_placeholder(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    host: &str,
+    error: Option<&str>,
+) {
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::raw(""),
+        Line::raw(format!("  bootstrapping codemuxd on {host}…")),
+        Line::raw(""),
+    ];
+    if let Some(err) = error {
+        lines.push(Line::styled(
+            "  bootstrap failed:".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        for line in err.lines() {
+            lines.push(Line::styled(
+                format!("    {line}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    } else {
+        lines.push(Line::raw(
+            "  (this can take 30–60s on first contact while codemuxd builds)",
+        ));
+    }
+    let title = if error.is_some() {
+        " remote agent (failed) "
+    } else {
+        " remote agent (bootstrapping) "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// Render the bootstrap error envelope for the placeholder pane. The
+/// stage hint is the first line; subsequent lines walk the source
+/// chain so the user sees the underlying ssh/scp/cargo message
+/// without having to dig in tracing logs.
+fn format_bootstrap_error(e: &codemuxd_bootstrap::Error) -> String {
+    use codemuxd_bootstrap::{Error, Stage};
+    let head = match e {
+        Error::Bootstrap {
+            stage: Stage::VersionProbe,
+            ..
+        } => "ssh probe failed (host unreachable or auth refused)",
+        Error::Bootstrap {
+            stage: Stage::TarballStage,
+            ..
+        } => "couldn't stage local tarball (disk full?)",
+        Error::Bootstrap {
+            stage: Stage::Scp, ..
+        } => "scp failed (network or remote disk)",
+        Error::Bootstrap {
+            stage: Stage::RemoteBuild,
+            ..
+        } => "remote build failed (cargo missing or compile error)",
+        Error::Bootstrap {
+            stage: Stage::DaemonSpawn,
+            ..
+        } => "remote daemon failed to spawn",
+        Error::Bootstrap {
+            stage: Stage::SocketTunnel,
+            ..
+        } => "ssh -L tunnel failed (OpenSSH < 6.7?)",
+        Error::Bootstrap {
+            stage: Stage::SocketConnect,
+            ..
+        } => "could not connect to remote daemon socket",
+        Error::Bootstrap { .. } => "bootstrap failed",
+        Error::Session { .. } => "wire handshake failed after bootstrap",
+        // Bootstrap's `Error` is `#[non_exhaustive]`; keep an
+        // explicit fallback so the renderer never panics on a
+        // future variant added downstream.
+        _ => "bootstrap failed (unknown error variant)",
+    };
+    let mut msg = head.to_string();
+    let mut source: Option<&dyn StdError> = e.source();
+    while let Some(s) = source {
+        msg.push('\n');
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    msg
+}
+
 fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], focused: usize) {
     let [nav_area, pty_area] = Layout::default()
         .direction(Direction::Horizontal)
@@ -499,8 +772,7 @@ fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], 
     frame.render_widget(nav, nav_area);
 
     if let Some(agent) = agents.get(focused) {
-        let widget = PseudoTerminal::new(agent.parser.screen());
-        frame.render_widget(widget, pty_area);
+        render_agent_pane(frame, pty_area, agent);
     }
 }
 
@@ -518,8 +790,7 @@ fn render_popup_style(
         .areas(area);
 
     if let Some(agent) = agents.get(focused) {
-        let widget = PseudoTerminal::new(agent.parser.screen());
-        frame.render_widget(widget, pty_area);
+        render_agent_pane(frame, pty_area, agent);
     }
 
     let labels: Vec<String> = agents

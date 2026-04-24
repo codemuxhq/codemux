@@ -2,6 +2,7 @@ use clap::Parser;
 use color_eyre::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod bootstrap_worker;
 mod config;
 mod keymap;
 mod runtime;

@@ -14,7 +14,7 @@ Commit style: `feat(p1): subject`. No AI trailers.
 - ✅ **Stage 2** — Filesystem layout, exclusivity, log redirection
 - ✅ **Stage 3** — `AgentTransport` enum + `LocalPty` (refactor only)
 - ✅ **Stage 4** — `SshDaemonPty` adapter + bootstrap
-- ⏳ **Stage 5** — Wire SSH transport into the spawn modal
+- ✅ **Stage 5** — Wire SSH transport into the spawn modal
 
 End-to-end ship test (after Stage 5) is in **Verification** below.
 
@@ -274,29 +274,94 @@ Replace the `tracing::warn!` placeholder in
 `apps/tui/src/runtime.rs:351-354` with a real
 `AgentTransport::spawn_ssh` call.
 
-### Scope
+### Deviations from plan (as shipped)
 
-- A "bootstrapping..." placeholder agent appears in the navigator while
-  the bootstrap runs. **Critical**: the bootstrap must NOT block the
-  event loop:
-  - Spawn the bootstrap on a worker thread
-  - Drain progress events through a crossbeam channel alongside PTY data
-    (re-use the `BootstrapStage` enum to render granular status if useful)
-  - On success, transition the placeholder agent into a real running
-    agent (transport swap + status flip)
-  - On failure, surface the actionable error message in the navigator
-    status line; keep the placeholder visible until the user dismisses
-    it
-- Cancellation: dropping the placeholder agent mid-bootstrap must
-  signal the worker thread to stop (channel close + `Child::kill` on
-  any in-flight ssh subprocess)
+- **The bootstrap entry point is `codemuxd_bootstrap::establish_ssh_transport`,
+  not `AgentTransport::spawn_ssh`.** The original plan named a method on
+  the transport enum, but Stage 4 (intentionally) did not add such a
+  method — the orchestration lives in the `codemuxd-bootstrap` adapter
+  crate per the Hexagonal split (see Stage 4 deviations). Stage 5 honors
+  that boundary: the runtime calls into `codemuxd-bootstrap`, which
+  composes its own bootstrap pipeline with `SshDaemonPty::attach` and
+  hands back an `AgentTransport`. This keeps the `session` core free of
+  ssh/scp orchestration.
+- **Cancellation is cooperative, not preemptive.** The plan called for
+  `Child::kill` on any in-flight ssh subprocess. As shipped,
+  cancellation goes through a `CancelableRunner` decorator wrapping
+  `CommandRunner`: each subprocess call checks an `Arc<AtomicBool>` and
+  short-circuits with `io::ErrorKind::Interrupted` when set. A
+  subprocess already running (e.g. `cargo build`) finishes on its own
+  before cancellation is observed. Pre-emptive kill would require
+  threading subprocess `Child` handles back through the
+  `CommandRunner` trait — deliberate scope cap because the typical
+  user-cancel ("wait, wrong host") happens before the long build step
+  anyway.
+- **No granular per-stage progress events.** The plan suggested
+  draining progress through a channel alongside PTY data and
+  rendering `BootstrapStage` updates. As shipped, the placeholder
+  pane shows a single static "bootstrapping codemuxd on {host}…"
+  message. The error path *is* stage-aware (the
+  `format_bootstrap_error` helper in `runtime.rs` keys off
+  `Stage::*`), so a failure surfaces an actionable hint. Granular
+  progress would require either threading a callback through
+  `bootstrap()` (changes its public surface) or re-implementing the
+  7-step orchestration in the worker (duplication). Either is a
+  worthwhile follow-up if the build step proves long enough that the
+  user wants live feedback.
+- **Failed bootstraps are sticky, not auto-dismissed.** The plan said
+  "keep the placeholder visible until the user dismisses it" — there
+  is no per-agent dismiss key in the codebase yet, so a failed
+  bootstrap stays in the navigator until the user exits the TUI
+  (`prefix + q`). The error text is rendered in red inside the agent
+  pane so it's immediately visible. A `prefix + x` close-current-agent
+  binding is a natural P2 follow-up.
+
+### Scope (as built)
+
+- New module `apps/tui/src/bootstrap_worker.rs`:
+  - `BootstrapHandle` — holds an `Arc<AtomicBool>` cancel flag, a
+    `crossbeam_channel::Receiver` for the result, and a detached
+    `JoinHandle` (Rust's `JoinHandle::drop` is detach, which is
+    exactly what we want — `BootstrapHandle::drop` must not block
+    the TUI).
+  - `start(host, agent_id, cwd, rows, cols)` — production entry
+    using `RealRunner`.
+  - `start_with_runner(...)` — test entry that injects a
+    `Box<dyn CommandRunner>`.
+  - Internal `CancelableRunner` decorator that intercepts subprocess
+    calls and returns `Interrupted` once the cancel flag is set.
+- `RuntimeAgent` (in `apps/tui/src/runtime.rs`) gains an `AgentState`
+  enum with two variants:
+  - `Bootstrapping { host, handle, error }` — placeholder while the
+    worker runs; `error` is `Some` once the worker reports failure.
+  - `Ready { parser, transport }` — steady state, identical to
+    Stage 3's shape modulo `Box<Parser>` (clippy `large_enum_variant`
+    flagged the disparity once `Bootstrapping` was added).
+- The event loop's drain phase polls `handle.try_recv()` for
+  `Bootstrapping` agents each tick; on `Ok(transport)` it transitions
+  to `Ready` (and immediately `transport.resize` to current geometry,
+  in case the terminal was resized during the bootstrap).
+- The spawn-modal SSH branch (formerly the `tracing::warn!`
+  placeholder) now calls `bootstrap_worker::start` and pushes a
+  `Bootstrapping` agent into the navigator.
+- Render: `render_agent_pane` switches on `AgentState`. Ready →
+  `tui-term` `PseudoTerminal`. Bootstrapping →
+  `render_bootstrap_placeholder` with stage-keyed error text.
+- Key writes (`KeyDispatch::Forward`) drop bytes destined for a
+  `Bootstrapping` agent (with a `tracing::trace!` breadcrumb).
 
 ### Tests
 
-- Worker-thread cancellation test — start a bootstrap with a slow ssh
-  mock, drop the placeholder, assert no leaked subprocesses
+- `bootstrap_worker::tests::cancel_short_circuits_at_next_subprocess_call`
+  — uses a `BlockingRunner` (records calls, blocks the first call on
+  a one-shot channel); test arms cancellation, releases the in-flight
+  call, polls the worker for completion, and asserts that the inner
+  runner saw exactly one call (the second stage was intercepted by
+  `CancelableRunner` before reaching it).
+- `bootstrap_worker::tests::cancel_is_idempotent` — explicit
+  double-cancel + Drop-cancel does not panic.
 - Manual end-to-end smoke per the script in **Verification** below
-  (no automated SSH integration test — that requires real network)
+  (no automated SSH integration test — that requires real network).
 
 ### Exit criteria
 
