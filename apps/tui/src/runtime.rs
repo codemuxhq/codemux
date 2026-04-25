@@ -22,10 +22,11 @@
 use std::error::Error as StdError;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use codemux_session::AgentTransport;
+use codemuxd_bootstrap::Stage;
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::{
@@ -39,14 +40,14 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
 
-use crate::bootstrap_worker::BootstrapHandle;
+use crate::bootstrap_worker::{BootstrapEvent, BootstrapHandle};
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
 use crate::spawn::{ModalOutcome, SpawnMinibuffer};
@@ -179,6 +180,20 @@ enum AgentState {
         /// readable even if `label` ends up encoding more than the
         /// host (e.g. `host:agent-3`).
         host: String,
+        /// Most-recent [`Stage`] reported by the worker through the
+        /// [`BootstrapEvent::Stage`] stream. `None` until the very
+        /// first event arrives (typically within a few ms — the
+        /// worker emits `VersionProbe` before its first subprocess
+        /// call). The placeholder renderer formats this as a
+        /// human-readable label appended to the spinner line so the
+        /// user can tell whether they're waiting on a 30-60s
+        /// `RemoteBuild` or a sub-second `SocketConnect`.
+        current_stage: Option<Stage>,
+        /// When the bootstrap was started, used to compute the
+        /// spinner phase. Per-agent rather than process-wide so
+        /// concurrent bootstraps each have their own spinner cycle
+        /// (and so a UI restart logically resets the animation).
+        started_at: Instant,
         handle: BootstrapHandle,
     },
     /// Bootstrap returned an error. The dead handle has already been
@@ -227,7 +242,12 @@ impl RuntimeAgent {
             label,
             rows,
             cols,
-            state: AgentState::Bootstrapping { host, handle },
+            state: AgentState::Bootstrapping {
+                host,
+                current_stage: None,
+                started_at: Instant::now(),
+                handle,
+            },
         }
     }
 }
@@ -347,17 +367,39 @@ fn event_loop(
                     }
                     AgentTransition::Stay
                 }
-                AgentState::Bootstrapping { host, handle } => match handle.try_recv() {
-                    Some(Ok(transport)) => AgentTransition::PromoteToReady(transport),
-                    Some(Err(e)) => {
-                        tracing::error!(label = %agent.label, "bootstrap failed: {e}");
-                        AgentTransition::PromoteToFailed {
-                            host: host.clone(),
-                            error: e,
+                AgentState::Bootstrapping {
+                    host,
+                    current_stage,
+                    started_at: _,
+                    handle,
+                } => {
+                    // Drain in a tight loop: the worker can emit
+                    // several `Stage` events per frame on the fast
+                    // path (~225ms total). Reading one at a time
+                    // would render an indicator that's perpetually
+                    // one stage behind.
+                    let mut transition = AgentTransition::Stay;
+                    while let Some(event) = handle.try_recv() {
+                        match event {
+                            BootstrapEvent::Stage(stage) => {
+                                *current_stage = Some(stage);
+                            }
+                            BootstrapEvent::Done(Ok(transport)) => {
+                                transition = AgentTransition::PromoteToReady(transport);
+                                break;
+                            }
+                            BootstrapEvent::Done(Err(e)) => {
+                                tracing::error!(label = %agent.label, "bootstrap failed: {e}");
+                                transition = AgentTransition::PromoteToFailed {
+                                    host: host.clone(),
+                                    error: e,
+                                };
+                                break;
+                            }
                         }
                     }
-                    None => AgentTransition::Stay,
-                },
+                    transition
+                }
                 AgentState::Failed { .. } => AgentTransition::Stay,
             };
             match transition {
@@ -467,19 +509,17 @@ fn event_loop(
                                 // loop's drain phase polls the worker
                                 // each tick and flips the placeholder to
                                 // Ready when the transport arrives.
-                                //
-                                // Empty path → None tells the bootstrap
-                                // to omit `--cwd` and let the daemon
-                                // inherit the SSH login shell's cwd
-                                // ($HOME on a typical login). A literal
+                                let label = format!("{host}:agent-{spawn_counter}");
+                                let agent_id = format!("agent-{spawn_counter}");
+                                // Empty path → None: omit `--cwd` on the
+                                // remote daemon and let it inherit the
+                                // remote shell's login cwd ($HOME). A
                                 // local path here would otherwise be
                                 // sent verbatim to the remote, fail
                                 // `cwd.exists()`, and exit the daemon
                                 // before it ever bound the socket — the
                                 // user-visible "EOF before HelloAck"
                                 // failure mode.
-                                let label = format!("{host}:agent-{spawn_counter}");
-                                let agent_id = format!("agent-{spawn_counter}");
                                 let cwd_path = if path.is_empty() {
                                     None
                                 } else {
@@ -684,7 +724,9 @@ fn render_frame(
     let area = frame.area();
     match nav_style {
         NavStyle::LeftPane => render_left_pane(frame, area, agents, focused),
-        NavStyle::Popup => render_popup_style(frame, area, agents, focused, popup, status_hint),
+        NavStyle::Popup => {
+            render_popup_style(frame, area, agents, focused, popup, status_hint);
+        }
     }
     if let Some(ui) = spawn_ui {
         ui.render(frame, area, &bindings.on_modal);
@@ -696,61 +738,152 @@ fn render_frame(
 
 /// Render an agent's main pane based on its current [`AgentState`]. A
 /// `Ready` agent shows the live PTY through `tui-term`'s
-/// [`PseudoTerminal`]; a `Bootstrapping` agent shows a static "in
-/// flight" placeholder; a `Failed` agent shows the same placeholder
-/// shape with the bootstrap error rendered in red.
+/// [`PseudoTerminal`]; a `Bootstrapping` agent shows a centered
+/// spinner + status line; a `Failed` agent shows the bootstrap error
+/// in red, also centered. Neither placeholder draws a border so the
+/// pane reads as "this slot is being prepared" rather than "here is a
+/// dead UI element."
 fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
     match &agent.state {
         AgentState::Ready { parser, .. } => {
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
         }
-        AgentState::Bootstrapping { host, .. } => {
-            render_bootstrap_placeholder(frame, area, host, None);
+        AgentState::Bootstrapping {
+            host,
+            current_stage,
+            started_at,
+            ..
+        } => {
+            render_bootstrap_placeholder(frame, area, host, *current_stage, *started_at, None);
         }
         AgentState::Failed { host, error } => {
             let formatted = format_bootstrap_error(error);
-            render_bootstrap_placeholder(frame, area, host, Some(&formatted));
+            render_bootstrap_placeholder(frame, area, host, None, Instant::now(), Some(&formatted));
         }
     }
 }
 
-/// Static placeholder shown in the agent pane while a SSH bootstrap
+/// Centered placeholder shown in the agent pane while a SSH bootstrap
 /// is in flight, or to surface the bootstrap error after a failure.
+///
+/// Renders **without a border or title** — the user explicitly
+/// rejected both during the Stage 5 UX pass: a bordered placeholder
+/// reads as "this is a real UI element" when in fact the pane is
+/// transient. The spinner (animated braille) + single status line
+/// communicate "we're working" without taking visual ownership of
+/// the slot.
+///
+/// The stage label appended in parens is the most recent
+/// [`Stage`] reported by [`crate::bootstrap_worker::BootstrapEvent`];
+/// without it, every bootstrap looks like a 30-60s black box (the
+/// `RemoteBuild` step dominates wall time on first contact).
 fn render_bootstrap_placeholder(
     frame: &mut Frame<'_>,
     area: Rect,
     host: &str,
+    stage: Option<Stage>,
+    started_at: Instant,
     error: Option<&str>,
 ) {
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::raw(""),
-        Line::raw(format!("  bootstrapping codemuxd on {host}…")),
-        Line::raw(""),
-    ];
+    // Build the status lines first so we can size the vertical
+    // centering layout to exactly the content height.
+    let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(err) = error {
         lines.push(Line::styled(
-            "  bootstrap failed:".to_string(),
+            format!("✗ bootstrap of {host} failed"),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
+        lines.push(Line::raw(""));
         for line in err.lines() {
             lines.push(Line::styled(
-                format!("    {line}"),
+                line.to_string(),
                 Style::default().fg(Color::Red),
             ));
         }
     } else {
-        lines.push(Line::raw(
-            "  (this can take 30–60s on first contact while codemuxd builds)",
-        ));
+        let spinner = spinner_frame(started_at);
+        let head = match stage {
+            Some(s) => format!(
+                "{spinner} bootstrapping codemuxd on {host}…  ({})",
+                stage_label(s)
+            ),
+            None => format!("{spinner} bootstrapping codemuxd on {host}…"),
+        };
+        lines.push(Line::raw(head));
+        if matches!(stage, Some(Stage::RemoteBuild)) {
+            // The build is the only stage that takes long enough on
+            // a fresh host to make the user wonder if the TUI hung.
+            // The other 6 stages each finish in under a second.
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(
+                "  this can take 30-60s on first contact while codemuxd builds",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
-    let title = if error.is_some() {
-        " remote agent (failed) "
-    } else {
-        " remote agent (bootstrapping) "
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+
+    // Vertical centering: top filler, content, bottom filler. The
+    // content gets exactly its line count so it sits on a single
+    // row in the visual middle.
+    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(content_height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    // Wipe the entire pane area first. The vertical centering layout
+    // only paints `chunks[1]`; the top/bottom `Min(0)` regions are
+    // never written. Without an explicit clear, whatever the previous
+    // frame's renderer left in those cells (e.g. PTY content from a
+    // local agent the user just switched away from) bleeds through
+    // and reads as garbled characters around the centered text.
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        chunks[1],
+    );
+}
+
+/// Map a bootstrap [`Stage`] to a short, user-readable label rendered
+/// next to the spinner. Kept terse so the whole status line fits on
+/// the typical 80-100 col terminal even when the host name is long.
+/// Updated alongside the `Stage` enum — if a new stage lands without
+/// a label here, the label silently becomes "running" (the catch-all
+/// `_` arm keeps the renderer from panicking on a future enum
+/// variant).
+fn stage_label(stage: Stage) -> &'static str {
+    match stage {
+        Stage::VersionProbe => "probing host",
+        Stage::TarballStage => "preparing source",
+        Stage::Scp => "uploading source",
+        Stage::RemoteBuild => "building remote daemon",
+        Stage::DaemonSpawn => "spawning daemon",
+        Stage::SocketTunnel => "opening tunnel",
+        Stage::SocketConnect => "connecting",
+        // `Stage` is `#[non_exhaustive]` upstream — give a sensible
+        // default rather than failing to compile here when a future
+        // stage is added.
+        _ => "running",
+    }
+}
+
+/// Single-character braille spinner frame keyed off the elapsed time
+/// since `started_at`. Rotates every [`SPINNER_PERIOD_MS`]; the
+/// runtime polls render at 20 Hz (`FRAME_POLL` = 50 ms) which means
+/// every other frame steps the spinner. The start instant is owned by
+/// the caller (typically `AgentState::Bootstrapping::started_at`) so
+/// concurrent bootstraps each animate independently.
+fn spinner_frame(started_at: Instant) -> char {
+    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    const SPINNER_PERIOD_MS: u128 = 80;
+    let frames_len = u128::try_from(FRAMES.len()).unwrap_or(1);
+    let idx = usize::try_from(started_at.elapsed().as_millis() / SPINNER_PERIOD_MS % frames_len)
+        .unwrap_or(0);
+    FRAMES[idx]
 }
 
 /// Render the bootstrap error envelope for the placeholder pane. The

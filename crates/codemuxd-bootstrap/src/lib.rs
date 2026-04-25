@@ -233,11 +233,22 @@ impl Drop for TunnelGuard {
 /// binds. Production callers pass [`default_local_socket_dir`]; tests
 /// pass a tempdir to avoid mutating `$HOME`.
 ///
+/// `on_stage` is invoked at the start of each of the 7 bootstrap
+/// stages (the same [`Stage`] values that get embedded in
+/// [`Error::Bootstrap`] on failure). The TUI uses this to drive a
+/// per-frame status indicator without polling the daemon over the
+/// wire — the hot path on a fast host runs through all 7 stages in a
+/// few hundred ms, so the callback is called from the same thread
+/// that called `bootstrap` and is allowed to do non-trivial work
+/// (e.g. send on a crossbeam channel) but should not block. Pass
+/// `|_| {}` if you don't care.
+///
 /// # Errors
 /// Any failure surfaces as [`Error::Bootstrap`] with the [`Stage`]
 /// that tripped. The TUI uses `stage` to render an actionable message.
 pub fn bootstrap(
     runner: &dyn CommandRunner,
+    on_stage: impl Fn(Stage),
     host: &str,
     agent_id: &str,
     cwd: Option<&Path>,
@@ -246,19 +257,26 @@ pub fn bootstrap(
     validate_agent_id(agent_id)?;
 
     let target_version = bootstrap_version();
+    on_stage(Stage::VersionProbe);
     let probe = probe_remote(runner, host)?;
     if probe.installed_version.as_deref() != Some(target_version) {
+        on_stage(Stage::TarballStage);
         let local_tarball = stage_tarball()?;
+        on_stage(Stage::Scp);
         scp_tarball(runner, host, &local_tarball, target_version)?;
+        on_stage(Stage::RemoteBuild);
         remote_build(runner, host, target_version)?;
     }
 
+    on_stage(Stage::DaemonSpawn);
     spawn_remote_daemon(runner, host, agent_id, cwd)?;
 
+    on_stage(Stage::SocketTunnel);
     let local_socket = local_socket_path(local_socket_dir, agent_id)?;
     let tunnel = open_ssh_tunnel(runner, host, agent_id, &local_socket, &probe.home)?;
     let tunnel_guard = TunnelGuard::new(tunnel);
 
+    on_stage(Stage::SocketConnect);
     let stream = connect_socket(&local_socket, CONNECT_TIMEOUT)?;
     Ok((stream, tunnel_guard.into_inner()))
 }
@@ -272,11 +290,22 @@ pub fn bootstrap(
 /// so callers don't have to know about the intermediate `(UnixStream,
 /// Child)` pair.
 ///
+/// `cwd` follows the same `Some`/`None` semantics as [`bootstrap`];
+/// `on_stage` is forwarded straight to [`bootstrap`].
+///
 /// # Errors
 /// Returns [`Error::Bootstrap`] for any of the 7 bootstrap stages, or
 /// [`Error::Session`] when the post-bootstrap wire handshake fails.
+//
+// 8 args is one over the clippy default of 7. Each one is a real
+// piece of input the bootstrap pipeline genuinely needs (runner +
+// progress callback + 4 SSH/agent inputs + PTY geometry); bundling
+// them into a config struct would obscure the call site without
+// removing any of them. Keep the signature flat.
+#[allow(clippy::too_many_arguments)]
 pub fn establish_ssh_transport(
     runner: &dyn CommandRunner,
+    on_stage: impl Fn(Stage),
     host: &str,
     agent_id: &str,
     cwd: Option<&Path>,
@@ -284,7 +313,7 @@ pub fn establish_ssh_transport(
     rows: u16,
     cols: u16,
 ) -> Result<AgentTransport, Error> {
-    let (stream, tunnel) = bootstrap(runner, host, agent_id, cwd, local_socket_dir)?;
+    let (stream, tunnel) = bootstrap(runner, on_stage, host, agent_id, cwd, local_socket_dir)?;
     let label = format!("{host}:{agent_id}");
     SshDaemonPty::attach(stream, label, agent_id, rows, cols, Some(tunnel))
         .map(AgentTransport::SshDaemon)
@@ -1413,6 +1442,7 @@ mod tests {
 
         let (stream, mut tunnel) = bootstrap(
             &runner,
+            |_| {},
             "fake-host",
             agent_id,
             Some(Path::new("/some/cwd")),

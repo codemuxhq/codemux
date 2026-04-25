@@ -25,10 +25,47 @@ use std::thread;
 
 use codemux_session::AgentTransport;
 use codemuxd_bootstrap::{
-    self, CommandOutput, CommandRunner, RealRunner, default_local_socket_dir,
+    self, CommandOutput, CommandRunner, RealRunner, Stage, default_local_socket_dir,
     establish_ssh_transport,
 };
-use crossbeam_channel::{Receiver, bounded};
+use crossbeam_channel::{Receiver, unbounded};
+
+/// Stream of events emitted by the worker thread, in the order the
+/// bootstrap pipeline produces them. The TUI's runtime drains all
+/// available events on each frame poll: every `Stage(_)` updates the
+/// placeholder pane's status indicator, and the terminating `Done(_)`
+/// triggers the `Bootstrapping → Ready/Failed` state transition.
+///
+/// Modeled as one channel rather than two (e.g. separate "progress"
+/// and "result" channels) so the runtime can't see a `Done` before
+/// the last `Stage` — the order is the channel's order. `Done` is
+/// always the final event; the channel goes empty after it.
+///
+/// `Debug` is implemented by hand because [`AgentTransport`] carries
+/// an open PTY/socket and deliberately doesn't implement `Debug`; the
+/// success arm prints opaquely (`Done(Ok(<transport>))`) so the wire
+/// protocol bytes never accidentally leak through `format!("{:?}")`.
+pub enum BootstrapEvent {
+    /// The named stage just started executing on the worker thread.
+    /// May arrive at any cadence (the slow path's `RemoteBuild` event
+    /// is followed by ~30s of silence; the fast path's events arrive
+    /// within a single frame).
+    Stage(Stage),
+    /// Bootstrap finished — `Ok` is ready to swap into the runtime as
+    /// a `Ready` agent, `Err` flips the placeholder to `Failed` with
+    /// the stage-tagged error rendered in red.
+    Done(Result<AgentTransport, codemuxd_bootstrap::Error>),
+}
+
+impl std::fmt::Debug for BootstrapEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stage(stage) => f.debug_tuple("Stage").field(stage).finish(),
+            Self::Done(Ok(_)) => f.write_str("Done(Ok(<transport>))"),
+            Self::Done(Err(e)) => f.debug_tuple("Done").field(&Err::<(), _>(e)).finish(),
+        }
+    }
+}
 
 /// Handle to an in-flight SSH bootstrap.
 ///
@@ -40,7 +77,7 @@ use crossbeam_channel::{Receiver, bounded};
 /// semantics) so the TUI never blocks on a slow bootstrap.
 pub struct BootstrapHandle {
     cancel: Arc<AtomicBool>,
-    rx: Receiver<Result<AgentTransport, codemuxd_bootstrap::Error>>,
+    rx: Receiver<BootstrapEvent>,
     /// Kept only to anchor the worker thread's lifetime in the type
     /// system. We never join — `JoinHandle::drop` detaches, which is
     /// the behavior we want (`Drop` must not block the TUI).
@@ -48,12 +85,12 @@ pub struct BootstrapHandle {
 }
 
 impl BootstrapHandle {
-    /// Non-blocking poll for the worker's result. `None` = still in
-    /// flight, `Some(Ok(t))` = ready to swap into the runtime,
-    /// `Some(Err(e))` = bootstrap failed (the runtime renders the
-    /// stage-tagged error in the placeholder pane).
+    /// Non-blocking poll for the worker's next event. `None` = no
+    /// event ready right now (still in flight), `Some(_)` = event
+    /// dequeued. The runtime drains in a tight loop until `None` so
+    /// queued progress events don't render stale.
     #[must_use]
-    pub fn try_recv(&self) -> Option<Result<AgentTransport, codemuxd_bootstrap::Error>> {
+    pub fn try_recv(&self) -> Option<BootstrapEvent> {
         self.rx.try_recv().ok()
     }
 
@@ -79,11 +116,11 @@ impl Drop for BootstrapHandle {
 /// to end. Returns immediately; poll the returned [`BootstrapHandle`]
 /// for the result.
 ///
-/// `cwd: None` tells the bootstrap to omit the daemon's `--cwd` flag
-/// so the remote process inherits the SSH login shell's cwd ($HOME on
-/// a typical login). Use this when the user didn't explicitly type a
-/// remote path; passing the local TUI's cwd verbatim would almost
-/// always fail `cwd.exists()` on the remote host.
+/// `cwd` is `None` when the user submitted an empty path field — the
+/// bootstrap omits the daemon's `--cwd` flag and the remote daemon
+/// inherits the SSH login shell's cwd ($HOME). `Some(path)` honors the
+/// user's literal input verbatim; the daemon validates with
+/// `cwd.exists()` on the remote side and refuses to bind if missing.
 pub fn start(
     host: String,
     agent_id: String,
@@ -107,7 +144,12 @@ pub fn start_with_runner(
     cols: u16,
 ) -> BootstrapHandle {
     let cancel = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = bounded(1);
+    // `unbounded` rather than `bounded(1)`: the bootstrap library
+    // emits 4-7 Stage events plus one Done, and a slow TUI render
+    // (e.g. user opened the help overlay) could let several events
+    // queue up. Per-bootstrap event count is small enough that
+    // unbounded never grows pathologically.
+    let (tx, rx) = unbounded();
     let cancel_for_thread = Arc::clone(&cancel);
     let join = thread::spawn(move || {
         let cancelable = CancelableRunner {
@@ -117,12 +159,20 @@ pub fn start_with_runner(
         let socket_dir = match default_local_socket_dir() {
             Ok(d) => d,
             Err(e) => {
-                let _ = tx.send(Err(e));
+                // Receiver may already be dropped; we don't care.
+                let _ = tx.send(BootstrapEvent::Done(Err(e)));
                 return;
             }
         };
+        let tx_for_stage = tx.clone();
+        let on_stage = move |stage: Stage| {
+            // Sender side of `unbounded` never blocks, so this stays
+            // non-blocking even if the TUI is slow to drain.
+            let _ = tx_for_stage.send(BootstrapEvent::Stage(stage));
+        };
         let result = establish_ssh_transport(
             &cancelable,
+            on_stage,
             &host,
             &agent_id,
             cwd.as_deref(),
@@ -130,7 +180,7 @@ pub fn start_with_runner(
             rows,
             cols,
         );
-        let _ = tx.send(result);
+        let _ = tx.send(BootstrapEvent::Done(result));
     });
     BootstrapHandle {
         cancel,
@@ -180,6 +230,31 @@ mod tests {
     use codemuxd_bootstrap::CommandOutput;
 
     use super::*;
+
+    /// `BootstrapEvent`'s manual `Debug` impl prints `Stage(...)` via
+    /// the inner `Stage`'s derived `Debug` and `Done(Ok(<transport>))`
+    /// opaquely (because [`AgentTransport`] doesn't implement `Debug`
+    /// and we don't want a logged event to leak wire-protocol bytes).
+    /// `Done(Err(_))` falls back to the bootstrap error's `Debug`.
+    #[test]
+    fn debug_impl_redacts_transport_in_done_ok_arm() {
+        let stage_event = BootstrapEvent::Stage(Stage::VersionProbe);
+        assert_eq!(format!("{stage_event:?}"), "Stage(VersionProbe)");
+
+        let err_event = BootstrapEvent::Done(Err(codemuxd_bootstrap::Error::Bootstrap {
+            stage: Stage::SocketConnect,
+            source: "boom".into(),
+        }));
+        let formatted = format!("{err_event:?}");
+        assert!(
+            formatted.starts_with("Done("),
+            "expected Done(Err(...)) shape, got {formatted}",
+        );
+        assert!(
+            formatted.contains("SocketConnect"),
+            "stage info should bubble through, got {formatted}",
+        );
+    }
 
     /// Test runner that:
     ///   1. records every `(program, args)` call,
@@ -306,20 +381,26 @@ mod tests {
         handle.cancel();
         let _ = release_tx.send(());
 
-        // Step 3: poll for the worker's result. Cancellation surfaces
-        // as a Bootstrap error from a later stage (typically Scp,
-        // since stage 1 returned Ok with empty stdout → bootstrap
-        // proceeds to stage 2 which calls runner.run for `mkdir`).
+        // Step 3: poll for the worker's terminating Done event.
+        // Stage events fire first (the version probe stage event is
+        // emitted before the runner is even called), so we filter
+        // those out and wait for the Done. Cancellation surfaces as a
+        // Bootstrap error from a later stage (typically Scp, since
+        // stage 1 returned Ok with empty stdout → bootstrap proceeds
+        // to stage 2 which calls runner.run for `mkdir`).
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = loop {
-            if let Some(r) = handle.try_recv() {
-                break r;
+            match handle.try_recv() {
+                Some(BootstrapEvent::Done(r)) => break r,
+                Some(BootstrapEvent::Stage(_)) => {} // skip progress events
+                None => {
+                    assert!(
+                        Instant::now() <= deadline,
+                        "worker did not finish within 5s of cancel"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
-            assert!(
-                Instant::now() <= deadline,
-                "worker did not finish within 5s of cancel"
-            );
-            thread::sleep(Duration::from_millis(20));
         };
         assert!(
             result.is_err(),
