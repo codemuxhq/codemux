@@ -5,8 +5,9 @@
 //! `cargo build --release` step over the wire dominates). Running it
 //! inline would freeze every other agent's rendering for the whole
 //! window. This module spawns a worker thread that drives
-//! [`codemuxd_bootstrap::establish_ssh_transport`] to completion and
-//! makes the result available to the runtime through a non-blocking
+//! [`codemuxd_bootstrap::prepare_remote`] +
+//! [`codemuxd_bootstrap::attach_agent`] to completion and makes the
+//! result available to the runtime through a non-blocking
 //! [`crossbeam_channel`].
 //!
 //! Cancellation is best-effort: a [`CancelableRunner`] decorator
@@ -25,8 +26,8 @@ use std::thread;
 
 use codemux_session::AgentTransport;
 use codemuxd_bootstrap::{
-    self, CommandOutput, CommandRunner, RealRunner, Stage, default_local_socket_dir,
-    establish_ssh_transport,
+    self, CommandOutput, CommandRunner, RealRunner, Stage, attach_agent, default_local_socket_dir,
+    prepare_remote,
 };
 use crossbeam_channel::{Receiver, unbounded};
 
@@ -170,16 +171,19 @@ pub fn start_with_runner(
             // non-blocking even if the TUI is slow to drain.
             let _ = tx_for_stage.send(BootstrapEvent::Stage(stage));
         };
-        let result = establish_ssh_transport(
-            &cancelable,
-            on_stage,
-            &host,
-            &agent_id,
-            cwd.as_deref(),
-            &socket_dir,
-            rows,
-            cols,
-        );
+        let result = prepare_remote(&cancelable, &on_stage, &host).and_then(|prepared| {
+            attach_agent(
+                &cancelable,
+                &on_stage,
+                &prepared,
+                &host,
+                &agent_id,
+                cwd.as_deref(),
+                &socket_dir,
+                rows,
+                cols,
+            )
+        });
         let _ = tx.send(BootstrapEvent::Done(result));
     });
     BootstrapHandle {

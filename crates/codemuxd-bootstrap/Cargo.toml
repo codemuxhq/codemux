@@ -13,9 +13,9 @@ repository.workspace = true
 build = "build.rs"
 
 [dependencies]
-# `establish_ssh_transport` constructs `AgentTransport::SshDaemon(...)`
-# directly — the session crate is the application core; this crate is
-# the SSH adapter that drives it.
+# `attach_agent` constructs `AgentTransport::SshDaemon(...)` directly —
+# the session crate is the application core; this crate is the SSH
+# adapter that drives it.
 codemux-session.workspace = true
 
 thiserror.workspace = true

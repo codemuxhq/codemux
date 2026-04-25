@@ -57,6 +57,37 @@ pub enum Stage {
     SocketConnect,
 }
 
+impl Stage {
+    /// Short, user-readable label rendered next to the spinner in the
+    /// spawn modal's locked path zone. Kept terse so the whole status
+    /// line fits on the typical 80-100 col terminal even when the host
+    /// name is long.
+    ///
+    /// Stays in this crate (next to the `Stage` enum it labels) so
+    /// adding a new variant forces a label update in the same change
+    /// — the variant + its label are a single concern. Marked `const`
+    /// so callers can drop it into `&'static str` slots without runtime
+    /// overhead.
+    ///
+    /// `Stage` is `#[non_exhaustive]` for downstream callers, but the
+    /// match here is in the defining crate so the compiler enforces
+    /// exhaustiveness — adding a variant is a build error until the
+    /// label is wired up. That's the right pressure: a missing label
+    /// would otherwise render as a confusing empty-parens in the modal.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::VersionProbe => "probing host",
+            Self::TarballStage => "preparing source",
+            Self::Scp => "uploading source",
+            Self::RemoteBuild => "building remote daemon",
+            Self::DaemonSpawn => "spawning daemon",
+            Self::SocketTunnel => "opening tunnel",
+            Self::SocketConnect => "connecting",
+        }
+    }
+}
+
 /// Errors raised by the bootstrap orchestration.
 ///
 /// Per AD-17, marked `#[non_exhaustive]` so variants can be added
@@ -77,8 +108,8 @@ pub enum Error {
     },
 
     /// Wrapper around session-level errors raised from
-    /// [`establish_ssh_transport`](crate::establish_ssh_transport)
-    /// after the bootstrap completes (the handshake inside
+    /// [`attach_agent`](crate::attach_agent) after the daemon is
+    /// spawned and the tunnel is open (the handshake inside
     /// `SshDaemonPty::attach`).
     #[error("session error after bootstrap")]
     Session {

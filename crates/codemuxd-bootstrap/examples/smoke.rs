@@ -17,7 +17,7 @@
 
 use std::time::{Duration, Instant};
 
-use codemuxd_bootstrap::{RealRunner, default_local_socket_dir, establish_ssh_transport};
+use codemuxd_bootstrap::{RealRunner, attach_agent, default_local_socket_dir, prepare_remote};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = std::env::args().nth(1).ok_or(
@@ -28,9 +28,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("→ bootstrap: host={host}");
     let started = Instant::now();
     let socket_dir = default_local_socket_dir()?;
-    let mut transport = establish_ssh_transport(
+    let prepared = prepare_remote(
         &RealRunner,
         |stage| eprintln!("  · stage: {stage:?}"),
+        &host,
+    )?;
+    eprintln!(
+        "✓ prepared (remote $HOME = {})",
+        prepared.remote_home.display()
+    );
+    let mut transport = attach_agent(
+        &RealRunner,
+        |stage| eprintln!("  · stage: {stage:?}"),
+        &prepared,
         &host,
         "smoke-agent",
         None, // inherit remote $HOME

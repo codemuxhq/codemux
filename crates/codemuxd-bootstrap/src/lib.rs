@@ -8,11 +8,15 @@
 //! [`AgentTransport::SshDaemon`] into existence.
 //!
 //! Public surface:
-//! - [`bootstrap`] — runs the 7-step pipeline and returns a connected
-//!   [`UnixStream`] + the tunnel subprocess `Child`.
-//! - [`establish_ssh_transport`] — convenience that bootstraps then
-//!   performs the wire handshake via `SshDaemonPty::attach`, returning
-//!   a ready-to-use [`AgentTransport`].
+//! - [`prepare_remote`] — runs steps 1-4 (probe + install if the
+//!   remote's `agent.version` mismatches our embedded tarball) and
+//!   returns a [`PreparedHost`] with the remote `$HOME`. Idempotent
+//!   on already-installed hosts: probe matches → returns immediately.
+//! - [`attach_agent`] — runs steps 5-7 (daemon spawn + tunnel +
+//!   connect) followed by the wire handshake via `SshDaemonPty::attach`,
+//!   returning a ready-to-use [`AgentTransport`]. Takes a fresh `cwd`
+//!   so the spawn modal can let the user pick a remote folder *between*
+//!   the two phases without holding the prepare result hostage.
 //! - [`CommandRunner`] / [`RealRunner`] — pluggable shim around
 //!   `std::process::Command` so failure modes are unit-testable
 //!   without touching the network.
@@ -20,14 +24,17 @@
 //!
 //! # The 7 steps
 //!
+//! Phase 1 — [`prepare_remote`]:
 //! 1. **Probe**: `ssh host 'cat ~/.cache/codemuxd/agent.version'`. If
 //!    the file matches our [`bootstrap_version`], skip steps 2-4.
 //! 2. **Stage tarball**: write the embedded daemon source archive to
-//!    a local tempfile. Cached process-wide so a second `bootstrap()`
+//!    a local tempfile. Cached process-wide so a second `prepare_remote()`
 //!    in the same TUI session reuses it.
 //! 3. **scp**: copy the tarball to the remote.
 //! 4. **Remote build**: untar, `cargo build --release --bin codemuxd`,
 //!    move the binary into place, write `agent.version`.
+//!
+//! Phase 2 — [`attach_agent`]:
 //! 5. **Spawn daemon**: `ssh host 'setsid -f codemuxd ...'`. The
 //!    `setsid -f` invocation detaches the daemon from the SSH session
 //!    so it survives when the SSH connection closes.
@@ -37,7 +44,8 @@
 //!    kill it on Drop.
 //! 7. **Connect**: `UnixStream::connect` against the local end of the
 //!    tunnel, with a short retry loop while the daemon's `bind()` and
-//!    the tunnel's first-packet warmup converge.
+//!    the tunnel's first-packet warmup converge. Followed by the wire
+//!    `Hello`/`HelloAck` handshake to produce the [`AgentTransport`].
 //!
 //! # Mockable command execution
 //!
@@ -215,47 +223,48 @@ impl Drop for TunnelGuard {
     }
 }
 
-/// Run the full 7-step SSH bootstrap. Returns the connected unix
-/// stream the wire-protocol handshake should run over, plus the
-/// tunnel subprocess (caller owns cleanup via `Child::kill`).
+/// Result of [`prepare_remote`] — everything the spawn modal and
+/// [`attach_agent`] need from the install/probe phase.
 ///
-/// `cwd` is interpreted on the **remote** host — when `Some`, the
-/// daemon is launched with `--cwd` and `chdir`'s into it before
-/// spawning `claude`; the daemon refuses to bind if the path doesn't
-/// exist on the remote (vision principle 6, no silent fallback). When
-/// `None`, the `--cwd` flag is omitted and the daemon inherits the
-/// SSH login shell's cwd ($HOME on a typical login). `None` is the
-/// right choice when the user didn't explicitly type a remote path —
-/// passing the local TUI's cwd verbatim would almost always fail
-/// `cwd.exists()` on the remote.
+/// Deliberately minimal: the `ControlMaster` connection that powers
+/// fast remote-directory autocomplete lives in [`RemoteFs`], owned
+/// separately by the runtime. Coupling them here would force
+/// `attach_agent` to carry a dead `ControlMaster` after the modal
+/// closed (it's only used for `ls`, not for the wire transport).
+#[derive(Debug, Clone)]
+pub struct PreparedHost {
+    /// Absolute path of the remote `$HOME`, captured by the probe step.
+    /// Load-bearing for the spawn modal's remote-path picker (the base
+    /// directory the wildmenu starts in) and for [`attach_agent`]'s
+    /// `ssh -L` forward spec (sshd's remote half does not shell-expand
+    /// `~`/`$HOME` — see notes on [`open_ssh_tunnel`]).
+    pub remote_home: PathBuf,
+}
+
+/// Phase 1 of the SSH bootstrap: probe the remote and (re)install
+/// `codemuxd` if its installed version doesn't match the embedded
+/// tarball. Idempotent on already-installed hosts — probe matches →
+/// returns immediately.
 ///
-/// `local_socket_dir` is where the local end of the `ssh -L` tunnel
-/// binds. Production callers pass [`default_local_socket_dir`]; tests
-/// pass a tempdir to avoid mutating `$HOME`.
+/// Split out so the spawn modal can pause between install and daemon
+/// spawn to let the user pick a remote folder. The remote `$HOME`
+/// captured here flows into both the modal (for autocomplete) and
+/// [`attach_agent`] (for the tunnel forward spec).
 ///
-/// `on_stage` is invoked at the start of each of the 7 bootstrap
-/// stages (the same [`Stage`] values that get embedded in
-/// [`Error::Bootstrap`] on failure). The TUI uses this to drive a
-/// per-frame status indicator without polling the daemon over the
-/// wire — the hot path on a fast host runs through all 7 stages in a
-/// few hundred ms, so the callback is called from the same thread
-/// that called `bootstrap` and is allowed to do non-trivial work
-/// (e.g. send on a crossbeam channel) but should not block. Pass
-/// `|_| {}` if you don't care.
+/// `on_stage` is invoked at the start of each install stage
+/// ([`Stage::VersionProbe`] always; [`Stage::TarballStage`] /
+/// [`Stage::Scp`] / [`Stage::RemoteBuild`] only if the probe shows a
+/// version mismatch). Same threading rules as [`attach_agent`]'s
+/// callback — non-blocking work is fine.
 ///
 /// # Errors
-/// Any failure surfaces as [`Error::Bootstrap`] with the [`Stage`]
-/// that tripped. The TUI uses `stage` to render an actionable message.
-pub fn bootstrap(
+/// Any failure surfaces as [`Error::Bootstrap`] with the [`Stage`] that
+/// tripped.
+pub fn prepare_remote(
     runner: &dyn CommandRunner,
     on_stage: impl Fn(Stage),
     host: &str,
-    agent_id: &str,
-    cwd: Option<&Path>,
-    local_socket_dir: &Path,
-) -> Result<(UnixStream, Child), Error> {
-    validate_agent_id(agent_id)?;
-
+) -> Result<PreparedHost, Error> {
     let target_version = bootstrap_version();
     on_stage(Stage::VersionProbe);
     let probe = probe_remote(runner, host)?;
@@ -267,45 +276,49 @@ pub fn bootstrap(
         on_stage(Stage::RemoteBuild);
         remote_build(runner, host, target_version)?;
     }
-
-    on_stage(Stage::DaemonSpawn);
-    spawn_remote_daemon(runner, host, agent_id, cwd)?;
-
-    on_stage(Stage::SocketTunnel);
-    let local_socket = local_socket_path(local_socket_dir, agent_id)?;
-    let tunnel = open_ssh_tunnel(runner, host, agent_id, &local_socket, &probe.home)?;
-    let tunnel_guard = TunnelGuard::new(tunnel);
-
-    on_stage(Stage::SocketConnect);
-    let stream = connect_socket(&local_socket, CONNECT_TIMEOUT)?;
-    Ok((stream, tunnel_guard.into_inner()))
+    Ok(PreparedHost {
+        remote_home: probe.home,
+    })
 }
 
-/// Bootstrap the remote daemon, then perform the
-/// [`SshDaemonPty::attach`] handshake, returning a fully constructed
+/// Phase 2 of the SSH bootstrap: spawn the remote daemon at the
+/// chosen `cwd`, open the tunnel, connect, and perform the
+/// [`SshDaemonPty::attach`] wire handshake. Returns a fully constructed
 /// [`AgentTransport`] ready for the runtime.
 ///
-/// This is the convenience entry point Stage 5 (TUI spawn modal) uses;
-/// it composes [`bootstrap`] with the session crate's wire handshake
-/// so callers don't have to know about the intermediate `(UnixStream,
-/// Child)` pair.
+/// `prepared` carries the remote `$HOME` from [`prepare_remote`] —
+/// load-bearing for the tunnel forward spec (sshd does not shell-expand
+/// `~` or `$HOME` in `-L` paths). The two phases are deliberately
+/// separable so the spawn modal can let the user navigate the remote
+/// filesystem (via [`RemoteFs`]) between probe/install and daemon spawn.
 ///
-/// `cwd` follows the same `Some`/`None` semantics as [`bootstrap`];
-/// `on_stage` is forwarded straight to [`bootstrap`].
+/// `cwd` is interpreted on the **remote** host — when `Some`, the
+/// daemon is launched with `--cwd` and `chdir`'s into it before
+/// spawning `claude`; the daemon refuses to bind if the path doesn't
+/// exist on the remote (vision principle 6, no silent fallback). When
+/// `None`, the `--cwd` flag is omitted and the daemon inherits the
+/// SSH login shell's cwd ($HOME on a typical login).
+///
+/// `local_socket_dir` is where the local end of the `ssh -L` tunnel
+/// binds. Production callers pass [`default_local_socket_dir`]; tests
+/// pass a tempdir to avoid mutating `$HOME`.
+///
+/// `on_stage` is invoked at the start of stages 5-7. Same callback
+/// semantics as [`prepare_remote`].
 ///
 /// # Errors
-/// Returns [`Error::Bootstrap`] for any of the 7 bootstrap stages, or
-/// [`Error::Session`] when the post-bootstrap wire handshake fails.
+/// Returns [`Error::Bootstrap`] for any of stages 5-7, or
+/// [`Error::Session`] when the post-tunnel wire handshake fails.
 //
-// 8 args is one over the clippy default of 7. Each one is a real
-// piece of input the bootstrap pipeline genuinely needs (runner +
-// progress callback + 4 SSH/agent inputs + PTY geometry); bundling
-// them into a config struct would obscure the call site without
-// removing any of them. Keep the signature flat.
+// 9 args is over the clippy default of 7. Each is a real input — the
+// alternative is bundling rows/cols into a `Geometry` struct just to
+// satisfy the lint, which obscures the call site. Flat signature kept
+// deliberately.
 #[allow(clippy::too_many_arguments)]
-pub fn establish_ssh_transport(
+pub fn attach_agent(
     runner: &dyn CommandRunner,
     on_stage: impl Fn(Stage),
+    prepared: &PreparedHost,
     host: &str,
     agent_id: &str,
     cwd: Option<&Path>,
@@ -313,13 +326,54 @@ pub fn establish_ssh_transport(
     rows: u16,
     cols: u16,
 ) -> Result<AgentTransport, Error> {
-    let (stream, tunnel) = bootstrap(runner, on_stage, host, agent_id, cwd, local_socket_dir)?;
+    let (stream, tunnel) = attach_socket(
+        runner,
+        on_stage,
+        prepared,
+        host,
+        agent_id,
+        cwd,
+        local_socket_dir,
+    )?;
     let label = format!("{host}:{agent_id}");
     SshDaemonPty::attach(stream, label, agent_id, rows, cols, Some(tunnel))
         .map(AgentTransport::SshDaemon)
         .map_err(|source| Error::Session {
             source: Box::new(source),
         })
+}
+
+/// Stages 5-7 without the wire handshake: spawns the daemon, opens
+/// the tunnel, connects. Returns the connected [`UnixStream`] plus the
+/// tunnel `Child` (caller owns cleanup via `Child::kill`, typically by
+/// handing it to [`SshDaemonPty::attach`]).
+///
+/// Private helper so the unit tests can exercise the orchestration
+/// (probe → install → daemon → tunnel → connect) without needing to
+/// stand up a real handshake. The public [`attach_agent`] composes
+/// this with [`SshDaemonPty::attach`].
+fn attach_socket(
+    runner: &dyn CommandRunner,
+    on_stage: impl Fn(Stage),
+    prepared: &PreparedHost,
+    host: &str,
+    agent_id: &str,
+    cwd: Option<&Path>,
+    local_socket_dir: &Path,
+) -> Result<(UnixStream, Child), Error> {
+    validate_agent_id(agent_id)?;
+
+    on_stage(Stage::DaemonSpawn);
+    spawn_remote_daemon(runner, host, agent_id, cwd)?;
+
+    on_stage(Stage::SocketTunnel);
+    let local_socket = local_socket_path(local_socket_dir, agent_id)?;
+    let tunnel = open_ssh_tunnel(runner, host, agent_id, &local_socket, &prepared.remote_home)?;
+    let tunnel_guard = TunnelGuard::new(tunnel);
+
+    on_stage(Stage::SocketConnect);
+    let stream = connect_socket(&local_socket, CONNECT_TIMEOUT)?;
+    Ok((stream, tunnel_guard.into_inner()))
 }
 
 /// Default `local_socket_dir` for production callers:
@@ -441,8 +495,8 @@ fn probe_remote(runner: &dyn CommandRunner, host: &str) -> Result<RemoteProbe, E
 }
 
 /// Step 2: write the embedded tarball to a local tempfile and return
-/// its path. Cached per-process so a second `bootstrap()` in the same
-/// TUI session doesn't pay for the disk write twice.
+/// its path. Cached per-process so a second [`prepare_remote`] in the
+/// same TUI session doesn't pay for the disk write twice.
 fn stage_tarball() -> Result<PathBuf, Error> {
     static STAGED: OnceLock<PathBuf> = OnceLock::new();
     if let Some(path) = STAGED.get() {
@@ -1406,21 +1460,49 @@ mod tests {
         assert!(status.success());
     }
 
-    /// End-to-end orchestration: probe miss → stage → scp → build →
-    /// daemon spawn → tunnel → connect. Uses the `FakeRunner` for all
-    /// network-touching steps and a delayed-bind thread to simulate
-    /// `ssh -L` creating the local socket file. Confirms the
-    /// orchestration order and that the connect stream is returned
-    /// cleanly. Passes a tempdir as `local_socket_dir` instead of
-    /// mutating `$HOME` (the workspace forbids `unsafe`, and
-    /// `std::env::set_var` is unsafe in 2024 edition).
+    /// `prepare_remote` happy path on a fresh host: probe miss → stage
+    /// → scp → build, returning a `PreparedHost` with the remote
+    /// `$HOME` from the probe. No socket / tunnel work — that's
+    /// `attach_socket`'s job.
     #[test]
-    fn bootstrap_full_happy_path_against_fake_runner() {
+    fn prepare_remote_happy_path_on_fresh_host() {
+        let runner = FakeRunner::new();
+        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b"/home/fake\n"));
+        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b""));
+        runner.expect_run("scp", &["-B"], ok(b""));
+        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b"build ok"));
+
+        let prepared = prepare_remote(&runner, |_| {}, "fake-host").unwrap();
+        assert_eq!(prepared.remote_home, PathBuf::from("/home/fake"));
+    }
+
+    /// `prepare_remote` skip-rebuild path: probe matches the embedded
+    /// version → stage/scp/build are skipped entirely. Confirms the
+    /// idempotent re-call shape (a second prepare against the same
+    /// already-installed host returns immediately).
+    #[test]
+    fn prepare_remote_skips_install_when_version_matches() {
+        let runner = FakeRunner::new();
+        let probe_stdout = format!("/home/fake\n{}\n", bootstrap_version());
+        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(probe_stdout.as_bytes()));
+        // No further script entries — if the test calls scp/build the
+        // FakeRunner will panic with "unexpected" matches.
+
+        let prepared = prepare_remote(&runner, |_| {}, "fake-host").unwrap();
+        assert_eq!(prepared.remote_home, PathBuf::from("/home/fake"));
+    }
+
+    /// `attach_socket` happy path: daemon spawn → tunnel → connect,
+    /// returning the connected `UnixStream` + tunnel `Child`. Uses a
+    /// `PreparedHost` constructed in the test (skipping the prepare
+    /// phase) and a delayed-bind thread to simulate `ssh -L` creating
+    /// the local socket file. Passes a tempdir as `local_socket_dir`
+    /// instead of mutating `$HOME` (the workspace forbids `unsafe`,
+    /// and `std::env::set_var` is unsafe in 2024 edition).
+    #[test]
+    fn attach_socket_happy_path_against_fake_runner() {
         let dir = tempfile::tempdir().unwrap();
         let socket_dir = dir.path().join("sockets");
-        // We do NOT pre-bind the listener — `local_socket_path` would
-        // unlink it. Instead, spawn a thread that binds shortly after
-        // bootstrap starts, simulating `ssh -L` creating the socket.
         let agent_id = "happy-agent";
         let local_sock = socket_dir.join(format!("{agent_id}.sock"));
         let local_sock_for_thread = local_sock.clone();
@@ -1433,26 +1515,23 @@ mod tests {
         });
 
         let runner = FakeRunner::new();
-        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b"/home/fake\n"));
-        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b""));
-        runner.expect_run("scp", &["-B"], ok(b""));
-        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b"build ok"));
         runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b""));
         runner.expect_spawn("ssh", &["-N"]);
 
-        let (stream, mut tunnel) = bootstrap(
+        let prepared = PreparedHost {
+            remote_home: PathBuf::from("/home/fake"),
+        };
+        let (stream, mut tunnel) = attach_socket(
             &runner,
             |_| {},
+            &prepared,
             "fake-host",
             agent_id,
             Some(Path::new("/some/cwd")),
             &socket_dir,
         )
         .unwrap();
-        // Stream is connected to our test listener; smoke-check by
-        // confirming write doesn't error.
         let _ = (&stream).write_all(b"x");
-        // Cleanup the dummy ssh tunnel subprocess
         let _ = tunnel.kill();
         let _ = tunnel.wait();
     }
