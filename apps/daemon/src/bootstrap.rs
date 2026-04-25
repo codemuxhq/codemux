@@ -88,6 +88,17 @@ pub fn bring_up_with(
 
     let pid_file = pid_file.map(PidFile::acquire).transpose()?;
 
+    // Production sockets land under `~/.cache/codemuxd/sockets/`; on a
+    // fresh remote that directory only exists if some prior step
+    // created it. Without this, the next `UnixListener::bind` returns
+    // `ENOENT` and the daemon dies before the supervisor ever runs.
+    // The pid-file branch creates `pids/` via `PidFile::acquire`'s
+    // own `ensure_parent`; we mirror that here for `sockets/`.
+    fs_layout::ensure_parent(socket).map_err(|source| Error::Bind {
+        path: socket.display().to_string(),
+        source,
+    })?;
+
     reap_stale_socket(socket);
 
     let listener = UnixListener::bind(socket).map_err(|source| Error::Bind {
@@ -313,6 +324,34 @@ mod tests {
             matches!(err, Error::Bind { .. }),
             "expected Error::Bind, got {err:?}",
         );
+    }
+
+    /// Regression for the AD-3 bootstrap path: when the socket lives
+    /// under a directory that doesn't exist yet (the `~/.cache/codemuxd/
+    /// sockets/` case on a fresh remote), `bring_up` must create the
+    /// parent on demand instead of letting `UnixListener::bind` fail
+    /// with `ENOENT` and exit the daemon before the supervisor ever
+    /// runs. Pre-fix, `agent-2.log` ended up empty on the remote and
+    /// the local TUI saw a `SocketConnect` stage failure with no
+    /// useful breadcrumb.
+    #[test]
+    fn bring_up_creates_socket_parent_on_demand() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let nested = dir.path().join("sockets");
+        let socket = nested.join("agent.sock");
+        assert!(
+            !nested.exists(),
+            "test precondition: parent dir must not exist yet",
+        );
+
+        let _resources = bring_up_with(&socket, None, cat_config())?;
+
+        assert!(
+            nested.exists(),
+            "bring_up must create the socket parent directory",
+        );
+        assert!(socket.exists(), "bring_up must bind the socket");
+        Ok(())
     }
 
     /// `--cwd` pointing at a non-existent directory fails fast with
