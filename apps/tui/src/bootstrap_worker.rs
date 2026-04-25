@@ -20,7 +20,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::thread;
 
 use codemux_session::AgentTransport;
@@ -61,7 +61,7 @@ impl BootstrapHandle {
     /// Idempotent. The worker still completes any in-flight subprocess
     /// call before observing the flag.
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel.store(true, Relaxed);
     }
 }
 
@@ -138,7 +138,7 @@ struct CancelableRunner {
 
 impl CommandRunner for CancelableRunner {
     fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
-        if self.cancel.load(Ordering::SeqCst) {
+        if self.cancel.load(Relaxed) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "bootstrap cancelled",
@@ -148,7 +148,7 @@ impl CommandRunner for CancelableRunner {
     }
 
     fn spawn_detached(&self, program: &str, args: &[&str]) -> std::io::Result<std::process::Child> {
-        if self.cancel.load(Ordering::SeqCst) {
+        if self.cancel.load(Relaxed) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "bootstrap cancelled",
@@ -287,9 +287,10 @@ mod tests {
             .expect("worker should issue its first call within 2s");
 
         // Step 2: arm cancellation, *then* let the in-flight call
-        // return. Order matters: the SeqCst store must happen-before
-        // the channel send so the worker's next CancelableRunner.run
-        // sees the flag.
+        // return. The crossbeam channel's send/recv pair provides the
+        // happens-before edge: the worker, after receiving from the
+        // release channel, will observe every write that happened
+        // before the send — including the cancel-flag store.
         handle.cancel();
         let _ = release_tx.send(());
 
@@ -353,5 +354,103 @@ mod tests {
         // Drop also calls cancel; that's the third invocation. Must
         // not panic.
         drop(handle);
+    }
+
+    /// Production [`start`] is just a `RealRunner` shim. We can't
+    /// drive it to a real bootstrap without an SSH host, but we can
+    /// confirm it returns a usable handle and tear it down without
+    /// hanging or leaking. The handle's worker thread will fail
+    /// immediately (no `host` is reachable in the unit-test
+    /// environment) and exit on its own.
+    #[test]
+    fn start_returns_a_handle_that_drops_cleanly() {
+        // A nonsense host — `RealRunner` will try to ssh to it,
+        // BatchMode + ConnectTimeout=5 means the ssh call returns
+        // within ~5s with status 255. Worker maps that to
+        // `Stage::VersionProbe` Ok(None) → bootstrap proceeds → hits
+        // network failures on subsequent stages → eventually returns
+        // an Error. We don't wait for any of that; we cancel and
+        // drop, exercising the cooperative-cancel path.
+        let handle = start(
+            "192.0.2.1".into(), // RFC 5737 TEST-NET-1, never reachable
+            "agent-1".into(),
+            PathBuf::from("/tmp/x"),
+            24,
+            80,
+        );
+        handle.cancel();
+        drop(handle);
+        // No assertion: the worker thread is detached. The test
+        // passes if no panic occurs in `start` or `Drop`.
+    }
+
+    /// Tiny inner runner shared by the `CancelableRunner`
+    /// branch-coverage tests. Records whether `spawn_detached` was
+    /// reached and returns an `io::Error` so the test can distinguish
+    /// "intercepted by decorator" (Interrupted) from "delegated"
+    /// (the inner-error message).
+    struct Inner {
+        called: Arc<AtomicBool>,
+    }
+
+    impl CommandRunner for Inner {
+        fn run(&self, _: &str, _: &[&str]) -> std::io::Result<CommandOutput> {
+            unreachable!("not used in CancelableRunner branch-coverage tests")
+        }
+
+        fn spawn_detached(&self, _: &str, _: &[&str]) -> std::io::Result<std::process::Child> {
+            self.called.store(true, Relaxed);
+            Err(std::io::Error::other("inner reached"))
+        }
+    }
+
+    /// `CancelableRunner::spawn_detached` checks the cancel flag and
+    /// short-circuits with `Interrupted` when set, mirroring the
+    /// `run` arm. The `cancel_short_circuits_at_next_subprocess_call`
+    /// test only exercises the `run` arm; this one targets
+    /// `spawn_detached` so both arms of the decorator are covered.
+    #[test]
+    fn cancelable_runner_spawn_detached_short_circuits_when_flag_set() {
+        let inner_called = Arc::new(AtomicBool::new(false));
+        let cancelable = CancelableRunner {
+            inner: Box::new(Inner {
+                called: Arc::clone(&inner_called),
+            }),
+            cancel: Arc::new(AtomicBool::new(true)),
+        };
+        let err = cancelable
+            .spawn_detached("ssh", &["-N"])
+            .expect_err("cancel flag set → must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(
+            !inner_called.load(Relaxed),
+            "inner spawn_detached must not be reached when cancel is armed"
+        );
+    }
+
+    /// Companion to the short-circuit test: when the cancel flag is
+    /// not set, `CancelableRunner::spawn_detached` delegates to the
+    /// inner runner. Together the two tests cover both branches of
+    /// the decorator.
+    #[test]
+    fn cancelable_runner_spawn_detached_delegates_when_flag_unset() {
+        let inner_called = Arc::new(AtomicBool::new(false));
+        let cancelable = CancelableRunner {
+            inner: Box::new(Inner {
+                called: Arc::clone(&inner_called),
+            }),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let err = cancelable
+            .spawn_detached("ssh", &["-N"])
+            .expect_err("inner returns an error which must propagate");
+        assert!(
+            err.to_string().contains("inner reached"),
+            "expected inner error to propagate, got {err}"
+        );
+        assert!(
+            inner_called.load(Relaxed),
+            "inner spawn_detached must be reached when cancel is unset"
+        );
     }
 }
