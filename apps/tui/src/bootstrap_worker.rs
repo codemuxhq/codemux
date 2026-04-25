@@ -1,23 +1,38 @@
-//! Off-thread driver for the SSH bootstrap.
+//! Off-thread drivers for the SSH bootstrap.
 //!
 //! The TUI event loop polls at ~20 Hz (`runtime::FRAME_POLL` = 50 ms);
 //! the SSH bootstrap can take 30-60 s on first contact (the
 //! `cargo build --release` step over the wire dominates). Running it
 //! inline would freeze every other agent's rendering for the whole
-//! window. This module spawns a worker thread that drives
-//! [`codemuxd_bootstrap::prepare_remote`] +
-//! [`codemuxd_bootstrap::attach_agent`] to completion and makes the
-//! result available to the runtime through a non-blocking
-//! [`crossbeam_channel`].
+//! window. This module spawns worker threads that drive
+//! [`codemuxd_bootstrap::prepare_remote`] and
+//! [`codemuxd_bootstrap::attach_agent`] to completion and make the
+//! results available to the runtime through non-blocking
+//! [`crossbeam_channel`]s.
+//!
+//! Two handles, mirroring the bootstrap library's split:
+//! - [`PrepareHandle`] runs only the probe + install phase and
+//!   produces a [`codemuxd_bootstrap::PreparedHost`]. Owned by the
+//!   spawn modal between the user "committing" a host and selecting a
+//!   remote folder. Cheap to cancel: the only blocking subprocess in
+//!   prepare is `cargo build`, and the user typically cancels before
+//!   that step starts.
+//! - [`AttachHandle`] runs only the daemon spawn + tunnel + handshake
+//!   given a `PreparedHost`, producing an [`AgentTransport`]. Owned by
+//!   the runtime until the agent transitions into Ready.
+//!
+//! [`start_full_pipeline`] is a temporary single-handle shim that
+//! chains prepare + attach in one worker thread, returning an
+//! [`AttachHandle`] whose event stream merges both phases. Used by the
+//! runtime today; will be replaced when the modal owns the prepare
+//! phase explicitly.
 //!
 //! Cancellation is best-effort: a [`CancelableRunner`] decorator
 //! shorts the worker between subprocess calls. A subprocess already in
 //! flight (e.g. `cargo build`) cannot be aborted from here without
 //! threading subprocess kill plumbing through the [`CommandRunner`]
-//! trait — deliberate scope cap. The user's typical "wait, wrong
-//! host" cancel happens before the long-running build step anyway,
-//! and any leaked ssh subprocess will die on its own when the network
-//! call returns.
+//! trait — deliberate scope cap. Any leaked ssh subprocess will die on
+//! its own when the network call returns.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,39 +41,64 @@ use std::thread;
 
 use codemux_session::AgentTransport;
 use codemuxd_bootstrap::{
-    self, CommandOutput, CommandRunner, RealRunner, Stage, attach_agent, default_local_socket_dir,
-    prepare_remote,
+    self, CommandOutput, CommandRunner, PreparedHost, RealRunner, Stage, attach_agent,
+    default_local_socket_dir, prepare_remote,
 };
 use crossbeam_channel::{Receiver, unbounded};
 
-/// Stream of events emitted by the worker thread, in the order the
-/// bootstrap pipeline produces them. The TUI's runtime drains all
+/// Stream of events emitted by a [`PrepareHandle`]'s worker thread, in
+/// the order the prepare pipeline produces them. The owner drains all
 /// available events on each frame poll: every `Stage(_)` updates the
-/// placeholder pane's status indicator, and the terminating `Done(_)`
-/// triggers the `Bootstrapping → Ready/Failed` state transition.
+/// modal's locked status row, and the terminating `Done(_)` triggers
+/// the unlock-and-pick-folder transition.
 ///
 /// Modeled as one channel rather than two (e.g. separate "progress"
-/// and "result" channels) so the runtime can't see a `Done` before
-/// the last `Stage` — the order is the channel's order. `Done` is
-/// always the final event; the channel goes empty after it.
+/// and "result" channels) so the owner can't see a `Done` before the
+/// last `Stage`. `Done` is always the final event; the channel goes
+/// empty after it.
+//
+// Reserved for the modal-driven flow: Step 3 lands the worker plumbing
+// so its tests can run independently; Step 6 wires it into the runtime.
+// `allow(dead_code)` is intentional bridging — remove with the runtime
+// wiring change.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum PrepareEvent {
+    /// The named stage just started executing on the worker thread.
+    /// During prepare, only the first 4 stages are emitted
+    /// (`VersionProbe`, `TarballStage`, `Scp`, `RemoteBuild`); the
+    /// fast path that hits a cached host emits only `VersionProbe`.
+    Stage(Stage),
+    /// Prepare finished — `Ok(prepared)` carries the remote `$HOME`
+    /// for the modal to seed remote-path autocomplete; `Err` flips
+    /// the modal status row to a stage-tagged error and unlocks back
+    /// to the host zone.
+    Done(Result<PreparedHost, codemuxd_bootstrap::Error>),
+}
+
+/// Stream of events emitted by an [`AttachHandle`]'s worker thread, in
+/// the order the attach pipeline produces them. `Stage(_)` updates
+/// the modal's second locked status row (after the user picked a
+/// folder); `Done(_)` triggers the agent's transition into Ready or
+/// Failed.
 ///
 /// `Debug` is implemented by hand because [`AgentTransport`] carries
 /// an open PTY/socket and deliberately doesn't implement `Debug`; the
 /// success arm prints opaquely (`Done(Ok(<transport>))`) so the wire
 /// protocol bytes never accidentally leak through `format!("{:?}")`.
-pub enum BootstrapEvent {
+pub enum AttachEvent {
     /// The named stage just started executing on the worker thread.
-    /// May arrive at any cadence (the slow path's `RemoteBuild` event
-    /// is followed by ~30s of silence; the fast path's events arrive
-    /// within a single frame).
+    /// In the per-phase flow, only the last 3 stages are emitted
+    /// (`DaemonSpawn`, `SocketTunnel`, `SocketConnect`). In the legacy
+    /// `start_full_pipeline` shim, all 7 stages stream through here.
     Stage(Stage),
-    /// Bootstrap finished — `Ok` is ready to swap into the runtime as
-    /// a `Ready` agent, `Err` flips the placeholder to `Failed` with
-    /// the stage-tagged error rendered in red.
+    /// Attach finished — `Ok(transport)` is ready to swap into the
+    /// runtime as a `Ready` agent; `Err` flips the agent state to
+    /// `Failed` with the stage-tagged error rendered in red.
     Done(Result<AgentTransport, codemuxd_bootstrap::Error>),
 }
 
-impl std::fmt::Debug for BootstrapEvent {
+impl std::fmt::Debug for AttachEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stage(stage) => f.debug_tuple("Stage").field(stage).finish(),
@@ -68,30 +108,33 @@ impl std::fmt::Debug for BootstrapEvent {
     }
 }
 
-/// Handle to an in-flight SSH bootstrap.
+/// Handle to an in-flight SSH prepare phase.
 ///
-/// The runtime polls [`Self::try_recv`] every event-loop tick and
-/// transitions the placeholder agent into a real one once the worker
-/// reports success. [`Drop`] is cooperative: it sets the cancel flag
-/// so the worker exits at the next subprocess boundary. The
-/// `JoinHandle` is detached (Rust's default `JoinHandle::drop`
-/// semantics) so the TUI never blocks on a slow bootstrap.
-pub struct BootstrapHandle {
+/// The owner polls [`Self::try_recv`] every event-loop tick and
+/// transitions UI state once the worker reports `Done`. [`Drop`] is
+/// cooperative: it sets the cancel flag so the worker exits at the
+/// next subprocess boundary. The `JoinHandle` is detached so the TUI
+/// never blocks on a slow prepare.
+//
+// Reserved for the modal-driven flow (see [`PrepareEvent`]).
+#[allow(dead_code)]
+pub struct PrepareHandle {
     cancel: Arc<AtomicBool>,
-    rx: Receiver<BootstrapEvent>,
+    rx: Receiver<PrepareEvent>,
     /// Kept only to anchor the worker thread's lifetime in the type
     /// system. We never join — `JoinHandle::drop` detaches, which is
-    /// the behavior we want (`Drop` must not block the TUI).
+    /// the behavior we want.
     _join: thread::JoinHandle<()>,
 }
 
-impl BootstrapHandle {
+#[allow(dead_code)]
+impl PrepareHandle {
     /// Non-blocking poll for the worker's next event. `None` = no
     /// event ready right now (still in flight), `Some(_)` = event
-    /// dequeued. The runtime drains in a tight loop until `None` so
+    /// dequeued. The owner drains in a tight loop until `None` so
     /// queued progress events don't render stale.
     #[must_use]
-    pub fn try_recv(&self) -> Option<BootstrapEvent> {
+    pub fn try_recv(&self) -> Option<PrepareEvent> {
         self.rx.try_recv().ok()
     }
 
@@ -103,53 +146,126 @@ impl BootstrapHandle {
     }
 }
 
-impl Drop for BootstrapHandle {
+impl Drop for PrepareHandle {
     fn drop(&mut self) {
-        // Cooperative cancel — the worker checks the flag at its next
-        // subprocess call and bails. `JoinHandle::drop` detaches the
-        // thread; we deliberately don't join, so the TUI doesn't block
-        // when the user dismisses a placeholder mid-bootstrap.
         self.cancel();
     }
 }
 
-/// Spawn a worker thread that runs the production SSH bootstrap end
-/// to end. Returns immediately; poll the returned [`BootstrapHandle`]
-/// for the result.
+/// Handle to an in-flight SSH attach phase.
 ///
-/// `cwd` is `None` when the user submitted an empty path field — the
-/// bootstrap omits the daemon's `--cwd` flag and the remote daemon
-/// inherits the SSH login shell's cwd ($HOME). `Some(path)` honors the
-/// user's literal input verbatim; the daemon validates with
-/// `cwd.exists()` on the remote side and refuses to bind if missing.
-pub fn start(
-    host: String,
-    agent_id: String,
-    cwd: Option<PathBuf>,
-    rows: u16,
-    cols: u16,
-) -> BootstrapHandle {
-    start_with_runner(Box::new(RealRunner), host, agent_id, cwd, rows, cols)
+/// Same shape as [`PrepareHandle`] but yields [`AttachEvent`]s and
+/// terminates with an [`AgentTransport`] rather than a
+/// [`PreparedHost`]. Also serves as the return type of
+/// [`start_full_pipeline`], the legacy single-handle shim.
+pub struct AttachHandle {
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<AttachEvent>,
+    _join: thread::JoinHandle<()>,
+}
+
+impl AttachHandle {
+    /// Non-blocking poll for the worker's next event. See
+    /// [`PrepareHandle::try_recv`].
+    #[must_use]
+    pub fn try_recv(&self) -> Option<AttachEvent> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Signal the worker to stop at the next subprocess boundary.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Relaxed);
+    }
+}
+
+impl Drop for AttachHandle {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Spawn a worker thread that runs only the prepare phase
+/// (`prepare_remote`) and reports its progress via [`PrepareHandle`].
+///
+/// Production calls this when the spawn modal sees the user "commit"
+/// a host (Tab from host zone with text, or Enter on host with empty
+/// path). The handle is owned by the modal until prepare returns;
+/// dropping it cancels.
+//
+// Reserved for the modal-driven flow (see [`PrepareEvent`]).
+#[allow(dead_code)]
+pub fn start_prepare(host: String) -> PrepareHandle {
+    start_prepare_with_runner(Box::new(RealRunner), host)
 }
 
 /// Test-friendly entry point: inject a [`CommandRunner`] so the
-/// cancel-mid-bootstrap path can be exercised without touching the
-/// network. Production calls [`start`] which delegates here with
-/// [`RealRunner`].
-pub fn start_with_runner(
-    runner: Box<dyn CommandRunner>,
+/// cancel-mid-prepare path can be exercised without touching the
+/// network.
+#[allow(dead_code)]
+pub fn start_prepare_with_runner(runner: Box<dyn CommandRunner>, host: String) -> PrepareHandle {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = unbounded();
+    let cancel_for_thread = Arc::clone(&cancel);
+    let join = thread::spawn(move || {
+        let cancelable = CancelableRunner {
+            inner: runner,
+            cancel: cancel_for_thread,
+        };
+        let tx_for_stage = tx.clone();
+        let on_stage = move |stage: Stage| {
+            let _ = tx_for_stage.send(PrepareEvent::Stage(stage));
+        };
+        let result = prepare_remote(&cancelable, &on_stage, &host);
+        let _ = tx.send(PrepareEvent::Done(result));
+    });
+    PrepareHandle {
+        cancel,
+        rx,
+        _join: join,
+    }
+}
+
+/// Spawn a worker thread that runs only the attach phase
+/// (`attach_agent`) given a [`PreparedHost`], reporting progress via
+/// [`AttachHandle`].
+///
+/// Production calls this once the modal closes with a chosen remote
+/// path. The handle is owned by the runtime until the agent's
+/// transport is returned via `Done(Ok(_))`; dropping it cancels.
+//
+// Reserved for the modal-driven flow (see [`PrepareEvent`]).
+#[allow(dead_code)]
+pub fn start_attach(
+    prepared: PreparedHost,
     host: String,
     agent_id: String,
     cwd: Option<PathBuf>,
     rows: u16,
     cols: u16,
-) -> BootstrapHandle {
+) -> AttachHandle {
+    start_attach_with_runner(
+        Box::new(RealRunner),
+        prepared,
+        host,
+        agent_id,
+        cwd,
+        rows,
+        cols,
+    )
+}
+
+/// Test-friendly entry point for the attach phase.
+#[allow(dead_code)]
+pub fn start_attach_with_runner(
+    runner: Box<dyn CommandRunner>,
+    prepared: PreparedHost,
+    host: String,
+    agent_id: String,
+    cwd: Option<PathBuf>,
+    rows: u16,
+    cols: u16,
+) -> AttachHandle {
     let cancel = Arc::new(AtomicBool::new(false));
-    // `unbounded` rather than `bounded(1)`: the bootstrap library
-    // emits 4-7 Stage events plus one Done, and a slow TUI render
-    // (e.g. user opened the help overlay) could let several events
-    // queue up. Per-bootstrap event count is small enough that
-    // unbounded never grows pathologically.
     let (tx, rx) = unbounded();
     let cancel_for_thread = Arc::clone(&cancel);
     let join = thread::spawn(move || {
@@ -160,16 +276,81 @@ pub fn start_with_runner(
         let socket_dir = match default_local_socket_dir() {
             Ok(d) => d,
             Err(e) => {
-                // Receiver may already be dropped; we don't care.
-                let _ = tx.send(BootstrapEvent::Done(Err(e)));
+                let _ = tx.send(AttachEvent::Done(Err(e)));
                 return;
             }
         };
         let tx_for_stage = tx.clone();
         let on_stage = move |stage: Stage| {
-            // Sender side of `unbounded` never blocks, so this stays
-            // non-blocking even if the TUI is slow to drain.
-            let _ = tx_for_stage.send(BootstrapEvent::Stage(stage));
+            let _ = tx_for_stage.send(AttachEvent::Stage(stage));
+        };
+        let result = attach_agent(
+            &cancelable,
+            &on_stage,
+            &prepared,
+            &host,
+            &agent_id,
+            cwd.as_deref(),
+            &socket_dir,
+            rows,
+            cols,
+        );
+        let _ = tx.send(AttachEvent::Done(result));
+    });
+    AttachHandle {
+        cancel,
+        rx,
+        _join: join,
+    }
+}
+
+/// Legacy single-handle pipeline that chains prepare + attach on one
+/// worker thread. Returns an [`AttachHandle`] whose event stream
+/// includes stages from both phases.
+///
+/// Used by the runtime until the spawn modal owns the prepare phase
+/// explicitly. Once that wiring lands, callers should use
+/// [`start_prepare`] + [`start_attach`] separately so the user can
+/// pick a remote folder between them.
+pub fn start_full_pipeline(
+    host: String,
+    agent_id: String,
+    cwd: Option<PathBuf>,
+    rows: u16,
+    cols: u16,
+) -> AttachHandle {
+    start_full_pipeline_with_runner(Box::new(RealRunner), host, agent_id, cwd, rows, cols)
+}
+
+/// Test-friendly entry point: inject a [`CommandRunner`] so the
+/// cancel-mid-bootstrap path can be exercised without touching the
+/// network.
+pub fn start_full_pipeline_with_runner(
+    runner: Box<dyn CommandRunner>,
+    host: String,
+    agent_id: String,
+    cwd: Option<PathBuf>,
+    rows: u16,
+    cols: u16,
+) -> AttachHandle {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = unbounded();
+    let cancel_for_thread = Arc::clone(&cancel);
+    let join = thread::spawn(move || {
+        let cancelable = CancelableRunner {
+            inner: runner,
+            cancel: cancel_for_thread,
+        };
+        let socket_dir = match default_local_socket_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(AttachEvent::Done(Err(e)));
+                return;
+            }
+        };
+        let tx_for_stage = tx.clone();
+        let on_stage = move |stage: Stage| {
+            let _ = tx_for_stage.send(AttachEvent::Stage(stage));
         };
         let result = prepare_remote(&cancelable, &on_stage, &host).and_then(|prepared| {
             attach_agent(
@@ -184,9 +365,9 @@ pub fn start_with_runner(
                 cols,
             )
         });
-        let _ = tx.send(BootstrapEvent::Done(result));
+        let _ = tx.send(AttachEvent::Done(result));
     });
-    BootstrapHandle {
+    AttachHandle {
         cancel,
         rx,
         _join: join,
@@ -235,17 +416,17 @@ mod tests {
 
     use super::*;
 
-    /// `BootstrapEvent`'s manual `Debug` impl prints `Stage(...)` via
+    /// `AttachEvent`'s manual `Debug` impl prints `Stage(...)` via
     /// the inner `Stage`'s derived `Debug` and `Done(Ok(<transport>))`
     /// opaquely (because [`AgentTransport`] doesn't implement `Debug`
     /// and we don't want a logged event to leak wire-protocol bytes).
     /// `Done(Err(_))` falls back to the bootstrap error's `Debug`.
     #[test]
-    fn debug_impl_redacts_transport_in_done_ok_arm() {
-        let stage_event = BootstrapEvent::Stage(Stage::VersionProbe);
+    fn attach_event_debug_redacts_transport_in_done_ok_arm() {
+        let stage_event = AttachEvent::Stage(Stage::VersionProbe);
         assert_eq!(format!("{stage_event:?}"), "Stage(VersionProbe)");
 
-        let err_event = BootstrapEvent::Done(Err(codemuxd_bootstrap::Error::Bootstrap {
+        let err_event = AttachEvent::Done(Err(codemuxd_bootstrap::Error::Bootstrap {
             stage: Stage::SocketConnect,
             source: "boom".into(),
         }));
@@ -324,9 +505,6 @@ mod tests {
             args: &[&str],
         ) -> std::io::Result<std::process::Child> {
             self.record(program, args);
-            // Should not be reached: the test cancels before the
-            // bootstrap reaches the SocketTunnel stage. If we somehow
-            // get here we'd return an Err so the worker exits cleanly.
             Err(std::io::Error::other(
                 "BlockingRunner.spawn_detached unexpectedly invoked",
             ))
@@ -352,51 +530,30 @@ mod tests {
         }
     }
 
-    /// Cancelling the [`BootstrapHandle`] short-circuits the worker at
-    /// the next subprocess boundary: the in-flight call finishes, the
-    /// next stage's call goes through [`CancelableRunner`] which
-    /// returns `Interrupted` without touching the inner runner.
-    /// Verified by counting the inner runner's recorded calls.
+    /// Cancelling a [`PrepareHandle`] short-circuits the worker at the
+    /// next subprocess boundary. The version-probe `ssh` call is
+    /// in-flight when we cancel; the next stage's call goes through
+    /// [`CancelableRunner`] which returns `Interrupted` without
+    /// touching the inner runner. Verified by counting the inner
+    /// runner's recorded calls.
     #[test]
-    fn cancel_short_circuits_at_next_subprocess_call() {
+    fn cancel_prepare_short_circuits_at_next_subprocess_call() {
         let (runner, started_rx, release_tx) = BlockingRunner::new();
         let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
-        let handle = start_with_runner(
-            Box::new(ArcRunner(runner_arc)),
-            "host".into(),
-            "agent-1".into(),
-            Some(PathBuf::from("/tmp/x")),
-            24,
-            80,
-        );
+        let handle = start_prepare_with_runner(Box::new(ArcRunner(runner_arc)), "host".into());
 
-        // Step 1: wait for the first subprocess call (the version
-        // probe) to start. Any timeout here points at a regression in
-        // the worker startup path, not at cancellation.
         started_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("worker should issue its first call within 2s");
 
-        // Step 2: arm cancellation, *then* let the in-flight call
-        // return. The crossbeam channel's send/recv pair provides the
-        // happens-before edge: the worker, after receiving from the
-        // release channel, will observe every write that happened
-        // before the send — including the cancel-flag store.
         handle.cancel();
         let _ = release_tx.send(());
 
-        // Step 3: poll for the worker's terminating Done event.
-        // Stage events fire first (the version probe stage event is
-        // emitted before the runner is even called), so we filter
-        // those out and wait for the Done. Cancellation surfaces as a
-        // Bootstrap error from a later stage (typically Scp, since
-        // stage 1 returned Ok with empty stdout → bootstrap proceeds
-        // to stage 2 which calls runner.run for `mkdir`).
         let deadline = Instant::now() + Duration::from_secs(5);
         let result = loop {
             match handle.try_recv() {
-                Some(BootstrapEvent::Done(r)) => break r,
-                Some(BootstrapEvent::Stage(_)) => {} // skip progress events
+                Some(PrepareEvent::Done(r)) => break r,
+                Some(PrepareEvent::Stage(_)) => {}
                 None => {
                     assert!(
                         Instant::now() <= deadline,
@@ -411,9 +568,6 @@ mod tests {
             "worker should report a Bootstrap error after cancel"
         );
 
-        // Step 4: the inner runner should have been called exactly
-        // once. The CancelableRunner intercepted call #2 before it
-        // reached the inner runner.
         let calls = runner.calls.lock().unwrap();
         assert_eq!(
             calls.len(),
@@ -427,15 +581,151 @@ mod tests {
         );
     }
 
-    /// `BootstrapHandle::cancel` is idempotent — calling it twice
-    /// (e.g. once explicitly, once via Drop) does not panic or
-    /// double-deliver.
+    /// Cancelling an [`AttachHandle`] short-circuits at the next
+    /// subprocess boundary, mirroring the prepare test. The first
+    /// blocking call is `ssh ... codemuxd ...` (the daemon spawn).
+    /// The cancel arrives while that's in flight; the next stage
+    /// (`SocketTunnel`'s `spawn_detached`) is intercepted by the
+    /// decorator.
     #[test]
-    fn cancel_is_idempotent() {
+    fn cancel_attach_short_circuits_at_next_subprocess_call() {
+        use std::path::PathBuf;
+
         let (runner, started_rx, release_tx) = BlockingRunner::new();
         let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
-        let handle = start_with_runner(
+        let prepared = PreparedHost {
+            remote_home: PathBuf::from("/home/test"),
+        };
+        let handle = start_attach_with_runner(
             Box::new(ArcRunner(runner_arc)),
+            prepared,
+            "host".into(),
+            "agent-1".into(),
+            Some(PathBuf::from("/tmp/x")),
+            24,
+            80,
+        );
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should issue its first call within 2s");
+
+        handle.cancel();
+        let _ = release_tx.send(());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            match handle.try_recv() {
+                Some(AttachEvent::Done(r)) => break r,
+                Some(AttachEvent::Stage(_)) => {}
+                None => {
+                    assert!(
+                        Instant::now() <= deadline,
+                        "worker did not finish within 5s of cancel"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        assert!(
+            result.is_err(),
+            "worker should report a Bootstrap error after cancel"
+        );
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly 1 inner-runner call, got {calls:?}"
+        );
+        assert!(
+            calls[0].starts_with("ssh "),
+            "first call should be the ssh daemon spawn, got {:?}",
+            calls[0]
+        );
+    }
+
+    /// Cancelling the legacy [`start_full_pipeline`] handle behaves
+    /// identically to cancelling either phase handle — the cancel
+    /// flag short-circuits the next subprocess call regardless of
+    /// which phase the worker is in.
+    #[test]
+    fn cancel_full_pipeline_short_circuits_at_next_subprocess_call() {
+        let (runner, started_rx, release_tx) = BlockingRunner::new();
+        let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
+        let handle = start_full_pipeline_with_runner(
+            Box::new(ArcRunner(runner_arc)),
+            "host".into(),
+            "agent-1".into(),
+            Some(PathBuf::from("/tmp/x")),
+            24,
+            80,
+        );
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should issue its first call within 2s");
+
+        handle.cancel();
+        let _ = release_tx.send(());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            match handle.try_recv() {
+                Some(AttachEvent::Done(r)) => break r,
+                Some(AttachEvent::Stage(_)) => {}
+                None => {
+                    assert!(
+                        Instant::now() <= deadline,
+                        "worker did not finish within 5s of cancel"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
+        assert!(
+            result.is_err(),
+            "worker should report a Bootstrap error after cancel"
+        );
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "expected exactly 1 inner-runner call, got {calls:?}"
+        );
+    }
+
+    /// `PrepareHandle::cancel` is idempotent — calling it twice does
+    /// not panic or double-deliver. Drop also calls cancel; the
+    /// handle's worker thread is detached, so this also exercises the
+    /// "cancel during drop" path.
+    #[test]
+    fn prepare_cancel_is_idempotent() {
+        let (runner, started_rx, release_tx) = BlockingRunner::new();
+        let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
+        let handle = start_prepare_with_runner(Box::new(ArcRunner(runner_arc)), "host".into());
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should issue its first call within 2s");
+        handle.cancel();
+        handle.cancel();
+        let _ = release_tx.send(());
+        drop(handle);
+    }
+
+    /// `AttachHandle::cancel` is idempotent. Companion to the prepare
+    /// idempotency test.
+    #[test]
+    fn attach_cancel_is_idempotent() {
+        let (runner, started_rx, release_tx) = BlockingRunner::new();
+        let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
+        let prepared = PreparedHost {
+            remote_home: PathBuf::from("/home/test"),
+        };
+        let handle = start_attach_with_runner(
+            Box::new(ArcRunner(runner_arc)),
+            prepared,
             "host".into(),
             "agent-1".into(),
             Some(PathBuf::from("/tmp/x")),
@@ -448,27 +738,18 @@ mod tests {
         handle.cancel();
         handle.cancel();
         let _ = release_tx.send(());
-        // Drop also calls cancel; that's the third invocation. Must
-        // not panic.
         drop(handle);
     }
 
-    /// Production [`start`] is just a `RealRunner` shim. We can't
-    /// drive it to a real bootstrap without an SSH host, but we can
-    /// confirm it returns a usable handle and tear it down without
-    /// hanging or leaking. The handle's worker thread will fail
-    /// immediately (no `host` is reachable in the unit-test
+    /// Production [`start_full_pipeline`] is just a `RealRunner` shim.
+    /// We can't drive it to a real bootstrap without an SSH host, but
+    /// we can confirm it returns a usable handle and tear it down
+    /// without hanging or leaking. The handle's worker thread will
+    /// fail immediately (no `host` is reachable in the unit-test
     /// environment) and exit on its own.
     #[test]
-    fn start_returns_a_handle_that_drops_cleanly() {
-        // A nonsense host — `RealRunner` will try to ssh to it,
-        // BatchMode + ConnectTimeout=5 means the ssh call returns
-        // within ~5s with status 255. Worker maps that to
-        // `Stage::VersionProbe` Ok(None) → bootstrap proceeds → hits
-        // network failures on subsequent stages → eventually returns
-        // an Error. We don't wait for any of that; we cancel and
-        // drop, exercising the cooperative-cancel path.
-        let handle = start(
+    fn start_full_pipeline_returns_a_handle_that_drops_cleanly() {
+        let handle = start_full_pipeline(
             "192.0.2.1".into(), // RFC 5737 TEST-NET-1, never reachable
             "agent-1".into(),
             Some(PathBuf::from("/tmp/x")),
@@ -477,8 +758,16 @@ mod tests {
         );
         handle.cancel();
         drop(handle);
-        // No assertion: the worker thread is detached. The test
-        // passes if no panic occurs in `start` or `Drop`.
+    }
+
+    /// `start_prepare` returns a handle that cancels and drops cleanly
+    /// even against an unreachable host. Smoke test for the production
+    /// `RealRunner` path.
+    #[test]
+    fn start_prepare_returns_a_handle_that_drops_cleanly() {
+        let handle = start_prepare("192.0.2.1".into());
+        handle.cancel();
+        drop(handle);
     }
 
     /// Tiny inner runner shared by the `CancelableRunner`
@@ -503,9 +792,9 @@ mod tests {
 
     /// `CancelableRunner::spawn_detached` checks the cancel flag and
     /// short-circuits with `Interrupted` when set, mirroring the
-    /// `run` arm. The `cancel_short_circuits_at_next_subprocess_call`
-    /// test only exercises the `run` arm; this one targets
-    /// `spawn_detached` so both arms of the decorator are covered.
+    /// `run` arm. The phase-cancel tests only exercise the `run` arm;
+    /// this one targets `spawn_detached` so both arms of the decorator
+    /// are covered.
     #[test]
     fn cancelable_runner_spawn_detached_short_circuits_when_flag_set() {
         let inner_called = Arc::new(AtomicBool::new(false));

@@ -47,7 +47,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
 
-use crate::bootstrap_worker::{BootstrapEvent, BootstrapHandle};
+use crate::bootstrap_worker::{AttachEvent, AttachHandle};
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
 use crate::log_tail::LogTail;
@@ -167,7 +167,7 @@ struct RuntimeAgent {
 /// Per-agent state. `Bootstrapping` is the placeholder a SSH spawn
 /// occupies while [`crate::bootstrap_worker`] drives the install on a
 /// worker thread. `Failed` captures a bootstrap that completed with
-/// an error; the dead [`BootstrapHandle`] is dropped at that point so
+/// an error; the dead [`AttachHandle`] is dropped at that point so
 /// the variant only carries the data the renderer actually needs.
 /// `Ready` is the steady state for both local and SSH transports
 /// once they have an [`AgentTransport`] and a renderable [`Parser`].
@@ -187,7 +187,7 @@ enum AgentState {
         /// host (e.g. `host:agent-3`).
         host: String,
         /// Most-recent [`Stage`] reported by the worker through the
-        /// [`BootstrapEvent::Stage`] stream. `None` until the very
+        /// [`AttachEvent::Stage`] stream. `None` until the very
         /// first event arrives (typically within a few ms — the
         /// worker emits `VersionProbe` before its first subprocess
         /// call). The placeholder renderer formats this as a
@@ -200,7 +200,7 @@ enum AgentState {
         /// concurrent bootstraps each have their own spinner cycle
         /// (and so a UI restart logically resets the animation).
         started_at: Instant,
-        handle: BootstrapHandle,
+        handle: AttachHandle,
     },
     /// Bootstrap returned an error. The dead handle has already been
     /// dropped; the variant carries the structured
@@ -240,7 +240,7 @@ impl RuntimeAgent {
     fn bootstrapping(
         label: String,
         host: String,
-        handle: BootstrapHandle,
+        handle: AttachHandle,
         rows: u16,
         cols: u16,
     ) -> Self {
@@ -395,14 +395,14 @@ fn event_loop(
                     let mut transition = AgentTransition::Stay;
                     while let Some(event) = handle.try_recv() {
                         match event {
-                            BootstrapEvent::Stage(stage) => {
+                            AttachEvent::Stage(stage) => {
                                 *current_stage = Some(stage);
                             }
-                            BootstrapEvent::Done(Ok(transport)) => {
+                            AttachEvent::Done(Ok(transport)) => {
                                 transition = AgentTransition::PromoteToReady(transport);
                                 break;
                             }
-                            BootstrapEvent::Done(Err(e)) => {
+                            AttachEvent::Done(Err(e)) => {
                                 tracing::error!(label = %agent.label, "bootstrap failed: {e}");
                                 transition = AgentTransition::PromoteToFailed {
                                     host: host.clone(),
@@ -541,7 +541,7 @@ fn event_loop(
                                 } else {
                                     Some(PathBuf::from(&path))
                                 };
-                                let handle = crate::bootstrap_worker::start(
+                                let handle = crate::bootstrap_worker::start_full_pipeline(
                                     host.clone(),
                                     agent_id,
                                     cwd_path,
@@ -828,7 +828,7 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
 /// the slot.
 ///
 /// The stage label appended in parens is the most recent
-/// [`Stage`] reported by [`crate::bootstrap_worker::BootstrapEvent`];
+/// [`Stage`] reported by [`crate::bootstrap_worker::AttachEvent`];
 /// without it, every bootstrap looks like a 30-60s black box (the
 /// `RemoteBuild` step dominates wall time on first contact).
 fn render_bootstrap_placeholder(
@@ -1513,7 +1513,7 @@ mod tests {
     // phase (see end-to-end smoke in docs/codemuxd-stages.md).
 
     /// Tiny runner that errors on every call. Used to spin up a real
-    /// `BootstrapHandle` for tests that only care about the
+    /// `AttachHandle` for tests that only care about the
     /// constructor's field placement (not the worker's behavior).
     /// The worker exits within microseconds with a Bootstrap error.
     struct NoopRunner;
@@ -1536,8 +1536,8 @@ mod tests {
         }
     }
 
-    fn dummy_handle() -> BootstrapHandle {
-        crate::bootstrap_worker::start_with_runner(
+    fn dummy_handle() -> AttachHandle {
+        crate::bootstrap_worker::start_full_pipeline_with_runner(
             Box::new(NoopRunner),
             "host".into(),
             "agent-x".into(),
