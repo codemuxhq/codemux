@@ -78,10 +78,16 @@ impl Drop for BootstrapHandle {
 /// Spawn a worker thread that runs the production SSH bootstrap end
 /// to end. Returns immediately; poll the returned [`BootstrapHandle`]
 /// for the result.
+///
+/// `cwd: None` tells the bootstrap to omit the daemon's `--cwd` flag
+/// so the remote process inherits the SSH login shell's cwd ($HOME on
+/// a typical login). Use this when the user didn't explicitly type a
+/// remote path; passing the local TUI's cwd verbatim would almost
+/// always fail `cwd.exists()` on the remote host.
 pub fn start(
     host: String,
     agent_id: String,
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
     rows: u16,
     cols: u16,
 ) -> BootstrapHandle {
@@ -96,7 +102,7 @@ pub fn start_with_runner(
     runner: Box<dyn CommandRunner>,
     host: String,
     agent_id: String,
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
     rows: u16,
     cols: u16,
 ) -> BootstrapHandle {
@@ -111,13 +117,19 @@ pub fn start_with_runner(
         let socket_dir = match default_local_socket_dir() {
             Ok(d) => d,
             Err(e) => {
-                // Receiver may already be dropped; we don't care.
                 let _ = tx.send(Err(e));
                 return;
             }
         };
-        let result =
-            establish_ssh_transport(&cancelable, &host, &agent_id, &cwd, &socket_dir, rows, cols);
+        let result = establish_ssh_transport(
+            &cancelable,
+            &host,
+            &agent_id,
+            cwd.as_deref(),
+            &socket_dir,
+            rows,
+            cols,
+        );
         let _ = tx.send(result);
     });
     BootstrapHandle {
@@ -274,7 +286,7 @@ mod tests {
             Box::new(ArcRunner(runner_arc)),
             "host".into(),
             "agent-1".into(),
-            PathBuf::from("/tmp/x"),
+            Some(PathBuf::from("/tmp/x")),
             24,
             80,
         );
@@ -341,7 +353,7 @@ mod tests {
             Box::new(ArcRunner(runner_arc)),
             "host".into(),
             "agent-1".into(),
-            PathBuf::from("/tmp/x"),
+            Some(PathBuf::from("/tmp/x")),
             24,
             80,
         );
@@ -374,7 +386,7 @@ mod tests {
         let handle = start(
             "192.0.2.1".into(), // RFC 5737 TEST-NET-1, never reachable
             "agent-1".into(),
-            PathBuf::from("/tmp/x"),
+            Some(PathBuf::from("/tmp/x")),
             24,
             80,
         );

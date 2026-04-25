@@ -98,13 +98,19 @@ pub struct SpawnMinibuffer {
 
 impl SpawnMinibuffer {
     pub fn open() -> Self {
-        let cwd = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_default();
+        // Path defaults to empty. The placeholder (`PATH_PLACEHOLDER`) shows
+        // the user that an empty submission means "use a sensible default":
+        //   - local agent → inherit the TUI's cwd
+        //   - SSH agent  → inherit the remote shell's login cwd ($HOME)
+        //
+        // Pre-filling with the local TUI's cwd was wrong for SSH targets:
+        // the daemon validates the path with `cwd.exists()` and exits before
+        // binding the socket if it doesn't (which is almost always the case
+        // when sending a local laptop path to a remote host). The runtime
+        // maps empty → None on both branches; see runtime.rs.
         let mut m = Self {
             host: String::new(),
-            path: cwd,
+            path: String::new(),
             focused: Zone::Path,
             ssh_hosts: load_ssh_hosts(),
             filtered: Vec::new(),
@@ -177,14 +183,13 @@ impl SpawnMinibuffer {
         } else {
             host.trim().to_string()
         };
-        let path = if path.trim().is_empty() {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_default()
-        } else {
-            path.trim().to_string()
-        };
+        // Empty path is meaningful — it tells the runtime "use the
+        // appropriate default for this transport" (local cwd for local
+        // spawns, remote $HOME for SSH spawns). We deliberately don't
+        // fall back to local cwd here: doing so would defeat the
+        // empty-path → remote-default mapping that makes SSH spawns
+        // work without the user typing a remote path explicitly.
+        let path = path.trim().to_string();
         ModalOutcome::Spawn { host, path }
     }
 
@@ -821,6 +826,28 @@ mod tests {
             ModalOutcome::Spawn {
                 host: "local".into(),
                 path: "/x".into()
+            },
+        );
+    }
+
+    /// Empty path stays empty on spawn — the runtime maps empty → None so
+    /// the daemon's `--cwd` flag is omitted on the remote (SSH branch
+    /// inherits `$HOME`, local branch inherits the TUI's cwd). Pre-fix,
+    /// `confirm` defaulted an empty path to `std::env::current_dir()`,
+    /// which sent the local laptop path verbatim to the remote daemon and
+    /// tripped its `cwd.exists()` validation — the user-visible "EOF
+    /// before `HelloAck`" failure mode for SSH spawns.
+    #[test]
+    fn empty_path_stays_empty_on_spawn() {
+        let mut m = mb("devpod-go", "", Zone::Path, &["devpod-go"]);
+        m.filtered = vec![];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "devpod-go".into(),
+                path: String::new(),
             },
         );
     }

@@ -219,8 +219,15 @@ impl Drop for TunnelGuard {
 /// stream the wire-protocol handshake should run over, plus the
 /// tunnel subprocess (caller owns cleanup via `Child::kill`).
 ///
-/// `cwd` is interpreted on the **remote** host — the daemon will
-/// `chdir` into it before spawning `claude`.
+/// `cwd` is interpreted on the **remote** host — when `Some`, the
+/// daemon is launched with `--cwd` and `chdir`'s into it before
+/// spawning `claude`; the daemon refuses to bind if the path doesn't
+/// exist on the remote (vision principle 6, no silent fallback). When
+/// `None`, the `--cwd` flag is omitted and the daemon inherits the
+/// SSH login shell's cwd ($HOME on a typical login). `None` is the
+/// right choice when the user didn't explicitly type a remote path —
+/// passing the local TUI's cwd verbatim would almost always fail
+/// `cwd.exists()` on the remote.
 ///
 /// `local_socket_dir` is where the local end of the `ssh -L` tunnel
 /// binds. Production callers pass [`default_local_socket_dir`]; tests
@@ -233,7 +240,7 @@ pub fn bootstrap(
     runner: &dyn CommandRunner,
     host: &str,
     agent_id: &str,
-    cwd: &Path,
+    cwd: Option<&Path>,
     local_socket_dir: &Path,
 ) -> Result<(UnixStream, Child), Error> {
     validate_agent_id(agent_id)?;
@@ -272,7 +279,7 @@ pub fn establish_ssh_transport(
     runner: &dyn CommandRunner,
     host: &str,
     agent_id: &str,
-    cwd: &Path,
+    cwd: Option<&Path>,
     local_socket_dir: &Path,
     rows: u16,
     cols: u16,
@@ -556,26 +563,33 @@ fn spawn_remote_daemon(
     runner: &dyn CommandRunner,
     host: &str,
     agent_id: &str,
-    cwd: &Path,
+    cwd: Option<&Path>,
 ) -> Result<(), Error> {
-    let cwd_str = cwd.to_str().ok_or_else(|| Error::Bootstrap {
-        stage: Stage::DaemonSpawn,
-        source: format!("cwd not UTF-8: {}", cwd.display()).into(),
-    })?;
-    if cwd_str.contains('\'') {
-        return Err(Error::Bootstrap {
-            stage: Stage::DaemonSpawn,
-            source: format!("cwd contains a single quote, refusing to shell-escape: {cwd_str:?}")
-                .into(),
-        });
-    }
+    let cwd_flag = match cwd {
+        None => String::new(),
+        Some(p) => {
+            let cwd_str = p.to_str().ok_or_else(|| Error::Bootstrap {
+                stage: Stage::DaemonSpawn,
+                source: format!("cwd not UTF-8: {}", p.display()).into(),
+            })?;
+            if cwd_str.contains('\'') {
+                return Err(Error::Bootstrap {
+                    stage: Stage::DaemonSpawn,
+                    source: format!(
+                        "cwd contains a single quote, refusing to shell-escape: {cwd_str:?}"
+                    )
+                    .into(),
+                });
+            }
+            format!(" --cwd '{cwd_str}'")
+        }
+    };
     let cmd = format!(
         "setsid -f ~/.cache/codemuxd/bin/codemuxd \
          --socket ~/.cache/codemuxd/sockets/{agent_id}.sock \
          --pid-file ~/.cache/codemuxd/pids/{agent_id}.pid \
          --log-file ~/.cache/codemuxd/logs/{agent_id}.log \
-         --agent-id {agent_id} \
-         --cwd '{cwd_str}' \
+         --agent-id {agent_id}{cwd_flag} \
          </dev/null >/dev/null 2>&1"
     );
     let out = runner
@@ -1062,7 +1076,8 @@ mod tests {
             &["-o", "BatchMode=yes"],
             fail(2, b"Error: cwd /no/such does not exist"),
         );
-        let err = spawn_remote_daemon(&runner, "host", "alpha", Path::new("/no/such")).unwrap_err();
+        let err =
+            spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/no/such"))).unwrap_err();
         let Error::Bootstrap { stage, source } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
@@ -1079,7 +1094,7 @@ mod tests {
     fn spawn_remote_daemon_rejects_quote_in_cwd() {
         let runner = FakeRunner::new();
         // No script entries — should error before ssh is invoked.
-        let err = spawn_remote_daemon(&runner, "host", "alpha", Path::new("/tmp/with'quote"))
+        let err = spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp/with'quote")))
             .unwrap_err();
         let Error::Bootstrap { stage, source } = err else {
             panic!("expected Bootstrap, got {err:?}");
@@ -1104,12 +1119,41 @@ mod tests {
     #[test]
     fn spawn_remote_daemon_redirects_stdio_to_devnull() {
         let runner = RecordingRunner::new();
-        spawn_remote_daemon(&runner, "host", "alpha", Path::new("/tmp")).unwrap();
+        spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp"))).unwrap();
         let cmd = runner.last_run_cmd();
         assert!(
             cmd.contains("</dev/null >/dev/null 2>&1"),
             "cmd must redirect stdio to /dev/null so setsid -f can detach \
              cleanly without ssh hanging on inherited pipes; got: {cmd}",
+        );
+    }
+
+    /// `cwd: None` ⇒ omit the `--cwd` flag from the daemon command line so the
+    /// daemon falls back to the SSH login shell's cwd ($HOME). Pre-fix the TUI
+    /// always sent its local cwd verbatim, which tripped the daemon's
+    /// `cwd.exists()` check on the remote and surfaced as "EOF before `HelloAck`".
+    #[test]
+    fn spawn_remote_daemon_omits_cwd_flag_when_none() {
+        let runner = RecordingRunner::new();
+        spawn_remote_daemon(&runner, "host", "alpha", None).unwrap();
+        let cmd = runner.last_run_cmd();
+        assert!(
+            !cmd.contains("--cwd"),
+            "cmd must not include --cwd when cwd is None; got: {cmd}",
+        );
+    }
+
+    /// `cwd: Some(p)` ⇒ include `--cwd '<p>'` in the daemon command line. Pin
+    /// the exact format so a future refactor can't silently drop the daemon's
+    /// chdir target.
+    #[test]
+    fn spawn_remote_daemon_includes_cwd_flag_when_some() {
+        let runner = RecordingRunner::new();
+        spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/srv/work"))).unwrap();
+        let cmd = runner.last_run_cmd();
+        assert!(
+            cmd.contains("--cwd '/srv/work'"),
+            "cmd must include --cwd '/srv/work' when cwd is Some; got: {cmd}",
         );
     }
 
@@ -1371,7 +1415,7 @@ mod tests {
             &runner,
             "fake-host",
             agent_id,
-            Path::new("/some/cwd"),
+            Some(Path::new("/some/cwd")),
             &socket_dir,
         )
         .unwrap();

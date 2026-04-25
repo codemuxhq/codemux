@@ -467,9 +467,24 @@ fn event_loop(
                                 // loop's drain phase polls the worker
                                 // each tick and flips the placeholder to
                                 // Ready when the transport arrives.
+                                //
+                                // Empty path → None tells the bootstrap
+                                // to omit `--cwd` and let the daemon
+                                // inherit the SSH login shell's cwd
+                                // ($HOME on a typical login). A literal
+                                // local path here would otherwise be
+                                // sent verbatim to the remote, fail
+                                // `cwd.exists()`, and exit the daemon
+                                // before it ever bound the socket — the
+                                // user-visible "EOF before HelloAck"
+                                // failure mode.
                                 let label = format!("{host}:agent-{spawn_counter}");
                                 let agent_id = format!("agent-{spawn_counter}");
-                                let cwd_path = PathBuf::from(&path);
+                                let cwd_path = if path.is_empty() {
+                                    None
+                                } else {
+                                    Some(PathBuf::from(&path))
+                                };
                                 let handle = crate::bootstrap_worker::start(
                                     host.clone(),
                                     agent_id,
@@ -1340,7 +1355,7 @@ mod tests {
             Box::new(NoopRunner),
             "host".into(),
             "agent-x".into(),
-            PathBuf::from("/tmp"),
+            Some(PathBuf::from("/tmp")),
             24,
             80,
         )
