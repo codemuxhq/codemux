@@ -493,6 +493,21 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
 /// SSH session's exit. The daemon's exclusive pid-file acquisition
 /// (apps/daemon/src/bootstrap.rs) handles the "already running" case
 /// — we surface its stderr directly if spawn fails.
+///
+/// Stdio redirection (`</dev/null >/dev/null 2>&1`) is **load-bearing**:
+/// `setsid -f` forks but doesn't reopen file descriptors, so without
+/// the redirect the daemon inherits the SSH session's pipes for
+/// stdin/stdout/stderr. ssh then waits for those pipes to close before
+/// exiting, which never happens (the daemon outlives ssh by design).
+/// The local `runner.run("ssh", ...)` call hangs forever, and the user
+/// sees a perpetual "bootstrapping" placeholder. Redirecting before
+/// `setsid` forks closes the pipes from the daemon's side; ssh
+/// observes EOF and exits cleanly. The cost is that any pre-tracing
+/// panic on the daemon side (e.g. a clap parse error before
+/// `init_tracing`) goes to /dev/null instead of the local terminal.
+/// That is an acceptable tradeoff — the alternative is a silent hang
+/// — and a future Stage-N task will fetch the daemon's log file post-
+/// failure for richer diagnostics.
 fn spawn_remote_daemon(
     runner: &dyn CommandRunner,
     host: &str,
@@ -516,7 +531,8 @@ fn spawn_remote_daemon(
          --pid-file ~/.cache/codemuxd/pids/{agent_id}.pid \
          --log-file ~/.cache/codemuxd/logs/{agent_id}.log \
          --agent-id {agent_id} \
-         --cwd '{cwd_str}'"
+         --cwd '{cwd_str}' \
+         </dev/null >/dev/null 2>&1"
     );
     let out = runner
         .run("ssh", &["-o", "BatchMode=yes", host, &cmd])
@@ -619,7 +635,7 @@ fn connect_socket(path: &Path, timeout: Duration) -> Result<UnixStream, Error> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::io::ErrorKind;
     use std::sync::Mutex;
@@ -942,6 +958,89 @@ mod tests {
             source.to_string().contains("single quote"),
             "should mention single quote, got {source}",
         );
+    }
+
+    /// Regression for the silent ssh hang: `setsid -f` forks but does
+    /// not reopen file descriptors, so the daemon inherits the SSH
+    /// session's pipes for stdin/stdout/stderr. Without an explicit
+    /// `</dev/null >/dev/null 2>&1`, ssh waits forever for those pipes
+    /// to close (the daemon outlives ssh by design), and the local
+    /// `runner.run("ssh", ...)` call hangs — the user sees a perpetual
+    /// "bootstrapping" placeholder. We assert the redirect is present
+    /// so a future refactor can't accidentally drop it. Verified by
+    /// hand: `time ssh host 'setsid -f sleep 30'` hangs ≥3s; the same
+    /// command with the redirect appended returns in <100ms.
+    #[test]
+    fn spawn_remote_daemon_redirects_stdio_to_devnull() {
+        let runner = RecordingRunner::new();
+        spawn_remote_daemon(&runner, "host", "alpha", Path::new("/tmp")).unwrap();
+        let cmd = runner.last_run_cmd();
+        assert!(
+            cmd.contains("</dev/null >/dev/null 2>&1"),
+            "cmd must redirect stdio to /dev/null so setsid -f can detach \
+             cleanly without ssh hanging on inherited pipes; got: {cmd}",
+        );
+    }
+
+    /// Tiny `CommandRunner` for tests that need to inspect the actual
+    /// argv produced by a single bootstrap step. Returns success for
+    /// every `run` call and spawns a real `sleep 60` for every
+    /// `spawn_detached` call (the test is responsible for killing the
+    /// returned Child). Stores the most-recent ssh argv vectors for
+    /// post-call inspection. Unlike `FakeRunner`, no script setup is
+    /// needed.
+    struct RecordingRunner {
+        last_run_args: Mutex<Option<Vec<String>>>,
+        last_spawn_args: Mutex<Option<Vec<String>>>,
+    }
+
+    impl RecordingRunner {
+        fn new() -> Self {
+            Self {
+                last_run_args: Mutex::new(None),
+                last_spawn_args: Mutex::new(None),
+            }
+        }
+
+        fn last_run_cmd(&self) -> String {
+            // The bootstrap composes the remote shell command as the
+            // last arg of the ssh argv (`ssh ... host '<cmd>'`), so
+            // grabbing args.last() is equivalent to "the command we
+            // sent the remote shell".
+            self.last_run_args
+                .lock()
+                .unwrap()
+                .clone()
+                .and_then(|args| args.last().cloned())
+                .expect("RecordingRunner.run was never called")
+        }
+
+        #[allow(dead_code)]
+        fn last_spawn_args(&self) -> Vec<String> {
+            self.last_spawn_args
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("RecordingRunner.spawn_detached was never called")
+        }
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&self, _program: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
+            *self.last_run_args.lock().unwrap() =
+                Some(args.iter().map(|s| (*s).to_string()).collect());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+
+        fn spawn_detached(&self, _: &str, args: &[&str]) -> std::io::Result<Child> {
+            *self.last_spawn_args.lock().unwrap() =
+                Some(args.iter().map(|s| (*s).to_string()).collect());
+            Command::new("sleep").arg("60").spawn()
+        }
     }
 
     /// `connect_socket` returns a `SocketConnect` Bootstrap error when
