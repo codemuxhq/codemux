@@ -239,8 +239,8 @@ pub fn bootstrap(
     validate_agent_id(agent_id)?;
 
     let target_version = bootstrap_version();
-    let installed = probe_remote_version(runner, host)?;
-    if installed.as_deref() != Some(target_version) {
+    let probe = probe_remote(runner, host)?;
+    if probe.installed_version.as_deref() != Some(target_version) {
         let local_tarball = stage_tarball()?;
         scp_tarball(runner, host, &local_tarball, target_version)?;
         remote_build(runner, host, target_version)?;
@@ -249,7 +249,7 @@ pub fn bootstrap(
     spawn_remote_daemon(runner, host, agent_id, cwd)?;
 
     let local_socket = local_socket_path(local_socket_dir, agent_id)?;
-    let tunnel = open_ssh_tunnel(runner, host, agent_id, &local_socket)?;
+    let tunnel = open_ssh_tunnel(runner, host, agent_id, &local_socket, &probe.home)?;
     let tunnel_guard = TunnelGuard::new(tunnel);
 
     let stream = connect_socket(&local_socket, CONNECT_TIMEOUT)?;
@@ -327,13 +327,35 @@ fn validate_agent_id(agent_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Step 1: cheap probe. Returns the trimmed contents of the remote's
+/// Result of the cheap probe step.
+///
+/// `home` is the remote `$HOME` (always present when ssh succeeded —
+/// `echo "$HOME"` is unconditional in the probe command). It's
+/// load-bearing for step 6: `ssh -L`'s remote half does not get
+/// shell-expanded, so we need an absolute path to put in the forward
+/// spec, and `$HOME` is the only piece we can't know in advance.
+///
+/// `installed_version` is the trimmed contents of the remote's
 /// `agent.version` file, or `None` if the file doesn't exist (fresh
-/// host) or the SSH probe fails. The latter is surfaced as
-/// [`Error::Bootstrap`] only when ssh itself can't be spawned —
-/// connection failures (exit 255) are returned as `Ok(None)` so the
-/// retry-from-scratch path still runs.
-fn probe_remote_version(runner: &dyn CommandRunner, host: &str) -> Result<Option<String>, Error> {
+/// host with no daemon installed).
+#[derive(Debug)]
+struct RemoteProbe {
+    home: PathBuf,
+    installed_version: Option<String>,
+}
+
+/// Step 1: cheap probe. Captures the remote `$HOME` and the installed
+/// daemon version (if any) in one round trip.
+///
+/// The probe shell command is `echo "$HOME"; cat <version> 2>/dev/null
+/// || true`. The `|| true` keeps the whole command's exit status 0 in
+/// the no-version-installed case, so a non-zero exit unambiguously
+/// means an SSH-level failure (host unreachable, auth refused — exit
+/// 255). Without a successful probe we can't compute the absolute
+/// remote socket path for step 6, so SSH-level failures bubble up as
+/// `Error::Bootstrap{stage: VersionProbe}` instead of being silently
+/// downgraded to "no installed version".
+fn probe_remote(runner: &dyn CommandRunner, host: &str) -> Result<RemoteProbe, Error> {
     let output = runner
         .run(
             "ssh",
@@ -343,7 +365,7 @@ fn probe_remote_version(runner: &dyn CommandRunner, host: &str) -> Result<Option
                 "-o",
                 &format!("ConnectTimeout={PROBE_TIMEOUT_SECS}"),
                 host,
-                "cat ~/.cache/codemuxd/agent.version 2>/dev/null",
+                "echo \"$HOME\"; cat ~/.cache/codemuxd/agent.version 2>/dev/null || true",
             ],
         )
         .map_err(|source| Error::Bootstrap {
@@ -351,13 +373,35 @@ fn probe_remote_version(runner: &dyn CommandRunner, host: &str) -> Result<Option
             source: Box::new(source),
         })?;
     if output.status != 0 {
-        // Status 255 = SSH-level failure (host unreachable, auth
-        // refused). Status 1 = remote command failed (file doesn't
-        // exist). Either way, treat as "no installed version".
-        return Ok(None);
+        return Err(Error::Bootstrap {
+            stage: Stage::VersionProbe,
+            source: format!(
+                "ssh probe failed (exit {}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim(),
+            )
+            .into(),
+        });
     }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let home = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::Bootstrap {
+            stage: Stage::VersionProbe,
+            source: "ssh probe stdout was empty (no $HOME line)".into(),
+        })?;
+    let installed_version = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(RemoteProbe {
+        home: PathBuf::from(home),
+        installed_version,
+    })
 }
 
 /// Step 2: write the embedded tarball to a local tempfile and return
@@ -574,17 +618,51 @@ fn local_socket_path(dir: &Path, agent_id: &str) -> Result<PathBuf, Error> {
 /// Step 6: spawn `ssh -N -L local.sock:remote.sock host` in the
 /// background. Returns the [`Child`] handle so the caller (transport
 /// Drop) can kill the tunnel.
+///
+/// `remote_home` comes from step 1's probe and is **load-bearing**:
+/// `ssh -L`'s remote half is opened by the remote sshd as the literal
+/// path we send — `~`, `$HOME`, and relative paths are NOT expanded.
+/// A path like `.cache/codemuxd/sockets/x.sock` resolves against
+/// sshd's cwd (`/`) and silently fails to find the daemon's socket.
+/// The local connect *succeeds* (ssh accepts the forward), the wire
+/// handshake then fails with EOF, and the user sees a confusing
+/// "EOF before `HelloAck`" without any clue the path was wrong.
+///
+/// `ControlPath=none` and `ControlMaster=no` are **also load-bearing**:
+/// if the user's `~/.ssh/config` sets `ControlMaster auto` for this
+/// host (extremely common — it's the standard recipe for connection
+/// multiplexing, used by every `~/.ssh/config` template at Uber and
+/// most public dotfile setups), our `ssh -N -L` will be routed
+/// through the existing master via mux. The slave then sends a
+/// `forward` request to the master and exits with status 0, but the
+/// local socket file is *never bound* (mux's handling of unix-socket
+/// forwards is buggy across many OpenSSH versions — verified on
+/// OpenSSH 10.2p1 / macOS Sequoia: `mux_client_request_session`
+/// reports the forward but the master never creates the socket
+/// file). Our retry loop in `connect_socket` then ENOENTs out for
+/// 5 s and the user sees "could not connect to remote daemon socket".
+/// Forcing a fresh, non-mux ssh session via these two opts sidesteps
+/// the mux path entirely; verified to bind the local socket within
+/// ~1 s in the same environment.
 fn open_ssh_tunnel(
     runner: &dyn CommandRunner,
     host: &str,
     agent_id: &str,
     local: &Path,
+    remote_home: &Path,
 ) -> Result<Child, Error> {
     let local_str = local.to_str().ok_or_else(|| Error::Bootstrap {
         stage: Stage::SocketTunnel,
         source: format!("local socket path not UTF-8: {}", local.display()).into(),
     })?;
-    let forward = format!("{local_str}:.cache/codemuxd/sockets/{agent_id}.sock");
+    let remote_socket = remote_home
+        .join(".cache/codemuxd/sockets")
+        .join(format!("{agent_id}.sock"));
+    let remote_str = remote_socket.to_str().ok_or_else(|| Error::Bootstrap {
+        stage: Stage::SocketTunnel,
+        source: format!("remote socket path not UTF-8: {}", remote_socket.display()).into(),
+    })?;
+    let forward = format!("{local_str}:{remote_str}");
     runner
         .spawn_detached(
             "ssh",
@@ -594,6 +672,10 @@ fn open_ssh_tunnel(
                 "BatchMode=yes",
                 "-o",
                 "ExitOnForwardFailure=yes",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "ControlMaster=no",
                 "-L",
                 &forward,
                 host,
@@ -822,14 +904,17 @@ mod tests {
         }
     }
 
-    /// The probe step returns `None` cleanly when the remote
-    /// command exits non-zero (file-not-found case).
+    /// The probe step parses `$HOME` and returns version=None when the
+    /// remote `agent.version` file is missing (fresh host). The `|| true`
+    /// in the probe shell command keeps exit status 0, so a missing
+    /// version file is distinguishable from a real ssh failure.
     #[test]
-    fn probe_returns_none_on_remote_exit_one() {
+    fn probe_returns_none_version_when_agent_version_missing() {
         let runner = FakeRunner::new();
-        runner.expect_run("ssh", &["-o", "BatchMode=yes"], fail(1, b""));
-        let got = probe_remote_version(&runner, "host").unwrap();
-        assert!(got.is_none());
+        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b"/home/user\n"));
+        let probe = probe_remote(&runner, "host").unwrap();
+        assert_eq!(probe.home, PathBuf::from("/home/user"));
+        assert!(probe.installed_version.is_none());
     }
 
     /// The probe step bubbles up `Error::Bootstrap{VersionProbe}`
@@ -842,7 +927,7 @@ mod tests {
             &["-o", "BatchMode=yes"],
             std::io::Error::new(ErrorKind::NotFound, "ssh: command not found"),
         );
-        let err = probe_remote_version(&runner, "host").unwrap_err();
+        let err = probe_remote(&runner, "host").unwrap_err();
         let Error::Bootstrap { stage, .. } = err else {
             panic!("expected Error::Bootstrap, got {err:?}");
         };
@@ -850,17 +935,63 @@ mod tests {
     }
 
     /// The probe step returns the trimmed remote `agent.version`
-    /// contents on success.
+    /// contents along with `$HOME` on success.
     #[test]
     fn probe_returns_trimmed_version_on_success() {
         let runner = FakeRunner::new();
         runner.expect_run(
             "ssh",
             &["-o", "BatchMode=yes"],
-            ok(b"codemuxd-sip-deadbeef00000000\n"),
+            ok(b"/home/user\ncodemuxd-sip-deadbeef00000000\n"),
         );
-        let got = probe_remote_version(&runner, "host").unwrap();
-        assert_eq!(got.as_deref(), Some("codemuxd-sip-deadbeef00000000"));
+        let probe = probe_remote(&runner, "host").unwrap();
+        assert_eq!(probe.home, PathBuf::from("/home/user"));
+        assert_eq!(
+            probe.installed_version.as_deref(),
+            Some("codemuxd-sip-deadbeef00000000"),
+        );
+    }
+
+    /// SSH-level failures (e.g. exit 255 for unreachable host) now
+    /// surface as `Error::Bootstrap{VersionProbe}` instead of being
+    /// silently downgraded to "no installed version". Previously the
+    /// downgrade meant we'd run scp/build before noticing the failure;
+    /// post-fix we also need `$HOME` for the tunnel forward spec, so
+    /// there's no useful fallback path here.
+    #[test]
+    fn probe_surfaces_ssh_connection_failure_as_bootstrap_error() {
+        let runner = FakeRunner::new();
+        runner.expect_run(
+            "ssh",
+            &["-o", "BatchMode=yes"],
+            fail(255, b"ssh: Could not resolve hostname no-such-host"),
+        );
+        let err = probe_remote(&runner, "no-such-host").unwrap_err();
+        let Error::Bootstrap { stage, source } = err else {
+            panic!("expected Bootstrap, got {err:?}");
+        };
+        assert_eq!(stage, Stage::VersionProbe);
+        assert!(
+            source.to_string().contains("Could not resolve"),
+            "remote stderr should surface in source, got {source}",
+        );
+    }
+
+    /// Empty stdout (echo somehow returned nothing) → error rather
+    /// than silently using a bogus relative path for the tunnel.
+    #[test]
+    fn probe_surfaces_empty_stdout_as_bootstrap_error() {
+        let runner = FakeRunner::new();
+        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b""));
+        let err = probe_remote(&runner, "host").unwrap_err();
+        let Error::Bootstrap { stage, source } = err else {
+            panic!("expected Bootstrap, got {err:?}");
+        };
+        assert_eq!(stage, Stage::VersionProbe);
+        assert!(
+            source.to_string().contains("empty"),
+            "should mention empty stdout, got {source}",
+        );
     }
 
     /// `scp_tarball` surfaces the right stage when scp exits non-zero.
@@ -982,6 +1113,66 @@ mod tests {
         );
     }
 
+    /// Regression: the daemon writes its socket under `$HOME/.cache/codemuxd/sockets/`,
+    /// so the `-L local:remote` forward must use the absolute remote path captured
+    /// by `probe_remote`. A relative path would land under whatever directory the
+    /// SSH session opens in, which is wrong on hosts where `pwd != $HOME`.
+    #[test]
+    fn open_ssh_tunnel_uses_absolute_remote_path_in_forward_spec() {
+        let runner = RecordingRunner::new();
+        let mut child = open_ssh_tunnel(
+            &runner,
+            "host.example",
+            "agent-x",
+            Path::new("/tmp/codemux/agent-x.sock"),
+            Path::new("/home/me"),
+        )
+        .unwrap();
+        let args = runner.last_spawn_args();
+        let l_index = args.iter().position(|a| a == "-L").expect("ssh -L missing");
+        let forward = &args[l_index + 1];
+        assert_eq!(
+            forward, "/tmp/codemux/agent-x.sock:/home/me/.cache/codemuxd/sockets/agent-x.sock",
+            "forward spec must pin the absolute remote socket path",
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Regression: an active OpenSSH `ControlMaster` mux on the user's machine
+    /// silently swallows `-L` forwards — the second `ssh -N` reuses the existing
+    /// mux connection and never installs the listener, so the local socket file
+    /// is never created. We pin `ControlPath=none` + `ControlMaster=no` to bypass
+    /// the mux entirely and force a fresh connection that owns the forward.
+    #[test]
+    fn open_ssh_tunnel_bypasses_ssh_control_master() {
+        let runner = RecordingRunner::new();
+        let mut child = open_ssh_tunnel(
+            &runner,
+            "host.example",
+            "agent-x",
+            Path::new("/tmp/codemux/agent-x.sock"),
+            Path::new("/home/me"),
+        )
+        .unwrap();
+        let args = runner.last_spawn_args();
+        let has_pair = |k: &str, v: &str| {
+            args.windows(3).any(|w| {
+                w[0] == "-o" && w[1] == k && w[2] == v || w[0] == "-o" && w[1] == format!("{k}={v}")
+            })
+        };
+        assert!(
+            has_pair("ControlPath", "none"),
+            "ssh tunnel must set ControlPath=none to bypass mux; got: {args:?}",
+        );
+        assert!(
+            has_pair("ControlMaster", "no"),
+            "ssh tunnel must set ControlMaster=no to bypass mux; got: {args:?}",
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     /// Tiny `CommandRunner` for tests that need to inspect the actual
     /// argv produced by a single bootstrap step. Returns success for
     /// every `run` call and spawns a real `sleep 60` for every
@@ -1015,7 +1206,6 @@ mod tests {
                 .expect("RecordingRunner.run was never called")
         }
 
-        #[allow(dead_code)]
         fn last_spawn_args(&self) -> Vec<String> {
             self.last_spawn_args
                 .lock()
@@ -1170,17 +1360,11 @@ mod tests {
         });
 
         let runner = FakeRunner::new();
-        // Step 1: probe → not installed
-        runner.expect_run("ssh", &["-o", "BatchMode=yes"], fail(1, b""));
-        // Step 3a: scp pre-mkdir
+        runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b"/home/fake\n"));
         runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b""));
-        // Step 3b: scp itself
         runner.expect_run("scp", &["-B"], ok(b""));
-        // Step 4: remote build
         runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b"build ok"));
-        // Step 5: daemon spawn
         runner.expect_run("ssh", &["-o", "BatchMode=yes"], ok(b""));
-        // Step 6: tunnel — Spawn (we'll just kill `sleep 60` in the test)
         runner.expect_spawn("ssh", &["-N"]);
 
         let (stream, mut tunnel) = bootstrap(
