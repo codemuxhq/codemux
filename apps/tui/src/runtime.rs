@@ -50,11 +50,17 @@ use vt100::Parser;
 use crate::bootstrap_worker::{BootstrapEvent, BootstrapHandle};
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
+use crate::log_tail::LogTail;
 use crate::spawn::{ModalOutcome, SpawnMinibuffer};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const NAV_PANE_WIDTH: u16 = 25;
 const STATUS_BAR_HEIGHT: u16 = 1;
+/// Height of the bottom log strip rendered when `--log` is passed.
+/// Currently 1 row (the user's chosen UX is "show only the latest
+/// line"); a future scrollable overlay could be N rows behind a
+/// keybinding without changing this constant.
+const LOG_STRIP_HEIGHT: u16 = 1;
 
 struct TerminalGuard {
     enhanced_keyboard: bool,
@@ -252,11 +258,11 @@ impl RuntimeAgent {
     }
 }
 
-pub fn run(nav_style: NavStyle, config: &Config) -> Result<()> {
+pub fn run(nav_style: NavStyle, config: &Config, log_tail: Option<&LogTail>) -> Result<()> {
     tracing::info!("codemux starting (nav={nav_style:?})");
 
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
-    let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols);
+    let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
 
     let initial = spawn_local_agent("agent-1".into(), None, pty_rows, pty_cols)?;
     let agents = vec![initial];
@@ -286,13 +292,20 @@ pub fn run(nav_style: NavStyle, config: &Config) -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
 
-    event_loop(&mut terminal, agents, nav_style, &config.bindings)
+    event_loop(&mut terminal, agents, nav_style, &config.bindings, log_tail)
 }
 
-fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16) -> (u16, u16) {
+fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16, log_strip: bool) -> (u16, u16) {
+    let log_rows = if log_strip { LOG_STRIP_HEIGHT } else { 0 };
     match style {
-        NavStyle::LeftPane => (term_rows, term_cols.saturating_sub(NAV_PANE_WIDTH)),
-        NavStyle::Popup => (term_rows.saturating_sub(STATUS_BAR_HEIGHT), term_cols),
+        NavStyle::LeftPane => (
+            term_rows.saturating_sub(log_rows),
+            term_cols.saturating_sub(NAV_PANE_WIDTH),
+        ),
+        NavStyle::Popup => (
+            term_rows.saturating_sub(STATUS_BAR_HEIGHT + log_rows),
+            term_cols,
+        ),
     }
 }
 
@@ -335,6 +348,7 @@ fn event_loop(
     mut agents: Vec<RuntimeAgent>,
     mut nav_style: NavStyle,
     bindings: &Bindings,
+    log_tail: Option<&LogTail>,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
@@ -456,6 +470,7 @@ fn event_loop(
                     spawn_ui.as_ref(),
                     bindings,
                     &status_hint,
+                    log_tail,
                 );
             })
             .wrap_err("draw frame")?;
@@ -484,7 +499,8 @@ fn event_loop(
                             spawn_ui = None;
                             let (term_cols, term_rows) =
                                 crossterm::terminal::size().wrap_err("read terminal size")?;
-                            let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
+                            let (rows, cols) =
+                                pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
                             spawn_counter += 1;
                             if host == "local" {
                                 let label = format!("agent-{spawn_counter}");
@@ -622,7 +638,8 @@ fn event_loop(
                         nav_style = nav_style.toggle();
                         let (term_cols, term_rows) =
                             crossterm::terminal::size().wrap_err("read terminal size")?;
-                        let (rows, cols) = pty_size_for(nav_style, term_rows, term_cols);
+                        let (rows, cols) =
+                            pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
                         resize_agents(&mut agents, rows, cols);
                     }
                     KeyDispatch::OpenPopup => {
@@ -634,7 +651,7 @@ fn event_loop(
                 }
             }
             Event::Resize(cols, rows) => {
-                let (pty_rows, pty_cols) = pty_size_for(nav_style, rows, cols);
+                let (pty_rows, pty_cols) = pty_size_for(nav_style, rows, cols, log_tail.is_some());
                 resize_agents(&mut agents, pty_rows, pty_cols);
             }
             _ => {}
@@ -720,13 +737,30 @@ fn render_frame(
     spawn_ui: Option<&SpawnMinibuffer>,
     bindings: &Bindings,
     status_hint: &str,
+    log_tail: Option<&LogTail>,
 ) {
     let area = frame.area();
-    match nav_style {
-        NavStyle::LeftPane => render_left_pane(frame, area, agents, focused),
-        NavStyle::Popup => {
-            render_popup_style(frame, area, agents, focused, popup, status_hint);
+    // Carve off the bottom log strip first, if enabled. The remaining
+    // area is what the nav-style render sees, so it doesn't need to
+    // know the log strip exists.
+    let (main_area, log_area) = match log_tail {
+        Some(_) => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(LOG_STRIP_HEIGHT)])
+                .split(area);
+            (chunks[0], Some(chunks[1]))
         }
+        None => (area, None),
+    };
+    match nav_style {
+        NavStyle::LeftPane => render_left_pane(frame, main_area, agents, focused),
+        NavStyle::Popup => {
+            render_popup_style(frame, main_area, agents, focused, popup, status_hint);
+        }
+    }
+    if let (Some(tail), Some(area)) = (log_tail, log_area) {
+        render_log_strip(frame, area, tail);
     }
     if let Some(ui) = spawn_ui {
         ui.render(frame, area, &bindings.on_modal);
@@ -734,6 +768,25 @@ fn render_frame(
     if matches!(help, HelpState::Open) {
         render_help(frame, area, bindings);
     }
+}
+
+/// Render the bottom log strip — a single row showing the most recent
+/// tracing event captured by [`LogTail`]. Uses dim styling so the
+/// strip reads as ambient information rather than competing with the
+/// agent pane for attention. Empty tail (no events yet) renders as a
+/// single dash so the row is visually present and the user can tell
+/// the strip is live.
+fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail) {
+    let line = tail.latest().unwrap_or_else(|| "—".to_string());
+    let widget = Paragraph::new(Line::raw(line)).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    );
+    // Clear so a previous frame's longer line doesn't leave trailing
+    // characters when the latest line is shorter.
+    frame.render_widget(Clear, area);
+    frame.render_widget(widget, area);
 }
 
 /// Render an agent's main pane based on its current [`AgentState`]. A

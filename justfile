@@ -4,7 +4,7 @@ default:
 
 # Run the TUI. Args pass through, e.g. `just run -- --nav left-pane`.
 run *ARGS:
-    cargo run -- {{ARGS}}
+    cargo run -p codemux-tui --bin codemux -- {{ARGS}}
 
 # Run the daemon (foreground mode for `cargo run`). Args pass through, e.g.
 # `just daemon -- --socket /tmp/dev.sock -- bash` to exec bash instead of
