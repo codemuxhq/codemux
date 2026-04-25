@@ -133,12 +133,15 @@ enum KeyDispatch {
 /// drain phase. Computed while we hold a borrow on `agent.state`,
 /// then applied in a second statement that has exclusive access.
 /// Carries the transition payload (the new transport, or the
-/// rendered error + host) so the apply-step doesn't need to re-match
-/// on the prior state.
+/// structured bootstrap error + host) so the apply-step doesn't
+/// need to re-match on the prior state.
 enum AgentTransition {
     Stay,
     PromoteToReady(AgentTransport),
-    PromoteToFailed { host: String, error: String },
+    PromoteToFailed {
+        host: String,
+        error: codemuxd_bootstrap::Error,
+    },
 }
 
 struct RuntimeAgent {
@@ -178,10 +181,15 @@ enum AgentState {
         host: String,
         handle: BootstrapHandle,
     },
-    /// Bootstrap returned an error. The dead handle has already
-    /// been dropped; only the host and pre-formatted message remain
-    /// for the renderer.
-    Failed { host: String, error: String },
+    /// Bootstrap returned an error. The dead handle has already been
+    /// dropped; the variant carries the structured
+    /// [`codemuxd_bootstrap::Error`] so the renderer can format it
+    /// (single-line summary today, "Caused by:" cascade later) without
+    /// the runtime baking in a stringification policy here.
+    Failed {
+        host: String,
+        error: codemuxd_bootstrap::Error,
+    },
     /// Live agent with an attached PTY (local or SSH-tunneled).
     Ready {
         /// Boxed because `vt100::Parser` carries a screen-sized cell
@@ -345,7 +353,7 @@ fn event_loop(
                         tracing::error!(label = %agent.label, "bootstrap failed: {e}");
                         AgentTransition::PromoteToFailed {
                             host: host.clone(),
-                            error: format_bootstrap_error(&e),
+                            error: e,
                         }
                     }
                     None => AgentTransition::Stay,
@@ -686,7 +694,8 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
             render_bootstrap_placeholder(frame, area, host, None);
         }
         AgentState::Failed { host, error } => {
-            render_bootstrap_placeholder(frame, area, host, Some(error));
+            let formatted = format_bootstrap_error(error);
+            render_bootstrap_placeholder(frame, area, host, Some(&formatted));
         }
     }
 }
