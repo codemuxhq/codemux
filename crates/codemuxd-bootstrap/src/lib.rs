@@ -17,6 +17,9 @@
 //!   returning a ready-to-use [`AgentTransport`]. Takes a fresh `cwd`
 //!   so the spawn modal can let the user pick a remote folder *between*
 //!   the two phases without holding the prepare result hostage.
+//! - [`RemoteFs`] — long-lived `ssh -M -N` `ControlMaster` used by the
+//!   spawn modal to autocomplete remote directories cheaply between
+//!   `prepare_remote` and `attach_agent`. Lives in [`remote_fs`].
 //! - [`CommandRunner`] / [`RealRunner`] — pluggable shim around
 //!   `std::process::Command` so failure modes are unit-testable
 //!   without touching the network.
@@ -56,6 +59,9 @@
 //! pairs to canned [`CommandOutput`] / [`std::io::Error`] values.
 
 pub mod error;
+pub mod remote_fs;
+
+pub use crate::remote_fs::{DirEntry, MAX_LIST_ENTRIES, RemoteFs, RemoteFsError};
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
