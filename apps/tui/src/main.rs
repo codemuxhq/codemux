@@ -13,6 +13,8 @@ mod bootstrap_worker;
 mod config;
 mod keymap;
 mod log_tail;
+mod pty_title;
+mod repo_name;
 mod runtime;
 mod spawn;
 mod ssh_config;

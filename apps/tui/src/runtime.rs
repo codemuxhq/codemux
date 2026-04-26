@@ -58,6 +58,8 @@ use crate::bootstrap_worker::{
 use crate::config::Config;
 use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction};
 use crate::log_tail::LogTail;
+use crate::pty_title::TitleCapture;
+use crate::repo_name;
 use crate::spawn::{DirLister, HOST_PLACEHOLDER, ModalOutcome, SpawnMinibuffer};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
@@ -145,7 +147,36 @@ enum KeyDispatch {
 }
 
 struct RuntimeAgent {
+    /// Static fallback shown when the foreground process hasn't yet
+    /// emitted an OSC title (and as a debugging breadcrumb in
+    /// tracing). User-visible labels render via [`agent_label_spans`]
+    /// using the live title when available.
     label: String,
+    /// Repo name for this agent: git root basename when local
+    /// resolution found a `.git`, otherwise the cwd basename. `None`
+    /// if neither could be determined (e.g. local agent spawned with
+    /// no cwd, or remote spawn that defaulted to `$HOME` with an
+    /// empty path); the renderer falls back to `label` in that case.
+    repo: Option<String>,
+    /// Hostname for SSH-backed agents (`Some` for both Ready and
+    /// Failed SSH agents, `None` for local). The single source of
+    /// truth — the renderer derives the dim/gray prefix from this,
+    /// and the failure pane reads it for the "✗ bootstrap of {host}
+    /// failed" line.
+    host: Option<String>,
+    /// Working state observed on the previous frame. The runtime
+    /// compares this to `parser.callbacks().is_working()` each tick;
+    /// a `true → false` transition while the agent is *not* focused
+    /// flips [`needs_attention`](Self::needs_attention) on. Stored
+    /// per-agent rather than as a side-table so reaping a transport
+    /// also drops the state — no stale slot to clean up.
+    last_working: bool,
+    /// True after the agent went working→idle while unfocused. The
+    /// renderer pulses the tab body in `DarkGray` with a small `●`
+    /// prefix so the user notices something completed without yelling
+    /// in yellow / red. Cleared the moment the user focuses this tab
+    /// (see [`change_focus`]).
+    needs_attention: bool,
     /// Cell width/height the agent's pane is currently allocated.
     /// Tracked separately so a `Failed` agent (no transport) still has
     /// the right geometry if the surrounding logic ever needs it, and
@@ -175,11 +206,10 @@ enum AgentState {
     /// dropped; the variant carries the structured
     /// [`codemuxd_bootstrap::Error`] so the renderer can format it
     /// (single-line summary today, "Caused by:" cascade later) without
-    /// the runtime baking in a stringification policy here.
-    Failed {
-        host: String,
-        error: codemuxd_bootstrap::Error,
-    },
+    /// the runtime baking in a stringification policy here. The host
+    /// itself lives on [`RuntimeAgent::host`] (single source of truth
+    /// across `Ready` and `Failed`).
+    Failed { error: codemuxd_bootstrap::Error },
     /// Live agent with an attached PTY (local or SSH-tunneled).
     Ready {
         /// Boxed because `vt100::Parser` carries a screen-sized cell
@@ -188,19 +218,40 @@ enum AgentState {
         /// `Ready`-sized footprint regardless of state, and clippy
         /// fires `large_enum_variant`. The pointer indirection is
         /// invisible against the per-frame parser/render work.
-        parser: Box<Parser>,
+        ///
+        /// Parameterised on [`TitleCapture`] so OSC 0 / OSC 2 titles
+        /// the foreground process emits land in
+        /// `parser.callbacks().title()` and feed the smart-label
+        /// renderer.
+        parser: Box<Parser<TitleCapture>>,
         transport: AgentTransport,
     },
 }
 
 impl RuntimeAgent {
-    fn ready(label: String, transport: AgentTransport, rows: u16, cols: u16) -> Self {
+    fn ready(
+        label: String,
+        repo: Option<String>,
+        host: Option<String>,
+        transport: AgentTransport,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
         Self {
             label,
+            repo,
+            host,
+            last_working: false,
+            needs_attention: false,
             rows,
             cols,
             state: AgentState::Ready {
-                parser: Box::new(Parser::new(rows, cols, 0)),
+                parser: Box::new(Parser::new_with_callbacks(
+                    rows,
+                    cols,
+                    0,
+                    TitleCapture::default(),
+                )),
                 transport,
             },
         }
@@ -208,6 +259,7 @@ impl RuntimeAgent {
 
     fn failed(
         label: String,
+        repo: Option<String>,
         host: String,
         error: codemuxd_bootstrap::Error,
         rows: u16,
@@ -215,9 +267,33 @@ impl RuntimeAgent {
     ) -> Self {
         Self {
             label,
+            repo,
+            host: Some(host),
+            last_working: false,
+            needs_attention: false,
             rows,
             cols,
-            state: AgentState::Failed { host, error },
+            state: AgentState::Failed { error },
+        }
+    }
+
+    /// Live OSC title from the agent's parser, if any. `None` for
+    /// `Failed` agents and for `Ready` agents whose foreground
+    /// process hasn't emitted a title yet.
+    fn title(&self) -> Option<&str> {
+        match &self.state {
+            AgentState::Ready { parser, .. } => parser.callbacks().title(),
+            AgentState::Failed { .. } => None,
+        }
+    }
+
+    /// Whether the foreground process is currently in a working
+    /// state per its OSC title. `false` for `Failed` agents and for
+    /// `Ready` agents whose title doesn't carry a status glyph.
+    fn is_working(&self) -> bool {
+        match &self.state {
+            AgentState::Ready { parser, .. } => parser.callbacks().is_working(),
+            AgentState::Failed { .. } => false,
         }
     }
 }
@@ -257,6 +333,11 @@ struct PendingPrepare {
 struct PendingAttach {
     label: String,
     host: String,
+    /// Repo name resolved from the user-typed remote cwd (basename).
+    /// Stored here rather than recomputed on Done because the cwd
+    /// itself isn't carried past attach kickoff and the modal might
+    /// have been replaced by then.
+    repo: Option<String>,
     rows: u16,
     cols: u16,
     handle: AttachHandle,
@@ -342,7 +423,10 @@ fn spawn_local_agent(
 ) -> Result<RuntimeAgent> {
     let transport = AgentTransport::spawn_local(label.clone(), cwd, rows, cols)
         .wrap_err("spawn local agent")?;
-    Ok(RuntimeAgent::ready(label, transport, rows, cols))
+    let repo = cwd.and_then(repo_name::resolve_local);
+    Ok(RuntimeAgent::ready(
+        label, repo, None, transport, rows, cols,
+    ))
 }
 
 fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
@@ -380,15 +464,45 @@ fn cancel_modal_owned_attach(attaches: &mut Vec<PendingAttach>) {
 }
 
 /// Move focus to `new`, remembering the previous index for `FocusLast`
+/// Move focus to `new`, recording the prior focus index for `prefix + Tab`
 /// (alt-tab) bouncing. No-op if the focus is already on `new` — that
 /// keeps a double-tap of the same direct-bind from clobbering the
 /// bounce slot. Centralized helper because the event loop has six
 /// focus-mutation sites and open-coding the `previous` update at each
 /// would be the obvious bug source.
-fn change_focus(focused: &mut usize, previous: &mut Option<usize>, new: usize) {
+///
+/// Also clears [`RuntimeAgent::needs_attention`] on the newly-focused
+/// agent so the slow-blink dismisses the moment the user actually
+/// looks at it. Done here rather than at each call site for the same
+/// reason as the bounce-slot bookkeeping: one place to reason about.
+fn change_focus(
+    agents: &mut [RuntimeAgent],
+    focused: &mut usize,
+    previous: &mut Option<usize>,
+    new: usize,
+) {
     if new != *focused {
         *previous = Some(*focused);
         *focused = new;
+        if let Some(a) = agents.get_mut(new) {
+            a.needs_attention = false;
+        }
+    }
+}
+
+/// Detect working→idle transitions on unfocused agents and flag them for
+/// the slow-blink attention cue. Called once per tick after the PTY drain
+/// so the title parser sees the freshest state. Focused agents are skipped
+/// — the user is already looking; nothing to alert about — and any agent
+/// caught in this window has its blink cleared on the next focus change
+/// via [`change_focus`].
+fn flag_finished_unfocused(agents: &mut [RuntimeAgent], focused: usize) {
+    for (i, agent) in agents.iter_mut().enumerate() {
+        let cur = agent.is_working();
+        if agent.last_working && !cur && i != focused {
+            agent.needs_attention = true;
+        }
+        agent.last_working = cur;
     }
 }
 
@@ -426,6 +540,12 @@ fn event_loop(
     // or the transport died) so the bounce never lands on a stale slot.
     let mut previous_focused: Option<usize> = None;
     let mut spawn_counter: usize = agents.len();
+    // Captured once at loop entry so per-tab spinner / blink phases
+    // are derived from a stable monotonic origin. The 50 ms event
+    // poll below already redraws on each tick when nothing else
+    // happens, so the wall-clock derivation is enough — no extra
+    // wakeup machinery needed.
+    let start = Instant::now();
 
     loop {
         // Drain prepare events first: the modal should reflect the
@@ -531,6 +651,8 @@ fn event_loop(
                         tracing::info!(label = %attach.label, "attach completed; transport ready");
                         new_agents.push(RuntimeAgent::ready(
                             attach.label.clone(),
+                            attach.repo.clone(),
+                            Some(attach.host.clone()),
                             transport,
                             attach.rows,
                             attach.cols,
@@ -540,6 +662,7 @@ fn event_loop(
                         tracing::error!(label = %attach.label, "attach failed: {e}");
                         new_agents.push(RuntimeAgent::failed(
                             attach.label.clone(),
+                            attach.repo.clone(),
                             attach.host.clone(),
                             e,
                             attach.rows,
@@ -572,7 +695,8 @@ fn event_loop(
         let new_count = new_agents.len();
         agents.extend(new_agents);
         if focus_new && new_count > 0 {
-            change_focus(&mut focused, &mut previous_focused, agents.len() - 1);
+            let target = agents.len() - 1;
+            change_focus(&mut agents, &mut focused, &mut previous_focused, target);
         }
 
         for agent in &mut agents {
@@ -585,6 +709,8 @@ fn event_loop(
                 AgentState::Failed { .. } => {}
             }
         }
+
+        flag_finished_unfocused(&mut agents, focused);
 
         agents.retain_mut(|agent| match &mut agent.state {
             AgentState::Ready { transport, .. } => transport.try_wait().is_none(),
@@ -615,6 +741,7 @@ fn event_loop(
             };
         }
 
+        let phase = AnimationPhase::from_elapsed(start.elapsed());
         terminal
             .draw(|frame| {
                 render_frame(
@@ -629,6 +756,7 @@ fn event_loop(
                     bindings,
                     prefix_state,
                     log_tail,
+                    phase,
                 );
             })
             .wrap_err("draw frame")?;
@@ -718,10 +846,12 @@ fn event_loop(
                                 match spawn_local_agent(label, cwd_path, rows, cols) {
                                     Ok(agent) => {
                                         agents.push(agent);
+                                        let target = agents.len() - 1;
                                         change_focus(
+                                            &mut agents,
                                             &mut focused,
                                             &mut previous_focused,
-                                            agents.len() - 1,
+                                            target,
                                         );
                                     }
                                     Err(e) => {
@@ -772,6 +902,21 @@ fn event_loop(
                                 } else {
                                     Some(PathBuf::from(&path))
                                 };
+                                // Repo name shown in the navigator
+                                // for this agent. We can't probe
+                                // the remote filesystem from here
+                                // without a second ssh round-trip
+                                // (the prepare's `RemoteFs` was
+                                // already dropped), so we settle
+                                // for the basename of whatever the
+                                // user typed. `None` for empty
+                                // paths — the renderer falls back
+                                // to the static label.
+                                let repo = if path.is_empty() {
+                                    None
+                                } else {
+                                    repo_name::resolve_remote(&path)
+                                };
                                 let handle = start_attach(
                                     prepared,
                                     host.clone(),
@@ -788,6 +933,7 @@ fn event_loop(
                                 attaches.push(PendingAttach {
                                     label,
                                     host,
+                                    repo,
                                     rows,
                                     cols,
                                     handle,
@@ -815,7 +961,12 @@ fn event_loop(
                                 popup_state = PopupState::Open { selection: prev };
                             }
                             PopupAction::Confirm => {
-                                change_focus(&mut focused, &mut previous_focused, selection);
+                                change_focus(
+                                    &mut agents,
+                                    &mut focused,
+                                    &mut previous_focused,
+                                    selection,
+                                );
                                 popup_state = PopupState::Closed;
                             }
                             PopupAction::Cancel => {
@@ -855,7 +1006,7 @@ fn event_loop(
                     }
                     KeyDispatch::FocusNext => {
                         let next = (focused + 1) % agents.len();
-                        change_focus(&mut focused, &mut previous_focused, next);
+                        change_focus(&mut agents, &mut focused, &mut previous_focused, next);
                     }
                     KeyDispatch::FocusPrev => {
                         let prev = if focused == 0 {
@@ -863,7 +1014,7 @@ fn event_loop(
                         } else {
                             focused - 1
                         };
-                        change_focus(&mut focused, &mut previous_focused, prev);
+                        change_focus(&mut agents, &mut focused, &mut previous_focused, prev);
                     }
                     KeyDispatch::FocusLast => {
                         // Bounce. No-op if the previous slot is gone
@@ -873,12 +1024,12 @@ fn event_loop(
                             && prev < agents.len()
                             && prev != focused
                         {
-                            change_focus(&mut focused, &mut previous_focused, prev);
+                            change_focus(&mut agents, &mut focused, &mut previous_focused, prev);
                         }
                     }
                     KeyDispatch::FocusAt(idx) => {
                         if idx < agents.len() {
-                            change_focus(&mut focused, &mut previous_focused, idx);
+                            change_focus(&mut agents, &mut focused, &mut previous_focused, idx);
                         }
                     }
                     KeyDispatch::ToggleNav => {
@@ -1032,6 +1183,7 @@ fn render_frame(
     bindings: &Bindings,
     prefix_state: PrefixState,
     log_tail: Option<&LogTail>,
+    phase: AnimationPhase,
 ) {
     let area = frame.area();
     // Carve off the bottom log strip first, if enabled. The remaining
@@ -1048,7 +1200,7 @@ fn render_frame(
         None => (area, None),
     };
     match nav_style {
-        NavStyle::LeftPane => render_left_pane(frame, main_area, agents, focused),
+        NavStyle::LeftPane => render_left_pane(frame, main_area, agents, focused, phase),
         NavStyle::Popup => {
             render_popup_style(
                 frame,
@@ -1059,6 +1211,7 @@ fn render_frame(
                 popup,
                 bindings,
                 prefix_state,
+                phase,
             );
         }
     }
@@ -1104,7 +1257,8 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
         }
-        AgentState::Failed { host, error } => {
+        AgentState::Failed { error } => {
+            let host = agent.host.as_deref().unwrap_or("");
             render_failure_pane(frame, area, host, &error.user_message());
         }
     }
@@ -1154,7 +1308,13 @@ fn render_failure_pane(frame: &mut Frame<'_>, area: Rect, host: &str, err: &str)
     );
 }
 
-fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], focused: usize) {
+fn render_left_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agents: &[RuntimeAgent],
+    focused: usize,
+    phase: AnimationPhase,
+) {
     let [nav_area, pty_area] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(NAV_PANE_WIDTH), Constraint::Min(1)])
@@ -1165,7 +1325,10 @@ fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], 
         .enumerate()
         .map(|(i, a)| {
             let prefix = if i == focused { "> " } else { "  " };
-            Line::from(format!("{prefix}[{}] {}", i + 1, a.label))
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+            spans.push(Span::raw(format!("{prefix}[{}] ", i + 1)));
+            spans.extend(agent_label_spans(a, false, phase));
+            Line::from(spans)
         })
         .collect();
     let nav = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" agents "));
@@ -1186,6 +1349,7 @@ fn render_popup_style(
     popup: PopupState,
     bindings: &Bindings,
     prefix_state: PrefixState,
+    phase: AnimationPhase,
 ) {
     let [pty_area, status_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -1204,10 +1368,11 @@ fn render_popup_style(
         previous_focused,
         bindings,
         prefix_state,
+        phase,
     );
 
     if let PopupState::Open { selection } = popup {
-        render_switcher_popup(frame, area, agents, selection);
+        render_switcher_popup(frame, area, agents, selection, phase);
     }
 }
 
@@ -1228,6 +1393,7 @@ fn render_popup_style(
 /// the help reminder; `AwaitingCommand` shows a `[NAV]` badge plus a
 /// short reminder of the sticky moves available, so the user has a
 /// visible cue that they're "in nav mode" and what they can do.
+#[allow(clippy::too_many_arguments)]
 fn render_status_bar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1236,6 +1402,7 @@ fn render_status_bar(
     previous_focused: Option<usize>,
     bindings: &Bindings,
     prefix_state: PrefixState,
+    phase: AnimationPhase,
 ) {
     // Compute the hint as both rendered Line (with styling) and a
     // plain text-width measurement (for the layout split). The two
@@ -1263,7 +1430,7 @@ fn render_status_bar(
     // a unit, instead of splitting tabs vs tail into competing layout
     // children that would each get half the width regardless of
     // content length.
-    let mut spans = build_tab_strip_spans(agents, focused);
+    let mut spans = build_tab_strip_spans(agents, focused, phase);
     if let Some(tail) = buddy_tail_spans(agents, focused, previous_focused) {
         spans.push(Span::styled(
             "    ← ",
@@ -1334,7 +1501,11 @@ fn build_hint(bindings: &Bindings, prefix_state: PrefixState) -> (Line<'static>,
 /// having to look at a marker character. Tabs are separated by a thin
 /// vertical bar — close enough to the browser tab convention to read
 /// as "tabs" rather than "list of items."
-fn build_tab_strip_spans(agents: &[RuntimeAgent], focused: usize) -> Vec<Span<'static>> {
+fn build_tab_strip_spans(
+    agents: &[RuntimeAgent],
+    focused: usize,
+    phase: AnimationPhase,
+) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(agents.len().saturating_mul(3));
     let separator_style = Style::default()
         .fg(Color::DarkGray)
@@ -1343,15 +1514,246 @@ fn build_tab_strip_spans(agents: &[RuntimeAgent], focused: usize) -> Vec<Span<'s
         if i > 0 {
             spans.push(Span::styled(" │ ", separator_style));
         }
-        let label = format!(" {} {} ", i + 1, agent.label);
-        let style = if i == focused {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        };
-        spans.push(Span::styled(label, style));
+        let focused_tab = i == focused;
+        spans.push(Span::styled(
+            format!(" {} ", i + 1),
+            tab_index_style(focused_tab),
+        ));
+        spans.extend(agent_label_spans(agent, focused_tab, phase));
+        spans.push(Span::styled(" ", tab_index_style(focused_tab)));
     }
     spans
+}
+
+fn tab_index_style(focused: bool) -> Style {
+    if focused {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+}
+
+/// Wall-clock-derived animation state. Computed once per render in
+/// [`render_frame`] and threaded down to every label site so the
+/// per-tab spinner and the slow-blink "needs attention" cue stay in
+/// lockstep across the navigator. Pure data so tests can construct
+/// an arbitrary phase without touching the clock.
+#[derive(Clone, Copy, Debug, Default)]
+struct AnimationPhase {
+    /// Current spinner frame index. Cycled at ~10 Hz (one frame per
+    /// 100 ms); modulo'd against [`SPINNER_FRAMES.len()`] in
+    /// [`from_elapsed`].
+    spinner_frame: usize,
+    /// Whether the slow-blink cue is in its *bright* half-cycle this
+    /// tick. Toggles every [`BLINK_HALF_CYCLE_MS`] — currently
+    /// 1500 ms (3-second full period). Slow heartbeat: noticeable
+    /// in peripheral vision but never feels jittery.
+    blink_bright: bool,
+}
+
+/// Half-period of the "needs attention" blink, in milliseconds. A
+/// 1500 ms half-cycle gives a 3-second full pulse — the user
+/// reported the previous 500 ms felt too fast and the colors swung
+/// too far. Both ends now sit in the light-grey range
+/// (see [`body_style`]) so the swing reads as a gentle pulse rather
+/// than a strobe.
+const BLINK_HALF_CYCLE_MS: u128 = 1500;
+
+/// Bright end of the slow-blink pulse — xterm 256-color index 252
+/// is a light grey, just below white. Paired with [`BLINK_DIM`]
+/// (~5 steps darker) for a gentle swing that still reads as a
+/// distinct cue against the surrounding `DIM` sibling tabs.
+const BLINK_BRIGHT: Color = Color::Indexed(252);
+
+/// Dim end of the slow-blink pulse — xterm 256-color index 247
+/// is a slightly darker light grey. Sits comfortably above the
+/// `DarkGray` baseline used elsewhere so the dim phase is still
+/// clearly visible.
+const BLINK_DIM: Color = Color::Indexed(247);
+
+impl AnimationPhase {
+    fn from_elapsed(elapsed: Duration) -> Self {
+        let ms = elapsed.as_millis();
+        // Bounded by `% SPINNER_FRAMES.len() as u128` (= % 8), so the
+        // result always fits in usize on every platform we target.
+        #[allow(clippy::cast_possible_truncation)]
+        let spinner_frame = (ms / 100 % SPINNER_FRAMES.len() as u128) as usize;
+        Self {
+            spinner_frame,
+            blink_bright: (ms / BLINK_HALF_CYCLE_MS).is_multiple_of(2),
+        }
+    }
+
+    fn spinner_glyph(self) -> &'static str {
+        // Bounds-safe by construction: `spinner_frame` is computed
+        // modulo `SPINNER_FRAMES.len()` in `from_elapsed`. Tests can
+        // build phases directly, so guard with `min` rather than an
+        // index panic if a future test passes an out-of-range value.
+        SPINNER_FRAMES[self.spinner_frame.min(SPINNER_FRAMES.len() - 1)]
+    }
+}
+
+/// Braille spinner that uses 7-of-8 dots per frame — the rotation
+/// reads as a missing dot moving around the cell, with the result
+/// that every frame fills most of the character cell vertically.
+/// Picked over the upper-half "dots" set Claude itself uses
+/// (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) because those frames live in the top half of
+/// the cell and visibly drift up against the navigator's tab strip
+/// — the user reported the spinner "touching the top border."
+/// Eight frames at 100 ms each is a clean 1.25 Hz rotation.
+const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+
+/// Smart per-agent label rendered as styled spans. The shape is
+/// `[host · ][⠋ ][● ]<repo>: <title>`, where:
+///
+/// - `host` (dim/gray) is shown only for SSH-backed agents so the
+///   user can tell at a glance which devpod the agent lives on
+/// - `⠋` is a Braille spinner frame, rendered when the foreground
+///   process is mid-turn (its OSC title carries Claude's spinner /
+///   ✱ glyph). Cycles via [`AnimationPhase`] at ~10 Hz so the motion
+///   reads as ambient liveness.
+/// - `●` is a soft pulsing dot rendered only when an unfocused tab
+///   needs attention (its agent finished a turn since the user was
+///   last there). Pulses on the same 1 Hz cycle as the body itself
+///   so the two cues read as a single signal.
+/// - `repo` is the git-root basename for local agents (or cwd
+///   basename when the cwd isn't inside a git repo) and the cwd
+///   basename for remote agents
+/// - `title` is the live OSC 0 / OSC 2 window title the foreground
+///   process emits — typically Claude Code's "current task" line
+///
+/// When the agent has no live title yet (fresh spawn, or the
+/// foreground process never emits one) the renderer falls back to
+/// the static `agent.label` so the tab still has something readable.
+/// Focused tabs reuse the surrounding tab-strip styling so the host
+/// prefix doesn't fight the reverse-video highlight; unfocused tabs
+/// get the dim host prefix to keep the repo+title the visual anchor.
+fn agent_label_spans(
+    agent: &RuntimeAgent,
+    focused: bool,
+    phase: AnimationPhase,
+) -> Vec<Span<'static>> {
+    // Attention only applies to unfocused tabs; the &&!focused guard
+    // is belt-and-braces against a stale flag (the per-frame
+    // transition detector already skips the focused index).
+    let attention = agent.needs_attention && !focused;
+    label_spans(
+        agent.host.as_deref(),
+        &agent_body_text(agent),
+        agent.is_working(),
+        attention,
+        focused,
+        phase,
+    )
+}
+
+/// Pure-data version of [`agent_label_spans`]. The wrapper resolves
+/// per-agent state into primitives; this function does the rendering.
+/// Split so unit tests can exercise every (host / working / attention /
+/// focused) permutation without needing a real `RuntimeAgent` (which
+/// requires an `AgentTransport` to reach the working spinner branch).
+fn label_spans(
+    host: Option<&str>,
+    body: &str,
+    working: bool,
+    attention: bool,
+    focused: bool,
+    phase: AnimationPhase,
+) -> Vec<Span<'static>> {
+    let body_style = body_style(focused, attention, phase);
+    let host_style = if focused {
+        // Reversed already; keep it readable by inheriting the same
+        // reverse style (no extra fg/bg) so the host doesn't blend
+        // into the highlight.
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
+
+    if let Some(host) = host {
+        spans.push(Span::styled(format!("{host} · "), host_style));
+    }
+
+    // Spinner before the body so its position stays put as titles
+    // grow and shrink. `Color::Gray` *without* DIM on unfocused tabs
+    // makes the spinner clearly visible against the surrounding DIM
+    // label — the user reported the previous DarkGray+DIM was too
+    // faint to read at a glance. On focused tabs we inherit the
+    // tab's reverse video so the cue stays visible without breaking
+    // the tab-highlight read.
+    if working {
+        let spinner_style = if focused {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(
+            format!("{} ", phase.spinner_glyph()),
+            spinner_style,
+        ));
+    }
+
+    // Attention dot pulses with the body — same style → reads as
+    // one signal, not two competing animations.
+    if attention {
+        spans.push(Span::styled("● ", body_style));
+    }
+
+    spans.push(Span::styled(body.to_string(), body_style));
+    spans
+}
+
+/// Pick a body style based on focus + attention + the current blink
+/// phase. The matrix:
+///
+/// - **focused** → reverse-video bold, ignoring attention (the user
+///   is already there; the blink is moot)
+/// - **unfocused, attention, bright phase** → [`BLINK_BRIGHT`]
+/// - **unfocused, attention, dim phase** → [`BLINK_DIM`]
+/// - **unfocused, no attention** → `DIM` (current default)
+///
+/// Both blink ends sit in the light-grey range (256-color indices
+/// 252 / 247 — the upper third of the xterm grayscale ramp). The
+/// resulting pulse stays well above the surrounding `DIM` siblings
+/// so the cue is unmistakable, but the swing between the two ends
+/// is small enough to read as a heartbeat rather than a strobe.
+fn body_style(focused: bool, attention: bool, phase: AnimationPhase) -> Style {
+    if focused {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else if attention {
+        let fg = if phase.blink_bright {
+            BLINK_BRIGHT
+        } else {
+            BLINK_DIM
+        };
+        Style::default().fg(fg)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
+}
+
+/// The non-host portion of the label: `<repo>: <title>` when both
+/// pieces are available, just `<title>` when there's no repo, just
+/// `<repo>` when there's no title, and the static `label` as the
+/// last resort.
+fn agent_body_text(agent: &RuntimeAgent) -> String {
+    body_text(agent.title(), agent.repo.as_deref(), &agent.label)
+}
+
+/// Pure-data version of [`agent_body_text`]. Split out so the four
+/// (repo, title) permutations can be tested without needing a Ready
+/// agent (which can only carry a live title via a real PTY parser).
+fn body_text(title: Option<&str>, repo: Option<&str>, fallback: &str) -> String {
+    match (repo, title) {
+        (Some(repo), Some(title)) => format!("{repo}: {title}"),
+        (Some(repo), None) => repo.to_string(),
+        (None, Some(title)) => title.to_string(),
+        (None, None) => fallback.to_string(),
+    }
 }
 
 /// Build the spans for the buddy tail — the last non-blank line of
@@ -1396,7 +1798,15 @@ fn buddy_tail_spans(
 /// contents aren't empty. Used by [`buddy_tail_spans`] to find the
 /// most recent meaningful output of an unfocused agent. Returns `None`
 /// if every row is blank (fresh PTY before any output).
-fn last_non_blank_row(parser: &Parser, rows: u16, cols: u16) -> Option<String> {
+///
+/// Generic over the callbacks type so the existing `Parser::new(...)`
+/// tests (which use `Parser<()>`) keep compiling alongside the
+/// `Parser<TitleCapture>` the runtime uses in production.
+fn last_non_blank_row<CB: vt100::Callbacks>(
+    parser: &Parser<CB>,
+    rows: u16,
+    cols: u16,
+) -> Option<String> {
     if rows == 0 || cols == 0 {
         return None;
     }
@@ -1413,6 +1823,7 @@ fn render_switcher_popup(
     area: Rect,
     agents: &[RuntimeAgent],
     selection: usize,
+    phase: AnimationPhase,
 ) {
     let popup_area = centered_rect(50, 60, area);
     frame.render_widget(Clear, popup_area);
@@ -1421,7 +1832,10 @@ fn render_switcher_popup(
         .enumerate()
         .map(|(i, a)| {
             let prefix = if i == selection { "> " } else { "  " };
-            Line::from(format!("{prefix}[{}] {}", i + 1, a.label))
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+            spans.push(Span::raw(format!("{prefix}[{}] ", i + 1)));
+            spans.extend(agent_label_spans(a, false, phase));
+            Line::from(spans)
         })
         .collect();
     let block = Block::default()
@@ -1568,7 +1982,7 @@ fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1879,9 +2293,10 @@ mod tests {
 
     #[test]
     fn change_focus_records_previous_when_focus_moves() {
+        let mut agents: Vec<RuntimeAgent> = Vec::new();
         let mut focused = 0;
         let mut previous = None;
-        change_focus(&mut focused, &mut previous, 2);
+        change_focus(&mut agents, &mut focused, &mut previous, 2);
         assert_eq!(focused, 2);
         assert_eq!(previous, Some(0));
     }
@@ -1891,9 +2306,10 @@ mod tests {
         // Critical: a no-op must not clobber `previous`. Otherwise a
         // double-tap of the same direct-bind (or pressing FocusAt(idx)
         // for an already-focused tab) would erase the bounce slot.
+        let mut agents: Vec<RuntimeAgent> = Vec::new();
         let mut focused = 1;
         let mut previous = Some(0);
-        change_focus(&mut focused, &mut previous, 1);
+        change_focus(&mut agents, &mut focused, &mut previous, 1);
         assert_eq!(focused, 1);
         assert_eq!(previous, Some(0));
     }
@@ -1903,18 +2319,53 @@ mod tests {
         // Simulates: focused=0, switch to 2 (FocusAt), then FocusLast
         // bounces back to 0 — and `previous` should now point to 2 so a
         // second FocusLast bounces forward again.
+        let mut agents: Vec<RuntimeAgent> = Vec::new();
         let mut focused = 0;
         let mut previous = None;
-        change_focus(&mut focused, &mut previous, 2);
+        change_focus(&mut agents, &mut focused, &mut previous, 2);
         assert_eq!((focused, previous), (2, Some(0)));
         // FocusLast handler reads `previous` then calls change_focus(prev).
         let bounce_target = previous.unwrap();
-        change_focus(&mut focused, &mut previous, bounce_target);
+        change_focus(&mut agents, &mut focused, &mut previous, bounce_target);
         assert_eq!((focused, previous), (0, Some(2)));
         // Second bounce.
         let bounce_target = previous.unwrap();
-        change_focus(&mut focused, &mut previous, bounce_target);
+        change_focus(&mut agents, &mut focused, &mut previous, bounce_target);
         assert_eq!((focused, previous), (2, Some(0)));
+    }
+
+    #[test]
+    fn change_focus_clears_needs_attention_on_target() {
+        // Slow-blink dismissal contract: the moment the user lands
+        // on a tab that's been screaming for attention, the blink
+        // stops. Otherwise the user would have to do something extra
+        // ("hit a key", "wait it out") to get the navigator back to
+        // a calm state — friction we deliberately want to avoid.
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        agents[1].needs_attention = true;
+        let mut focused = 0;
+        let mut previous = None;
+        change_focus(&mut agents, &mut focused, &mut previous, 1);
+        assert!(!agents[1].needs_attention);
+    }
+
+    #[test]
+    fn change_focus_noop_does_not_touch_needs_attention() {
+        // If the user is already on tab 1 and a re-focus to 1 fires
+        // (e.g. a duplicate direct-bind), needs_attention shouldn't
+        // be silently flipped — the no-op semantics apply to the
+        // attention bit just like to the bounce slot.
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        agents[1].needs_attention = true;
+        let mut focused = 1;
+        let mut previous = Some(0);
+        change_focus(&mut agents, &mut focused, &mut previous, 1);
+        // The interesting bit: the re-focus didn't enter the "moved"
+        // branch, so the attention flag stays set. The next event-loop
+        // tick will see focused==1 and not pulse, but the flag itself
+        // is left to the explicit clear path on the *next* real focus
+        // change.
+        assert!(agents[1].needs_attention);
     }
 
     // last_non_blank_row — feeds the buddy tail.
@@ -1961,7 +2412,393 @@ mod tests {
             stage: codemuxd_bootstrap::Stage::VersionProbe,
             source: Box::new(io::Error::other("test")),
         };
-        RuntimeAgent::failed(label.into(), "host".into(), err, 24, 80)
+        RuntimeAgent::failed(label.into(), None, "host".into(), err, 24, 80)
+    }
+
+    fn failed_agent_with(label: &str, repo: Option<&str>, host: Option<&str>) -> RuntimeAgent {
+        let err = codemuxd_bootstrap::Error::Bootstrap {
+            stage: codemuxd_bootstrap::Stage::VersionProbe,
+            source: Box::new(io::Error::other("test")),
+        };
+        let mut agent = RuntimeAgent::failed(
+            label.into(),
+            repo.map(str::to_string),
+            host.unwrap_or("host").into(),
+            err,
+            24,
+            80,
+        );
+        // The constructor always sets `host: Some(...)` for Failed
+        // agents (a Failed agent always has a host — that's what
+        // bootstrap was operating on). Tests that want to exercise
+        // the "no host prefix in label" code path opt out by passing
+        // `None` here; we override to model that case for the renderer
+        // tests.
+        if host.is_none() {
+            agent.host = None;
+        }
+        agent
+    }
+
+    // agent_body_text — covers the four label-source combinations
+    // the renderer can hit. Title is `None` here because Failed
+    // agents have no parser; the title-present arms are exercised
+    // implicitly by the pty_title module tests, which prove vt100
+    // surfaces the captured title via `parser.callbacks().title()`.
+
+    #[test]
+    fn agent_body_text_uses_repo_when_no_title() {
+        let agent = failed_agent_with("agent-1", Some("codemux"), None);
+        assert_eq!(agent_body_text(&agent), "codemux");
+    }
+
+    #[test]
+    fn agent_body_text_falls_back_to_label_when_neither_repo_nor_title() {
+        let agent = failed_agent_with("agent-1", None, None);
+        assert_eq!(agent_body_text(&agent), "agent-1");
+    }
+
+    // agent_label_spans — host prefix is the user-visible signal
+    // for "this lives on a remote box," so it must not silently
+    // disappear when the agent has a host set.
+
+    #[test]
+    fn agent_label_spans_includes_host_prefix_for_ssh() {
+        let agent = failed_agent_with("agent-1", Some("codemux"), Some("devpod-01"));
+        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains("devpod-01"),
+            "host prefix missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("codemux"),
+            "repo body missing: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn agent_label_spans_omits_host_prefix_for_local() {
+        let agent = failed_agent_with("agent-1", Some("codemux"), None);
+        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, "codemux");
+    }
+
+    // ── animation rendering ──────────────────────────────────────
+    //
+    // Failed agents are convenient for the wrapper tests because they
+    // expose the renderer-visible fields (`needs_attention`) without
+    // requiring an `AgentTransport`. The working-spinner branch is
+    // exercised separately against [`label_spans`] (the pure-data
+    // helper), which takes `working: bool` directly and so doesn't
+    // need a real PTY to flip the bit.
+
+    #[test]
+    fn agent_label_spans_renders_attention_dot_when_unfocused_and_flagged() {
+        let mut agent = failed_agent_with("agent-1", Some("codemux"), None);
+        agent.needs_attention = true;
+        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains('●'),
+            "attention dot missing: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn agent_label_spans_omits_attention_dot_when_focused() {
+        // Focused → user is looking → no need to alert. The flag
+        // should be cleared by change_focus before rendering, but
+        // the renderer also defends against a transient stale flag.
+        let mut agent = failed_agent_with("agent-1", Some("codemux"), None);
+        agent.needs_attention = true;
+        let spans = agent_label_spans(&agent, true, AnimationPhase::default());
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !rendered.contains('●'),
+            "focused tab should not show attention dot: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn agent_label_spans_omits_attention_dot_when_not_flagged() {
+        let agent = failed_agent_with("agent-1", Some("codemux"), None);
+        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!rendered.contains('●'));
+    }
+
+    #[test]
+    fn body_style_swings_between_grey_tones_when_attention_active() {
+        // The blink contract: bright phase → BLINK_BRIGHT (light
+        // grey, ANSI 256 index 252), dim phase → BLINK_DIM (slightly
+        // darker light grey, index 247). Pin both ends so a renderer
+        // change can't accidentally drop one half of the cycle or
+        // wander back into the high-contrast palette the user
+        // explicitly asked us to leave behind.
+        let bright = body_style(
+            false,
+            true,
+            AnimationPhase {
+                spinner_frame: 0,
+                blink_bright: true,
+            },
+        );
+        let dim = body_style(
+            false,
+            true,
+            AnimationPhase {
+                spinner_frame: 0,
+                blink_bright: false,
+            },
+        );
+        assert_eq!(bright.fg, Some(BLINK_BRIGHT));
+        assert_eq!(dim.fg, Some(BLINK_DIM));
+        assert_ne!(bright, dim);
+    }
+
+    #[test]
+    fn body_style_focused_overrides_attention() {
+        // Focused tabs use the reverse-video tab highlight regardless
+        // of attention state. Otherwise the user would see the
+        // focused tab pulsing the same as a remote alerting tab and
+        // lose the "where am I?" anchor.
+        let focused_with_attention = body_style(
+            true,
+            true,
+            AnimationPhase {
+                spinner_frame: 0,
+                blink_bright: true,
+            },
+        );
+        assert!(
+            focused_with_attention
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn animation_phase_advances_spinner_with_elapsed_time() {
+        // Frame index advances every 100 ms. Spot-check a couple of
+        // boundaries so a future tweak to the cadence has to update
+        // these too — the contract is "10 Hz spinner."
+        let f0 = AnimationPhase::from_elapsed(Duration::from_millis(0));
+        let f1 = AnimationPhase::from_elapsed(Duration::from_millis(100));
+        let f2 = AnimationPhase::from_elapsed(Duration::from_millis(200));
+        let wrap = AnimationPhase::from_elapsed(Duration::from_millis(800));
+        assert_eq!(f0.spinner_frame, 0);
+        assert_eq!(f1.spinner_frame, 1);
+        assert_eq!(f2.spinner_frame, 2);
+        // Cycle wraps after `SPINNER_FRAMES.len()` frames (800 ms
+        // for the current 8-frame dots8 set).
+        assert_eq!(wrap.spinner_frame, 0);
+    }
+
+    #[test]
+    fn animation_phase_blink_toggles_at_half_cycle_boundary() {
+        // Pin the slow-heartbeat cadence. The user explicitly asked
+        // for a slower pulse than the original 500 ms; if a future
+        // edit drops `BLINK_HALF_CYCLE_MS` back down, this test
+        // forces the rationale to be revisited.
+        let half_ms = u64::try_from(BLINK_HALF_CYCLE_MS).unwrap_or(u64::MAX);
+        let bright0 = AnimationPhase::from_elapsed(Duration::from_millis(0));
+        let dim = AnimationPhase::from_elapsed(Duration::from_millis(half_ms));
+        let bright1 = AnimationPhase::from_elapsed(Duration::from_millis(half_ms * 2));
+        assert!(bright0.blink_bright);
+        assert!(!dim.blink_bright);
+        assert!(bright1.blink_bright);
+    }
+
+    #[test]
+    fn animation_phase_spinner_glyph_returns_a_known_frame() {
+        // Pin both ends of the cycle so a future SPINNER_FRAMES rewrite
+        // has to update this test, not silently break the contract.
+        let p = AnimationPhase {
+            spinner_frame: 0,
+            blink_bright: false,
+        };
+        assert_eq!(p.spinner_glyph(), SPINNER_FRAMES[0]);
+        let last = SPINNER_FRAMES.len() - 1;
+        let p = AnimationPhase {
+            spinner_frame: last,
+            blink_bright: false,
+        };
+        assert_eq!(p.spinner_glyph(), SPINNER_FRAMES[last]);
+    }
+
+    #[test]
+    fn animation_phase_spinner_glyph_clamps_out_of_range_frame() {
+        // `from_elapsed` always produces a modulo'd index, so this only
+        // matters for test code that builds an AnimationPhase by hand.
+        // The clamp keeps that path bounds-safe rather than panicking.
+        let p = AnimationPhase {
+            spinner_frame: SPINNER_FRAMES.len() + 100,
+            blink_bright: false,
+        };
+        assert_eq!(p.spinner_glyph(), SPINNER_FRAMES[SPINNER_FRAMES.len() - 1]);
+    }
+
+    // ── label_spans (pure renderer) ───────────────────────────────
+    //
+    // Direct tests against the primitive-taking helper. These cover
+    // the working-spinner branch that the agent-wrapper tests can't
+    // reach (spinner is gated on `is_working()`, which requires a
+    // Ready agent with a real PTY parser).
+
+    fn rendered(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn label_spans_renders_spinner_glyph_when_working() {
+        let phase = AnimationPhase {
+            spinner_frame: 3,
+            blink_bright: true,
+        };
+        let spans = label_spans(None, "codemux", true, false, false, phase);
+        assert!(
+            rendered(&spans).contains(SPINNER_FRAMES[3]),
+            "spinner glyph missing: {:?}",
+            rendered(&spans)
+        );
+    }
+
+    #[test]
+    fn label_spans_omits_spinner_when_not_working() {
+        let phase = AnimationPhase::default();
+        let spans = label_spans(None, "codemux", false, false, false, phase);
+        let out = rendered(&spans);
+        for frame in SPINNER_FRAMES {
+            assert!(!out.contains(frame), "stray spinner glyph: {out:?}");
+        }
+    }
+
+    #[test]
+    fn label_spans_renders_focused_spinner_with_reverse_style() {
+        // Focused spinner inherits the tab's reverse-video highlight
+        // rather than the unfocused gray. Otherwise the spinner would
+        // visually drop out of the highlighted tab.
+        let phase = AnimationPhase::default();
+        let spans = label_spans(None, "codemux", true, false, true, phase);
+        let spinner_span = spans
+            .iter()
+            .find(|s| SPINNER_FRAMES.iter().any(|g| s.content.contains(g)))
+            .expect("spinner span present");
+        assert!(spinner_span.style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn label_spans_renders_host_prefix_when_provided() {
+        let spans = label_spans(
+            Some("devpod-01"),
+            "codemux",
+            false,
+            false,
+            false,
+            AnimationPhase::default(),
+        );
+        assert!(rendered(&spans).contains("devpod-01"));
+    }
+
+    #[test]
+    fn label_spans_omits_host_prefix_when_absent() {
+        let spans = label_spans(
+            None,
+            "codemux",
+            false,
+            false,
+            false,
+            AnimationPhase::default(),
+        );
+        assert_eq!(rendered(&spans), "codemux");
+    }
+
+    // ── body_text (pure formatter) ────────────────────────────────
+    //
+    // The four (repo, title) permutations. The agent-wrapper tests
+    // exercise the no-title arms (Failed agents have no parser); these
+    // cover the title-present arms that need a Ready agent's parser
+    // output.
+
+    #[test]
+    fn body_text_combines_repo_and_title() {
+        assert_eq!(
+            body_text(Some("Add tab names"), Some("codemux"), "fallback"),
+            "codemux: Add tab names"
+        );
+    }
+
+    #[test]
+    fn body_text_uses_title_alone_when_no_repo() {
+        assert_eq!(
+            body_text(Some("Add tab names"), None, "fallback"),
+            "Add tab names"
+        );
+    }
+
+    #[test]
+    fn body_text_uses_repo_alone_when_no_title() {
+        assert_eq!(body_text(None, Some("codemux"), "fallback"), "codemux");
+    }
+
+    #[test]
+    fn body_text_falls_back_to_label_when_neither() {
+        assert_eq!(body_text(None, None, "fallback"), "fallback");
+    }
+
+    // ── flag_finished_unfocused ──────────────────────────────────
+    //
+    // The working→idle detector that runs once per tick. Pulled out
+    // of the event loop so the transition matrix can be tested with
+    // Failed agents (whose `is_working()` is always false; we drive
+    // the input by setting `last_working` directly).
+
+    #[test]
+    fn flag_finished_unfocused_marks_unfocused_agent_that_just_finished() {
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        agents[1].last_working = true;
+        flag_finished_unfocused(&mut agents, 0);
+        assert!(agents[1].needs_attention);
+        assert!(!agents[1].last_working, "last_working must be reset");
+    }
+
+    #[test]
+    fn flag_finished_unfocused_skips_focused_agent() {
+        // Focused → user is already looking → no slow-blink. The
+        // detector still resets last_working so the transition is
+        // consumed (not re-flagged on the next tick).
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        agents[0].last_working = true;
+        flag_finished_unfocused(&mut agents, 0);
+        assert!(!agents[0].needs_attention);
+        assert!(!agents[0].last_working);
+    }
+
+    #[test]
+    fn flag_finished_unfocused_no_op_when_state_unchanged() {
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        // Both already idle; nothing transitioned.
+        flag_finished_unfocused(&mut agents, 0);
+        assert!(!agents[0].needs_attention);
+        assert!(!agents[1].needs_attention);
+    }
+
+    // ── tab_index_style ──────────────────────────────────────────
+
+    #[test]
+    fn tab_index_style_focused_is_reverse_bold() {
+        let s = tab_index_style(true);
+        assert!(s.add_modifier.contains(Modifier::REVERSED));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn tab_index_style_unfocused_is_dim() {
+        let s = tab_index_style(false);
+        assert!(s.add_modifier.contains(Modifier::DIM));
+        assert!(!s.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
