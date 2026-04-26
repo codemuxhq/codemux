@@ -21,12 +21,6 @@
 //!   given a `PreparedHost`, producing an [`AgentTransport`]. Owned by
 //!   the runtime until the agent transitions into Ready.
 //!
-//! [`start_full_pipeline`] is the legacy single-handle shim that chains
-//! prepare + attach on one worker thread. Kept in tree for the smoke
-//! example's regression coverage and for the cancel-mid-bootstrap test;
-//! production no longer routes through it (the runtime drives prepare
-//! and attach as separate handles via the spawn modal).
-//!
 //! Cancellation is best-effort: a [`CancelableRunner`] decorator
 //! shorts the worker between subprocess calls. A subprocess already in
 //! flight (e.g. `cargo build`) cannot be aborted from here without
@@ -82,9 +76,9 @@ pub enum PrepareEvent {
 /// protocol bytes never accidentally leak through `format!("{:?}")`.
 pub enum AttachEvent {
     /// The named stage just started executing on the worker thread.
-    /// In the per-phase flow, only the last 3 stages are emitted
-    /// (`DaemonSpawn`, `SocketTunnel`, `SocketConnect`). In the legacy
-    /// `start_full_pipeline` shim, all 7 stages stream through here.
+    /// Only the last 3 stages are emitted (`DaemonSpawn`,
+    /// `SocketTunnel`, `SocketConnect`) — the prepare phase is
+    /// reported separately via [`PrepareEvent`].
     Stage(Stage),
     /// Attach finished — `Ok(transport)` is ready to swap into the
     /// runtime as a `Ready` agent; `Err` flips the agent state to
@@ -107,15 +101,11 @@ impl std::fmt::Debug for AttachEvent {
 /// The owner polls [`Self::try_recv`] every event-loop tick and
 /// transitions UI state once the worker reports `Done`. [`Drop`] is
 /// cooperative: it sets the cancel flag so the worker exits at the
-/// next subprocess boundary. The `JoinHandle` is detached so the TUI
-/// never blocks on a slow prepare.
+/// next subprocess boundary. The worker thread is detached at
+/// `thread::spawn` time — the TUI never blocks on a slow prepare.
 pub struct PrepareHandle {
     cancel: Arc<AtomicBool>,
     rx: Receiver<PrepareEvent>,
-    /// Kept only to anchor the worker thread's lifetime in the type
-    /// system. We never join — `JoinHandle::drop` detaches, which is
-    /// the behavior we want.
-    _join: thread::JoinHandle<()>,
 }
 
 impl PrepareHandle {
@@ -146,12 +136,10 @@ impl Drop for PrepareHandle {
 ///
 /// Same shape as [`PrepareHandle`] but yields [`AttachEvent`]s and
 /// terminates with an [`AgentTransport`] rather than a
-/// [`PreparedHost`]. Also serves as the return type of
-/// [`start_full_pipeline`], the legacy single-handle shim.
+/// [`PreparedHost`].
 pub struct AttachHandle {
     cancel: Arc<AtomicBool>,
     rx: Receiver<AttachEvent>,
-    _join: thread::JoinHandle<()>,
 }
 
 impl AttachHandle {
@@ -192,7 +180,7 @@ pub fn start_prepare_with_runner(runner: Box<dyn CommandRunner>, host: String) -
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded();
     let cancel_for_thread = Arc::clone(&cancel);
-    let join = thread::spawn(move || {
+    thread::spawn(move || {
         let cancelable = CancelableRunner {
             inner: runner,
             cancel: cancel_for_thread,
@@ -204,11 +192,7 @@ pub fn start_prepare_with_runner(runner: Box<dyn CommandRunner>, host: String) -
         let result = prepare_remote(&cancelable, &on_stage, &host);
         let _ = tx.send(PrepareEvent::Done(result));
     });
-    PrepareHandle {
-        cancel,
-        rx,
-        _join: join,
-    }
+    PrepareHandle { cancel, rx }
 }
 
 /// Spawn a worker thread that runs only the attach phase
@@ -250,7 +234,7 @@ pub fn start_attach_with_runner(
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded();
     let cancel_for_thread = Arc::clone(&cancel);
-    let join = thread::spawn(move || {
+    thread::spawn(move || {
         let cancelable = CancelableRunner {
             inner: runner,
             cancel: cancel_for_thread,
@@ -279,83 +263,7 @@ pub fn start_attach_with_runner(
         );
         let _ = tx.send(AttachEvent::Done(result));
     });
-    AttachHandle {
-        cancel,
-        rx,
-        _join: join,
-    }
-}
-
-/// Legacy single-handle pipeline that chains prepare + attach on one
-/// worker thread. Returns an [`AttachHandle`] whose event stream
-/// includes stages from both phases.
-///
-/// Production no longer calls this — the runtime drives prepare and
-/// attach as separate handles via the spawn modal. Kept in tree as the
-/// regression target for the cancel-mid-bootstrap test and as a
-/// minimal entry point for ad-hoc smoke runs.
-#[allow(dead_code)]
-pub fn start_full_pipeline(
-    host: String,
-    agent_id: String,
-    cwd: Option<PathBuf>,
-    rows: u16,
-    cols: u16,
-) -> AttachHandle {
-    start_full_pipeline_with_runner(Box::new(RealRunner), host, agent_id, cwd, rows, cols)
-}
-
-/// Test-friendly entry point: inject a [`CommandRunner`] so the
-/// cancel-mid-bootstrap path can be exercised without touching the
-/// network.
-#[allow(dead_code)]
-pub fn start_full_pipeline_with_runner(
-    runner: Box<dyn CommandRunner>,
-    host: String,
-    agent_id: String,
-    cwd: Option<PathBuf>,
-    rows: u16,
-    cols: u16,
-) -> AttachHandle {
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = unbounded();
-    let cancel_for_thread = Arc::clone(&cancel);
-    let join = thread::spawn(move || {
-        let cancelable = CancelableRunner {
-            inner: runner,
-            cancel: cancel_for_thread,
-        };
-        let socket_dir = match default_local_socket_dir() {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.send(AttachEvent::Done(Err(e)));
-                return;
-            }
-        };
-        let tx_for_stage = tx.clone();
-        let on_stage = move |stage: Stage| {
-            let _ = tx_for_stage.send(AttachEvent::Stage(stage));
-        };
-        let result = prepare_remote(&cancelable, &on_stage, &host).and_then(|prepared| {
-            attach_agent(
-                &cancelable,
-                &on_stage,
-                &prepared,
-                &host,
-                &agent_id,
-                cwd.as_deref(),
-                &socket_dir,
-                rows,
-                cols,
-            )
-        });
-        let _ = tx.send(AttachEvent::Done(result));
-    });
-    AttachHandle {
-        cancel,
-        rx,
-        _join: join,
-    }
+    AttachHandle { cancel, rx }
 }
 
 /// Wraps a [`CommandRunner`] with a cancel flag. Each subprocess call
@@ -629,57 +537,6 @@ mod tests {
         );
     }
 
-    /// Cancelling the legacy [`start_full_pipeline`] handle behaves
-    /// identically to cancelling either phase handle — the cancel
-    /// flag short-circuits the next subprocess call regardless of
-    /// which phase the worker is in.
-    #[test]
-    fn cancel_full_pipeline_short_circuits_at_next_subprocess_call() {
-        let (runner, started_rx, release_tx) = BlockingRunner::new();
-        let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
-        let handle = start_full_pipeline_with_runner(
-            Box::new(ArcRunner(runner_arc)),
-            "host".into(),
-            "agent-1".into(),
-            Some(PathBuf::from("/tmp/x")),
-            24,
-            80,
-        );
-
-        started_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("worker should issue its first call within 2s");
-
-        handle.cancel();
-        let _ = release_tx.send(());
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let result = loop {
-            match handle.try_recv() {
-                Some(AttachEvent::Done(r)) => break r,
-                Some(AttachEvent::Stage(_)) => {}
-                None => {
-                    assert!(
-                        Instant::now() <= deadline,
-                        "worker did not finish within 5s of cancel"
-                    );
-                    thread::sleep(Duration::from_millis(20));
-                }
-            }
-        };
-        assert!(
-            result.is_err(),
-            "worker should report a Bootstrap error after cancel"
-        );
-
-        let calls = runner.calls.lock().unwrap();
-        assert_eq!(
-            calls.len(),
-            1,
-            "expected exactly 1 inner-runner call, got {calls:?}"
-        );
-    }
-
     /// `PrepareHandle::cancel` is idempotent — calling it twice does
     /// not panic or double-deliver. Drop also calls cancel; the
     /// handle's worker thread is detached, so this also exercises the
@@ -722,25 +579,6 @@ mod tests {
         handle.cancel();
         handle.cancel();
         let _ = release_tx.send(());
-        drop(handle);
-    }
-
-    /// Production [`start_full_pipeline`] is just a `RealRunner` shim.
-    /// We can't drive it to a real bootstrap without an SSH host, but
-    /// we can confirm it returns a usable handle and tear it down
-    /// without hanging or leaking. The handle's worker thread will
-    /// fail immediately (no `host` is reachable in the unit-test
-    /// environment) and exit on its own.
-    #[test]
-    fn start_full_pipeline_returns_a_handle_that_drops_cleanly() {
-        let handle = start_full_pipeline(
-            "192.0.2.1".into(), // RFC 5737 TEST-NET-1, never reachable
-            "agent-1".into(),
-            Some(PathBuf::from("/tmp/x")),
-            24,
-            80,
-        );
-        handle.cancel();
         drop(handle);
     }
 
