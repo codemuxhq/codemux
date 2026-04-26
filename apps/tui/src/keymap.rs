@@ -196,6 +196,32 @@ impl<'de> Deserialize<'de> for KeyChord {
     }
 }
 
+/// Deserialize a list of chords from TOML accepting either a single
+/// string (`focus_next = "n"`) or an array (`focus_next = ["n", "l",
+/// "j"]`). Used for the focus actions where vim (`h`/`l`) and
+/// tmux-style (`n`/`p`) aliases to the same action are genuinely
+/// useful; every other binding stays single-chord. Keeping
+/// single-string syntax working means existing configs are forward-
+/// compatible — no migration step.
+fn deserialize_chord_list<'de, D>(d: D) -> Result<Vec<KeyChord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SingleOrList {
+        Single(String),
+        List(Vec<String>),
+    }
+    match SingleOrList::deserialize(d)? {
+        SingleOrList::Single(s) => s.parse().map(|c| vec![c]).map_err(de::Error::custom),
+        SingleOrList::List(v) => v
+            .into_iter()
+            .map(|s| s.parse().map_err(de::Error::custom))
+            .collect(),
+    }
+}
+
 // ---------- Action enums (per scope) ----------
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +230,7 @@ pub enum PrefixAction {
     SpawnAgent,
     FocusNext,
     FocusPrev,
+    FocusLast,
     ToggleNav,
     OpenSwitcher,
     Help,
@@ -215,6 +242,7 @@ impl PrefixAction {
         Self::SpawnAgent,
         Self::FocusNext,
         Self::FocusPrev,
+        Self::FocusLast,
         Self::ToggleNav,
         Self::OpenSwitcher,
         Self::Help,
@@ -226,6 +254,7 @@ impl PrefixAction {
             Self::SpawnAgent => "open the spawn modal",
             Self::FocusNext => "focus the next agent",
             Self::FocusPrev => "focus the previous agent",
+            Self::FocusLast => "bounce to the previously-focused agent",
             Self::ToggleNav => "toggle navigator style",
             Self::OpenSwitcher => "open the agent switcher popup",
             Self::Help => "show this help",
@@ -293,8 +322,19 @@ impl ModalAction {
 pub struct PrefixBindings {
     pub quit: KeyChord,
     pub spawn_agent: KeyChord,
-    pub focus_next: KeyChord,
-    pub focus_prev: KeyChord,
+    /// Multi-chord: defaults map both `n` (tmux) and `l`/`j` (vim) to
+    /// "next agent" so neither muscle memory has to fight the other.
+    /// Single string in TOML still parses as a one-element list.
+    #[serde(deserialize_with = "deserialize_chord_list")]
+    pub focus_next: Vec<KeyChord>,
+    /// Multi-chord; mirrors `focus_next` with `p`, `h`, `k`.
+    #[serde(deserialize_with = "deserialize_chord_list")]
+    pub focus_prev: Vec<KeyChord>,
+    /// Multi-chord; default is just `Tab` (the canonical alt-tab move
+    /// in tmux/zellij). Multi-chord support is here for symmetry with
+    /// the other focus actions, not because the default needs aliases.
+    #[serde(deserialize_with = "deserialize_chord_list")]
+    pub focus_last: Vec<KeyChord>,
     pub toggle_nav: KeyChord,
     pub open_switcher: KeyChord,
     pub help: KeyChord,
@@ -305,8 +345,27 @@ impl Default for PrefixBindings {
         Self {
             quit: KeyChord::plain(KeyCode::Char('q')),
             spawn_agent: KeyChord::plain(KeyCode::Char('c')),
-            focus_next: KeyChord::plain(KeyCode::Char('n')),
-            focus_prev: KeyChord::plain(KeyCode::Char('p')),
+            focus_next: vec![
+                // tmux convention
+                KeyChord::plain(KeyCode::Char('n')),
+                // vim horizontal motion
+                KeyChord::plain(KeyCode::Char('l')),
+                // vim vertical motion (down)
+                KeyChord::plain(KeyCode::Char('j')),
+                // arrow-key motion (right + down) — for users who
+                // think in arrows; works the same way in sticky
+                // prefix mode as hjkl does.
+                KeyChord::plain(KeyCode::Right),
+                KeyChord::plain(KeyCode::Down),
+            ],
+            focus_prev: vec![
+                KeyChord::plain(KeyCode::Char('p')),
+                KeyChord::plain(KeyCode::Char('h')),
+                KeyChord::plain(KeyCode::Char('k')),
+                KeyChord::plain(KeyCode::Left),
+                KeyChord::plain(KeyCode::Up),
+            ],
+            focus_last: vec![KeyChord::plain(KeyCode::Tab)],
             toggle_nav: KeyChord::plain(KeyCode::Char('v')),
             open_switcher: KeyChord::plain(KeyCode::Char('w')),
             help: KeyChord::plain(KeyCode::Char('?')),
@@ -316,29 +375,62 @@ impl Default for PrefixBindings {
 
 impl PrefixBindings {
     pub fn lookup(&self, key: &KeyEvent) -> Option<PrefixAction> {
-        let table: [(KeyChord, PrefixAction); 7] = [
+        // Single-chord actions checked first via a small fixed-size
+        // table — these don't need aliasing and the table form makes
+        // the registry read as data declaration.
+        let single: [(KeyChord, PrefixAction); 5] = [
             (self.quit, PrefixAction::Quit),
             (self.spawn_agent, PrefixAction::SpawnAgent),
-            (self.focus_next, PrefixAction::FocusNext),
-            (self.focus_prev, PrefixAction::FocusPrev),
             (self.toggle_nav, PrefixAction::ToggleNav),
             (self.open_switcher, PrefixAction::OpenSwitcher),
             (self.help, PrefixAction::Help),
         ];
-        table.iter().find(|(c, _)| c.matches(key)).map(|(_, a)| *a)
+        if let Some((_, action)) = single.iter().find(|(c, _)| c.matches(key)) {
+            return Some(*action);
+        }
+        // Multi-chord focus actions: linear scan across each Vec.
+        // With ~3 chords per action and 3 actions, this is 9 ops max
+        // per keystroke — negligible at the 50ms FRAME_POLL cadence.
+        let multi: [(&[KeyChord], PrefixAction); 3] = [
+            (&self.focus_next, PrefixAction::FocusNext),
+            (&self.focus_prev, PrefixAction::FocusPrev),
+            (&self.focus_last, PrefixAction::FocusLast),
+        ];
+        for (chords, action) in multi {
+            if chords.iter().any(|c| c.matches(key)) {
+                return Some(action);
+            }
+        }
+        None
     }
 
+    /// Primary chord for an action — the first one in the user's
+    /// list. Used by the help screen for a single-line summary;
+    /// aliases are config-discoverable rather than help-rendered to
+    /// keep the help screen scannable.
     pub fn binding_for(&self, action: PrefixAction) -> KeyChord {
         match action {
             PrefixAction::Quit => self.quit,
             PrefixAction::SpawnAgent => self.spawn_agent,
-            PrefixAction::FocusNext => self.focus_next,
-            PrefixAction::FocusPrev => self.focus_prev,
+            PrefixAction::FocusNext => first_or_default(&self.focus_next, KeyCode::Char('n')),
+            PrefixAction::FocusPrev => first_or_default(&self.focus_prev, KeyCode::Char('p')),
+            PrefixAction::FocusLast => first_or_default(&self.focus_last, KeyCode::Tab),
             PrefixAction::ToggleNav => self.toggle_nav,
             PrefixAction::OpenSwitcher => self.open_switcher,
             PrefixAction::Help => self.help,
         }
     }
+}
+
+/// Return the first chord in `list` if non-empty, else fall back to a
+/// plain-modifier chord on `default_code`. The fallback path only
+/// fires when the user wrote `focus_next = []` in their config —
+/// surprising but valid TOML — so we degrade to "binding shows
+/// default in help; lookup returns None" rather than crash.
+fn first_or_default(list: &[KeyChord], default_code: KeyCode) -> KeyChord {
+    list.first()
+        .copied()
+        .unwrap_or(KeyChord::plain(default_code))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -431,6 +523,137 @@ impl ModalBindings {
     }
 }
 
+// ---------- DirectBindings (no-prefix, fast-path navigation) ----------
+
+/// Actions reachable without first arming the prefix-key state
+/// machine. Same semantics as the matching `PrefixAction` variants —
+/// this enum exists for the help screen and the dispatch table, not
+/// because the underlying state mutation differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// All three variants are intentionally `Focus*` to mirror the
+// matching `PrefixAction` names — clippy's enum_variant_names lint
+// would have us drop the prefix, which would create a `Next` /
+// `Prev` / `Last` enum that is impossible to read in isolation.
+#[allow(clippy::enum_variant_names)]
+pub enum DirectAction {
+    FocusNext,
+    FocusPrev,
+    FocusLast,
+}
+
+impl DirectAction {
+    pub const ALL: &'static [DirectAction] = &[Self::FocusNext, Self::FocusPrev, Self::FocusLast];
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::FocusNext => "focus the next agent",
+            Self::FocusPrev => "focus the previous agent",
+            Self::FocusLast => "bounce to the previously-focused agent",
+        }
+    }
+}
+
+/// Direct (no-prefix) navigation chords. The whole point of this
+/// scope is the fast path: the user pays one chord (e.g. `Cmd-;`)
+/// instead of the two of `Ctrl-B p`. Defaults use the `SUPER` (Cmd
+/// on macOS, Win on most Linux DEs) modifier; the runtime
+/// auto-enables the Kitty Keyboard Protocol whenever any binding
+/// uses `SUPER`, which is what makes Cmd deliverable to a TUI.
+///
+/// **Two chords only by default**: `Cmd+;` for prev and `Cmd+'` for
+/// next. The wider sticky-mode navigation (hjkl with no modifier)
+/// lives behind the prefix instead — see `PrefixState` in the
+/// runtime. This is deliberate: the prior multi-chord defaults
+/// (`Cmd+]`, `Cmd+[`, `Cmd+L`, `Cmd+H`, `` Cmd+` ``) ran into a
+/// mess of OS reservations (`Cmd+H` = Hide, `` Cmd+` `` = window
+/// cycle) and terminal claims (Ghostty owns `Cmd+]`/`Cmd+[`). The
+/// two surviving defaults are verified-working and on the right
+/// side of every layout we tested.
+///
+/// Multi-chord per action — same shape as `PrefixBindings.focus_*` —
+/// so users on different terminals can add aliases without forking
+/// the schema (`focus_next = ["cmd+'", "cmd+l"]`). Single-string
+/// TOML still parses.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+// Same rationale as DirectAction: the `focus_` prefix makes each
+// field self-describing and matches the names used in PrefixBindings.
+// Dropping it would land us with `next` / `prev` / `last` which read
+// as ambiguous list-navigation rather than tab-focus moves.
+#[allow(clippy::struct_field_names)]
+pub struct DirectBindings {
+    #[serde(deserialize_with = "deserialize_chord_list")]
+    pub focus_next: Vec<KeyChord>,
+    #[serde(deserialize_with = "deserialize_chord_list")]
+    pub focus_prev: Vec<KeyChord>,
+    /// Empty by default. The bounce ("alt-tab") move is covered by
+    /// `Ctrl-B Tab` in the prefix-mode scope; a Cmd-modifier chord
+    /// for it would either fight the OS (`` Cmd+` ``) or add
+    /// learning surface for a move people use less often than
+    /// straight next/prev. Users who want one can add it via
+    /// config.
+    #[serde(deserialize_with = "deserialize_chord_list")]
+    pub focus_last: Vec<KeyChord>,
+}
+
+impl Default for DirectBindings {
+    fn default() -> Self {
+        // `Cmd+'` and `Cmd+;` are adjacent on the home row, both
+        // verified free in Ghostty + macOS, both unclaimed across
+        // common terminals (iTerm2, WezTerm, Terminal.app). The
+        // semicolon was the user-confirmed working chord; the
+        // apostrophe rides next to it.
+        Self {
+            focus_next: vec![KeyChord {
+                code: KeyCode::Char('\''),
+                modifiers: KeyModifiers::SUPER,
+            }],
+            focus_prev: vec![KeyChord {
+                code: KeyCode::Char(';'),
+                modifiers: KeyModifiers::SUPER,
+            }],
+            focus_last: Vec::new(),
+        }
+    }
+}
+
+impl DirectBindings {
+    pub fn lookup(&self, key: &KeyEvent) -> Option<DirectAction> {
+        // Linear scan over each Vec; with ~1 chord per action and
+        // 3 actions, it's 3 ops max per keystroke at the 50ms frame
+        // cadence — invisible.
+        let table: [(&[KeyChord], DirectAction); 3] = [
+            (&self.focus_next, DirectAction::FocusNext),
+            (&self.focus_prev, DirectAction::FocusPrev),
+            (&self.focus_last, DirectAction::FocusLast),
+        ];
+        for (chords, action) in table {
+            if chords.iter().any(|c| c.matches(key)) {
+                return Some(action);
+            }
+        }
+        None
+    }
+
+    /// Primary chord for an action — the first one in the user's
+    /// list. Used by the help screen for a single-line summary;
+    /// aliases are config-discoverable rather than help-rendered to
+    /// keep the help screen scannable.
+    ///
+    /// `focus_last` falls back to `Tab` for the help-screen display
+    /// even though it's unbound by default — the help line still
+    /// renders, just dimmed by the runtime to indicate "configure
+    /// to enable" (rendering policy is the renderer's call, not
+    /// this method's).
+    pub fn binding_for(&self, action: DirectAction) -> KeyChord {
+        match action {
+            DirectAction::FocusNext => first_or_default(&self.focus_next, KeyCode::Char('\'')),
+            DirectAction::FocusPrev => first_or_default(&self.focus_prev, KeyCode::Char(';')),
+            DirectAction::FocusLast => first_or_default(&self.focus_last, KeyCode::Tab),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Bindings {
@@ -438,6 +661,7 @@ pub struct Bindings {
     pub on_prefix: PrefixBindings,
     pub on_popup: PopupBindings,
     pub on_modal: ModalBindings,
+    pub on_direct: DirectBindings,
 }
 
 impl Default for Bindings {
@@ -447,6 +671,7 @@ impl Default for Bindings {
             on_prefix: PrefixBindings::default(),
             on_popup: PopupBindings::default(),
             on_modal: ModalBindings::default(),
+            on_direct: DirectBindings::default(),
         }
     }
 }
@@ -457,15 +682,16 @@ impl Bindings {
     /// the Kitty Keyboard Protocol with the terminal — without it, terminals
     /// usually swallow Cmd / Super before the application can see it.
     ///
-    /// We only check what the user actually bound. Defaults never use SUPER,
-    /// so a user who never touches the config never pays the protocol cost.
+    /// Defaults DO use SUPER for the `on_direct` scope (the whole
+    /// point of direct binds is fast Cmd-key access), so the
+    /// protocol negotiation runs on the default config. Users who
+    /// don't want it can override the direct chords to non-SUPER
+    /// alternatives in their config.
     pub fn uses_super_modifier(&self) -> bool {
-        let chords = [
+        let single = [
             self.prefix,
             self.on_prefix.quit,
             self.on_prefix.spawn_agent,
-            self.on_prefix.focus_next,
-            self.on_prefix.focus_prev,
             self.on_prefix.toggle_nav,
             self.on_prefix.open_switcher,
             self.on_prefix.help,
@@ -480,8 +706,26 @@ impl Bindings {
             self.on_modal.next_completion,
             self.on_modal.prev_completion,
         ];
-        chords
+        if single
             .iter()
+            .any(|c| c.modifiers.contains(KeyModifiers::SUPER))
+        {
+            return true;
+        }
+        // Multi-chord scopes — flatten across each Vec. Includes
+        // both prefix-mode focus aliases and the entire direct-bind
+        // scope (which now stores Vec<KeyChord> per action).
+        let multi: [&[KeyChord]; 6] = [
+            &self.on_prefix.focus_next,
+            &self.on_prefix.focus_prev,
+            &self.on_prefix.focus_last,
+            &self.on_direct.focus_next,
+            &self.on_direct.focus_prev,
+            &self.on_direct.focus_last,
+        ];
+        multi
+            .iter()
+            .flat_map(|v| v.iter())
             .any(|c| c.modifiers.contains(KeyModifiers::SUPER))
     }
 }
@@ -668,6 +912,47 @@ mod tests {
         assert!(toml::from_str::<Bindings>(toml_text).is_err());
     }
 
+    #[test]
+    fn focus_next_accepts_a_single_string_in_toml() {
+        // Backwards-compat with the original single-chord syntax —
+        // the deserializer accepts a string OR an array.
+        let toml_text = r#"
+            [on_prefix]
+            focus_next = "x"
+        "#;
+        let bindings: Bindings = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            bindings.on_prefix.focus_next,
+            vec![KeyChord::plain(KeyCode::Char('x'))],
+        );
+    }
+
+    #[test]
+    fn focus_next_accepts_an_array_in_toml() {
+        let toml_text = r#"
+            [on_prefix]
+            focus_next = ["n", "l", "j"]
+        "#;
+        let bindings: Bindings = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            bindings.on_prefix.focus_next,
+            vec![
+                KeyChord::plain(KeyCode::Char('n')),
+                KeyChord::plain(KeyCode::Char('l')),
+                KeyChord::plain(KeyCode::Char('j')),
+            ],
+        );
+    }
+
+    #[test]
+    fn focus_next_array_with_an_invalid_chord_is_an_error() {
+        let toml_text = r#"
+            [on_prefix]
+            focus_next = ["n", "ctrl+nonsense"]
+        "#;
+        assert!(toml::from_str::<Bindings>(toml_text).is_err());
+    }
+
     // --- Lookup ---
 
     #[test]
@@ -687,6 +972,145 @@ mod tests {
     fn prefix_lookup_returns_none_for_unbound_key() {
         let b = PrefixBindings::default();
         assert_eq!(b.lookup(&ev(KeyCode::Char('z'), KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn prefix_focus_next_aliases_all_resolve_to_focus_next() {
+        // Default `focus_next` includes n (tmux), l + j (vim),
+        // and Right + Down (arrows).
+        let b = PrefixBindings::default();
+        for c in ['n', 'l', 'j'] {
+            assert_eq!(
+                b.lookup(&ev(KeyCode::Char(c), KeyModifiers::NONE)),
+                Some(PrefixAction::FocusNext),
+                "char {c} should map to FocusNext",
+            );
+        }
+        for code in [KeyCode::Right, KeyCode::Down] {
+            assert_eq!(
+                b.lookup(&ev(code, KeyModifiers::NONE)),
+                Some(PrefixAction::FocusNext),
+                "{code:?} should map to FocusNext",
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_focus_prev_aliases_all_resolve_to_focus_prev() {
+        let b = PrefixBindings::default();
+        for c in ['p', 'h', 'k'] {
+            assert_eq!(
+                b.lookup(&ev(KeyCode::Char(c), KeyModifiers::NONE)),
+                Some(PrefixAction::FocusPrev),
+                "char {c} should map to FocusPrev",
+            );
+        }
+        for code in [KeyCode::Left, KeyCode::Up] {
+            assert_eq!(
+                b.lookup(&ev(code, KeyModifiers::NONE)),
+                Some(PrefixAction::FocusPrev),
+                "{code:?} should map to FocusPrev",
+            );
+        }
+    }
+
+    #[test]
+    fn direct_lookup_finds_default_cmd_bindings() {
+        let b = DirectBindings::default();
+        // Two chords by default: Cmd+' for next, Cmd+; for prev.
+        // No focus_last default — that move lives behind the prefix
+        // (Ctrl-B Tab).
+        assert_eq!(
+            b.lookup(&ev(KeyCode::Char('\''), KeyModifiers::SUPER)),
+            Some(DirectAction::FocusNext),
+        );
+        assert_eq!(
+            b.lookup(&ev(KeyCode::Char(';'), KeyModifiers::SUPER)),
+            Some(DirectAction::FocusPrev),
+        );
+    }
+
+    #[test]
+    fn direct_lookup_focus_last_unbound_by_default() {
+        let b = DirectBindings::default();
+        // No default chord. The bounce move is reachable via
+        // `Ctrl-B Tab` (prefix mode); a Cmd default would have to
+        // pick a chord that doesn't fight the OS, and none of the
+        // candidates were worth the learning surface.
+        assert!(b.focus_last.is_empty());
+    }
+
+    #[test]
+    fn direct_lookup_does_not_match_os_reserved_or_terminal_claimed_chords() {
+        // Sanity check: codemux must NOT bind chords that macOS or
+        // common terminals claim. This catches regressions if the
+        // defaults grow back the kitchen-sink alias list we just
+        // removed.
+        let b = DirectBindings::default();
+        for c in ['h', '`', ']', '['] {
+            assert_eq!(
+                b.lookup(&ev(KeyCode::Char(c), KeyModifiers::SUPER)),
+                None,
+                "Cmd+{c} should not be bound by default",
+            );
+        }
+    }
+
+    #[test]
+    fn direct_lookup_round_trip_for_bound_actions() {
+        // FocusLast is unbound by default (empty Vec), so it
+        // doesn't round-trip — that's intentional, see
+        // `direct_lookup_focus_last_unbound_by_default`.
+        let b = DirectBindings::default();
+        for action in [DirectAction::FocusNext, DirectAction::FocusPrev] {
+            let chord = b.binding_for(action);
+            let event = KeyEvent::new(chord.code, chord.modifiers);
+            assert_eq!(b.lookup(&event), Some(action));
+        }
+    }
+
+    #[test]
+    fn direct_lookup_returns_none_when_modifier_does_not_match() {
+        // Plain `;` (no SUPER) must NOT trigger the direct bind —
+        // otherwise the user couldn't type the character into a
+        // focused PTY without it stealing focus.
+        let b = DirectBindings::default();
+        assert_eq!(b.lookup(&ev(KeyCode::Char(';'), KeyModifiers::NONE)), None,);
+    }
+
+    #[test]
+    fn direct_binding_for_focus_last_falls_back_to_tab_when_unbound() {
+        // FocusLast is empty in the default config (see
+        // direct_lookup_focus_last_unbound_by_default). The help
+        // screen still renders a row for it, so binding_for must
+        // produce a printable chord rather than panicking. Tab is
+        // the chosen fallback because it mirrors the prefix-mode
+        // alt-tab move (`Ctrl-B Tab`).
+        let b = DirectBindings::default();
+        assert_eq!(
+            b.binding_for(DirectAction::FocusLast),
+            KeyChord::plain(KeyCode::Tab),
+        );
+    }
+
+    #[test]
+    fn user_can_swap_direct_modifier_to_alt() {
+        // The chord vocabulary is the same everywhere — users on
+        // terminals that can't deliver Cmd swap to Alt by editing
+        // the chord, no separate "modifier" config required.
+        let toml_text = r#"
+            [on_direct]
+            focus_next = "alt+l"
+            focus_prev = "alt+h"
+            focus_last = "alt+`"
+        "#;
+        let bindings: Bindings = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            bindings
+                .on_direct
+                .lookup(&ev(KeyCode::Char('l'), KeyModifiers::ALT)),
+            Some(DirectAction::FocusNext),
+        );
     }
 
     #[test]
@@ -712,8 +1136,14 @@ mod tests {
     // --- uses_super_modifier ---
 
     #[test]
-    fn defaults_do_not_use_super_modifier() {
-        assert!(!Bindings::default().uses_super_modifier());
+    fn defaults_use_super_modifier_via_direct_binds() {
+        // Direct binds default to `cmd+l` / `cmd+h` / `cmd+grave`,
+        // so out-of-the-box codemux DOES request the Kitty Keyboard
+        // Protocol. This is intentional — the fast-path navigation
+        // is the headline of the direct-bind layer; making it work
+        // by default outweighs the cost of the protocol negotiation.
+        // Users who don't want it override the `on_direct` chords.
+        assert!(Bindings::default().uses_super_modifier());
     }
 
     #[test]
@@ -735,10 +1165,19 @@ mod tests {
 
     #[test]
     fn ctrl_only_overrides_do_not_trigger_super_detection() {
+        // Override every default that uses SUPER — including the
+        // `on_direct` defaults — to a non-SUPER chord. Without
+        // overriding `on_direct`, the default Cmd chords would keep
+        // detection true, masking the actual scenario being tested
+        // (a user who has explicitly opted out of all Cmd bindings).
         let toml_text = r#"
             prefix = "ctrl+a"
             [on_prefix]
             quit = "x"
+            [on_direct]
+            focus_next = "ctrl+l"
+            focus_prev = "ctrl+h"
+            focus_last = "ctrl+t"
         "#;
         let bindings: Bindings = toml::from_str(toml_text).unwrap();
         assert!(!bindings.uses_super_modifier());

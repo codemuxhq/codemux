@@ -46,7 +46,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
@@ -56,7 +56,7 @@ use crate::bootstrap_worker::{
     start_prepare,
 };
 use crate::config::Config;
-use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
+use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction};
 use crate::log_tail::LogTail;
 use crate::spawn::{DirLister, HOST_PLACEHOLDER, ModalOutcome, SpawnMinibuffer};
 
@@ -137,6 +137,7 @@ enum KeyDispatch {
     SpawnAgent,
     FocusNext,
     FocusPrev,
+    FocusLast,
     FocusAt(usize),
     ToggleNav,
     OpenPopup,
@@ -378,6 +379,19 @@ fn cancel_modal_owned_attach(attaches: &mut Vec<PendingAttach>) {
     attaches.swap_remove(idx);
 }
 
+/// Move focus to `new`, remembering the previous index for `FocusLast`
+/// (alt-tab) bouncing. No-op if the focus is already on `new` — that
+/// keeps a double-tap of the same direct-bind from clobbering the
+/// bounce slot. Centralized helper because the event loop has six
+/// focus-mutation sites and open-coding the `previous` update at each
+/// would be the obvious bug source.
+fn change_focus(focused: &mut usize, previous: &mut Option<usize>, new: usize) {
+    if new != *focused {
+        *previous = Some(*focused);
+        *focused = new;
+    }
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut agents: Vec<RuntimeAgent>,
@@ -404,11 +418,14 @@ fn event_loop(
     let mut prepare: Option<PendingPrepare> = None;
     let mut attaches: Vec<PendingAttach> = Vec::new();
     let mut focused: usize = 0;
+    // Last agent the user was focused on, before the most recent
+    // switch. Lets `prefix + Tab` (`FocusLast`) bounce between two
+    // agents — the canonical alt-tab move when juggling a couple of
+    // workspaces. `None` until the first switch happens; cleared if
+    // the agent it points to is reaped (the user explicitly quit it
+    // or the transport died) so the bounce never lands on a stale slot.
+    let mut previous_focused: Option<usize> = None;
     let mut spawn_counter: usize = agents.len();
-    // Status-bar hint is bindings-derived but bindings cannot change at
-    // runtime. Cache the formatted suffix so the render loop does not
-    // re-allocate it 20 times per second (per the FRAME_POLL cadence).
-    let status_hint = format!("{} {} for help", bindings.prefix, bindings.on_prefix.help,);
 
     loop {
         // Drain prepare events first: the modal should reflect the
@@ -555,7 +572,7 @@ fn event_loop(
         let new_count = new_agents.len();
         agents.extend(new_agents);
         if focus_new && new_count > 0 {
-            focused = agents.len() - 1;
+            change_focus(&mut focused, &mut previous_focused, agents.len() - 1);
         }
 
         for agent in &mut agents {
@@ -582,6 +599,14 @@ fn event_loop(
             return Ok(());
         }
         focused = focused.min(agents.len() - 1);
+        // Clear the bounce slot if the agent it pointed to was just
+        // reaped — landing alt-tab on a stale index would silently
+        // jump to whatever filled that slot, which is worse than no-op.
+        if let Some(prev) = previous_focused
+            && (prev >= agents.len() || prev == focused)
+        {
+            previous_focused = None;
+        }
         if let PopupState::Open { selection } = popup_state
             && selection >= agents.len()
         {
@@ -596,12 +621,13 @@ fn event_loop(
                     frame,
                     &agents,
                     focused,
+                    previous_focused,
                     nav_style,
                     popup_state,
                     help_state,
                     spawn_ui.as_ref(),
                     bindings,
-                    &status_hint,
+                    prefix_state,
                     log_tail,
                 );
             })
@@ -692,7 +718,11 @@ fn event_loop(
                                 match spawn_local_agent(label, cwd_path, rows, cols) {
                                     Ok(agent) => {
                                         agents.push(agent);
-                                        focused = agents.len() - 1;
+                                        change_focus(
+                                            &mut focused,
+                                            &mut previous_focused,
+                                            agents.len() - 1,
+                                        );
                                     }
                                     Err(e) => {
                                         tracing::error!("spawn failed: {e}");
@@ -785,7 +815,7 @@ fn event_loop(
                                 popup_state = PopupState::Open { selection: prev };
                             }
                             PopupAction::Confirm => {
-                                focused = selection;
+                                change_focus(&mut focused, &mut previous_focused, selection);
                                 popup_state = PopupState::Closed;
                             }
                             PopupAction::Cancel => {
@@ -824,18 +854,31 @@ fn event_loop(
                         spawn_ui = Some(SpawnMinibuffer::open(initial_cwd));
                     }
                     KeyDispatch::FocusNext => {
-                        focused = (focused + 1) % agents.len();
+                        let next = (focused + 1) % agents.len();
+                        change_focus(&mut focused, &mut previous_focused, next);
                     }
                     KeyDispatch::FocusPrev => {
-                        focused = if focused == 0 {
+                        let prev = if focused == 0 {
                             agents.len() - 1
                         } else {
                             focused - 1
                         };
+                        change_focus(&mut focused, &mut previous_focused, prev);
+                    }
+                    KeyDispatch::FocusLast => {
+                        // Bounce. No-op if the previous slot is gone
+                        // (already cleared in the per-frame clamp) or
+                        // somehow points to current focus.
+                        if let Some(prev) = previous_focused
+                            && prev < agents.len()
+                            && prev != focused
+                        {
+                            change_focus(&mut focused, &mut previous_focused, prev);
+                        }
                     }
                     KeyDispatch::FocusAt(idx) => {
                         if idx < agents.len() {
-                            focused = idx;
+                            change_focus(&mut focused, &mut previous_focused, idx);
                         }
                     }
                     KeyDispatch::ToggleNav => {
@@ -865,9 +908,27 @@ fn event_loop(
 
 /// Drives the prefix-key state machine, consulting the user's bindings.
 /// Returns the dispatch the event loop should perform.
+///
+/// `AwaitingCommand` is **sticky for navigation**: after the user presses
+/// the prefix once, repeated nav keystrokes (`h`/`l`/`j`/`k`/`n`/`p`/Tab/digits)
+/// keep the state armed so the user can `Ctrl-B h h h` to step back three
+/// agents without re-pressing the prefix. Non-nav commands (`q`, `c`, `?`,
+/// `v`, `w`) and unbound keys exit the mode after dispatching once.
 fn dispatch_key(state: &mut PrefixState, key: &KeyEvent, bindings: &Bindings) -> KeyDispatch {
     match *state {
         PrefixState::Idle => {
+            // Direct binds (no-prefix fast path) win first. Their
+            // whole point is single-chord access; checking them
+            // before the prefix means a user who binds the same
+            // chord to both gets the direct behavior — surprising
+            // only if they did this on purpose, which they wouldn't.
+            if let Some(action) = bindings.on_direct.lookup(key) {
+                return match action {
+                    DirectAction::FocusNext => KeyDispatch::FocusNext,
+                    DirectAction::FocusPrev => KeyDispatch::FocusPrev,
+                    DirectAction::FocusLast => KeyDispatch::FocusLast,
+                };
+            }
             if bindings.prefix.matches(key) {
                 *state = PrefixState::AwaitingCommand;
                 KeyDispatch::Consume
@@ -878,37 +939,65 @@ fn dispatch_key(state: &mut PrefixState, key: &KeyEvent, bindings: &Bindings) ->
             }
         }
         PrefixState::AwaitingCommand => {
-            *state = PrefixState::Idle;
-            // Double-prefix: forward a literal prefix byte to the focused PTY.
-            // Only meaningful when the prefix is a single Ctrl-modified char.
-            if bindings.prefix.matches(key) {
-                if let Some(byte) = literal_byte_for(&bindings.prefix) {
-                    return KeyDispatch::Forward(vec![byte]);
-                }
-                return KeyDispatch::Consume;
+            let dispatch = compute_awaiting_dispatch(key, bindings);
+            // Sticky semantics: nav dispatches keep us armed so the
+            // user can repeat the move without re-pressing the
+            // prefix. Anything else (commands, unbound, double-
+            // prefix passthrough) drops back to Idle.
+            if !is_nav_dispatch(&dispatch) {
+                *state = PrefixState::Idle;
             }
-            // Hardcoded: digit-keys 1..=9 focus the agent at that index.
-            if let KeyCode::Char(c) = key.code
-                && c.is_ascii_digit()
-                && !key.modifiers.contains(KeyModifiers::CONTROL)
-                && let Some(d) = c.to_digit(10)
-                && d > 0
-            {
-                return KeyDispatch::FocusAt((d as usize) - 1);
-            }
-            // Bound prefix-mode actions.
-            match bindings.on_prefix.lookup(key) {
-                Some(PrefixAction::Quit) => KeyDispatch::Exit,
-                Some(PrefixAction::SpawnAgent) => KeyDispatch::SpawnAgent,
-                Some(PrefixAction::FocusNext) => KeyDispatch::FocusNext,
-                Some(PrefixAction::FocusPrev) => KeyDispatch::FocusPrev,
-                Some(PrefixAction::ToggleNav) => KeyDispatch::ToggleNav,
-                Some(PrefixAction::OpenSwitcher) => KeyDispatch::OpenPopup,
-                Some(PrefixAction::Help) => KeyDispatch::OpenHelp,
-                None => KeyDispatch::Consume,
-            }
+            dispatch
         }
     }
+}
+
+/// Compute the dispatch for a key pressed while in
+/// `AwaitingCommand` state. Pulled out of `dispatch_key` so the
+/// state-transition policy (sticky for nav, exit otherwise) lives in
+/// one place rather than being interleaved with key-decoding logic.
+fn compute_awaiting_dispatch(key: &KeyEvent, bindings: &Bindings) -> KeyDispatch {
+    // Double-prefix: forward a literal prefix byte to the focused PTY.
+    // Only meaningful when the prefix is a single Ctrl-modified char.
+    if bindings.prefix.matches(key) {
+        if let Some(byte) = literal_byte_for(&bindings.prefix) {
+            return KeyDispatch::Forward(vec![byte]);
+        }
+        return KeyDispatch::Consume;
+    }
+    // Hardcoded: digit-keys 1..=9 focus the agent at that index.
+    if let KeyCode::Char(c) = key.code
+        && c.is_ascii_digit()
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && let Some(d) = c.to_digit(10)
+        && d > 0
+    {
+        return KeyDispatch::FocusAt((d as usize) - 1);
+    }
+    match bindings.on_prefix.lookup(key) {
+        Some(PrefixAction::Quit) => KeyDispatch::Exit,
+        Some(PrefixAction::SpawnAgent) => KeyDispatch::SpawnAgent,
+        Some(PrefixAction::FocusNext) => KeyDispatch::FocusNext,
+        Some(PrefixAction::FocusPrev) => KeyDispatch::FocusPrev,
+        Some(PrefixAction::FocusLast) => KeyDispatch::FocusLast,
+        Some(PrefixAction::ToggleNav) => KeyDispatch::ToggleNav,
+        Some(PrefixAction::OpenSwitcher) => KeyDispatch::OpenPopup,
+        Some(PrefixAction::Help) => KeyDispatch::OpenHelp,
+        None => KeyDispatch::Consume,
+    }
+}
+
+/// Is this dispatch a navigation move? Used by the
+/// `AwaitingCommand` state machine to decide whether to stay sticky
+/// (nav: yes) or fall back to `Idle` (everything else: no).
+const fn is_nav_dispatch(dispatch: &KeyDispatch) -> bool {
+    matches!(
+        dispatch,
+        KeyDispatch::FocusNext
+            | KeyDispatch::FocusPrev
+            | KeyDispatch::FocusLast
+            | KeyDispatch::FocusAt(_)
+    )
 }
 
 /// Compute the byte a "Ctrl-letter" prefix sends on the wire (e.g. Ctrl-B = 0x02).
@@ -935,12 +1024,13 @@ fn render_frame(
     frame: &mut Frame<'_>,
     agents: &[RuntimeAgent],
     focused: usize,
+    previous_focused: Option<usize>,
     nav_style: NavStyle,
     popup: PopupState,
     help: HelpState,
     spawn_ui: Option<&SpawnMinibuffer>,
     bindings: &Bindings,
-    status_hint: &str,
+    prefix_state: PrefixState,
     log_tail: Option<&LogTail>,
 ) {
     let area = frame.area();
@@ -960,7 +1050,16 @@ fn render_frame(
     match nav_style {
         NavStyle::LeftPane => render_left_pane(frame, main_area, agents, focused),
         NavStyle::Popup => {
-            render_popup_style(frame, main_area, agents, focused, popup, status_hint);
+            render_popup_style(
+                frame,
+                main_area,
+                agents,
+                focused,
+                previous_focused,
+                popup,
+                bindings,
+                prefix_state,
+            );
         }
     }
     if let (Some(tail), Some(area)) = (log_tail, log_area) {
@@ -1077,13 +1176,16 @@ fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_popup_style(
     frame: &mut Frame<'_>,
     area: Rect,
     agents: &[RuntimeAgent],
     focused: usize,
+    previous_focused: Option<usize>,
     popup: PopupState,
-    status_hint: &str,
+    bindings: &Bindings,
+    prefix_state: PrefixState,
 ) {
     let [pty_area, status_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -1094,45 +1196,216 @@ fn render_popup_style(
         render_agent_pane(frame, pty_area, agent);
     }
 
-    let labels: Vec<String> = agents
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            let marker = if i == focused { "*" } else { " " };
-            format!("[{}{}] {}", i + 1, marker, a.label)
-        })
-        .collect();
-    let status = format!("{}    {status_hint}", labels.join("  "));
-    // Status bar is a single row; truncate with an ellipsis if the labels
-    // plus the hint overflow the available width. Without this, long user
-    // chords (e.g. `ctrl+alt+pageup`) or many agent labels would clip
-    // silently at the right edge.
-    let display = clip_to_width(&status, status_area.width as usize);
-    frame.render_widget(Paragraph::new(display), status_area);
+    render_status_bar(
+        frame,
+        status_area,
+        agents,
+        focused,
+        previous_focused,
+        bindings,
+        prefix_state,
+    );
 
     if let PopupState::Open { selection } = popup {
         render_switcher_popup(frame, area, agents, selection);
     }
 }
 
-/// Truncate `s` to at most `max` terminal cells, appending an ellipsis when
-/// truncation actually happened. Counts Unicode code points (good enough for
-/// the ASCII-heavy status bar); CJK / emoji widths would need the
-/// `unicode-width` crate, which is not pulled in for one helper.
-fn clip_to_width(s: &str, max: usize) -> String {
-    let len = s.chars().count();
-    if len <= max {
-        return s.to_string();
+/// Render the bottom status bar in Popup mode: tab strip (left,
+/// styled spans), buddy tail (middle, dim) showing the last non-blank
+/// line of the previously-focused agent's screen, and the prefix hint
+/// right-aligned. Splitting into discrete areas means each section
+/// can be styled and clipped independently; the previous flat-string
+/// approach forced uniform style and made it awkward to highlight the
+/// focused tab without rendering a custom widget.
+///
+/// The buddy tail is the codemux-specific affordance: tmux can't show
+/// what an unfocused window is doing without a custom integration,
+/// because it doesn't parse the child's output. We already do (for
+/// rendering), so the last visible line is free.
+///
+/// The hint at the right swaps based on `prefix_state`: idle shows
+/// the help reminder; `AwaitingCommand` shows a `[NAV]` badge plus a
+/// short reminder of the sticky moves available, so the user has a
+/// visible cue that they're "in nav mode" and what they can do.
+fn render_status_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agents: &[RuntimeAgent],
+    focused: usize,
+    previous_focused: Option<usize>,
+    bindings: &Bindings,
+    prefix_state: PrefixState,
+) {
+    // Compute the hint as both rendered Line (with styling) and a
+    // plain text-width measurement (for the layout split). The two
+    // need to stay in sync — the alternative was to render twice.
+    let (hint_line, hint_width) = build_hint(bindings, prefix_state);
+
+    // Reserve space for the hint on the right when there's room.
+    // Below a small threshold (just enough for one tab plus the hint),
+    // drop the hint entirely so the user can still see at least one
+    // tab label. Truncation is handled implicitly by ratatui's
+    // Paragraph clipping at the area edge.
+    let (left_area, hint_area) = if area.width > hint_width.saturating_add(8) {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(hint_width)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
+
+    // Build the left half as a single Line: tabs first, then a
+    // separator and the buddy tail if there's a sensible buddy. Using
+    // one Line lets ratatui clip the whole thing at the area edge as
+    // a unit, instead of splitting tabs vs tail into competing layout
+    // children that would each get half the width regardless of
+    // content length.
+    let mut spans = build_tab_strip_spans(agents, focused);
+    if let Some(tail) = buddy_tail_spans(agents, focused, previous_focused) {
+        spans.push(Span::styled(
+            "    ← ",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+        spans.extend(tail);
     }
-    if max == 0 {
-        return String::new();
+    frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
+
+    if let Some(area) = hint_area {
+        let widget = Paragraph::new(hint_line).alignment(Alignment::Right);
+        frame.render_widget(widget, area);
     }
-    if max == 1 {
-        return "…".into();
+}
+
+/// Build the right-aligned hint shown in the Popup-mode status bar.
+/// The text changes based on `prefix_state` so the user has a
+/// visible cue when sticky nav mode is active. Returns the styled
+/// `Line` plus the plain-text width — the caller needs both because
+/// ratatui's layout splits need a numeric width while rendering
+/// uses the styled `Line`.
+fn build_hint(bindings: &Bindings, prefix_state: PrefixState) -> (Line<'static>, u16) {
+    match prefix_state {
+        PrefixState::Idle => {
+            let text = format!("{} {} for help", bindings.prefix, bindings.on_prefix.help);
+            let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+            let line = Line::styled(
+                text,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            );
+            (line, width)
+        }
+        PrefixState::AwaitingCommand => {
+            // [NAV] in yellow + bold to draw the eye; the rest dim
+            // to read as ambient guidance, matching the idle hint
+            // style. Width is the full plain-text length so the
+            // layout reserves enough room for both spans.
+            let badge = "[NAV] ";
+            let body = "h/l prev/next  esc exit";
+            let width =
+                u16::try_from(badge.chars().count() + body.chars().count()).unwrap_or(u16::MAX);
+            let line = Line::from(vec![
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    body,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ]);
+            (line, width)
+        }
     }
-    let mut out: String = s.chars().take(max - 1).collect();
-    out.push('…');
-    out
+}
+
+/// Build the styled spans for the tab strip portion of the status
+/// bar. Focused tab gets reverse-video + bold so the eye lands on it
+/// immediately; others render dim so the focused tab pops without
+/// having to look at a marker character. Tabs are separated by a thin
+/// vertical bar — close enough to the browser tab convention to read
+/// as "tabs" rather than "list of items."
+fn build_tab_strip_spans(agents: &[RuntimeAgent], focused: usize) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(agents.len().saturating_mul(3));
+    let separator_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    for (i, agent) in agents.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" │ ", separator_style));
+        }
+        let label = format!(" {} {} ", i + 1, agent.label);
+        let style = if i == focused {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    spans
+}
+
+/// Build the spans for the buddy tail — the last non-blank line of
+/// the previously-focused agent's screen. Returns `None` when there's
+/// nothing useful to show: no previous, previous index out of range,
+/// previous agent isn't a `Ready` (no parser), or all rows are blank.
+/// The "prev != focused" guard is belt-and-braces; `change_focus`
+/// already filters that out, but the renderer shouldn't trust it.
+fn buddy_tail_spans(
+    agents: &[RuntimeAgent],
+    focused: usize,
+    previous_focused: Option<usize>,
+) -> Option<Vec<Span<'static>>> {
+    let prev = previous_focused?;
+    if prev == focused {
+        return None;
+    }
+    let agent = agents.get(prev)?;
+    let parser = match &agent.state {
+        AgentState::Ready { parser, .. } => parser,
+        AgentState::Failed { .. } => return None,
+    };
+    let (rows, cols) = parser.screen().size();
+    let line = last_non_blank_row(parser, rows, cols)?;
+    Some(vec![
+        Span::styled(
+            format!("[{}] ", prev + 1),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(
+            line,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ),
+    ])
+}
+
+/// Walk the visible screen and return the last row whose trimmed
+/// contents aren't empty. Used by [`buddy_tail_spans`] to find the
+/// most recent meaningful output of an unfocused agent. Returns `None`
+/// if every row is blank (fresh PTY before any output).
+fn last_non_blank_row(parser: &Parser, rows: u16, cols: u16) -> Option<String> {
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    parser
+        .screen()
+        .rows(0, cols)
+        .filter(|line| !line.trim().is_empty())
+        .last()
+        .map(|line| line.trim_end().to_string())
 }
 
 fn render_switcher_popup(
@@ -1158,7 +1431,7 @@ fn render_switcher_popup(
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, bindings: &Bindings) {
-    let popup_area = centered_rect_with_size(64, 26, area);
+    let popup_area = centered_rect_with_size(64, 30, area);
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1173,6 +1446,17 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, bindings: &Bindings) {
         format!("prefix:  {}", bindings.prefix),
         header_style,
     ));
+    lines.push(Line::raw(""));
+
+    // Direct binds appear first because they're the fast path. The
+    // help screen ordering reflects "what the user reaches for most."
+    lines.push(Line::styled("direct (no prefix):", header_style));
+    for action in DirectAction::ALL {
+        lines.push(binding_line(
+            bindings.on_direct.binding_for(*action),
+            action.description(),
+        ));
+    }
     lines.push(Line::raw(""));
 
     lines.push(Line::styled("in prefix mode:", header_style));
@@ -1410,6 +1694,325 @@ mod tests {
         assert_eq!(action, KeyDispatch::SpawnAgent);
     }
 
+    // Direct-bind dispatch (no prefix needed) — the fast path the
+    // user pays for via the Cmd modifier.
+
+    #[test]
+    fn direct_cmd_apostrophe_focuses_next_without_arming_prefix() {
+        let mut state = PrefixState::Idle;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('\''), KeyModifiers::SUPER),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusNext);
+        // Crucial: state must remain Idle. If the direct bind
+        // accidentally armed the prefix state machine, the next
+        // keystroke would be consumed as a prefix command.
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn direct_cmd_semicolon_focuses_prev() {
+        let mut state = PrefixState::Idle;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char(';'), KeyModifiers::SUPER),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusPrev);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn plain_semicolon_without_super_still_forwards_as_a_byte() {
+        // Without the SUPER modifier, `;` is just a typed
+        // character for the focused PTY. The direct-bind layer
+        // only fires on the configured chord, not bare keys.
+        let mut state = PrefixState::Idle;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char(';'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::Forward(vec![b';']));
+    }
+
+    // Sticky prefix mode — after Ctrl-B, repeated nav keys keep the
+    // state armed so the user can `Ctrl-B h h h` without re-pressing
+    // the prefix. Non-nav commands and unbound keys exit.
+
+    #[test]
+    fn prefix_then_nav_key_stays_in_awaiting_command() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('h'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusPrev);
+        // Sticky: stays armed for repeated nav.
+        assert_eq!(state, PrefixState::AwaitingCommand);
+    }
+
+    #[test]
+    fn prefix_then_repeated_nav_keys_keeps_dispatching() {
+        // Simulates `Ctrl-B h h h` — three FocusPrev dispatches
+        // without re-pressing the prefix in between.
+        let mut state = PrefixState::AwaitingCommand;
+        for _ in 0..3 {
+            let action = dispatch_key(
+                &mut state,
+                &key(KeyCode::Char('h'), KeyModifiers::NONE),
+                &defaults(),
+            );
+            assert_eq!(action, KeyDispatch::FocusPrev);
+            assert_eq!(state, PrefixState::AwaitingCommand);
+        }
+    }
+
+    #[test]
+    fn prefix_then_digit_stays_sticky() {
+        // 1-9 is also a nav move (focus by index), so it should
+        // keep us armed for further nav.
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('2'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusAt(1));
+        assert_eq!(state, PrefixState::AwaitingCommand);
+    }
+
+    #[test]
+    fn prefix_then_tab_stays_sticky() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Tab, KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusLast);
+        assert_eq!(state, PrefixState::AwaitingCommand);
+    }
+
+    #[test]
+    fn prefix_then_non_nav_command_exits_sticky() {
+        // Spawn-agent (`c`) is a one-shot command — after dispatch
+        // the state should drop back to Idle.
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('c'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::SpawnAgent);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn prefix_then_unbound_key_exits_sticky() {
+        // `z` isn't bound to anything — exits sticky and consumes.
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('z'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::Consume);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn prefix_then_esc_exits_sticky_via_unbound_path() {
+        // Esc isn't a bound action — falls through to Consume +
+        // exit. This is the user-facing way to leave nav mode.
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Esc, KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::Consume);
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn prefix_h_via_alias_focuses_prev() {
+        // After arming with the prefix, vim-style `h` is one of the
+        // aliases (alongside tmux `p` and vim `k`) that should map
+        // to FocusPrev.
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('h'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusPrev);
+    }
+
+    #[test]
+    fn prefix_l_via_alias_focuses_next() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('l'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusNext);
+    }
+
+    #[test]
+    fn prefix_tab_dispatches_focus_last() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Tab, KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::FocusLast);
+    }
+
+    // change_focus semantics — the helper that keeps `previous_focused`
+    // in sync with `focused` at every user-initiated switch site.
+
+    #[test]
+    fn change_focus_records_previous_when_focus_moves() {
+        let mut focused = 0;
+        let mut previous = None;
+        change_focus(&mut focused, &mut previous, 2);
+        assert_eq!(focused, 2);
+        assert_eq!(previous, Some(0));
+    }
+
+    #[test]
+    fn change_focus_is_a_noop_when_target_is_already_focused() {
+        // Critical: a no-op must not clobber `previous`. Otherwise a
+        // double-tap of the same direct-bind (or pressing FocusAt(idx)
+        // for an already-focused tab) would erase the bounce slot.
+        let mut focused = 1;
+        let mut previous = Some(0);
+        change_focus(&mut focused, &mut previous, 1);
+        assert_eq!(focused, 1);
+        assert_eq!(previous, Some(0));
+    }
+
+    #[test]
+    fn change_focus_lets_alt_tab_bounce_via_two_calls() {
+        // Simulates: focused=0, switch to 2 (FocusAt), then FocusLast
+        // bounces back to 0 — and `previous` should now point to 2 so a
+        // second FocusLast bounces forward again.
+        let mut focused = 0;
+        let mut previous = None;
+        change_focus(&mut focused, &mut previous, 2);
+        assert_eq!((focused, previous), (2, Some(0)));
+        // FocusLast handler reads `previous` then calls change_focus(prev).
+        let bounce_target = previous.unwrap();
+        change_focus(&mut focused, &mut previous, bounce_target);
+        assert_eq!((focused, previous), (0, Some(2)));
+        // Second bounce.
+        let bounce_target = previous.unwrap();
+        change_focus(&mut focused, &mut previous, bounce_target);
+        assert_eq!((focused, previous), (2, Some(0)));
+    }
+
+    // last_non_blank_row — feeds the buddy tail.
+
+    #[test]
+    fn last_non_blank_row_returns_none_for_a_fresh_parser() {
+        // No bytes processed: every row is blank.
+        let parser = Parser::new(10, 40, 0);
+        assert_eq!(last_non_blank_row(&parser, 10, 40), None);
+    }
+
+    #[test]
+    fn last_non_blank_row_finds_the_most_recent_meaningful_line() {
+        let mut parser = Parser::new(5, 20, 0);
+        parser.process(b"first\r\n");
+        parser.process(b"second\r\n");
+        parser.process(b"third\r\n");
+        // VT terminals don't naturally append blank lines after the
+        // cursor — we just expect the last *written* line to come back.
+        assert_eq!(last_non_blank_row(&parser, 5, 20).as_deref(), Some("third"),);
+    }
+
+    #[test]
+    fn last_non_blank_row_skips_trailing_whitespace_rows() {
+        let mut parser = Parser::new(5, 20, 0);
+        parser.process(b"useful output\r\n\r\n\r\n");
+        // Last meaningful line is still `useful output`, not the
+        // empty rows pushed by the trailing newlines.
+        assert_eq!(
+            last_non_blank_row(&parser, 5, 20).as_deref(),
+            Some("useful output"),
+        );
+    }
+
+    // buddy_tail_spans gating — protect the renderer from stale or
+    // missing previous slots. The "renders the right styled spans for
+    // a Ready agent" path requires constructing an AgentTransport,
+    // which the TUI crate can't build directly (see RuntimeAgent
+    // constructors note); we cover the None gates here and rely on
+    // last_non_blank_row tests for the data-extraction half.
+
+    fn failed_agent(label: &str) -> RuntimeAgent {
+        let err = codemuxd_bootstrap::Error::Bootstrap {
+            stage: codemuxd_bootstrap::Stage::VersionProbe,
+            source: Box::new(io::Error::other("test")),
+        };
+        RuntimeAgent::failed(label.into(), "host".into(), err, 24, 80)
+    }
+
+    #[test]
+    fn buddy_tail_spans_returns_none_when_no_previous() {
+        let agents = vec![failed_agent("a"), failed_agent("b")];
+        assert!(buddy_tail_spans(&agents, 0, None).is_none());
+    }
+
+    #[test]
+    fn buddy_tail_spans_returns_none_when_previous_equals_focused() {
+        // Belt-and-braces: change_focus already filters this, but the
+        // renderer mustn't crash if the invariant ever slips.
+        let agents = vec![failed_agent("a"), failed_agent("b")];
+        assert!(buddy_tail_spans(&agents, 1, Some(1)).is_none());
+    }
+
+    #[test]
+    fn buddy_tail_spans_returns_none_when_previous_index_is_out_of_range() {
+        // The per-frame clamp clears stale slots, but a transient
+        // out-of-range value (mid-reap) must still produce no output.
+        let agents = vec![failed_agent("a")];
+        assert!(buddy_tail_spans(&agents, 0, Some(7)).is_none());
+    }
+
+    #[test]
+    fn buddy_tail_spans_returns_none_when_previous_agent_is_failed() {
+        // A Failed agent has no Parser, so there's no last-line to
+        // surface. The buddy tail just stays hidden in this case.
+        let agents = vec![failed_agent("a"), failed_agent("b")];
+        assert!(buddy_tail_spans(&agents, 0, Some(1)).is_none());
+    }
+
+    // build_hint state-driven branch — the user's visible cue that
+    // sticky nav mode is active. The two branches must produce
+    // distinguishable output (different widths) so the layout reserves
+    // appropriate room.
+
+    #[test]
+    fn build_hint_idle_and_awaiting_command_produce_different_widths() {
+        let bindings = defaults();
+        let (_, idle_width) = build_hint(&bindings, PrefixState::Idle);
+        let (_, nav_width) = build_hint(&bindings, PrefixState::AwaitingCommand);
+        // The NAV-mode hint includes a `[NAV]` badge plus a sticky-mode
+        // reminder, so it's strictly wider than the idle help reminder.
+        // If a future edit makes them equal, the cue gets lost — fail
+        // loudly here so the renderer's affordance stays visible.
+        assert!(nav_width > 0);
+        assert!(idle_width > 0);
+        assert_ne!(idle_width, nav_width);
+    }
+
     #[test]
     fn prefix_question_mark_opens_help() {
         let mut state = PrefixState::AwaitingCommand;
@@ -1530,37 +2133,6 @@ mod tests {
         use crate::keymap::KeyChord;
         assert_eq!(literal_byte_for(&KeyChord::plain(KeyCode::Char('q'))), None);
         assert_eq!(literal_byte_for(&KeyChord::ctrl(KeyCode::F(1))), None);
-    }
-
-    #[test]
-    fn clip_to_width_returns_input_unchanged_when_short_enough() {
-        assert_eq!(clip_to_width("hello", 10), "hello");
-        assert_eq!(clip_to_width("hello", 5), "hello");
-    }
-
-    #[test]
-    fn clip_to_width_truncates_with_ellipsis_when_overflowing() {
-        assert_eq!(clip_to_width("hello world", 8), "hello w…");
-        assert_eq!(clip_to_width("hello", 4), "hel…");
-    }
-
-    #[test]
-    fn clip_to_width_handles_max_zero_and_one() {
-        assert_eq!(clip_to_width("hello", 0), "");
-        assert_eq!(clip_to_width("hello", 1), "…");
-    }
-
-    #[test]
-    fn clip_to_width_handles_empty_input() {
-        assert_eq!(clip_to_width("", 10), "");
-        assert_eq!(clip_to_width("", 0), "");
-    }
-
-    #[test]
-    fn clip_to_width_counts_codepoints_not_bytes() {
-        // Multi-byte chars: "café" is 4 chars, 5 bytes.
-        assert_eq!(clip_to_width("café", 4), "café");
-        assert_eq!(clip_to_width("café bar", 5), "café…");
     }
 
     // RuntimeAgent constructors
