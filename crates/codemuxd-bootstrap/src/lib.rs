@@ -605,16 +605,36 @@ fn scp_tarball(
 /// && echo {version} > agent.version'`. Long-running. Surfaces a
 /// rustup-install hint when cargo isn't on the remote PATH.
 fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result<(), Error> {
-    // Build steps in one ssh invocation to amortize handshake cost.
-    // The `&& echo ${version}` write is last so a partial build doesn't
-    // leave a misleading agent.version. `tee build.log` keeps a log
-    // for diagnostics without consuming the rust output.
+    // One ssh invocation amortizes handshake cost. Order is
+    // load-bearing — `agent.version` is written last so a partial
+    // build doesn't leave a misleading version marker on disk.
+    //
+    // The pre-fix recipe used `cargo build … 2>&1 | tee build.log`,
+    // which silently swallows cargo's exit code: a pipeline's exit
+    // status is the rightmost command's, `tee` always succeeds, so
+    // `set -e` never trips. The script then marched on to
+    // `mv target/release/codemuxd …` and surfaced the misleading
+    // `mv: cannot stat …` instead of the real rustc diagnostic.
+    //
+    // Portable POSIX has no `pipefail`, so we capture cargo's exit
+    // explicitly via the `cmd || rc=$?` idiom, redirect cargo's
+    // output to `build.log`, and dump the log tail to stderr on
+    // failure so the actual compile diagnostic reaches the user
+    // (modal banner + tracing log) instead of `mv`'s downstream
+    // ENOENT noise.
     let cmd = format!(
-        "set -e; cd ~/.cache/codemuxd/src && \
-         tar -xzf {version}.tar.gz && \
-         cargo build --release --bin codemuxd 2>&1 | tee build.log && \
-         mkdir -p ~/.cache/codemuxd/bin && \
-         mv target/release/codemuxd ~/.cache/codemuxd/bin/codemuxd && \
+        "set -e\n\
+         cd ~/.cache/codemuxd/src\n\
+         tar -xzf {version}.tar.gz\n\
+         cargo_status=0\n\
+         cargo build --release --bin codemuxd > build.log 2>&1 || cargo_status=$?\n\
+         if [ $cargo_status -ne 0 ]; then\n\
+         echo '--- build.log tail (last 50 lines) ---' >&2\n\
+         tail -50 build.log >&2\n\
+         exit $cargo_status\n\
+         fi\n\
+         mkdir -p ~/.cache/codemuxd/bin\n\
+         mv target/release/codemuxd ~/.cache/codemuxd/bin/codemuxd\n\
          echo {version} > ~/.cache/codemuxd/agent.version"
     );
     let out = runner
@@ -625,9 +645,18 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
         })?;
     if out.status != 0 {
         let stderr_text = String::from_utf8_lossy(&out.stderr);
-        let hint = if stderr_text.contains("cargo: not found")
+        // The remote shell formats "binary not on PATH" errors
+        // differently per shell. Cover the three common cases:
+        //   sh/dash → "sh: cargo: not found"
+        //   bash    → "bash: cargo: command not found"
+        //   zsh     → "zsh:N: command not found: cargo"   ← reversed order
+        // The colon-anchored substrings are specific enough that
+        // false positives from a real cargo build error mentioning
+        // "not found" (e.g. crate not found) are unlikely.
+        let cargo_missing = stderr_text.contains("cargo: not found")
             || stderr_text.contains("cargo: command not found")
-        {
+            || stderr_text.contains("command not found: cargo");
+        let hint = if cargo_missing {
             format!(
                 "`cargo` not found on {host}. Install rustup first: https://rustup.rs/\n\
                  Remote stderr: {stderr_text}"
@@ -1148,6 +1177,62 @@ mod tests {
         assert!(
             msg.contains("devbox"),
             "expected host name in source, got {msg}",
+        );
+    }
+
+    /// zsh formats the missing-binary error as
+    /// `zsh:N: command not found: cargo` — note the reversed word
+    /// order vs bash. The detector must handle this so users on
+    /// zsh-default boxes (devpods, macOS hosts) get the rustup hint
+    /// rather than the generic compile-error fallback.
+    #[test]
+    fn remote_build_surfaces_cargo_not_found_hint_on_zsh() {
+        let runner = FakeRunner::new();
+        runner.expect_run(
+            "ssh",
+            &["-o", "BatchMode=yes"],
+            fail(
+                127,
+                b"--- build.log tail (last 50 lines) ---\nzsh:5: command not found: cargo\n",
+            ),
+        );
+        let err = remote_build(&runner, "devpod", "v1").unwrap_err();
+        let Error::Bootstrap { stage, source } = err else {
+            panic!("expected Bootstrap, got {err:?}");
+        };
+        assert_eq!(stage, Stage::RemoteBuild);
+        let msg = source.to_string();
+        assert!(
+            msg.contains("rustup.rs"),
+            "expected rustup hint in source, got {msg}",
+        );
+        assert!(
+            msg.contains("devpod"),
+            "expected host name in source, got {msg}",
+        );
+    }
+
+    /// sh/dash formats the missing-binary error as
+    /// `sh: cargo: not found` (no "command" word). Locked in so
+    /// the OR chain doesn't accidentally drop this case during a
+    /// future cleanup.
+    #[test]
+    fn remote_build_surfaces_cargo_not_found_hint_on_sh() {
+        let runner = FakeRunner::new();
+        runner.expect_run(
+            "ssh",
+            &["-o", "BatchMode=yes"],
+            fail(127, b"sh: 1: cargo: not found"),
+        );
+        let err = remote_build(&runner, "alpine", "v1").unwrap_err();
+        let Error::Bootstrap { stage, source } = err else {
+            panic!("expected Bootstrap, got {err:?}");
+        };
+        assert_eq!(stage, Stage::RemoteBuild);
+        let msg = source.to_string();
+        assert!(
+            msg.contains("rustup.rs"),
+            "expected rustup hint in source, got {msg}",
         );
     }
 

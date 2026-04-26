@@ -118,6 +118,62 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Render a user-facing message for this error: a stage-specific
+    /// actionable head line, then each link of the source chain on
+    /// its own line. The TUI surfaces this string in both the
+    /// failure pane and the spawn-modal banner, so the wording
+    /// stays consistent across render sites.
+    ///
+    /// The head-line match is exhaustive within this crate even
+    /// though `Error` and `Stage` are `#[non_exhaustive]` for
+    /// downstream callers — the compiler enforces an arm update
+    /// here when a new variant lands, which is the right pressure:
+    /// a missing head line would otherwise surface as a confusing
+    /// generic message in the spawn modal.
+    #[must_use]
+    pub fn user_message(&self) -> String {
+        let head = match self {
+            Self::Bootstrap {
+                stage: Stage::VersionProbe,
+                ..
+            } => "ssh probe failed (host unreachable or auth refused)",
+            Self::Bootstrap {
+                stage: Stage::TarballStage,
+                ..
+            } => "couldn't stage local tarball (disk full?)",
+            Self::Bootstrap {
+                stage: Stage::Scp, ..
+            } => "scp failed (network or remote disk)",
+            Self::Bootstrap {
+                stage: Stage::RemoteBuild,
+                ..
+            } => "remote build failed (cargo missing or compile error)",
+            Self::Bootstrap {
+                stage: Stage::DaemonSpawn,
+                ..
+            } => "remote daemon failed to spawn",
+            Self::Bootstrap {
+                stage: Stage::SocketTunnel,
+                ..
+            } => "ssh -L tunnel failed (OpenSSH < 6.7?)",
+            Self::Bootstrap {
+                stage: Stage::SocketConnect,
+                ..
+            } => "could not connect to remote daemon socket",
+            Self::Session { .. } => "wire handshake failed after bootstrap",
+        };
+        let mut msg = head.to_string();
+        let mut source: Option<&dyn StdError> = self.source();
+        while let Some(s) = source {
+            msg.push('\n');
+            msg.push_str(&s.to_string());
+            source = s.source();
+        }
+        msg
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -155,5 +211,50 @@ mod tests {
             unreachable!("Session variant must have a source")
         };
         assert_eq!(source.to_string(), "handshake EOF");
+    }
+
+    fn boot_err(stage: Stage, source: &'static str) -> Error {
+        Error::Bootstrap {
+            stage,
+            source: Box::new(io::Error::other(source)),
+        }
+    }
+
+    #[test]
+    fn user_message_includes_stage_hint_and_source_chain() {
+        let err = boot_err(Stage::Scp, "permission denied");
+        let msg = err.user_message();
+        assert!(msg.starts_with("scp failed"), "got {msg:?}");
+        assert!(msg.contains("permission denied"), "got {msg:?}");
+    }
+
+    #[test]
+    fn user_message_keys_each_stage_to_a_distinct_hint() {
+        let stages = [
+            (Stage::VersionProbe, "ssh probe"),
+            (Stage::TarballStage, "tarball"),
+            (Stage::Scp, "scp"),
+            (Stage::RemoteBuild, "remote build"),
+            (Stage::DaemonSpawn, "daemon"),
+            (Stage::SocketTunnel, "tunnel"),
+            (Stage::SocketConnect, "remote daemon socket"),
+        ];
+        for (stage, expected_substr) in stages {
+            let msg = boot_err(stage, "x").user_message();
+            assert!(
+                msg.to_lowercase().contains(expected_substr),
+                "stage {stage:?}: expected message to contain {expected_substr:?}, got {msg:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn user_message_handles_session_variant() {
+        let err = Error::Session {
+            source: Box::new(io::Error::other("handshake EOF")),
+        };
+        let msg = err.user_message();
+        assert!(msg.contains("handshake"), "got {msg:?}");
+        assert!(msg.contains("handshake EOF"), "got {msg:?}");
     }
 }

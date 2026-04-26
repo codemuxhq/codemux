@@ -24,7 +24,6 @@
 //! `Failed` agent so the bootstrap error has a render surface even
 //! after the modal closes.
 
-use std::error::Error as StdError;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -460,9 +459,9 @@ fn event_loop(
                     Err(e) => {
                         tracing::error!(host = %p.host, "prepare failed: {e}");
                         if let Some(ui) = spawn_ui.as_mut() {
-                            // Back-to-host refresh only touches Host
-                            // completions; Local lister is fine.
-                            ui.unlock_back_to_host(&mut DirLister::Local);
+                            // Pass the structured error; the modal formats
+                            // via `user_message()` at render time.
+                            ui.unlock_back_to_host(&mut DirLister::Local, Some(e));
                         }
                         prepare = None;
                     }
@@ -998,7 +997,7 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
             frame.render_widget(widget, area);
         }
         AgentState::Failed { host, error } => {
-            render_failure_pane(frame, area, host, &format_bootstrap_error(error));
+            render_failure_pane(frame, area, host, &error.user_message());
         }
     }
 }
@@ -1045,57 +1044,6 @@ fn render_failure_pane(frame: &mut Frame<'_>, area: Rect, host: &str, err: &str)
         Paragraph::new(lines).alignment(Alignment::Center),
         chunks[1],
     );
-}
-
-/// Render the bootstrap error envelope for the placeholder pane. The
-/// stage hint is the first line; subsequent lines walk the source
-/// chain so the user sees the underlying ssh/scp/cargo message
-/// without having to dig in tracing logs.
-fn format_bootstrap_error(e: &codemuxd_bootstrap::Error) -> String {
-    use codemuxd_bootstrap::{Error, Stage};
-    let head = match e {
-        Error::Bootstrap {
-            stage: Stage::VersionProbe,
-            ..
-        } => "ssh probe failed (host unreachable or auth refused)",
-        Error::Bootstrap {
-            stage: Stage::TarballStage,
-            ..
-        } => "couldn't stage local tarball (disk full?)",
-        Error::Bootstrap {
-            stage: Stage::Scp, ..
-        } => "scp failed (network or remote disk)",
-        Error::Bootstrap {
-            stage: Stage::RemoteBuild,
-            ..
-        } => "remote build failed (cargo missing or compile error)",
-        Error::Bootstrap {
-            stage: Stage::DaemonSpawn,
-            ..
-        } => "remote daemon failed to spawn",
-        Error::Bootstrap {
-            stage: Stage::SocketTunnel,
-            ..
-        } => "ssh -L tunnel failed (OpenSSH < 6.7?)",
-        Error::Bootstrap {
-            stage: Stage::SocketConnect,
-            ..
-        } => "could not connect to remote daemon socket",
-        Error::Bootstrap { .. } => "bootstrap failed",
-        Error::Session { .. } => "wire handshake failed after bootstrap",
-        // Bootstrap's `Error` is `#[non_exhaustive]`; keep an
-        // explicit fallback so the renderer never panics on a
-        // future variant added downstream.
-        _ => "bootstrap failed (unknown error variant)",
-    };
-    let mut msg = head.to_string();
-    let mut source: Option<&dyn StdError> = e.source();
-    while let Some(s) = source {
-        msg.push('\n');
-        msg.push_str(&s.to_string());
-        source = s.source();
-    }
-    msg
 }
 
 fn render_left_pane(frame: &mut Frame<'_>, area: Rect, agents: &[RuntimeAgent], focused: usize) {
@@ -1616,54 +1564,7 @@ mod tests {
     // point on the session crate (out of scope here). It's covered
     // indirectly by the spawn-local path tests in `spawn::tests`.
 
-    // format_bootstrap_error
-
-    fn boot_err(
-        stage: codemuxd_bootstrap::Stage,
-        source: &'static str,
-    ) -> codemuxd_bootstrap::Error {
-        codemuxd_bootstrap::Error::Bootstrap {
-            stage,
-            source: Box::new(io::Error::other(source)),
-        }
-    }
-
-    #[test]
-    fn format_bootstrap_error_includes_stage_hint_and_source_chain() {
-        let err = boot_err(codemuxd_bootstrap::Stage::Scp, "permission denied");
-        let msg = format_bootstrap_error(&err);
-        assert!(msg.starts_with("scp failed"), "got {msg:?}");
-        assert!(msg.contains("permission denied"), "got {msg:?}");
-    }
-
-    #[test]
-    fn format_bootstrap_error_keys_each_stage_to_a_distinct_hint() {
-        use codemuxd_bootstrap::Stage;
-        let stages = [
-            (Stage::VersionProbe, "ssh probe"),
-            (Stage::TarballStage, "tarball"),
-            (Stage::Scp, "scp"),
-            (Stage::RemoteBuild, "remote build"),
-            (Stage::DaemonSpawn, "daemon"),
-            (Stage::SocketTunnel, "tunnel"),
-            (Stage::SocketConnect, "remote daemon socket"),
-        ];
-        for (stage, expected_substr) in stages {
-            let msg = format_bootstrap_error(&boot_err(stage, "x"));
-            assert!(
-                msg.to_lowercase().contains(expected_substr),
-                "stage {stage:?}: expected message to contain {expected_substr:?}, got {msg:?}",
-            );
-        }
-    }
-
-    #[test]
-    fn format_bootstrap_error_handles_session_variant() {
-        let err = codemuxd_bootstrap::Error::Session {
-            source: Box::new(io::Error::other("handshake EOF")),
-        };
-        let msg = format_bootstrap_error(&err);
-        assert!(msg.contains("handshake"), "got {msg:?}");
-        assert!(msg.contains("handshake EOF"), "got {msg:?}");
-    }
+    // The user-facing message formatting (stage hint + source chain)
+    // is tested in `codemuxd_bootstrap::error::tests::user_message_*`,
+    // co-located with the `Error` type it formats.
 }

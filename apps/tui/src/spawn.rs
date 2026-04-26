@@ -71,7 +71,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use codemuxd_bootstrap::{CommandRunner, DirEntry, RemoteFs, Stage};
+use codemuxd_bootstrap::{CommandRunner, DirEntry, Error as BootstrapError, RemoteFs, Stage};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -214,6 +214,15 @@ pub struct SpawnMinibuffer {
     /// worker (prepare or attach). Render data only — the worker
     /// itself lives in the runtime.
     bootstrap_view: Option<BootstrapView>,
+    /// One-shot error banner shown in the wildmenu region after a
+    /// prepare failure. Set by the runtime via
+    /// [`Self::unlock_back_to_host`]; cleared on the next keystroke.
+    /// Mutually exclusive with `bootstrap_view`.
+    ///
+    /// Stored as the structured [`BootstrapError`] so the modal owns
+    /// presentation — the stage-keyed head line and source-chain walk
+    /// happen at render time via [`BootstrapError::user_message`].
+    prepare_error: Option<BootstrapError>,
 }
 
 impl SpawnMinibuffer {
@@ -237,6 +246,7 @@ impl SpawnMinibuffer {
             selected: None,
             path_mode: PathMode::Local,
             bootstrap_view: None,
+            prepare_error: None,
         };
         // Initial wildmenu lists local cwd entries — modal opens in
         // PathMode::Local so the lister doesn't matter.
@@ -270,14 +280,18 @@ impl SpawnMinibuffer {
     /// path mode to [`PathMode::Remote`] so subsequent keystrokes
     /// scan the remote filesystem via the supplied [`DirLister`];
     /// seeds the path field with the remote `$HOME` so the user can
-    /// edit from there. The host text is preserved.
+    /// edit from there. Overwrites the host text with the runtime's
+    /// canonical value so a partial-typed prefix (e.g. user typed
+    /// "web", selected "devpod-web" from the wildmenu) is replaced
+    /// with the resolved alias the bootstrap actually targeted.
     pub fn unlock_for_remote_path(
         &mut self,
-        _host: String,
+        host: String,
         remote_home: PathBuf,
         lister: &mut DirLister<'_>,
     ) {
         self.bootstrap_view = None;
+        self.host = host;
         // Seed the path zone with the remote $HOME as a trailing-slash
         // path so the wildmenu lists $HOME's entries directly. The
         // user can edit forward or backspace up to /.
@@ -299,10 +313,19 @@ impl SpawnMinibuffer {
     /// cancel or on a prepare error. Preserves the host text so the
     /// user can edit it; resets `path_mode` to `Local` because the
     /// remote home is no longer trustworthy.
-    pub fn unlock_back_to_host(&mut self, lister: &mut DirLister<'_>) {
+    ///
+    /// Pass `Some(err)` for prepare failures (surfaces a red banner
+    /// in the wildmenu, formatted via [`BootstrapError::user_message`]
+    /// at render time) and `None` for cancel paths.
+    pub fn unlock_back_to_host(
+        &mut self,
+        lister: &mut DirLister<'_>,
+        error: Option<BootstrapError>,
+    ) {
         self.bootstrap_view = None;
         self.path_mode = PathMode::Local;
         self.focused = Zone::Host;
+        self.prepare_error = error;
         self.refresh(lister);
     }
 
@@ -329,6 +352,11 @@ impl SpawnMinibuffer {
                 _ => ModalOutcome::None,
             };
         }
+
+        // Read-once banner: any actionable keystroke dismisses a stale
+        // prepare error so the user doesn't see a frozen banner from a
+        // previous attempt while editing the host name.
+        self.prepare_error = None;
 
         // SwapToHost (`@`) is dual-purpose: an action in the path zone
         // (jump to host) but a literal char in the host zone (so
@@ -384,7 +412,7 @@ impl SpawnMinibuffer {
     /// run, the user just hasn't typed a path yet.
     fn swap_field_outcome(&mut self, lister: &mut DirLister<'_>) -> ModalOutcome {
         if self.focused == Zone::Host && self.is_remote_host_committed() {
-            let host = self.resolved_host();
+            let host = self.commit_resolved_host();
             return ModalOutcome::PrepareHost { host };
         }
         self.toggle_zone(lister);
@@ -411,7 +439,24 @@ impl SpawnMinibuffer {
         self.host.clone()
     }
 
-    fn confirm(&self) -> ModalOutcome {
+    /// Resolve the host (typed text or highlighted wildmenu candidate)
+    /// AND write it back to `self.host` so subsequent renders show the
+    /// canonical name, not the typed prefix. The `resolved_host`
+    /// reader-only sibling shares the resolution path; every commit
+    /// site (Tab/Enter → `PrepareHost`, Enter → Spawn) calls this so
+    /// the locked-spinner view and any failure pane stay consistent.
+    ///
+    /// The write is gated on `Zone::Host` because `selected` only
+    /// points at host candidates while the host zone is focused.
+    fn commit_resolved_host(&mut self) -> String {
+        let resolved = self.resolved_host();
+        if self.focused == Zone::Host {
+            self.host.clone_from(&resolved);
+        }
+        resolved
+    }
+
+    fn confirm(&mut self) -> ModalOutcome {
         // Enter on the host zone with an empty path field commits the
         // host like Tab does — the user wants to pick a remote folder
         // next, not spawn at the remote $HOME with no further input.
@@ -422,12 +467,16 @@ impl SpawnMinibuffer {
             && self.is_remote_host_committed()
         {
             return ModalOutcome::PrepareHost {
-                host: self.resolved_host(),
+                host: self.commit_resolved_host(),
             };
         }
 
         // Apply highlighted wildmenu candidate to the focused field if any —
         // this lets the user arrow-down + Enter without an extra Tab step.
+        // Commit the host write first (when focused on Host) so the
+        // post-Spawn renders and any failure-pane text show the
+        // resolved host instead of the partial typed prefix.
+        self.commit_resolved_host();
         let (host, path) = self.resolved_values();
         let host = if host.trim().is_empty() {
             "local".into()
@@ -604,6 +653,30 @@ impl SpawnMinibuffer {
             .block(block);
         }
 
+        // Prepare-failure banner. Up to `WILDMENU_ROWS - 1` lines fit;
+        // anything beyond is dropped (full detail still lands in the
+        // tracing log).
+        if let Some(err) = self.prepare_error.as_ref() {
+            const HEAD: &str = " ✗ ";
+            const CONT: &str = "   ";
+            let formatted = err.user_message();
+            let usable = WILDMENU_ROWS as usize - 1;
+            let lines: Vec<Line> = formatted
+                .lines()
+                .take(usable)
+                .enumerate()
+                .map(|(i, line)| {
+                    let prefix = if i == 0 { HEAD } else { CONT };
+                    let display = clip_middle(line, width.saturating_sub(prefix.len()));
+                    Line::styled(
+                        format!("{prefix}{display}"),
+                        Style::default().fg(Color::Red),
+                    )
+                })
+                .collect();
+            return Paragraph::new(lines).block(block);
+        }
+
         if self.filtered.is_empty() {
             let msg = match self.focused {
                 Zone::Path => match &self.path_mode {
@@ -692,6 +765,7 @@ impl SpawnMinibuffer {
                 HOST_PLACEHOLDER,
                 placeholder_style,
                 cursor_style,
+                false,
             ));
             spans.push(Span::styled(" : ", separator_style));
             let frame = spinner_frame(view.started_at);
@@ -715,6 +789,7 @@ impl SpawnMinibuffer {
             HOST_PLACEHOLDER,
             placeholder_style,
             cursor_style,
+            false,
         ));
         spans.push(Span::styled(" : ", separator_style));
         spans.extend(zone_spans(
@@ -723,6 +798,7 @@ impl SpawnMinibuffer {
             PATH_PLACEHOLDER,
             placeholder_style,
             cursor_style,
+            true,
         ));
 
         let hint = format!(
@@ -766,6 +842,13 @@ impl SpawnMinibuffer {
 /// Real input gets the focused/non-focused value style and the cursor at
 /// the end, where typing extends it.
 ///
+/// `highlight_basename` is true for the path zone: when the value is
+/// non-empty, focused, and contains a `/`, only the trailing component
+/// (after the last `/`) is rendered in the focused style — the rest is
+/// default. This matches how shells highlight the in-progress path
+/// segment without drowning out the parent directory context. False for
+/// the host zone, which has no analog (a hostname is a single segment).
+///
 /// Lifetime note: `value` and `placeholder` share `'a` so the returned
 /// `Span`s can borrow from both. ratatui is immediate-mode and redraws on
 /// every event/tick, so we deliberately avoid `to_string()` /
@@ -776,9 +859,10 @@ fn zone_spans<'a>(
     placeholder: &'a str,
     placeholder_style: Style,
     cursor_style: Style,
+    highlight_basename: bool,
 ) -> Vec<Span<'a>> {
     const CURSOR: &str = "█";
-    let mut out = Vec::with_capacity(2);
+    let mut out = Vec::with_capacity(3);
     if value.is_empty() {
         if focused {
             out.push(Span::styled(CURSOR, cursor_style));
@@ -795,7 +879,26 @@ fn zone_spans<'a>(
             out.push(Span::styled(placeholder, placeholder_style));
         }
     } else {
-        out.push(Span::styled(value, value_style(focused)));
+        // Path basename split: when focused on the path zone and the
+        // value has at least one `/`, render the parent prefix
+        // (including the trailing slash) in the default style and
+        // only the trailing component in the focused style. `rfind`
+        // returns a byte index; `/` is a single byte in UTF-8 so
+        // `slash + 1` is always a valid char boundary regardless of
+        // any multi-byte chars elsewhere in the path.
+        if focused
+            && highlight_basename
+            && let Some(slash) = value.rfind('/')
+        {
+            let split = slash + 1;
+            let (prefix, tail) = value.split_at(split);
+            out.push(Span::styled(prefix, Style::default()));
+            if !tail.is_empty() {
+                out.push(Span::styled(tail, value_style(true)));
+            }
+        } else {
+            out.push(Span::styled(value, value_style(focused)));
+        }
         if focused {
             out.push(Span::styled(CURSOR, cursor_style));
         }
@@ -1077,6 +1180,17 @@ mod tests {
         DirLister::Local
     }
 
+    /// Build a `BootstrapError::Bootstrap` with `VersionProbe` stage
+    /// and the supplied source text. The stage maps to a known head
+    /// line ("ssh probe failed …") in `BootstrapError::user_message`,
+    /// which the prepare-error tests assert against.
+    fn probe_err(source: &'static str) -> BootstrapError {
+        BootstrapError::Bootstrap {
+            stage: Stage::VersionProbe,
+            source: Box::new(std::io::Error::other(source)),
+        }
+    }
+
     /// Construct a minibuffer with controlled state, bypassing `open()` so
     /// tests are deterministic regardless of the real cwd / `~/.ssh/config`.
     fn mb(host: &str, path: &str, focused: Zone, ssh_hosts: &[&str]) -> SpawnMinibuffer {
@@ -1089,6 +1203,7 @@ mod tests {
             selected: None,
             path_mode: PathMode::Local,
             bootstrap_view: None,
+            prepare_error: None,
         };
         m.refresh(&mut local());
         m
@@ -1241,6 +1356,88 @@ mod tests {
             },
         );
         assert_eq!(m.host, "custom");
+    }
+
+    /// User types a partial host prefix that resolves to exactly one
+    /// SSH alias via the wildmenu, then Tab-commits. The modal must
+    /// write the *resolved* alias into `self.host` so the rendered
+    /// spinner (and the post-prepare path zone) shows the alias the
+    /// runtime is actually targeting, not the partial prefix the user
+    /// typed. Without this write, "@web → Tab" would render as
+    /// `@web : <spinner>` while bootstrap actually runs against
+    /// `devpod-web`, and the post-bootstrap path zone would still
+    /// show `@web`.
+    #[test]
+    fn tab_with_partial_match_writes_resolved_host_back() {
+        let mut m = mb("", "/tmp", Zone::Path, &["devpod-go", "devpod-web"]);
+        // Walk the production path: enter host zone via @, type
+        // a unique prefix, Tab to commit.
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
+        m.handle(&key(KeyCode::Char('w')), &b(), &mut local());
+        m.handle(&key(KeyCode::Char('e')), &b(), &mut local());
+        m.handle(&key(KeyCode::Char('b')), &b(), &mut local());
+        assert_eq!(
+            m.selected,
+            Some(0),
+            "wildmenu must auto-highlight the unique match"
+        );
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::PrepareHost {
+                host: "devpod-web".into(),
+            },
+        );
+        assert_eq!(
+            m.host, "devpod-web",
+            "self.host must reflect the resolved candidate"
+        );
+    }
+
+    /// Same write-back as the Tab path, exercised via Enter on the
+    /// host zone with an empty path field (the "I want to pick a
+    /// remote folder next" gesture).
+    #[test]
+    fn enter_with_partial_match_writes_resolved_host_back() {
+        let mut m = mb("", "", Zone::Path, &["devpod-go", "devpod-web"]);
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
+        m.handle(&key(KeyCode::Char('w')), &b(), &mut local());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::PrepareHost {
+                host: "devpod-web".into(),
+            },
+        );
+        assert_eq!(m.host, "devpod-web");
+    }
+
+    /// User in path zone types a path then Enter → Spawn carries the
+    /// resolved host, NOT the partial prefix. Mirrors the failure
+    /// mode where a typo in the host zone bled into the eventual
+    /// attach call (and the failure-pane label).
+    #[test]
+    fn enter_in_path_after_partial_host_spawns_with_resolved_host() {
+        // Set up a state matching post-prepare: user typed "web",
+        // committed via Tab (which wrote "devpod-web" back to
+        // self.host), now is in path zone with a path typed.
+        let mut m = mb(
+            "devpod-web",
+            "/srv",
+            Zone::Path,
+            &["devpod-go", "devpod-web"],
+        );
+        m.filtered = vec![];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "devpod-web".into(),
+                path: "/srv".into(),
+            },
+        );
+        assert_eq!(m.host, "devpod-web");
     }
 
     #[test]
@@ -1553,7 +1750,7 @@ mod tests {
     fn zone_spans_empty_focused_overlays_cursor_on_first_placeholder_char() {
         let placeholder_style = Style::default().add_modifier(Modifier::DIM);
         let cursor_style = Style::default().fg(Color::Cyan);
-        let spans = zone_spans(true, "", "local", placeholder_style, cursor_style);
+        let spans = zone_spans(true, "", "local", placeholder_style, cursor_style, false);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "█");
         // First char of "local" is consumed by the cursor; "ocal" remains.
@@ -1570,7 +1767,7 @@ mod tests {
     /// would still allocate a row cell for it).
     #[test]
     fn zone_spans_empty_focused_with_single_char_placeholder_omits_remainder() {
-        let spans = zone_spans(true, "", "x", Style::default(), Style::default());
+        let spans = zone_spans(true, "", "x", Style::default(), Style::default(), false);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "█");
     }
@@ -1579,7 +1776,7 @@ mod tests {
     fn zone_spans_empty_unfocused_renders_full_placeholder_no_cursor() {
         let placeholder_style = Style::default().add_modifier(Modifier::DIM);
         let cursor_style = Style::default();
-        let spans = zone_spans(false, "", "local", placeholder_style, cursor_style);
+        let spans = zone_spans(false, "", "local", placeholder_style, cursor_style, false);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "local");
     }
@@ -1588,7 +1785,14 @@ mod tests {
     fn zone_spans_non_empty_focused_puts_cursor_after_value() {
         let placeholder_style = Style::default();
         let cursor_style = Style::default().fg(Color::Cyan);
-        let spans = zone_spans(true, "alpha", "local", placeholder_style, cursor_style);
+        let spans = zone_spans(
+            true,
+            "alpha",
+            "local",
+            placeholder_style,
+            cursor_style,
+            false,
+        );
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "alpha");
         assert_eq!(spans[1].content, "█");
@@ -1596,9 +1800,98 @@ mod tests {
 
     #[test]
     fn zone_spans_non_empty_unfocused_omits_cursor() {
-        let spans = zone_spans(false, "alpha", "local", Style::default(), Style::default());
+        let spans = zone_spans(
+            false,
+            "alpha",
+            "local",
+            Style::default(),
+            Style::default(),
+            false,
+        );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "alpha");
+    }
+
+    /// Focused path with multiple segments: the parent prefix
+    /// (everything up to and including the last `/`) renders in
+    /// default style, the trailing component renders in the focused
+    /// style. This is the path-zone UX so the user can see the
+    /// in-progress segment without losing the parent for context.
+    #[test]
+    fn zone_spans_focused_path_highlights_only_basename() {
+        let spans = zone_spans(
+            true,
+            "/home/df/repos",
+            "<cwd>",
+            Style::default(),
+            Style::default(),
+            true,
+        );
+        // prefix + tail + cursor = 3 spans
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "/home/df/");
+        // Prefix is plain default — no fg, no BOLD.
+        assert_eq!(spans[0].style, Style::default());
+        assert_eq!(spans[1].content, "repos");
+        // Tail uses the focused value style (cyan + bold).
+        assert_eq!(spans[1].style.fg, Some(Color::Cyan));
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[2].content, "█");
+    }
+
+    /// A path that ends in `/` (e.g. just-seeded remote $HOME) has no
+    /// trailing component. Render the prefix in default style, no
+    /// tail span, then the cursor.
+    #[test]
+    fn zone_spans_focused_path_with_trailing_slash_emits_no_tail_span() {
+        let spans = zone_spans(
+            true,
+            "/home/df/",
+            "<cwd>",
+            Style::default(),
+            Style::default(),
+            true,
+        );
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "/home/df/");
+        assert_eq!(spans[0].style, Style::default());
+        assert_eq!(spans[1].content, "█");
+    }
+
+    /// A path with no `/` (relative single segment) falls through to
+    /// the legacy whole-value highlight — there's nothing to split on.
+    #[test]
+    fn zone_spans_focused_path_without_slash_highlights_whole_value() {
+        let spans = zone_spans(
+            true,
+            "repos",
+            "<cwd>",
+            Style::default(),
+            Style::default(),
+            true,
+        );
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "repos");
+        assert_eq!(spans[0].style.fg, Some(Color::Cyan));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(spans[1].content, "█");
+    }
+
+    /// Unfocused path: no highlight regardless of `highlight_basename`.
+    /// (This is the baseline we render when the host zone is focused.)
+    #[test]
+    fn zone_spans_unfocused_path_skips_basename_highlight() {
+        let spans = zone_spans(
+            false,
+            "/home/df/repos",
+            "<cwd>",
+            Style::default(),
+            Style::default(),
+            true,
+        );
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "/home/df/repos");
+        assert_eq!(spans[0].style, Style::default());
     }
 
     // -- Step 4: lock_for_bootstrap / unlock_* setters and the
@@ -1714,11 +2007,76 @@ mod tests {
     fn unlock_back_to_host_preserves_host_text_and_clears_view() {
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
-        m.unlock_back_to_host(&mut local());
+        m.unlock_back_to_host(&mut local(), None);
         assert!(m.bootstrap_view.is_none());
         assert_eq!(m.host, "devpod-go");
         assert_eq!(m.focused, Zone::Host);
         assert!(matches!(m.path_mode, PathMode::Local));
+        assert!(m.prepare_error.is_none());
+    }
+
+    /// `unlock_back_to_host` with an error stores the structured
+    /// banner so the next render surfaces it in the wildmenu region.
+    /// The banner is the only feedback the user gets on a prepare
+    /// failure (the previous behavior was a silent re-flip back to
+    /// the host zone, with the error trapped in `tracing::error!`).
+    #[test]
+    fn unlock_back_to_host_with_error_stores_banner() {
+        let mut m = mb("foo", "", Zone::Host, &["foo"]);
+        m.lock_for_bootstrap("foo".into(), Instant::now());
+        m.unlock_back_to_host(&mut local(), Some(probe_err("auth refused")));
+        let Some(stored) = m.prepare_error.as_ref() else {
+            unreachable!("banner must be set after unlock with Some(err)")
+        };
+        let formatted = stored.user_message();
+        assert!(
+            formatted.starts_with("ssh probe failed"),
+            "got {formatted:?}"
+        );
+        assert!(formatted.contains("auth refused"), "got {formatted:?}");
+        assert_eq!(
+            m.focused,
+            Zone::Host,
+            "user should land back on the host zone"
+        );
+        assert_eq!(m.host, "foo", "host text preserved so the user can edit");
+    }
+
+    /// Any actionable keystroke clears the banner — read once, gone.
+    /// We use a printable Char so the keystroke is unambiguously
+    /// "actionable"; Ctrl-* keys are dropped before the clear, but
+    /// that's not a UX-relevant scenario (no one Ctrl-clicks an
+    /// error message).
+    #[test]
+    fn next_keystroke_clears_prepare_error_banner() {
+        let mut m = mb("foo", "", Zone::Host, &["foo"]);
+        m.prepare_error = Some(probe_err("something broke"));
+        m.handle(&key(KeyCode::Char('x')), &b(), &mut local());
+        assert!(
+            m.prepare_error.is_none(),
+            "banner must clear on the first key after surfacing",
+        );
+    }
+
+    /// Banner persists when the modal is in locked state and the
+    /// user mashes keys that get swallowed (the typing-while-locked
+    /// behavior). In practice the locked state and a banner are
+    /// mutually exclusive, but if a future code path violates that
+    /// the banner shouldn't get accidentally cleared by a no-op
+    /// keystroke against the lock.
+    #[test]
+    fn keystroke_during_lock_does_not_clear_banner() {
+        let mut m = mb("foo", "", Zone::Host, &["foo"]);
+        m.prepare_error = Some(probe_err("stale banner"));
+        m.lock_for_bootstrap("foo".into(), Instant::now());
+        m.handle(&key(KeyCode::Char('x')), &b(), &mut local());
+        let Some(stored) = m.prepare_error.as_ref() else {
+            unreachable!("banner must persist while locked")
+        };
+        assert!(
+            stored.user_message().contains("stale banner"),
+            "got {stored:?}",
+        );
     }
 
     #[test]
@@ -1744,6 +2102,20 @@ mod tests {
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
         m.unlock_for_remote_path("devpod-go".into(), PathBuf::from("/"), &mut local());
         assert_eq!(m.path, "/");
+    }
+
+    /// Belt-and-suspenders for the partial-host write-back: even if a
+    /// future code path leaves `self.host` as the typed prefix at
+    /// unlock time, `unlock_for_remote_path` now overwrites with the
+    /// runtime's canonical host. The runtime is the source of truth
+    /// because it owns the prepare slot's host string (the modal can
+    /// be re-edited mid-flight).
+    #[test]
+    fn unlock_for_remote_path_overwrites_host_with_runtime_value() {
+        let mut m = mb("web", "", Zone::Host, &["devpod-web"]);
+        m.lock_for_bootstrap("devpod-web".into(), Instant::now());
+        m.unlock_for_remote_path("devpod-web".into(), PathBuf::from("/home/df"), &mut local());
+        assert_eq!(m.host, "devpod-web");
     }
 
     // -- Step 7: remote completion + cache --
