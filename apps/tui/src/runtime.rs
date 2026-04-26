@@ -266,13 +266,18 @@ struct PendingAttach {
     modal_owner: bool,
 }
 
-pub fn run(nav_style: NavStyle, config: &Config, log_tail: Option<&LogTail>) -> Result<()> {
-    tracing::info!("codemux starting (nav={nav_style:?})");
+pub fn run(
+    nav_style: NavStyle,
+    config: &Config,
+    initial_cwd: &Path,
+    log_tail: Option<&LogTail>,
+) -> Result<()> {
+    tracing::info!(?initial_cwd, "codemux starting (nav={nav_style:?})");
 
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
 
-    let initial = spawn_local_agent("agent-1".into(), None, pty_rows, pty_cols)?;
+    let initial = spawn_local_agent("agent-1".into(), Some(initial_cwd), pty_rows, pty_cols)?;
     let agents = vec![initial];
 
     enable_raw_mode().wrap_err("enable raw mode")?;

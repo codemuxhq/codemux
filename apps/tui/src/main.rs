@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use clap::Parser;
@@ -21,6 +21,15 @@ use runtime::NavStyle;
 #[derive(Debug, Parser)]
 #[command(name = "codemux", version, about)]
 struct Cli {
+    /// Working directory for the initial agent. Omit to inherit the
+    /// shell's current pwd (the common case); pass a path to spawn the
+    /// agent there instead. Relative paths are resolved against the
+    /// shell's pwd. The path is validated up-front — a missing or
+    /// non-directory path exits non-zero before the terminal switches
+    /// to raw mode.
+    #[arg(value_name = "PATH")]
+    path: Option<PathBuf>,
+
     /// Initial navigator style. Toggle at runtime with the prefix-key + v.
     #[arg(long, value_enum, env = "CODEMUX_NAV", default_value = "popup")]
     nav: NavStyle,
@@ -49,7 +58,34 @@ fn main() -> Result<()> {
     // Load config (or defaults if missing) before touching the terminal so a
     // malformed config file fails loud instead of corrupting raw mode.
     let config = config::load()?;
-    runtime::run(cli.nav, &config, cli.log.then_some(&tail))
+    // Resolve and validate the cwd before raw mode for the same
+    // reason: a typo'd path should print a clean error, not corrupt
+    // the user's terminal mid-init. When the user omits `[PATH]` we
+    // capture `std::env::current_dir()` ourselves rather than passing
+    // `None` through to `portable-pty` — the latter is documented to
+    // inherit the parent's cwd, but in practice the `claude` agent
+    // reports `~` as its working directory unless we set it
+    // explicitly.
+    let initial_cwd = match cli.path.as_deref() {
+        Some(p) => resolve_cwd(p)?,
+        None => std::env::current_dir().wrap_err("read current working directory")?,
+    };
+    runtime::run(cli.nav, &config, &initial_cwd, cli.log.then_some(&tail))
+}
+
+/// Canonicalize `path` and verify it's a directory. Returns a clean
+/// `eyre` chain on failure so the user sees `<path>: <reason>` rather
+/// than a bare `io::Error`.
+fn resolve_cwd(path: &Path) -> Result<PathBuf> {
+    let resolved =
+        fs::canonicalize(path).wrap_err_with(|| format!("invalid path `{}`", path.display()))?;
+    if !resolved.is_dir() {
+        return Err(color_eyre::eyre::eyre!(
+            "`{}` is not a directory",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Default log file path. Created on first run via `init_tracing`.
@@ -106,4 +142,43 @@ fn init_tracing(tail: &log_tail::LogTail) -> Result<()> {
         .try_init()
         .map_err(|e| color_eyre::eyre::eyre!("tracing init failed: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_cwd_returns_canonicalized_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_cwd(dir.path()).unwrap();
+        assert_eq!(resolved, dir.path().canonicalize().unwrap());
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn resolve_cwd_errors_when_path_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = resolve_cwd(&missing).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid path"),
+            "expected `invalid path` in error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_errors_when_path_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, b"").unwrap();
+        let err = resolve_cwd(&file).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("is not a directory"),
+            "expected `is not a directory` in error, got: {msg}",
+        );
+    }
 }
