@@ -126,21 +126,19 @@ pub enum ModalOutcome {
 /// lifetime: closing the modal drops the cache, opening it again
 /// starts fresh. The `RemoteFs` (the actual ssh `ControlMaster`
 /// subprocess) lives in the runtime alongside the prepare worker, and
-/// is borrowed into the modal as a `&mut DirLister` per keystroke once
-/// Step 7 wires the lister abstraction.
-//
-// Step 4 lands the variant + setters; Step 7 reads `remote_home` and
-// `cache` (the lister substitutes a `RemoteFs` lookup against the
-// cache, falling back to the network on miss). `allow(dead_code)` is
-// the bridge.
+/// is borrowed into the modal as a `&mut DirLister` per keystroke.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum PathMode {
     Local,
     Remote {
         /// Remote `$HOME` returned from `prepare_remote`. Used to seed
         /// the path-zone cursor and as the default scan root when the
         /// path field is empty.
+        //
+        // Read by the runtime when constructing the `PreparedHost`
+        // for the attach phase; the modal itself only writes it
+        // during `unlock_for_remote_path`.
+        #[allow(dead_code)]
         remote_home: PathBuf,
         /// Directory → entries cache. Hit rate is high because the
         /// user's typing pattern is mostly prefix-narrowing within one
@@ -270,9 +268,9 @@ impl SpawnMinibuffer {
 
     /// Unlock the path zone after a successful prepare. Switches the
     /// path mode to [`PathMode::Remote`] so subsequent keystrokes
-    /// scan the remote filesystem (Step 7 wires the lister); seeds
-    /// the path field with the remote `$HOME` so the user can edit
-    /// from there. The host text is preserved.
+    /// scan the remote filesystem via the supplied [`DirLister`];
+    /// seeds the path field with the remote `$HOME` so the user can
+    /// edit from there. The host text is preserved.
     pub fn unlock_for_remote_path(
         &mut self,
         _host: String,

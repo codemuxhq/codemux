@@ -15,6 +15,7 @@ Commit style: `feat(p1): subject`. No AI trailers.
 - ✅ **Stage 3** — `AgentTransport` enum + `LocalPty` (refactor only)
 - ✅ **Stage 4** — `SshDaemonPty` adapter + bootstrap
 - ✅ **Stage 5** — Wire SSH transport into the spawn modal
+- ✅ **Stage 6** — Modal-driven spawn flow + remote folder picker
 
 End-to-end ship test (after Stage 5) is in **Verification** below.
 
@@ -382,6 +383,146 @@ End-to-end smoke passes:
    exists (one-per-agent model from AD-3)
 8. Switch focus between local and remote agents in a single keystroke.
    This reproduces Scenario 1 from `docs/use-cases.md`
+
+---
+
+## Stage 6 — Modal-driven spawn flow + remote folder picker
+
+Restructure the SSH spawn UX so the bootstrap progress lives *inside*
+the spawn modal (not in the agent pane), and add remote-`$HOME` folder
+autocomplete once the daemon is reachable.
+
+### Motivation
+
+Stage 5 shipped the SSH path with a placeholder agent created the
+moment the user pressed Enter — the agent pane went into a 30-60 s
+spinner while `cargo build` ran on the remote. Two problems:
+
+- The user had to type the remote `cwd` *before* the daemon existed,
+  so there was no way to validate it; typos surfaced as "directory not
+  found" in the agent pane after the long build.
+- The placeholder agent cluttered the navigator and required a
+  `prefix + x` (which doesn't exist yet) to clean up after a failed
+  bootstrap.
+
+The fix: keep the modal open through the whole flow. Lock the path
+zone with a per-stage spinner during prepare, unlock it with a remote
+folder picker once the daemon is reachable, lock again briefly during
+attach, then close once the agent is Ready.
+
+### Scope (as built)
+
+- **Bootstrap split** in `crates/codemuxd-bootstrap`:
+  - `prepare_remote(runner, on_stage, host) -> Result<PreparedHost>` —
+    probe + tarball stage + scp + remote build. Returns the remote
+    `$HOME` so the modal can seed the folder picker.
+  - `attach_agent(runner, on_stage, prepared, host, agent_id, cwd,
+    socket_dir, rows, cols) -> Result<AgentTransport>` — daemon spawn
+    + tunnel + handshake.
+  - The legacy `bootstrap()` and `establish_ssh_transport()` entry
+    points are deleted; the smoke example calls prepare then attach in
+    sequence.
+  - `Stage::label() -> &'static str` lifts the human-readable stage
+    name out of the runtime so the modal can render it.
+- **`RemoteFs`** (new module `crates/codemuxd-bootstrap/src/remote_fs.rs`):
+  - Long-lived `ssh -M -N -S {socket} -o ControlPersist=no -o
+    ExitOnForwardFailure=yes -o BatchMode=yes {host}` ControlMaster
+    spawned during the prepare→attach handoff. Subsequent `list_dir`
+    calls reuse it via `ssh -S {socket} {host} -- ls -1pA -- {path}`,
+    so each completion request is sub-100 ms even on a slow link.
+  - Drop-killable: `Drop` kills the master and unlinks the socket file
+    so a cancelled spawn doesn't leak ssh subprocesses.
+  - Path argument is char-allowlisted and shell-escaped — same defense
+    the daemon-spawn path uses for `--cwd`.
+  - `RemoteFs::open` failure is non-fatal: the modal degrades to
+    literal-path mode with a wildmenu hint instead of blocking the
+    user from typing a remote path by hand.
+- **Two-handle worker** in `apps/tui/src/bootstrap_worker.rs`:
+  - `start_prepare(host) -> PrepareHandle` — owned by the modal
+    between the user "committing" a host and selecting a folder.
+  - `start_attach(prepared, host, agent_id, cwd, rows, cols) ->
+    AttachHandle` — owned by the runtime until the agent goes Ready.
+  - Both use the existing `CancelableRunner` decorator from Stage 5.
+  - `start_full_pipeline` is kept as a legacy single-handle shim for
+    the cancel-mid-bootstrap regression test and ad-hoc smoke runs.
+- **Spawn modal** (`apps/tui/src/spawn.rs`):
+  - New `bootstrap_view: Option<BootstrapView>` field — pure render
+    data (host, current stage, started_at). Setters
+    `lock_for_bootstrap` / `set_bootstrap_stage` /
+    `unlock_for_remote_path` / `unlock_back_to_host` are driven by the
+    runtime as worker events arrive.
+  - New `path_mode: PathMode { Local | Remote { remote_home, cache } }` —
+    keeps the per-directory completion cache so prefix-narrowing
+    keystrokes filter in process and only crossing a `/` re-shells.
+  - `DirLister<'a>` borrow-only enum (Local / Remote { fs, runner })
+    supplied per keystroke by the runtime; no `Box<dyn>` allocation in
+    the hot path.
+  - New outcomes `ModalOutcome::PrepareHost` (Tab from host with text
+    or Enter on host with empty path) and `ModalOutcome::CancelBootstrap`
+    (Esc / `@` while locked).
+- **Runtime** (`apps/tui/src/runtime.rs`):
+  - `AgentState::Bootstrapping` removed. Two states left: `Failed` (so
+    bootstrap errors still have a render surface after the modal
+    closes) and `Ready`.
+  - New `prepare: Option<PendingPrepare>` for the in-flight prepare
+    phase (modal owns one prepare at a time) and
+    `attaches: Vec<PendingAttach>` so the user can fire-and-forget
+    multiple spawns in quick succession. The "modal-owned" attach is
+    flagged so cancel finds it; detached attaches keep running on
+    their own thread.
+  - Drain phase: prepare events first (synchronous `RemoteFs::open` on
+    `Done(Ok)`), then attach events (deferred mutation — collect
+    `finished_attaches`, `new_agents`, `focus_new`, `close_modal`
+    during iteration, apply after — to avoid borrow conflicts).
+  - Modal dispatch: `PrepareHost` kicks off `start_prepare` and locks
+    the modal; `CancelBootstrap` drops the prepare or modal-owned
+    attach; remote `Spawn` takes the prepared host out, drops the
+    `RemoteFs`, kicks off `start_attach`, and re-locks the modal until
+    the attach completes.
+
+### Tests
+
+- `crates/codemuxd-bootstrap`: `prepare_remote` happy path,
+  `attach_agent` happy path, per-stage failure tests stay where their
+  stage now lives. New `remote_fs::tests` covers `open`+`Drop` not
+  leaking the master subprocess, `list_dir` parsing, and quote
+  rejection (mirrors `spawn_remote_daemon_rejects_quote_in_cwd`).
+- `apps/tui/src/bootstrap_worker.rs`: `cancel_short_circuits_at_next_subprocess_call`
+  duplicated for both `PrepareHandle` and `AttachHandle`, plus the
+  legacy `start_full_pipeline` test as the regression target.
+- `apps/tui/src/spawn.rs`: `lock_for_bootstrap` /
+  `set_bootstrap_stage` / `unlock_*` setters, new outcomes,
+  `Remote` path mode round-trip via a `ScriptedRunner` mock that
+  intercepts the `ssh -S {socket} -- ls` invocation. Covers cache hit
+  on prefix-narrowing keystrokes and cache miss on `/` traversal.
+- `apps/tui/src/runtime.rs`: tests for `AgentState::Bootstrapping`
+  removed; `format_bootstrap_error_*` kept (still used by the Failed
+  renderer).
+
+### Exit criteria
+
+End-to-end smoke (manual, single-user):
+
+1. `prefix + c`, type `@<host>`, Tab. Path zone locks with spinner;
+   stages cycle (probing → uploading → building → daemon → tunnel →
+   connect).
+2. During build, hit `Esc`. Focus returns to host zone with text
+   preserved; the worker thread shuts down (verifiable via
+   `RUST_LOG=codemux=debug`).
+3. Re-do the spawn, let prepare finish. Path zone unlocks and shows
+   `~`-relative entries from remote `$HOME`. Type a prefix; completions
+   filter without a new `list_dir` call. Cross a `/`; new `list_dir`
+   fires.
+4. Hit Enter. Path zone re-locks briefly (DaemonSpawn → SocketTunnel
+   → SocketConnect), then modal closes and the agent appears in the
+   navigator already at the chosen cwd.
+5. Repeat the spawn while the previous attach is still in flight
+   (rapid `prefix + c`). Both attaches complete; both agents land in
+   the navigator.
+6. Failure modes: unreachable host renders the error inline in the
+   modal (not a full-screen pane); modal returns to host zone after
+   Esc. `RemoteFs::open` failure (e.g. ssh socket forwarding blocked)
+   degrades to literal-path mode with a wildmenu hint.
 
 ---
 

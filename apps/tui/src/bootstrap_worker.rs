@@ -21,11 +21,11 @@
 //!   given a `PreparedHost`, producing an [`AgentTransport`]. Owned by
 //!   the runtime until the agent transitions into Ready.
 //!
-//! [`start_full_pipeline`] is a temporary single-handle shim that
-//! chains prepare + attach in one worker thread, returning an
-//! [`AttachHandle`] whose event stream merges both phases. Used by the
-//! runtime today; will be replaced when the modal owns the prepare
-//! phase explicitly.
+//! [`start_full_pipeline`] is the legacy single-handle shim that chains
+//! prepare + attach on one worker thread. Kept in tree for the smoke
+//! example's regression coverage and for the cancel-mid-bootstrap test;
+//! production no longer routes through it (the runtime drives prepare
+//! and attach as separate handles via the spawn modal).
 //!
 //! Cancellation is best-effort: a [`CancelableRunner`] decorator
 //! shorts the worker between subprocess calls. A subprocess already in
@@ -56,12 +56,6 @@ use crossbeam_channel::{Receiver, unbounded};
 /// and "result" channels) so the owner can't see a `Done` before the
 /// last `Stage`. `Done` is always the final event; the channel goes
 /// empty after it.
-//
-// Reserved for the modal-driven flow: Step 3 lands the worker plumbing
-// so its tests can run independently; Step 6 wires it into the runtime.
-// `allow(dead_code)` is intentional bridging — remove with the runtime
-// wiring change.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum PrepareEvent {
     /// The named stage just started executing on the worker thread.
@@ -115,9 +109,6 @@ impl std::fmt::Debug for AttachEvent {
 /// cooperative: it sets the cancel flag so the worker exits at the
 /// next subprocess boundary. The `JoinHandle` is detached so the TUI
 /// never blocks on a slow prepare.
-//
-// Reserved for the modal-driven flow (see [`PrepareEvent`]).
-#[allow(dead_code)]
 pub struct PrepareHandle {
     cancel: Arc<AtomicBool>,
     rx: Receiver<PrepareEvent>,
@@ -127,7 +118,6 @@ pub struct PrepareHandle {
     _join: thread::JoinHandle<()>,
 }
 
-#[allow(dead_code)]
 impl PrepareHandle {
     /// Non-blocking poll for the worker's next event. `None` = no
     /// event ready right now (still in flight), `Some(_)` = event
@@ -158,12 +148,6 @@ impl Drop for PrepareHandle {
 /// terminates with an [`AgentTransport`] rather than a
 /// [`PreparedHost`]. Also serves as the return type of
 /// [`start_full_pipeline`], the legacy single-handle shim.
-//
-// `rx` and `try_recv` are unused between Step 5 (delete the SSH spawn
-// placeholder) and Step 6 (wire the new prepare + attaches flow into
-// the runtime). Tests in this module exercise both, but `dead_code`
-// only counts non-test usage.
-#[allow(dead_code)]
 pub struct AttachHandle {
     cancel: Arc<AtomicBool>,
     rx: Receiver<AttachEvent>,
@@ -173,7 +157,6 @@ pub struct AttachHandle {
 impl AttachHandle {
     /// Non-blocking poll for the worker's next event. See
     /// [`PrepareHandle::try_recv`].
-    #[allow(dead_code)]
     #[must_use]
     pub fn try_recv(&self) -> Option<AttachEvent> {
         self.rx.try_recv().ok()
@@ -198,9 +181,6 @@ impl Drop for AttachHandle {
 /// a host (Tab from host zone with text, or Enter on host with empty
 /// path). The handle is owned by the modal until prepare returns;
 /// dropping it cancels.
-//
-// Reserved for the modal-driven flow (see [`PrepareEvent`]).
-#[allow(dead_code)]
 pub fn start_prepare(host: String) -> PrepareHandle {
     start_prepare_with_runner(Box::new(RealRunner), host)
 }
@@ -208,7 +188,6 @@ pub fn start_prepare(host: String) -> PrepareHandle {
 /// Test-friendly entry point: inject a [`CommandRunner`] so the
 /// cancel-mid-prepare path can be exercised without touching the
 /// network.
-#[allow(dead_code)]
 pub fn start_prepare_with_runner(runner: Box<dyn CommandRunner>, host: String) -> PrepareHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded();
@@ -239,9 +218,6 @@ pub fn start_prepare_with_runner(runner: Box<dyn CommandRunner>, host: String) -
 /// Production calls this once the modal closes with a chosen remote
 /// path. The handle is owned by the runtime until the agent's
 /// transport is returned via `Done(Ok(_))`; dropping it cancels.
-//
-// Reserved for the modal-driven flow (see [`PrepareEvent`]).
-#[allow(dead_code)]
 pub fn start_attach(
     prepared: PreparedHost,
     host: String,
@@ -262,7 +238,6 @@ pub fn start_attach(
 }
 
 /// Test-friendly entry point for the attach phase.
-#[allow(dead_code)]
 pub fn start_attach_with_runner(
     runner: Box<dyn CommandRunner>,
     prepared: PreparedHost,
@@ -315,9 +290,10 @@ pub fn start_attach_with_runner(
 /// worker thread. Returns an [`AttachHandle`] whose event stream
 /// includes stages from both phases.
 ///
-/// Kept for the smoke test and the test suite while Step 6 of the
-/// spawn-flow refactor is in flight; once that lands the runtime
-/// drives prepare and attach as separate handles.
+/// Production no longer calls this — the runtime drives prepare and
+/// attach as separate handles via the spawn modal. Kept in tree as the
+/// regression target for the cancel-mid-bootstrap test and as a
+/// minimal entry point for ad-hoc smoke runs.
 #[allow(dead_code)]
 pub fn start_full_pipeline(
     host: String,

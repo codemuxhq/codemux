@@ -15,7 +15,11 @@
 //! The SSH spawn flow runs *inside* the spawn modal: the path zone
 //! locks with a per-stage spinner while [`crate::bootstrap_worker`]
 //! drives prepare and attach off-thread (see Stage 6 of
-//! `docs/codemuxd-stages.md`). When the attach completes the modal
+//! `docs/codemuxd-stages.md`). The runtime tracks the in-flight
+//! prepare phase as a single [`PendingPrepare`] (the modal can only
+//! prepare one host at a time) and tracks each in-flight attach as a
+//! [`PendingAttach`] entry so the user can fire-and-forget multiple
+//! spawns in quick succession. When an attach completes the runtime
 //! pushes a `Ready` agent into the navigator; on failure it pushes a
 //! `Failed` agent so the bootstrap error has a render surface even
 //! after the modal closes.
