@@ -22,11 +22,12 @@
 
 use std::error::Error as StdError;
 use std::io;
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use codemux_session::AgentTransport;
+use codemuxd_bootstrap::{PreparedHost, RemoteFs};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::{
@@ -47,6 +48,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
 
+use crate::bootstrap_worker::{
+    AttachEvent, AttachHandle, PrepareEvent, PrepareHandle, start_attach, start_prepare,
+};
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
 use crate::log_tail::LogTail;
@@ -167,11 +171,6 @@ enum AgentState {
     /// [`codemuxd_bootstrap::Error`] so the renderer can format it
     /// (single-line summary today, "Caused by:" cascade later) without
     /// the runtime baking in a stringification policy here.
-    //
-    // Constructed by the attach Done(Err(_)) handler that lands in
-    // Step 6. Allow until then so `just check` stays green between
-    // commits.
-    #[allow(dead_code)]
     Failed {
         host: String,
         error: codemuxd_bootstrap::Error,
@@ -201,6 +200,66 @@ impl RuntimeAgent {
             },
         }
     }
+
+    fn failed(
+        label: String,
+        host: String,
+        error: codemuxd_bootstrap::Error,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        Self {
+            label,
+            rows,
+            cols,
+            state: AgentState::Failed { host, error },
+        }
+    }
+}
+
+/// In-flight prepare worker plus the data it produces. Owned by the
+/// runtime; the spawn modal only sees the prepare's progress through
+/// the [`Stage`] events the runtime forwards via
+/// [`SpawnMinibuffer::set_bootstrap_stage`]. On success we open
+/// [`RemoteFs`] synchronously (sub-second) so the modal's path-zone
+/// autocomplete (Step 7) has a live `ssh -S` `ControlMaster` to query;
+/// on `RemoteFs::open` failure the modal degrades to literal-path
+/// mode rather than blocking the user from typing a path.
+struct PendingPrepare {
+    host: String,
+    handle: PrepareHandle,
+    /// Set after prepare reports `Done(Ok(_))`. Holds the remote
+    /// `$HOME` so the runtime can pass it to
+    /// `unlock_for_remote_path` and, later, build the `PreparedHost`
+    /// the attach worker needs.
+    prepared: Option<PreparedHost>,
+    /// `Some` if `RemoteFs::open` succeeded. Held alongside `prepared`
+    /// purely to keep the `ControlMaster`'s `Drop` semantics on the
+    /// runtime side (Step 7 will hand a `&mut RemoteFs` to the modal
+    /// per keystroke).
+    //
+    // Step 7 wires the lister; until then the field is allocated only
+    // for its drop-on-cancel side effect.
+    #[allow(dead_code)]
+    remote_fs: Option<RemoteFs>,
+}
+
+/// In-flight attach worker. The modal usually stays locked watching
+/// this attach via `modal_owner = true`; on Done we push a Ready or
+/// Failed agent and close the modal. `attaches: Vec<_>` rather than
+/// `Option<_>` so a future flow where the user dismisses the modal
+/// during attach can leave the handle running in the background.
+struct PendingAttach {
+    label: String,
+    host: String,
+    rows: u16,
+    cols: u16,
+    handle: AttachHandle,
+    /// `true` if the spawn modal is currently locked watching this
+    /// attach — at most one `PendingAttach` has this set at a time.
+    /// Stored per-attach so removing a finished entry from the Vec
+    /// doesn't shift indices and break a separate `modal_attach_idx`.
+    modal_owner: bool,
 }
 
 pub fn run(nav_style: NavStyle, config: &Config, log_tail: Option<&LogTail>) -> Result<()> {
@@ -289,6 +348,20 @@ fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
     }
 }
 
+/// Cancel and remove the at-most-one [`PendingAttach`] currently owned
+/// by the spawn modal. Used by both `Cancel` and `CancelBootstrap` so
+/// dismissing the modal in the middle of an attach takes the worker
+/// down with it. Other attaches in the Vec are left running — there
+/// aren't any in the current flow, but the data shape supports it.
+fn cancel_modal_owned_attach(attaches: &mut Vec<PendingAttach>) {
+    let Some(idx) = attaches.iter().position(|a| a.modal_owner) else {
+        return;
+    };
+    // `swap_remove` is fine: we don't care about ordering, just that
+    // the slot is gone and its `Drop` (cancels the worker) fires.
+    attaches.swap_remove(idx);
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut agents: Vec<RuntimeAgent>,
@@ -305,6 +378,14 @@ fn event_loop(
     let mut popup_state = PopupState::default();
     let mut help_state = HelpState::default();
     let mut spawn_ui: Option<SpawnMinibuffer> = None;
+    // In-flight SSH bootstrap state. The modal owns the per-stage UX
+    // via `lock_for_bootstrap` / `set_bootstrap_stage`, but the worker
+    // handles + the live `RemoteFs` ControlMaster live here so their
+    // `Drop` semantics are tied to the runtime's exit (or to an
+    // explicit cancel/finish event), not to the modal's open/close
+    // lifecycle.
+    let mut prepare: Option<PendingPrepare> = None;
+    let mut attaches: Vec<PendingAttach> = Vec::new();
     let mut focused: usize = 0;
     let mut spawn_counter: usize = agents.len();
     // Status-bar hint is bindings-derived but bindings cannot change at
@@ -313,6 +394,141 @@ fn event_loop(
     let status_hint = format!("{} {} for help", bindings.prefix, bindings.on_prefix.help,);
 
     loop {
+        // Drain prepare events first: the modal should reflect the
+        // worker's progress on the same frame the events arrive,
+        // before any keystroke handling. On `Done` we either unlock
+        // the modal for a remote-folder pick (success) or unlock back
+        // to the host zone with the error visible (failure).
+        if let Some(p) = prepare.as_mut() {
+            let mut completion: Option<Result<PreparedHost, codemuxd_bootstrap::Error>> = None;
+            while let Some(event) = p.handle.try_recv() {
+                match event {
+                    PrepareEvent::Stage(stage) => {
+                        if let Some(ui) = spawn_ui.as_mut() {
+                            ui.set_bootstrap_stage(stage);
+                        }
+                    }
+                    PrepareEvent::Done(result) => {
+                        completion = Some(result);
+                        break;
+                    }
+                }
+            }
+            if let Some(result) = completion {
+                match result {
+                    Ok(prepared) => {
+                        // Open the ControlMaster synchronously — it
+                        // takes a single SSH round-trip (sub-second).
+                        // If it fails, fall back to literal-path mode
+                        // rather than blocking the user from typing
+                        // a path; the wildmenu is autocomplete, the
+                        // path field is the source of truth.
+                        match RemoteFs::open(&p.host) {
+                            Ok(fs) => p.remote_fs = Some(fs),
+                            Err(e) => {
+                                tracing::warn!(
+                                    host = %p.host,
+                                    error = %e,
+                                    "RemoteFs::open failed; modal will use literal-path mode",
+                                );
+                            }
+                        }
+                        if let Some(ui) = spawn_ui.as_mut() {
+                            ui.unlock_for_remote_path(p.host.clone(), prepared.remote_home.clone());
+                        }
+                        p.prepared = Some(prepared);
+                    }
+                    Err(e) => {
+                        tracing::error!(host = %p.host, "prepare failed: {e}");
+                        if let Some(ui) = spawn_ui.as_mut() {
+                            ui.unlock_back_to_host();
+                        }
+                        prepare = None;
+                    }
+                }
+            }
+        }
+
+        // Drain attach events. Each pending attach has its own
+        // handle; we batch the ready set, apply transitions outside
+        // the loop so we can mutate `agents`, `attaches`, and
+        // `spawn_ui` without borrow conflicts.
+        let mut finished_attaches: Vec<usize> = Vec::new();
+        let mut new_agents: Vec<RuntimeAgent> = Vec::new();
+        let mut focus_new = false;
+        let mut close_modal = false;
+        for (idx, attach) in attaches.iter_mut().enumerate() {
+            let mut completion: Option<Result<AgentTransport, codemuxd_bootstrap::Error>> = None;
+            while let Some(event) = attach.handle.try_recv() {
+                match event {
+                    AttachEvent::Stage(stage) => {
+                        if attach.modal_owner
+                            && let Some(ui) = spawn_ui.as_mut()
+                        {
+                            ui.set_bootstrap_stage(stage);
+                        }
+                    }
+                    AttachEvent::Done(result) => {
+                        completion = Some(result);
+                        break;
+                    }
+                }
+            }
+            if let Some(result) = completion {
+                match result {
+                    Ok(mut transport) => {
+                        // Geometry may have changed during the attach;
+                        // the wire `Hello` was sized when the attach
+                        // started, so the remote daemon may need an
+                        // immediate Resize before any frames flow.
+                        let _ = transport.resize(attach.rows, attach.cols);
+                        tracing::info!(label = %attach.label, "attach completed; transport ready");
+                        new_agents.push(RuntimeAgent::ready(
+                            attach.label.clone(),
+                            transport,
+                            attach.rows,
+                            attach.cols,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!(label = %attach.label, "attach failed: {e}");
+                        new_agents.push(RuntimeAgent::failed(
+                            attach.label.clone(),
+                            attach.host.clone(),
+                            e,
+                            attach.rows,
+                            attach.cols,
+                        ));
+                    }
+                }
+                if attach.modal_owner {
+                    close_modal = true;
+                }
+                focus_new = true;
+                finished_attaches.push(idx);
+            }
+        }
+        if close_modal {
+            spawn_ui = None;
+            // Drop any prepare slot left over from the prepare→attach
+            // transition (its `RemoteFs` was already moved out at
+            // attach time, but the slot itself still owns
+            // `prepared`).
+            prepare = None;
+        }
+        if !finished_attaches.is_empty() {
+            // Remove from highest index down so earlier indices stay
+            // valid as we splice.
+            for &idx in finished_attaches.iter().rev() {
+                attaches.swap_remove(idx);
+            }
+        }
+        let new_count = new_agents.len();
+        agents.extend(new_agents);
+        if focus_new && new_count > 0 {
+            focused = agents.len() - 1;
+        }
+
         for agent in &mut agents {
             match &mut agent.state {
                 AgentState::Ready { parser, transport } => {
@@ -378,27 +594,53 @@ fn event_loop(
 
                 if let Some(ui) = spawn_ui.as_mut() {
                     match ui.handle(&key, &bindings.on_modal) {
-                        // Step 6 wires the prepare worker + RemoteFs;
-                        // until then PrepareHost / CancelBootstrap are
-                        // unreachable (the modal can't enter the
-                        // locked state without the runtime calling
-                        // `lock_for_bootstrap`). Treat as no-op so the
-                        // modal stays usable if the variants ever
-                        // surface from a stale state.
-                        ModalOutcome::None
-                        | ModalOutcome::PrepareHost { .. }
-                        | ModalOutcome::CancelBootstrap => {}
+                        ModalOutcome::None => {}
                         ModalOutcome::Cancel => {
+                            // Esc when not locked: dismiss the modal
+                            // and tear down any in-flight prepare /
+                            // modal-owned attach. We deliberately
+                            // mirror CancelBootstrap's cleanup so a
+                            // user who esc'd at the host-zone never
+                            // ends up with an orphan worker.
                             spawn_ui = None;
+                            prepare = None;
+                            cancel_modal_owned_attach(&mut attaches);
+                        }
+                        ModalOutcome::PrepareHost { host } => {
+                            // Replacing an existing prepare slot
+                            // cancels the prior worker via Drop —
+                            // intentional if the user re-locks for
+                            // a different host without going through
+                            // CancelBootstrap.
+                            prepare = Some(PendingPrepare {
+                                host: host.clone(),
+                                handle: start_prepare(host.clone()),
+                                prepared: None,
+                                remote_fs: None,
+                            });
+                            ui.lock_for_bootstrap(host, Instant::now());
+                        }
+                        ModalOutcome::CancelBootstrap => {
+                            // User hit Esc / @ during the locked
+                            // phase. The modal already updated its
+                            // own visual state (back to host zone);
+                            // we just need to drop the in-flight
+                            // worker so it doesn't surface a Done
+                            // event after the modal has moved on.
+                            if prepare.is_some() {
+                                prepare = None;
+                            } else {
+                                cancel_modal_owned_attach(&mut attaches);
+                            }
                         }
                         ModalOutcome::Spawn { host, path } => {
-                            spawn_ui = None;
                             let (term_cols, term_rows) =
                                 crossterm::terminal::size().wrap_err("read terminal size")?;
                             let (rows, cols) =
                                 pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
                             spawn_counter += 1;
                             if host == "local" {
+                                spawn_ui = None;
                                 let label = format!("agent-{spawn_counter}");
                                 let cwd_path = if path.is_empty() {
                                     None
@@ -415,20 +657,70 @@ fn event_loop(
                                     }
                                 }
                             } else {
-                                // SSH branch: temporarily disabled
-                                // between Step 5 (delete Bootstrapping
-                                // placeholder) and Step 6 (wire the
-                                // modal-driven prepare + attach
-                                // flow). The plan splits these for
-                                // reviewability; the new flow runs
-                                // through `lock_for_bootstrap` and a
-                                // runtime-owned `attaches` Vec rather
-                                // than a placeholder agent.
-                                tracing::warn!(
-                                    %host,
-                                    %path,
-                                    "SSH spawn temporarily disabled — Step 6 wires the new flow",
+                                // SSH branch: the prepare slot must
+                                // exist (the modal can only emit a
+                                // remote `Spawn` after going through
+                                // PrepareHost). Move out the
+                                // prepared host; the `RemoteFs`
+                                // ControlMaster goes with `prepare`'s
+                                // Drop since attach has its own
+                                // tunnel.
+                                let Some(slot) = prepare.take() else {
+                                    tracing::error!(
+                                        %host,
+                                        "remote Spawn without an active prepare slot — \
+                                         dropping (modal state machine bug)",
+                                    );
+                                    spawn_ui = None;
+                                    continue;
+                                };
+                                let Some(prepared) = slot.prepared else {
+                                    tracing::error!(
+                                        %host,
+                                        "remote Spawn before prepare reported Done — \
+                                         dropping (modal state machine bug)",
+                                    );
+                                    spawn_ui = None;
+                                    continue;
+                                };
+                                let label = format!("{host}:agent-{spawn_counter}");
+                                let agent_id = format!("agent-{spawn_counter}");
+                                // Empty path → None: omit `--cwd` on
+                                // the remote daemon and let it
+                                // inherit the remote shell's login
+                                // cwd ($HOME). A local path here
+                                // would otherwise be sent verbatim
+                                // to the remote, fail
+                                // `cwd.exists()`, and exit the
+                                // daemon before it ever bound the
+                                // socket — the user-visible "EOF
+                                // before HelloAck" failure mode.
+                                let cwd_path = if path.is_empty() {
+                                    None
+                                } else {
+                                    Some(PathBuf::from(&path))
+                                };
+                                let handle = start_attach(
+                                    prepared,
+                                    host.clone(),
+                                    agent_id,
+                                    cwd_path,
+                                    rows,
+                                    cols,
                                 );
+                                tracing::info!(%host, label = %label, "started SSH attach worker");
+                                // Re-lock the modal so the spinner
+                                // continues through the ~1-2 s
+                                // attach phase.
+                                ui.lock_for_bootstrap(host.clone(), Instant::now());
+                                attaches.push(PendingAttach {
+                                    label,
+                                    host,
+                                    rows,
+                                    cols,
+                                    handle,
+                                    modal_owner: true,
+                                });
                             }
                         }
                     }
