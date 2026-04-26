@@ -95,7 +95,11 @@ const MAX_COMPLETIONS: usize = 8;
 /// the path zone. Without this guard, landing the prompt in a huge directory
 /// (`/usr/lib`, `node_modules`, mailbox) would block the render loop.
 const MAX_SCAN_ENTRIES: usize = 1024;
-const HOST_PLACEHOLDER: &str = "local";
+/// The sentinel host string for "spawn locally" — both the modal's
+/// placeholder and the runtime's routing branch reference this so the
+/// UI/runtime contract has a single source of truth. See
+/// `runtime.rs`'s spawn dispatch for the consumer.
+pub const HOST_PLACEHOLDER: &str = "local";
 const PATH_PLACEHOLDER: &str = "<cwd>";
 
 /// What the spawn UI tells the event loop after handling a key.
@@ -200,6 +204,20 @@ enum Zone {
     Host,
 }
 
+/// Provenance of the `path` field's current value. See
+/// [`SpawnMinibuffer::path_origin`] for the contract.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PathOrigin {
+    /// Filled by the system (local cwd at modal open, or remote
+    /// `$HOME` after a successful prepare). Safe for the SSH flow to
+    /// clear without confirmation.
+    AutoSeeded,
+    /// User typed, backspaced, or applied a Tab completion. Must
+    /// not be cleared without explicit user intent.
+    #[default]
+    UserTyped,
+}
+
 #[derive(Debug)]
 pub struct SpawnMinibuffer {
     host: String,
@@ -229,20 +247,42 @@ pub struct SpawnMinibuffer {
     /// presentation — the stage-keyed head line and source-chain walk
     /// happen at render time via [`BootstrapError::user_message`].
     prepare_error: Option<BootstrapError>,
+    /// Provenance of the current `path` value. `AutoSeeded` means the
+    /// field was filled by the system ([`Self::open`] using the local
+    /// TUI cwd, or [`Self::unlock_for_remote_path`] using the remote
+    /// `$HOME`); `UserTyped` means the user touched it (typed,
+    /// backspaced, or applied a Tab completion).
+    ///
+    /// The distinction matters because system seeds carry context
+    /// that doesn't apply across host boundaries — sending the local
+    /// laptop path verbatim to the remote daemon trips its
+    /// `cwd.exists()` validation. The `@`-into-host transition uses
+    /// this flag to clear an `AutoSeeded` value silently while
+    /// preserving any `UserTyped` value (the existing power-user
+    /// escape hatch where `/path` then `@host` Enter spawns directly
+    /// at that path on the remote host).
+    path_origin: PathOrigin,
+    /// Local TUI cwd captured at [`Self::open`]. Used to (re-)seed
+    /// the path zone when the user comes back from the host zone
+    /// (Enter on `local`, Tab on empty/local, Esc from host) so the
+    /// path zone always lands ready-to-use, mirroring the SSH flow's
+    /// post-prepare reseed with the remote `$HOME`.
+    cwd: PathBuf,
 }
 
 impl SpawnMinibuffer {
-    pub fn open() -> Self {
-        // Path defaults to empty. The placeholder (`PATH_PLACEHOLDER`) shows
-        // the user that an empty submission means "use a sensible default":
-        //   - local agent → inherit the TUI's cwd
-        //   - SSH agent  → inherit the remote shell's login cwd ($HOME)
-        //
-        // Pre-filling with the local TUI's cwd was wrong for SSH targets:
-        // the daemon validates the path with `cwd.exists()` and exits before
-        // binding the socket if it doesn't (which is almost always the case
-        // when sending a local laptop path to a remote host). The runtime
-        // maps empty → None on both branches; see runtime.rs.
+    /// Open the spawn modal seeded with the local TUI's cwd in the
+    /// path zone (with a trailing `/` so the wildmenu lists the cwd's
+    /// subfolders directly). The seed gives the user immediate visual
+    /// confirmation of where a local spawn would land — the previous
+    /// empty default required the runtime to map empty → cwd at spawn
+    /// time, which worked but left the user staring at a `<cwd>`
+    /// placeholder with no idea what that resolved to.
+    ///
+    /// The seed is tracked via [`Self::path_origin`] so the SSH
+    /// path (`@host` Enter / Tab) can clear it without disturbing a
+    /// user-typed path.
+    pub fn open(cwd: &Path) -> Self {
         let mut m = Self {
             host: String::new(),
             path: String::new(),
@@ -253,11 +293,54 @@ impl SpawnMinibuffer {
             path_mode: PathMode::Local,
             bootstrap_view: None,
             prepare_error: None,
+            path_origin: PathOrigin::UserTyped,
+            cwd: cwd.to_path_buf(),
         };
-        // Initial wildmenu lists local cwd entries — modal opens in
-        // PathMode::Local so the lister doesn't matter.
+        m.seed_path_with_cwd();
+        // Initial wildmenu lists the cwd's subfolders (filtered to
+        // directories only — files are not valid spawn targets).
+        // Modal opens in `PathMode::Local` so the lister doesn't
+        // matter; the local branch in `refresh` calls into the
+        // synchronous `read_dir` path.
         m.refresh(&mut DirLister::Local);
+        // Seeded path field is non-empty so `refresh` set
+        // `selected = Some(0)` — leave it. The first highlighted
+        // subfolder is the visual cue: "this is what Enter will
+        // pick". To spawn at the cwd itself the user backspaces the
+        // trailing `/` (which makes the cwd the wildmenu's only
+        // matching candidate, still highlighted).
         m
+    }
+
+    /// Set the path zone to the local cwd plus a trailing `/` so the
+    /// wildmenu lists subfolders directly, and mark the field as
+    /// auto-seeded (so a follow-up `@`-into-host clears it without
+    /// disturbing a user-typed path).
+    ///
+    /// Idempotent — safe to call from any `Host → Path` transition
+    /// (Enter on `local`, Tab on empty/local, Esc from host zone).
+    fn seed_path_with_cwd(&mut self) {
+        let cwd_str = self.cwd.to_string_lossy();
+        self.path = if cwd_str.ends_with('/') {
+            cwd_str.into_owned()
+        } else {
+            format!("{cwd_str}/")
+        };
+        self.path_origin = PathOrigin::AutoSeeded;
+    }
+
+    /// Switch focus to the path zone, reseeding the local cwd when the
+    /// field is empty so the user always lands at a usable folder
+    /// picker. Centralised so every Host→Path transition (Enter on
+    /// `local`, Tab on empty/local, Esc from host) shares one
+    /// reseed-and-refresh contract — the bug class this prevents is "I
+    /// added a new transition and forgot to reseed."
+    fn transition_to_path_zone(&mut self, lister: &mut DirLister<'_>) {
+        self.focused = Zone::Path;
+        if self.path.is_empty() {
+            self.seed_path_with_cwd();
+        }
+        self.refresh(lister);
     }
 
     /// Lock the path zone with a spinner + stage label while the
@@ -307,6 +390,11 @@ impl SpawnMinibuffer {
         } else {
             format!("{home_str}/")
         };
+        // The remote $HOME is a system-derived seed, not a user-typed
+        // path. Mark it as auto-seeded so a follow-up `@`-into-host
+        // (e.g. user changed their mind about the host) doesn't
+        // preserve a stale local-irrelevant value.
+        self.path_origin = PathOrigin::AutoSeeded;
         self.path_mode = PathMode::Remote {
             remote_home,
             cache: HashMap::new(),
@@ -341,10 +429,6 @@ impl SpawnMinibuffer {
         bindings: &ModalBindings,
         lister: &mut DirLister<'_>,
     ) -> ModalOutcome {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return ModalOutcome::None;
-        }
-
         // Path zone locked by an in-flight bootstrap. Only Cancel and
         // SwapToHost are accepted; both produce CancelBootstrap so the
         // runtime can drop the worker and unlock back to the host
@@ -357,6 +441,17 @@ impl SpawnMinibuffer {
                 }
                 _ => ModalOutcome::None,
             };
+        }
+
+        // Ctrl-modified typing shortcuts. Handled before the action
+        // lookup so Ctrl-Backspace / Ctrl-W (delete word backward) and
+        // Ctrl-U (delete to start) work in either zone. Every other
+        // Ctrl-key is dropped to avoid clashing with terminal /
+        // wrapping-shell shortcuts (Ctrl-C, Ctrl-Z, the global prefix
+        // key, etc.) — those should fall through to the host shell, not
+        // be silently consumed by the modal.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.handle_ctrl_shortcut(key.code, lister);
         }
 
         // Read-once banner: any actionable keystroke dismisses a stale
@@ -377,8 +472,8 @@ impl SpawnMinibuffer {
 
         if let Some(action) = action {
             return match action {
-                ModalAction::Cancel => ModalOutcome::Cancel,
-                ModalAction::Confirm => self.confirm(),
+                ModalAction::Cancel => self.cancel(lister),
+                ModalAction::Confirm => self.confirm(lister),
                 ModalAction::SwapField => self.swap_field_outcome(lister),
                 ModalAction::SwapToHost => {
                     self.enter_host_zone(lister);
@@ -397,16 +492,67 @@ impl SpawnMinibuffer {
 
         match key.code {
             KeyCode::Char(c) => {
+                if self.focused == Zone::Path {
+                    self.path_origin = PathOrigin::UserTyped;
+                }
                 self.current_field_mut().push(c);
                 self.refresh(lister);
                 ModalOutcome::None
             }
             KeyCode::Backspace => {
+                if self.focused == Zone::Path {
+                    self.path_origin = PathOrigin::UserTyped;
+                }
                 self.current_field_mut().pop();
                 self.refresh(lister);
                 ModalOutcome::None
             }
             _ => ModalOutcome::None,
+        }
+    }
+
+    /// Handle Ctrl-modified keys. Currently supports Ctrl-Backspace
+    /// and Ctrl-W (delete word backward, where "word" = back to and
+    /// including the preceding `/`) and Ctrl-U (clear the field).
+    /// All other Ctrl-keys are dropped — the modal is text-input
+    /// only, and consuming Ctrl-C / Ctrl-Z / the global prefix key
+    /// would be surprising.
+    ///
+    /// Word-delete is most useful in the path zone (back through one
+    /// path segment) but applies to whichever zone is focused so the
+    /// host zone benefits from Ctrl-U too.
+    fn handle_ctrl_shortcut(&mut self, code: KeyCode, lister: &mut DirLister<'_>) -> ModalOutcome {
+        match code {
+            KeyCode::Backspace | KeyCode::Char('w') => {
+                if self.focused == Zone::Path {
+                    self.path_origin = PathOrigin::UserTyped;
+                }
+                delete_word_backward(self.current_field_mut());
+                self.refresh(lister);
+                ModalOutcome::None
+            }
+            KeyCode::Char('u') => {
+                if self.focused == Zone::Path {
+                    self.path_origin = PathOrigin::UserTyped;
+                }
+                self.current_field_mut().clear();
+                self.refresh(lister);
+                ModalOutcome::None
+            }
+            _ => ModalOutcome::None,
+        }
+    }
+
+    /// Cancel handler. Esc in the host zone is "back" — switch to the
+    /// path zone and re-seed the cwd if the path field was previously
+    /// cleared (the `@`-into-host clear, or the user backspaced it
+    /// to nothing). Esc in the path zone closes the modal entirely.
+    fn cancel(&mut self, lister: &mut DirLister<'_>) -> ModalOutcome {
+        if self.focused == Zone::Host {
+            self.transition_to_path_zone(lister);
+            ModalOutcome::None
+        } else {
+            ModalOutcome::Cancel
         }
     }
 
@@ -428,8 +574,11 @@ impl SpawnMinibuffer {
                 host: self.commit_resolved_host(),
             },
             Zone::Host => {
-                self.focused = Zone::Path;
-                self.refresh(lister);
+                // Empty / `local` host commit: just a zone toggle.
+                // Re-seed the cwd so the user has a folder picker to
+                // work with — the `@`-into-host clear left the path
+                // empty and an empty wildmenu would be useless here.
+                self.transition_to_path_zone(lister);
                 ModalOutcome::None
             }
             Zone::Path => {
@@ -439,17 +588,36 @@ impl SpawnMinibuffer {
         }
     }
 
-    /// Replace the path field with the highlighted wildmenu candidate
-    /// and refresh so the wildmenu shows entries inside the new
-    /// directory (typical when the candidate is a directory ending in
-    /// `/`). No-op when nothing is selected — the user can hit Down
-    /// to start cycling, or just type a prefix which auto-highlights
+    /// Tab in the path zone applies the highlighted wildmenu
+    /// candidate. The first Tab applies the basename WITHOUT the
+    /// trailing `/` so the wildmenu doesn't immediately descend into
+    /// the folder — matching zsh / fish autocomplete: the first Tab
+    /// confirms what you picked, then you descend either by typing
+    /// `/` yourself or by hitting Tab again. The second Tab is
+    /// detected by `path == candidate-without-slash` and applies the
+    /// candidate WITH the slash, which makes `refresh` list the
+    /// folder's contents.
+    ///
+    /// No-op when nothing is selected — the user can hit Down to
+    /// start cycling, or just type a prefix which auto-highlights
     /// the first match.
     fn apply_path_completion(&mut self, lister: &mut DirLister<'_>) {
         if let Some(idx) = self.selected
             && let Some(candidate) = self.filtered.get(idx).cloned()
         {
-            self.path = candidate;
+            let trimmed = candidate.strip_suffix('/').unwrap_or(&candidate);
+            self.path = if self.path == trimmed {
+                // Second Tab on the same folder → descend.
+                candidate
+            } else {
+                // First Tab → apply without trailing slash so the
+                // wildmenu stays at the same level.
+                trimmed.to_string()
+            };
+            // Tab-applying a completion is an explicit user choice;
+            // the seeded cwd is no longer the literal value in the
+            // field, so the auto-seeded marker no longer applies.
+            self.path_origin = PathOrigin::UserTyped;
             self.refresh(lister);
         }
     }
@@ -491,19 +659,33 @@ impl SpawnMinibuffer {
         resolved
     }
 
-    fn confirm(&mut self) -> ModalOutcome {
-        // Enter on the host zone with an empty path field commits the
-        // host like Tab does — the user wants to pick a remote folder
-        // next, not spawn at the remote $HOME with no further input.
-        // Enter on the host zone with a non-empty path falls through
-        // to Spawn (today's escape hatch for power users).
-        if self.focused == Zone::Host
-            && self.path.trim().is_empty()
-            && self.is_remote_host_committed()
-        {
-            return ModalOutcome::PrepareHost {
-                host: self.commit_resolved_host(),
-            };
+    fn confirm(&mut self, lister: &mut DirLister<'_>) -> ModalOutcome {
+        // Enter on the host zone with an empty path field is a "I want
+        // to pick a folder next" gesture, not a "spawn now" gesture.
+        // Two cases by host:
+        //   - remote   → emit `PrepareHost` so the runtime can start
+        //                the SSH bootstrap; after prepare succeeds the
+        //                modal unlocks at the remote `$HOME` for the
+        //                folder picker.
+        //   - local /  → switch to the path zone with the local cwd
+        //     empty       reseeded; mirrors the SSH flow visually so
+        //                 the user always lands at a folder picker.
+        // Enter on the host zone with a NON-empty path falls through
+        // to Spawn (today's escape hatch for power users who already
+        // know the remote / local path they want).
+        if self.focused == Zone::Host && self.path.trim().is_empty() {
+            if self.is_remote_host_committed() {
+                return ModalOutcome::PrepareHost {
+                    host: self.commit_resolved_host(),
+                };
+            }
+            // Local / empty host: switch to the path picker. Clear
+            // the host field so the dim `local` placeholder shows
+            // (consistent with the empty-host = local convention
+            // used everywhere else).
+            self.host.clear();
+            self.transition_to_path_zone(lister);
+            return ModalOutcome::None;
         }
 
         // Apply highlighted wildmenu candidate to the focused field if any —
@@ -547,8 +729,21 @@ impl SpawnMinibuffer {
     /// user has expressed intent makes `@ Enter` silently spawn on
     /// whichever host happens to sort first, with the prompt showing that
     /// host while the user thinks they're just opening the picker.
+    ///
+    /// Also clears the auto-seeded local cwd in the path field. The
+    /// local cwd doesn't apply to remote targets, and leaving it in
+    /// place would defeat the `Enter on host with empty path →
+    /// PrepareHost` gesture (the user would silently spawn directly
+    /// at the local laptop path on the remote host, which fails the
+    /// daemon's `cwd.exists()` check). User-typed paths are preserved
+    /// — the existing power-user escape hatch (`/path` then `@host`
+    /// Enter spawns directly) still works.
     fn enter_host_zone(&mut self, lister: &mut DirLister<'_>) {
         self.focused = Zone::Host;
+        if self.path_origin == PathOrigin::AutoSeeded {
+            self.path.clear();
+            self.path_origin = PathOrigin::UserTyped;
+        }
         self.refresh(lister);
     }
 
@@ -727,6 +922,7 @@ impl SpawnMinibuffer {
         }
 
         let usable = WILDMENU_ROWS as usize - 1; // top border eats one row
+        let zone = self.focused;
         let lines: Vec<Line> = self
             .filtered
             .iter()
@@ -743,7 +939,8 @@ impl SpawnMinibuffer {
                 } else {
                     Style::default()
                 };
-                let display = clip_middle(c, width.saturating_sub(3));
+                let display_str = wildmenu_display_text(zone, c);
+                let display = clip_middle(&display_str, width.saturating_sub(3));
                 Line::styled(format!("{marker}{display}"), style)
             })
             .collect();
@@ -1040,12 +1237,12 @@ fn remote_path_completions(
         .iter()
         .filter(|e| e.name.starts_with(&prefix))
         .filter(|e| !e.name.starts_with('.') || prefix.starts_with('.'))
+        // Spawn target = working directory; files are filtered out so
+        // the wildmenu only shows pickable candidates. Mirrors the
+        // local `scan_dir` policy.
+        .filter(|e| e.is_dir)
         .map(|e| {
-            let name = if e.is_dir {
-                format!("{}/", e.name)
-            } else {
-                e.name.clone()
-            };
+            let name = format!("{}/", e.name);
             if dir_str == "." && !input.starts_with("./") {
                 name
             } else if dir_str.ends_with('/') {
@@ -1085,9 +1282,11 @@ fn split_path_for_completion(input: &str) -> (PathBuf, String) {
     (PathBuf::from("."), input.to_string())
 }
 
-/// Scan `dir` for entries matching `prefix`, returning at most `cap` names
-/// (directories with a trailing slash). Hidden entries are kept only if the
-/// prefix itself starts with a dot.
+/// Scan `dir` for *directory* entries matching `prefix`, returning at most
+/// `cap` names with a trailing slash. Files are excluded — the spawn modal
+/// picks a working directory for the agent, so a regular file is never a
+/// valid candidate. Hidden entries are kept only if the prefix itself
+/// starts with a dot.
 ///
 /// I/O failures (missing directory, permission denied, non-utf8) degrade
 /// silently to an empty Vec — autocomplete should never crash the TUI. A
@@ -1109,8 +1308,15 @@ fn scan_dir(dir: &Path, prefix: &str, cap: usize) -> Vec<String> {
             if name.starts_with('.') && !prefix.starts_with('.') {
                 return None;
             }
-            let is_dir = e.file_type().ok()?.is_dir();
-            Some(if is_dir { format!("{name}/") } else { name })
+            // Spawn target = working directory; files are filtered
+            // out so the wildmenu only shows pickable candidates.
+            // `file_type()` failure (e.g. dangling symlink) is treated
+            // as "not a dir" and skipped — same as the previous
+            // is_dir-or-bust behavior, just without the file branch.
+            if !e.file_type().ok()?.is_dir() {
+                return None;
+            }
+            Some(format!("{name}/"))
         })
         .collect();
     out.sort();
@@ -1119,19 +1325,38 @@ fn scan_dir(dir: &Path, prefix: &str, cap: usize) -> Vec<String> {
 }
 
 /// Host-zone completions: filter the cached SSH `Host` list against the
-/// typed prefix. Returns the full pool when the input is empty (so the user
-/// can browse).
+/// typed prefix. Always pins the [`HOST_PLACEHOLDER`] (`"local"`) entry to
+/// the top so the local-spawn target is one Enter away — the runtime
+/// already routes `host == "local"` through the local-PTY branch (see
+/// `runtime.rs`). When the user has typed a prefix, `local` is included
+/// only if it matches (so typing `dev` doesn't surface `local`).
+///
+/// Returns the full pool when the input is empty (so the user can browse).
 fn host_completions(input: &str, hosts: &[String]) -> Vec<String> {
     let needle = input.trim().to_lowercase();
+    let local = HOST_PLACEHOLDER.to_string();
+
     if needle.is_empty() {
-        return hosts.to_vec();
+        let mut out = Vec::with_capacity(hosts.len() + 1);
+        out.push(local);
+        out.extend(hosts.iter().cloned());
+        return out;
+    }
+
+    let mut out = Vec::new();
+    // `local` is always first when it matches the typed prefix /
+    // substring — bypass the score-then-sort pipeline so it can't
+    // be outranked by a hostname that happens to score lower.
+    if score(HOST_PLACEHOLDER, &needle).is_some() {
+        out.push(local);
     }
     let mut scored: Vec<(usize, &String)> = hosts
         .iter()
         .filter_map(|c| score(&c.to_lowercase(), &needle).map(|s| (s, c)))
         .collect();
     scored.sort_by_key(|(s, _)| *s);
-    scored.into_iter().map(|(_, c)| c.clone()).collect()
+    out.extend(scored.into_iter().map(|(_, c)| c.clone()));
+    out
 }
 
 fn score(haystack: &str, needle: &str) -> Option<usize> {
@@ -1139,6 +1364,58 @@ fn score(haystack: &str, needle: &str) -> Option<usize> {
         let prefix_bonus = if pos == 0 { 0 } else { 100 };
         prefix_bonus + pos + haystack.len() / 8
     })
+}
+
+/// Strip the parent directory from a path-zone candidate so the
+/// wildmenu shows just the leaf — `/Users/x/codemux/apps/` renders as
+/// `apps/`, `/etc/hosts` as `hosts`. The full path lives in the
+/// `filtered` Vec so applying the candidate (Tab, Enter) still uses
+/// the correct value; this is purely a render-time transform.
+///
+/// Edge cases: empty input → empty output; single-segment path with
+/// no separator → returned unchanged; `"/"` → `"/"` (root directory).
+fn basename_for_display(path: &str) -> String {
+    let (stem, suffix) = match path.strip_suffix('/') {
+        Some(stem) => (stem, "/"),
+        None => (path, ""),
+    };
+    let base = stem.rsplit('/').next().unwrap_or(stem);
+    format!("{base}{suffix}")
+}
+
+/// Delete the last "word" from `s`, where "word" follows path-segment
+/// semantics: drop the trailing `/` if any, then drop everything back
+/// to and including the previous `/`. If no `/` remains, clear the
+/// string. Mirrors Ctrl-W in zsh / bash with `WORDCHARS` configured
+/// for path editing.
+///
+/// Examples:
+/// - `"/Users/x/codemux/"` → `"/Users/x/"`
+/// - `"/Users/x/codemux"`  → `"/Users/x/"`
+/// - `"abc"`               → `""`
+/// - `""`                  → `""`
+fn delete_word_backward(s: &mut String) {
+    if s.ends_with('/') {
+        s.pop();
+    }
+    if let Some(idx) = s.rfind('/') {
+        s.truncate(idx + 1);
+    } else {
+        s.clear();
+    }
+}
+
+/// Pick the wildmenu display text for a candidate. Path-zone
+/// candidates collapse to the leaf folder (`apps/`) because the path
+/// field already shows the parent context; host-zone candidates show
+/// the full host name. The `filtered` Vec keeps full paths so
+/// applying a candidate (Tab / Enter) still uses the correct value —
+/// this is purely a render-time transform.
+fn wildmenu_display_text(zone: Zone, candidate: &str) -> String {
+    match zone {
+        Zone::Path => basename_for_display(candidate),
+        Zone::Host => candidate.to_string(),
+    }
 }
 
 fn clip_middle(s: &str, width: usize) -> String {
@@ -1240,6 +1517,14 @@ mod tests {
             path_mode: PathMode::Local,
             bootstrap_view: None,
             prepare_error: None,
+            // Tests that exercise the auto-seeded behavior set this
+            // explicitly; the default mirrors the user-typed semantics
+            // the bulk of the tests (which set `path` to a literal
+            // value) were written against.
+            path_origin: PathOrigin::UserTyped,
+            // A stable test cwd. The Esc/Confirm tests that exercise
+            // the cwd-reseed behavior assert against this value.
+            cwd: PathBuf::from("/test/cwd"),
         };
         m.refresh(&mut local());
         m
@@ -1260,6 +1545,80 @@ mod tests {
             m.handle(&key(KeyCode::Esc), &b(), &mut local()),
             ModalOutcome::Cancel
         );
+    }
+
+    /// Esc in the host zone is "back to path", not "close modal" —
+    /// the user opened the host picker and changed their mind. The
+    /// path field is reseeded with the cwd if it was previously
+    /// cleared (the `@`-into-host clear) so the user lands at a
+    /// usable folder picker.
+    #[test]
+    fn esc_in_host_zone_returns_to_path_with_cwd_reseeded() {
+        let mut m = mb("", "", Zone::Host, &["alpha"]);
+        // Simulate the post-`@` state: path empty, focus = Host.
+        let outcome = m.handle(&key(KeyCode::Esc), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.focused, Zone::Path);
+        assert_eq!(m.path, "/test/cwd/");
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
+    }
+
+    /// Esc in host zone preserves a non-empty path (the user's
+    /// already-typed path; we only reseed if the field is empty).
+    #[test]
+    fn esc_in_host_zone_preserves_user_typed_path() {
+        let mut m = mb("", "/work/proj", Zone::Host, &["alpha"]);
+        let outcome = m.handle(&key(KeyCode::Esc), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.focused, Zone::Path);
+        assert_eq!(m.path, "/work/proj");
+        assert_eq!(m.path_origin, PathOrigin::UserTyped);
+    }
+
+    /// Ctrl-Backspace in the path zone deletes the last path segment
+    /// (back through the previous `/`). Chosen over plain Backspace
+    /// because typing a long path and shaving it one char at a time
+    /// is tedious — power users expect Ctrl-Backspace to behave like
+    /// the shell's word delete.
+    #[test]
+    fn ctrl_backspace_deletes_word_in_path_zone() {
+        let mut m = mb("", "/Users/x/codemux/", Zone::Path, &[]);
+        let outcome = m.handle(&ctrl(KeyCode::Backspace), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "/Users/x/");
+    }
+
+    /// Ctrl-W is the vim/shell convention for "delete word backward".
+    /// Same semantics as Ctrl-Backspace — the modal accepts both.
+    #[test]
+    fn ctrl_w_deletes_word_in_path_zone() {
+        let mut m = mb("", "/Users/x/codemux", Zone::Path, &[]);
+        let outcome = m.handle(&ctrl(KeyCode::Char('w')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "/Users/x/");
+    }
+
+    /// Ctrl-U clears the focused field. Useful to wipe the seeded
+    /// cwd in one keystroke and start typing a different path from
+    /// scratch (or to clear a typed-but-wrong host name).
+    #[test]
+    fn ctrl_u_clears_field_in_path_zone() {
+        let mut m = mb("", "/Users/x/codemux", Zone::Path, &[]);
+        let outcome = m.handle(&ctrl(KeyCode::Char('u')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "");
+    }
+
+    /// Ctrl-Backspace also marks the path as user-touched — same as
+    /// any other path-zone edit. Without this, a follow-up
+    /// `@`-into-host wouldn't clear the field (auto-seed defense).
+    #[test]
+    fn ctrl_backspace_clears_auto_seeded_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path());
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
+        m.handle(&ctrl(KeyCode::Backspace), &b(), &mut local());
+        assert_eq!(m.path_origin, PathOrigin::UserTyped);
     }
 
     #[test]
@@ -1292,14 +1651,22 @@ mod tests {
     fn at_in_path_zone_enters_empty_host_with_full_wildmenu() {
         // After dropping the prefill, `@` no longer commits to a specific
         // host. The field stays empty (placeholder shows "local"), the
-        // wildmenu lists every SSH host so the user can browse, and
+        // wildmenu lists every SSH host (with `local` pinned first so
+        // the local-spawn target is always one Enter away), and
         // `selected = None` so a stray Enter spawns local rather than
         // silently picking the first host.
         let mut m = mb("", "/tmp", Zone::Path, &["alpha", "bravo"]);
         m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "");
-        assert_eq!(m.filtered, vec!["alpha".to_string(), "bravo".to_string()]);
+        assert_eq!(
+            m.filtered,
+            vec![
+                "local".to_string(),
+                "alpha".to_string(),
+                "bravo".to_string()
+            ]
+        );
         assert_eq!(m.selected, None);
     }
 
@@ -1309,6 +1676,94 @@ mod tests {
         m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "custom");
+    }
+
+    /// `open(cwd)` seeds the path zone with the cwd as a string,
+    /// appending a trailing `/` so the wildmenu lists subfolders. The
+    /// `path_origin` flag is set to `AutoSeeded` so a follow-up `@`-into-host
+    /// can clear the local-only path before the SSH flow runs.
+    #[test]
+    fn open_seeds_path_with_cwd_and_marks_auto_seeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SpawnMinibuffer::open(dir.path());
+        let expected = format!("{}/", dir.path().display());
+        assert_eq!(m.path, expected);
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
+        assert_eq!(m.focused, Zone::Path);
+    }
+
+    /// `open(cwd)` is idempotent on a cwd that already ends in `/`
+    /// (root, or any path the caller normalized). Don't double-slash.
+    #[test]
+    fn open_does_not_double_slash_when_cwd_already_ends_in_slash() {
+        let m = SpawnMinibuffer::open(Path::new("/"));
+        assert_eq!(m.path, "/");
+    }
+
+    /// User typing in the path zone flips `path_origin` to `UserTyped` — from
+    /// that point forward the field is "user-typed" and the SSH-flow
+    /// clearing on `@` no longer applies.
+    #[test]
+    fn typing_in_path_zone_clears_auto_seeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path());
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
+        m.handle(&key(KeyCode::Char('x')), &b(), &mut local());
+        assert_eq!(m.path_origin, PathOrigin::UserTyped);
+    }
+
+    /// Backspacing in the path zone also marks the field as
+    /// user-touched. (Trimming the trailing slash is a common
+    /// gesture to back out of the seeded cwd into the parent.)
+    #[test]
+    fn backspace_in_path_zone_clears_auto_seeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path());
+        m.handle(&key(KeyCode::Backspace), &b(), &mut local());
+        assert_eq!(m.path_origin, PathOrigin::UserTyped);
+    }
+
+    /// Tab-applying a wildmenu candidate is also a user choice; the
+    /// resulting path is the candidate's value (without the trailing
+    /// slash on first Tab, see [`SpawnMinibuffer::apply_path_completion`]),
+    /// not the auto-seeded cwd, so the marker is cleared.
+    #[test]
+    fn tab_completion_in_path_zone_clears_auto_seeded() {
+        let mut m = mb("", "/tmp", Zone::Path, &[]);
+        m.path_origin = PathOrigin::AutoSeeded;
+        m.filtered = vec!["/tmp/alpha/".into()];
+        m.selected = Some(0);
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        // First Tab applies the basename without the trailing slash.
+        assert_eq!(m.path, "/tmp/alpha");
+        assert_eq!(m.path_origin, PathOrigin::UserTyped);
+    }
+
+    /// `@` into the host zone clears the path field if it was
+    /// auto-seeded (the local cwd doesn't apply to remote targets,
+    /// and the SSH flow's `Enter on host with empty path →
+    /// PrepareHost` gesture needs the field empty to fire).
+    #[test]
+    fn at_into_host_clears_auto_seeded_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path());
+        assert!(!m.path.is_empty());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
+        assert_eq!(m.focused, Zone::Host);
+        assert_eq!(m.path, "");
+        assert_eq!(m.path_origin, PathOrigin::UserTyped);
+    }
+
+    /// `@` into the host zone PRESERVES a user-typed path. The
+    /// existing power-user escape hatch (`/path` then `@host` Enter
+    /// spawns directly at that path on the remote) must still work.
+    #[test]
+    fn at_into_host_preserves_user_typed_path() {
+        let mut m = mb("", "/work/project", Zone::Path, &["alpha"]);
+        // mb() defaults path_origin to PathOrigin::UserTyped.
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
+        assert_eq!(m.focused, Zone::Host);
+        assert_eq!(m.path, "/work/project");
     }
 
     #[test]
@@ -1517,6 +1972,45 @@ mod tests {
         assert_eq!(m.path, "/tmp", "field must be unchanged");
     }
 
+    /// First Tab on a folder candidate applies the basename WITHOUT
+    /// the trailing slash, so the wildmenu stays at the same level
+    /// (the user is "selecting" the folder, not descending into it).
+    /// Mirrors zsh / fish autocomplete: confirm the pick, then choose
+    /// to descend.
+    #[test]
+    fn first_tab_on_folder_applies_without_trailing_slash() {
+        let mut m = mb("", "/tmp/", Zone::Path, &[]);
+        m.filtered = vec!["/tmp/alpha/".into(), "/tmp/beta/".into()];
+        m.selected = Some(0);
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "/tmp/alpha");
+    }
+
+    /// Second Tab on the same folder (path already matches the
+    /// trimmed candidate) applies WITH the trailing slash, which
+    /// causes `refresh` to list the folder's contents — i.e.
+    /// descend.
+    #[test]
+    fn second_tab_on_same_folder_descends() {
+        let mut m = mb("", "/tmp/alpha", Zone::Path, &[]);
+        m.filtered = vec!["/tmp/alpha/".into()];
+        m.selected = Some(0);
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "/tmp/alpha/");
+    }
+
+    /// Typing `/` after a first Tab also descends (refresh re-runs
+    /// against the new path with trailing slash). This test pins the
+    /// keystroke-equivalence so the user has two ways to descend.
+    #[test]
+    fn typing_slash_after_first_tab_also_descends() {
+        let mut m = mb("", "/tmp/alpha", Zone::Path, &[]);
+        m.handle(&key(KeyCode::Char('/')), &b(), &mut local());
+        assert_eq!(m.path, "/tmp/alpha/");
+    }
+
     #[test]
     fn empty_host_becomes_local_on_spawn() {
         let mut m = mb("", "/x", Zone::Path, &[]);
@@ -1602,14 +2096,17 @@ mod tests {
 
     #[test]
     fn down_cycles_with_wrap() {
+        // Filtered list is `local` + the three SSH hosts (`local` is
+        // pinned first per `host_completions`), giving four entries
+        // total. Empty field → no implicit selection; first Down
+        // advances from None to Some(0), then it cycles 0→1→2→3→0.
         let mut m = mb("", "", Zone::Host, &["a", "b", "c"]);
-        // Empty field → no implicit selection. First Down advances from
-        // None to Some(0), then it cycles normally with wrap-around.
         assert_eq!(m.selected, None);
         m.handle(&key(KeyCode::Down), &b(), &mut local());
         assert_eq!(m.selected, Some(0));
         m.handle(&key(KeyCode::Down), &b(), &mut local());
         assert_eq!(m.selected, Some(1));
+        m.handle(&key(KeyCode::Down), &b(), &mut local());
         m.handle(&key(KeyCode::Down), &b(), &mut local());
         m.handle(&key(KeyCode::Down), &b(), &mut local());
         assert_eq!(m.selected, Some(0));
@@ -1677,8 +2174,35 @@ mod tests {
 
     #[test]
     fn host_completions_returns_full_pool_for_empty_input() {
+        // Empty input returns `local` first followed by every SSH host;
+        // the local-spawn target is always one Enter away.
         let pool = vec!["a".into(), "b".into()];
-        assert_eq!(host_completions("", &pool), pool);
+        assert_eq!(
+            host_completions("", &pool),
+            vec!["local".to_string(), "a".to_string(), "b".to_string()],
+        );
+    }
+
+    #[test]
+    fn host_completions_with_typed_prefix_pins_local_first_when_it_matches() {
+        let pool = vec!["alpine-1".into(), "loki".into()];
+        // `lo` matches both `local` and `loki`; `local` must come first
+        // even though `loki` would have a comparable score on its own.
+        assert_eq!(
+            host_completions("lo", &pool),
+            vec!["local".to_string(), "loki".to_string()],
+        );
+    }
+
+    #[test]
+    fn host_completions_omits_local_when_input_does_not_match_it() {
+        let pool = vec!["devpod-1".into(), "devpod-2".into()];
+        // `dev` does not appear in `local`, so `local` is dropped from
+        // the completions — surfacing it would be a distraction.
+        assert_eq!(
+            host_completions("dev", &pool),
+            vec!["devpod-1".to_string(), "devpod-2".to_string()],
+        );
     }
 
     #[test]
@@ -1718,6 +2242,22 @@ mod tests {
         assert_eq!(prefix, "baz");
     }
 
+    /// Local `scan_dir` only returns directory entries; regular files
+    /// in the same parent are silently dropped. Spawn target = working
+    /// directory, so a file is never a valid candidate. Mirrors the
+    /// remote-side `remote_completions_filters_out_files` test.
+    #[test]
+    fn scan_dir_filters_out_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        std::fs::write(dir.path().join("beta.txt"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("gamma")).unwrap();
+        std::fs::write(dir.path().join("delta.md"), b"").unwrap();
+
+        let out = scan_dir(dir.path(), "", 8);
+        assert_eq!(out, vec!["alpha/".to_string(), "gamma/".to_string()]);
+    }
+
     #[test]
     fn clip_middle_passes_short_strings_through() {
         assert_eq!(clip_middle("hello", 10), "hello");
@@ -1736,6 +2276,92 @@ mod tests {
         assert_eq!(clip_middle("anything", 0), "");
     }
 
+    /// `basename_for_display` strips the parent dir from a path
+    /// candidate so the wildmenu shows the leaf only. Trailing slash
+    /// indicates a folder and must be preserved on output.
+    #[test]
+    fn basename_for_display_extracts_leaf_with_trailing_slash() {
+        assert_eq!(basename_for_display("/Users/x/codemux/apps/"), "apps/");
+    }
+
+    #[test]
+    fn basename_for_display_extracts_leaf_without_trailing_slash() {
+        assert_eq!(basename_for_display("/etc/hosts"), "hosts");
+    }
+
+    #[test]
+    fn basename_for_display_handles_root() {
+        assert_eq!(basename_for_display("/"), "/");
+    }
+
+    #[test]
+    fn basename_for_display_handles_single_segment() {
+        assert_eq!(basename_for_display("apps/"), "apps/");
+        assert_eq!(basename_for_display("apps"), "apps");
+    }
+
+    #[test]
+    fn basename_for_display_handles_empty() {
+        assert_eq!(basename_for_display(""), "");
+    }
+
+    /// Wildmenu picks the right display text per zone: leaf folder
+    /// in path zone, full host name in host zone. Pinned here as a
+    /// guard against future "swap the arms" refactors.
+    #[test]
+    fn wildmenu_display_text_path_zone_returns_basename() {
+        assert_eq!(
+            wildmenu_display_text(Zone::Path, "/Users/x/codemux/apps/"),
+            "apps/",
+        );
+    }
+
+    #[test]
+    fn wildmenu_display_text_host_zone_returns_full_value() {
+        assert_eq!(wildmenu_display_text(Zone::Host, "devpod-go"), "devpod-go");
+    }
+
+    /// `delete_word_backward` operates on path-segment boundaries:
+    /// drop the trailing `/` if any, then drop everything back to
+    /// (and including) the previous `/`. If there's nothing left to
+    /// scan, the string is cleared.
+    #[test]
+    fn delete_word_backward_removes_trailing_segment_with_slash() {
+        let mut s = String::from("/Users/x/codemux/");
+        delete_word_backward(&mut s);
+        assert_eq!(s, "/Users/x/");
+    }
+
+    #[test]
+    fn delete_word_backward_removes_trailing_segment_without_slash() {
+        let mut s = String::from("/Users/x/codemux");
+        delete_word_backward(&mut s);
+        assert_eq!(s, "/Users/x/");
+    }
+
+    #[test]
+    fn delete_word_backward_clears_when_no_slash() {
+        let mut s = String::from("abc");
+        delete_word_backward(&mut s);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn delete_word_backward_on_empty_is_noop() {
+        let mut s = String::new();
+        delete_word_backward(&mut s);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn delete_word_backward_on_root_clears() {
+        let mut s = String::from("/");
+        delete_word_backward(&mut s);
+        // After stripping the trailing `/`, the string is empty and
+        // there's no `/` to find — clear it.
+        assert_eq!(s, "");
+    }
+
     #[test]
     fn move_selection_clears_selection_when_filtered_is_empty() {
         let mut m = mb("", "/tmp", Zone::Host, &[]);
@@ -1747,10 +2373,13 @@ mod tests {
 
     #[test]
     fn move_selection_from_none_with_backward_jumps_to_last() {
+        // Filtered list is `local` + the three SSH hosts (`local` is
+        // pinned first per `host_completions`), so backward-from-None
+        // wraps to the last index 3, not 2.
         let mut m = mb("", "", Zone::Host, &["a", "b", "c"]);
         m.selected = None;
         m.move_selection_backward();
-        assert_eq!(m.selected, Some(2));
+        assert_eq!(m.selected, Some(3));
     }
 
     #[test]
@@ -1968,20 +2597,22 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_host_with_empty_path_and_local_host_still_spawns_local() {
-        // Empty host + empty path is the local-spawn gesture from
-        // the moment the modal opens. No prepare to run.
+    fn enter_on_host_with_empty_path_and_local_host_routes_to_path_zone() {
+        // Empty host + empty path on the host zone is "I want to pick
+        // a folder next" for local — switch to the path zone with the
+        // cwd reseeded, mirroring the SSH flow's post-prepare reseed
+        // with the remote `$HOME`. No spawn yet.
         let mut m = mb("", "", Zone::Host, &[]);
         m.filtered = vec![];
         m.selected = None;
         let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
-        assert_eq!(
-            outcome,
-            ModalOutcome::Spawn {
-                host: "local".into(),
-                path: String::new(),
-            },
-        );
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.focused, Zone::Path);
+        // Path was reseeded from the test cwd in `mb()` (`/test/cwd`).
+        assert_eq!(m.path, "/test/cwd/");
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
+        // Host cleared so the dim `local` placeholder shows.
+        assert_eq!(m.host, "");
     }
 
     #[test]
@@ -2144,6 +2775,11 @@ mod tests {
         // failed" fallback path, exercised here for simplicity.
         assert_eq!(m.path, "/home/df/");
         assert_eq!(m.focused, Zone::Path);
+        // The remote $HOME is system-derived, not user-typed. Mark
+        // it auto-seeded so a follow-up `@`-into-host clears it
+        // before the SSH flow's `Enter on empty path → PrepareHost`
+        // gesture would otherwise smuggle a stale path through.
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
     }
 
     #[test]
@@ -2242,14 +2878,12 @@ mod tests {
         let runner = ScriptedRunner::new(vec![b"bin/\nREADME.md\n.hidden\nsrc/\n"]);
         let mut cache = HashMap::new();
         let out = remote_path_completions("/home/df/", &fs, &runner, &mut cache);
-        // Sorted; dotfile filtered (prefix is empty); is_dir gets `/`.
+        // Sorted; dotfile filtered (prefix is empty); files (`README.md`)
+        // are filtered too — spawn target is a working directory, not a
+        // file. Mirrors the local `scan_dir` behavior.
         assert_eq!(
             out,
-            vec![
-                "/home/df/README.md".to_string(),
-                "/home/df/bin/".to_string(),
-                "/home/df/src/".to_string(),
-            ],
+            vec!["/home/df/bin/".to_string(), "/home/df/src/".to_string(),],
         );
     }
 
@@ -2264,15 +2898,33 @@ mod tests {
     }
 
     #[test]
-    fn remote_completions_show_dotfiles_when_prefix_starts_with_dot() {
+    fn remote_completions_show_dot_dirs_when_prefix_starts_with_dot() {
         // The dot needs at least one trailing char; `/home/df/.` on
         // its own normalizes away (Path::file_name returns None on a
-        // bare `.`), matching the local-completion behavior.
+        // bare `.`), matching the local-completion behavior. Dot
+        // *files* (`.bashrc`) are still filtered because they're not
+        // directories — only dot *dirs* (`.config/`) survive.
         let fs = fake_fs();
         let runner = ScriptedRunner::new(vec![b".bashrc\n.config/\nREADME.md\n"]);
         let mut cache = HashMap::new();
-        let out = remote_path_completions("/home/df/.b", &fs, &runner, &mut cache);
-        assert_eq!(out, vec!["/home/df/.bashrc".to_string()]);
+        let out = remote_path_completions("/home/df/.c", &fs, &runner, &mut cache);
+        assert_eq!(out, vec!["/home/df/.config/".to_string()]);
+    }
+
+    /// Files in the listing must be filtered out regardless of how
+    /// well their basename matches the prefix. Pinning this here
+    /// because the dotfile / sort tests don't exercise the file
+    /// filter on its own.
+    #[test]
+    fn remote_completions_filters_out_files() {
+        let fs = fake_fs();
+        let runner = ScriptedRunner::new(vec![b"alpha.txt\nbeta/\ngamma.md\ndelta/\n"]);
+        let mut cache = HashMap::new();
+        let out = remote_path_completions("/home/df/", &fs, &runner, &mut cache);
+        assert_eq!(
+            out,
+            vec!["/home/df/beta/".to_string(), "/home/df/delta/".to_string()],
+        );
     }
 
     #[test]
@@ -2296,9 +2948,10 @@ mod tests {
     fn remote_completions_re_shells_when_user_crosses_a_slash() {
         // Listing `/home/df/`, then `/home/df/src/` should fire two
         // separate `list_dir` calls — different parent directories,
-        // distinct cache keys.
+        // distinct cache keys. Both responses are dirs so the
+        // file-filter doesn't drop them.
         let fs = fake_fs();
-        let runner = ScriptedRunner::new(vec![b"src/\n", b"main.rs\nlib.rs\n"]);
+        let runner = ScriptedRunner::new(vec![b"src/\n", b"build/\nlib/\n"]);
         let mut cache = HashMap::new();
 
         let _ = remote_path_completions("/home/df/", &fs, &runner, &mut cache);
@@ -2307,8 +2960,8 @@ mod tests {
         assert_eq!(
             out2,
             vec![
-                "/home/df/src/lib.rs".to_string(),
-                "/home/df/src/main.rs".to_string(),
+                "/home/df/src/build/".to_string(),
+                "/home/df/src/lib/".to_string(),
             ],
         );
     }

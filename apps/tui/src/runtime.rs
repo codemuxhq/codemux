@@ -58,7 +58,7 @@ use crate::bootstrap_worker::{
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
 use crate::log_tail::LogTail;
-use crate::spawn::{DirLister, ModalOutcome, SpawnMinibuffer};
+use crate::spawn::{DirLister, HOST_PLACEHOLDER, ModalOutcome, SpawnMinibuffer};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const NAV_PANE_WIDTH: u16 = 25;
@@ -305,7 +305,14 @@ pub fn run(
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
 
-    event_loop(&mut terminal, agents, nav_style, &config.bindings, log_tail)
+    event_loop(
+        &mut terminal,
+        agents,
+        nav_style,
+        &config.bindings,
+        log_tail,
+        initial_cwd,
+    )
 }
 
 fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16, log_strip: bool) -> (u16, u16) {
@@ -377,6 +384,7 @@ fn event_loop(
     mut nav_style: NavStyle,
     bindings: &Bindings,
     log_tail: Option<&LogTail>,
+    initial_cwd: &Path,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
@@ -673,7 +681,7 @@ fn event_loop(
                             let (rows, cols) =
                                 pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
                             spawn_counter += 1;
-                            if host == "local" {
+                            if host == HOST_PLACEHOLDER {
                                 spawn_ui = None;
                                 let label = format!("agent-{spawn_counter}");
                                 let cwd_path = if path.is_empty() {
@@ -813,7 +821,7 @@ fn event_loop(
                     KeyDispatch::Consume => {}
                     KeyDispatch::Exit => return Ok(()),
                     KeyDispatch::SpawnAgent => {
-                        spawn_ui = Some(SpawnMinibuffer::open());
+                        spawn_ui = Some(SpawnMinibuffer::open(initial_cwd));
                     }
                     KeyDispatch::FocusNext => {
                         focused = (focused + 1) % agents.len();
