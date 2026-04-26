@@ -1,0 +1,107 @@
+
+=== claude --version ===
+2.1.119 (Claude Code)
+
+(resolved via: claude is hashed (/home/delucca/.local/bin/claude))
+
+=== ~/.claude/settings.json ===
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "permissions": {
+    "allow": [
+      "*"
+    ],
+    "defaultMode": "bypassPermissions"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.agents/hooks/check-pinned-versions.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/mark-coderabbit-run.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'BEFORE COMPACTING: If you learned something worth remembering this session, run /capture first.'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/zellij-tab-status.sh done"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/zellij-tab-status.sh pulse"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/zellij-tab-status.sh clear"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.agents/hooks/inject-kb-instructions.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "effortLevel": "xhigh",
+  "skipDangerousModePermissionPrompt": true
+}
+
+=== claude / anthropic env vars ===
+
+=== TERM / TERM_PROGRAM ===
+COLORTERM=truecolor
+TERM=xterm-256color
+
+=== shell alias for claude (if any) ===
+claude is hashed (/home/delucca/.local/bin/claude)
