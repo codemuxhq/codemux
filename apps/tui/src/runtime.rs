@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use codemux_session::AgentTransport;
-use codemuxd_bootstrap::{PreparedHost, RemoteFs};
+use codemuxd_bootstrap::{PreparedHost, RealRunner, RemoteFs};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::{
@@ -54,7 +54,7 @@ use crate::bootstrap_worker::{
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
 use crate::log_tail::LogTail;
-use crate::spawn::{ModalOutcome, SpawnMinibuffer};
+use crate::spawn::{DirLister, ModalOutcome, SpawnMinibuffer};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const NAV_PANE_WIDTH: u16 = 25;
@@ -434,14 +434,35 @@ fn event_loop(
                             }
                         }
                         if let Some(ui) = spawn_ui.as_mut() {
-                            ui.unlock_for_remote_path(p.host.clone(), prepared.remote_home.clone());
+                            // Once unlocked, the modal sits in
+                            // PathMode::Remote and immediately
+                            // refreshes the wildmenu against the
+                            // remote `$HOME` — pass the live
+                            // ControlMaster (or fall back to Local
+                            // if RemoteFs::open failed) so the first
+                            // listing is real, not empty.
+                            let runner = RealRunner;
+                            let mut lister = match p.remote_fs.as_ref() {
+                                Some(fs) => DirLister::Remote {
+                                    fs,
+                                    runner: &runner,
+                                },
+                                None => DirLister::Local,
+                            };
+                            ui.unlock_for_remote_path(
+                                p.host.clone(),
+                                prepared.remote_home.clone(),
+                                &mut lister,
+                            );
                         }
                         p.prepared = Some(prepared);
                     }
                     Err(e) => {
                         tracing::error!(host = %p.host, "prepare failed: {e}");
                         if let Some(ui) = spawn_ui.as_mut() {
-                            ui.unlock_back_to_host();
+                            // Back-to-host refresh only touches Host
+                            // completions; Local lister is fine.
+                            ui.unlock_back_to_host(&mut DirLister::Local);
                         }
                         prepare = None;
                     }
@@ -593,7 +614,20 @@ fn event_loop(
                 }
 
                 if let Some(ui) = spawn_ui.as_mut() {
-                    match ui.handle(&key, &bindings.on_modal) {
+                    // Construct the per-keystroke `DirLister`: Remote
+                    // when there's a live `RemoteFs` (prepare done,
+                    // user is path-picking), Local otherwise. The
+                    // runner is zero-sized so allocating it inline
+                    // every tick is free.
+                    let runner = RealRunner;
+                    let mut lister = match prepare.as_ref().and_then(|p| p.remote_fs.as_ref()) {
+                        Some(fs) => DirLister::Remote {
+                            fs,
+                            runner: &runner,
+                        },
+                        None => DirLister::Local,
+                    };
+                    match ui.handle(&key, &bindings.on_modal, &mut lister) {
                         ModalOutcome::None => {}
                         ModalOutcome::Cancel => {
                             // Esc when not locked: dismiss the modal

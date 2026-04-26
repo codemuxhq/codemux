@@ -71,7 +71,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use codemuxd_bootstrap::{DirEntry, Stage};
+use codemuxd_bootstrap::{CommandRunner, DirEntry, RemoteFs, Stage};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -150,6 +150,26 @@ pub enum PathMode {
     },
 }
 
+/// Per-keystroke I/O surface the runtime hands the modal so the path
+/// zone can complete against either the local filesystem or a live
+/// SSH `ControlMaster`. Borrow-only: the cache the [`Remote`] arm
+/// reads/writes lives inside [`PathMode::Remote`] on the modal
+/// itself, while the [`RemoteFs`] is owned by `runtime::PendingPrepare`
+/// (its `Drop` tears down the ssh subprocess).
+///
+/// We deliberately use an enum rather than `Box<dyn DirLister>` —
+/// this is constructed on every keystroke into the spawn modal, and
+/// the `Box` allocation would be unnecessary churn.
+///
+/// [`Remote`]: DirLister::Remote
+pub enum DirLister<'a> {
+    Local,
+    Remote {
+        fs: &'a RemoteFs,
+        runner: &'a dyn CommandRunner,
+    },
+}
+
 /// Pure render state for the path-zone-locked-during-bootstrap UI.
 /// The runtime sets this when it starts a prepare or attach worker
 /// and clears it via [`SpawnMinibuffer::unlock_for_remote_path`] /
@@ -220,7 +240,9 @@ impl SpawnMinibuffer {
             path_mode: PathMode::Local,
             bootstrap_view: None,
         };
-        m.refresh();
+        // Initial wildmenu lists local cwd entries — modal opens in
+        // PathMode::Local so the lister doesn't matter.
+        m.refresh(&mut DirLister::Local);
         m
     }
 
@@ -229,9 +251,6 @@ impl SpawnMinibuffer {
     /// twice in a row replaces the existing view (e.g. switching from
     /// the prepare lock to the attach lock once the user picks a
     /// remote folder).
-    //
-    // Reserved for the runtime wiring change in Step 6.
-    #[allow(dead_code)]
     pub fn lock_for_bootstrap(&mut self, host: String, started_at: Instant) {
         self.bootstrap_view = Some(BootstrapView {
             host,
@@ -243,9 +262,6 @@ impl SpawnMinibuffer {
     /// Update the rendered stage label. Called by the runtime when
     /// the worker emits a `Stage(_)` event. No-op if the path zone
     /// is not locked (the runtime has already cancelled).
-    //
-    // Reserved for the runtime wiring change in Step 6.
-    #[allow(dead_code)]
     pub fn set_bootstrap_stage(&mut self, stage: Stage) {
         if let Some(view) = self.bootstrap_view.as_mut() {
             view.current_stage = Some(stage);
@@ -257,15 +273,16 @@ impl SpawnMinibuffer {
     /// scan the remote filesystem (Step 7 wires the lister); seeds
     /// the path field with the remote `$HOME` so the user can edit
     /// from there. The host text is preserved.
-    //
-    // Reserved for the runtime wiring change in Step 6.
-    #[allow(dead_code)]
-    pub fn unlock_for_remote_path(&mut self, _host: String, remote_home: PathBuf) {
+    pub fn unlock_for_remote_path(
+        &mut self,
+        _host: String,
+        remote_home: PathBuf,
+        lister: &mut DirLister<'_>,
+    ) {
         self.bootstrap_view = None;
         // Seed the path zone with the remote $HOME as a trailing-slash
-        // path so the wildmenu (once Step 7 is in) lists $HOME's
-        // entries directly. The user can edit forward or backspace
-        // up to /.
+        // path so the wildmenu lists $HOME's entries directly. The
+        // user can edit forward or backspace up to /.
         let home_str = remote_home.to_string_lossy();
         self.path = if home_str.ends_with('/') {
             home_str.into_owned()
@@ -277,24 +294,26 @@ impl SpawnMinibuffer {
             cache: HashMap::new(),
         };
         self.focused = Zone::Path;
-        self.refresh();
+        self.refresh(lister);
     }
 
     /// Unlock the path zone back to the host-pick state. Used on
     /// cancel or on a prepare error. Preserves the host text so the
     /// user can edit it; resets `path_mode` to `Local` because the
     /// remote home is no longer trustworthy.
-    //
-    // Reserved for the runtime wiring change in Step 6.
-    #[allow(dead_code)]
-    pub fn unlock_back_to_host(&mut self) {
+    pub fn unlock_back_to_host(&mut self, lister: &mut DirLister<'_>) {
         self.bootstrap_view = None;
         self.path_mode = PathMode::Local;
         self.focused = Zone::Host;
-        self.refresh();
+        self.refresh(lister);
     }
 
-    pub fn handle(&mut self, key: &KeyEvent, bindings: &ModalBindings) -> ModalOutcome {
+    pub fn handle(
+        &mut self,
+        key: &KeyEvent,
+        bindings: &ModalBindings,
+        lister: &mut DirLister<'_>,
+    ) -> ModalOutcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return ModalOutcome::None;
         }
@@ -328,9 +347,9 @@ impl SpawnMinibuffer {
             return match action {
                 ModalAction::Cancel => ModalOutcome::Cancel,
                 ModalAction::Confirm => self.confirm(),
-                ModalAction::SwapField => self.swap_field_outcome(),
+                ModalAction::SwapField => self.swap_field_outcome(lister),
                 ModalAction::SwapToHost => {
-                    self.enter_host_zone();
+                    self.enter_host_zone(lister);
                     ModalOutcome::None
                 }
                 ModalAction::NextCompletion => {
@@ -347,12 +366,12 @@ impl SpawnMinibuffer {
         match key.code {
             KeyCode::Char(c) => {
                 self.current_field_mut().push(c);
-                self.refresh();
+                self.refresh(lister);
                 ModalOutcome::None
             }
             KeyCode::Backspace => {
                 self.current_field_mut().pop();
-                self.refresh();
+                self.refresh(lister);
                 ModalOutcome::None
             }
             _ => ModalOutcome::None,
@@ -365,12 +384,12 @@ impl SpawnMinibuffer {
     ///
     /// "local" / empty host stays in pure-local mode — no prepare to
     /// run, the user just hasn't typed a path yet.
-    fn swap_field_outcome(&mut self) -> ModalOutcome {
+    fn swap_field_outcome(&mut self, lister: &mut DirLister<'_>) -> ModalOutcome {
         if self.focused == Zone::Host && self.is_remote_host_committed() {
             let host = self.resolved_host();
             return ModalOutcome::PrepareHost { host };
         }
-        self.toggle_zone();
+        self.toggle_zone(lister);
         ModalOutcome::None
     }
 
@@ -438,12 +457,12 @@ impl SpawnMinibuffer {
         }
     }
 
-    fn toggle_zone(&mut self) {
+    fn toggle_zone(&mut self, lister: &mut DirLister<'_>) {
         match self.focused {
-            Zone::Path => self.enter_host_zone(),
+            Zone::Path => self.enter_host_zone(lister),
             Zone::Host => {
                 self.focused = Zone::Path;
-                self.refresh();
+                self.refresh(lister);
             }
         }
     }
@@ -456,9 +475,9 @@ impl SpawnMinibuffer {
     /// user has expressed intent makes `@ Enter` silently spawn on
     /// whichever host happens to sort first, with the prompt showing that
     /// host while the user thinks they're just opening the picker.
-    fn enter_host_zone(&mut self) {
+    fn enter_host_zone(&mut self, lister: &mut DirLister<'_>) {
         self.focused = Zone::Host;
-        self.refresh();
+        self.refresh(lister);
     }
 
     fn current_field(&self) -> &str {
@@ -499,16 +518,24 @@ impl SpawnMinibuffer {
         });
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self, lister: &mut DirLister<'_>) {
         self.filtered = match self.focused {
-            Zone::Path => match &self.path_mode {
+            Zone::Path => match &mut self.path_mode {
                 PathMode::Local => path_completions(&self.path),
-                // Remote autocomplete arrives in Step 7 (DirLister
-                // injection). Until then, the wildmenu is empty in
-                // Remote mode — the dim hint in `wildmenu_view`
-                // makes that visible to the user instead of silently
-                // showing local entries that don't exist on the host.
-                PathMode::Remote { .. } => Vec::new(),
+                PathMode::Remote { cache, .. } => match lister {
+                    DirLister::Local => {
+                        // Mode mismatch: modal is in Remote mode but
+                        // the runtime supplied a Local lister
+                        // (RemoteFs::open failed earlier or the
+                        // prepare slot was dropped). Render an empty
+                        // wildmenu — the user can still type a
+                        // literal remote path and hit Enter.
+                        Vec::new()
+                    }
+                    DirLister::Remote { fs, runner } => {
+                        remote_path_completions(&self.path, fs, *runner, cache)
+                    }
+                },
             },
             Zone::Host => host_completions(&self.host, &self.ssh_hosts),
         };
@@ -830,6 +857,72 @@ fn path_completions(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Remote path completion. Same input/output contract as
+/// [`path_completions`] but the underlying directory scan goes
+/// through [`RemoteFs::list_dir`] (a single `ssh -S {socket} -- ls`
+/// over the live `ControlMaster`). The cache is keyed by parent
+/// directory so the typical user pattern — "land at a directory, then
+/// narrow with a prefix" — re-shells once and filters in-process for
+/// every subsequent keystroke.
+///
+/// Errors from `list_dir` (network blip, permission denied, weird
+/// chars in the path) degrade silently to an empty wildmenu, mirroring
+/// the local [`scan_dir`] policy. A `tracing::debug!` event is emitted
+/// so `RUST_LOG=codemux=debug` reveals what went wrong.
+fn remote_path_completions(
+    input: &str,
+    fs: &RemoteFs,
+    runner: &dyn CommandRunner,
+    cache: &mut HashMap<PathBuf, Vec<DirEntry>>,
+) -> Vec<String> {
+    let (dir, prefix) = split_path_for_completion(input);
+    // Cache lookup. On miss we shell out and insert. We do the
+    // contains-then-insert dance instead of `entry().or_insert_with`
+    // because the initializer is fallible (network errors). On
+    // failure return early — empty wildmenu — rather than poisoning
+    // the cache with a placeholder.
+    if !cache.contains_key(&dir) {
+        match fs.list_dir(runner, &dir) {
+            Ok(listed) => {
+                cache.insert(dir.clone(), listed);
+            }
+            Err(e) => {
+                tracing::debug!(dir = %dir.display(), error = %e, "remote list_dir failed");
+                return Vec::new();
+            }
+        }
+    }
+    let Some(entries) = cache.get(&dir) else {
+        // Unreachable: we just inserted (or it was already there).
+        // Bail rather than panic so a future refactor can't ship a
+        // crash if this invariant breaks.
+        return Vec::new();
+    };
+    let dir_str = dir.to_string_lossy();
+    let mut out: Vec<String> = entries
+        .iter()
+        .filter(|e| e.name.starts_with(&prefix))
+        .filter(|e| !e.name.starts_with('.') || prefix.starts_with('.'))
+        .map(|e| {
+            let name = if e.is_dir {
+                format!("{}/", e.name)
+            } else {
+                e.name.clone()
+            };
+            if dir_str == "." && !input.starts_with("./") {
+                name
+            } else if dir_str.ends_with('/') {
+                format!("{dir_str}{name}")
+            } else {
+                format!("{dir_str}/{name}")
+            }
+        })
+        .take(MAX_COMPLETIONS)
+        .collect();
+    out.sort();
+    out
+}
+
 /// Split a partial path into (parent dir, basename prefix) for completion.
 fn split_path_for_completion(input: &str) -> (PathBuf, String) {
     if input.is_empty() {
@@ -979,6 +1072,13 @@ mod tests {
         ModalBindings::default()
     }
 
+    /// Default lister for the vast majority of tests, none of which
+    /// touch the remote-completion path. The remote variant is
+    /// exercised by dedicated tests further down.
+    fn local() -> DirLister<'static> {
+        DirLister::Local
+    }
+
     /// Construct a minibuffer with controlled state, bypassing `open()` so
     /// tests are deterministic regardless of the real cwd / `~/.ssh/config`.
     fn mb(host: &str, path: &str, focused: Zone, ssh_hosts: &[&str]) -> SpawnMinibuffer {
@@ -992,14 +1092,14 @@ mod tests {
             path_mode: PathMode::Local,
             bootstrap_view: None,
         };
-        m.refresh();
+        m.refresh(&mut local());
         m
     }
 
     #[test]
     fn ctrl_modified_keys_are_dropped() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        let outcome = m.handle(&ctrl(KeyCode::Char('b')), &b());
+        let outcome = m.handle(&ctrl(KeyCode::Char('b')), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.path, "/tmp");
     }
@@ -1007,13 +1107,16 @@ mod tests {
     #[test]
     fn esc_returns_cancel() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        assert_eq!(m.handle(&key(KeyCode::Esc), &b()), ModalOutcome::Cancel);
+        assert_eq!(
+            m.handle(&key(KeyCode::Esc), &b(), &mut local()),
+            ModalOutcome::Cancel
+        );
     }
 
     #[test]
     fn typing_a_char_appends_to_focused_zone() {
         let mut m = mb("", "/tm", Zone::Path, &[]);
-        m.handle(&key(KeyCode::Char('p')), &b());
+        m.handle(&key(KeyCode::Char('p')), &b(), &mut local());
         assert_eq!(m.path, "/tmp");
         assert_eq!(m.host, "");
     }
@@ -1021,7 +1124,7 @@ mod tests {
     #[test]
     fn backspace_pops_from_focused_zone() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        m.handle(&key(KeyCode::Backspace), &b());
+        m.handle(&key(KeyCode::Backspace), &b(), &mut local());
         assert_eq!(m.path, "/tm");
     }
 
@@ -1029,7 +1132,7 @@ mod tests {
     fn at_in_path_zone_jumps_to_host() {
         // No SSH hosts → no prefill; host stays empty.
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        m.handle(&key(KeyCode::Char('@')), &b());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         // The `@` was consumed, not appended to either field.
         assert_eq!(m.path, "/tmp");
@@ -1044,7 +1147,7 @@ mod tests {
         // `selected = None` so a stray Enter spawns local rather than
         // silently picking the first host.
         let mut m = mb("", "/tmp", Zone::Path, &["alpha", "bravo"]);
-        m.handle(&key(KeyCode::Char('@')), &b());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "");
         assert_eq!(m.filtered, vec!["alpha".to_string(), "bravo".to_string()]);
@@ -1054,7 +1157,7 @@ mod tests {
     #[test]
     fn at_does_not_overwrite_existing_host() {
         let mut m = mb("custom", "/tmp", Zone::Path, &["alpha"]);
-        m.handle(&key(KeyCode::Char('@')), &b());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "custom");
     }
@@ -1064,7 +1167,7 @@ mod tests {
         // The `@`-jump and Tab-toggle share entry semantics; both must
         // leave the host field empty so the user explicitly picks.
         let mut m = mb("", "/tmp", Zone::Path, &["devpod-1"]);
-        m.handle(&key(KeyCode::Tab), &b());
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "");
         assert_eq!(m.selected, None);
@@ -1077,7 +1180,7 @@ mod tests {
         // selection" rule only applies when the field is empty.
         let mut m = mb("", "/tmp", Zone::Host, &["devpod-go", "devpod-web"]);
         assert_eq!(m.selected, None);
-        m.handle(&key(KeyCode::Char('d')), &b());
+        m.handle(&key(KeyCode::Char('d')), &b(), &mut local());
         assert_eq!(m.host, "d");
         assert_eq!(
             m.filtered,
@@ -1093,7 +1196,7 @@ mod tests {
         // Enter.
         let mut m = mb("d", "/tmp", Zone::Host, &["devpod-go"]);
         assert_eq!(m.selected, Some(0));
-        m.handle(&key(KeyCode::Backspace), &b());
+        m.handle(&key(KeyCode::Backspace), &b(), &mut local());
         assert_eq!(m.host, "");
         assert_eq!(m.selected, None);
     }
@@ -1103,8 +1206,8 @@ mod tests {
         // `@` then `Enter` — the user opened the host picker but didn't
         // pick. Should spawn local, NOT the first SSH host.
         let mut m = mb("", "/work", Zone::Path, &["devpod-go", "devpod-web"]);
-        m.handle(&key(KeyCode::Char('@')), &b());
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1119,7 +1222,7 @@ mod tests {
         // Tab from Host with empty text is *not* a commit — there's
         // nothing to commit. It's a plain zone toggle.
         let mut m = mb("", "/tmp", Zone::Host, &[]);
-        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.focused, Zone::Path);
     }
@@ -1132,7 +1235,7 @@ mod tests {
         // re-render the spinner with the host name and the user can
         // see what they're waiting on.
         let mut m = mb("custom", "/tmp", Zone::Host, &[]);
-        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::PrepareHost {
@@ -1147,7 +1250,7 @@ mod tests {
         // The literal "local" sentinel is the local-spawn marker;
         // there's no remote to prepare. Tab toggles zones as before.
         let mut m = mb("local", "/tmp", Zone::Host, &[]);
-        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.focused, Zone::Path);
     }
@@ -1156,7 +1259,7 @@ mod tests {
     fn at_in_host_zone_is_a_literal_char() {
         // Important for `user@hostname` SSH targets.
         let mut m = mb("", "", Zone::Host, &[]);
-        m.handle(&key(KeyCode::Char('@')), &b());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "@");
     }
@@ -1164,9 +1267,9 @@ mod tests {
     #[test]
     fn tab_toggles_zones_in_both_directions() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        m.handle(&key(KeyCode::Tab), &b());
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
-        m.handle(&key(KeyCode::Tab), &b());
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(m.focused, Zone::Path);
     }
 
@@ -1176,7 +1279,7 @@ mod tests {
         // No wildmenu match → resolved values are the literal fields.
         m.filtered = vec![];
         m.selected = None;
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1198,7 +1301,7 @@ mod tests {
         let mut m = mb("devpod-go", "", Zone::Path, &["devpod-go"]);
         m.filtered = vec![];
         m.selected = None;
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1213,7 +1316,7 @@ mod tests {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
         m.filtered = vec!["/tmp/alpha".into(), "/tmp/beta".into()];
         m.selected = Some(1);
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1228,7 +1331,7 @@ mod tests {
         let mut m = mb("dev", "/work", Zone::Host, &["devpod-1", "devpod-2"]);
         // refresh() filtered "dev" against the seed.
         m.selected = Some(1);
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1243,7 +1346,7 @@ mod tests {
         let mut m = mb("custom-host", "/work", Zone::Path, &[]);
         m.filtered = vec![];
         m.selected = None;
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1259,12 +1362,12 @@ mod tests {
         // Empty field → no implicit selection. First Down advances from
         // None to Some(0), then it cycles normally with wrap-around.
         assert_eq!(m.selected, None);
-        m.handle(&key(KeyCode::Down), &b());
+        m.handle(&key(KeyCode::Down), &b(), &mut local());
         assert_eq!(m.selected, Some(0));
-        m.handle(&key(KeyCode::Down), &b());
+        m.handle(&key(KeyCode::Down), &b(), &mut local());
         assert_eq!(m.selected, Some(1));
-        m.handle(&key(KeyCode::Down), &b());
-        m.handle(&key(KeyCode::Down), &b());
+        m.handle(&key(KeyCode::Down), &b(), &mut local());
+        m.handle(&key(KeyCode::Down), &b(), &mut local());
         assert_eq!(m.selected, Some(0));
     }
 
@@ -1273,7 +1376,7 @@ mod tests {
         let mut m = mb("dev", "/tmp", Zone::Path, &["devpod-1", "devpod-2"]);
         // Path zone: filtered is path-derived (probably non-empty if /tmp exists,
         // empty otherwise — ignore here).
-        m.handle(&key(KeyCode::Tab), &b());
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         // Filtered now reflects the host pool, narrowed by "dev".
         assert_eq!(
@@ -1289,12 +1392,12 @@ mod tests {
         // fallback host.
         let mut m = mb("", "/work", Zone::Host, &["devpod-go", "devpod-web"]);
         for c in "unknown-host".chars() {
-            m.handle(&key(KeyCode::Char(c)), &b());
+            m.handle(&key(KeyCode::Char(c)), &b(), &mut local());
         }
         assert_eq!(m.host, "unknown-host");
         assert!(m.filtered.is_empty());
         assert_eq!(m.selected, None);
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1315,7 +1418,7 @@ mod tests {
         // Stage the wildmenu state as if "dev" had just been typed in
         // host before tabbing away — the production path does this
         // through `refresh()` on each keystroke.
-        m.handle(&key(KeyCode::Tab), &b());
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "dev");
         assert_eq!(
@@ -1512,7 +1615,7 @@ mod tests {
         // Spawn would have to pick a default cwd and the user can't
         // see what — so commit the host instead.
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::PrepareHost {
@@ -1528,7 +1631,7 @@ mod tests {
         let mut m = mb("", "", Zone::Host, &[]);
         m.filtered = vec![];
         m.selected = None;
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1544,7 +1647,7 @@ mod tests {
         // path: Enter from the Host zone with a non-empty path
         // skips the remote folder picker and spawns straight away.
         let mut m = mb("devpod-go", "/srv", Zone::Host, &["devpod-go"]);
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
@@ -1561,15 +1664,15 @@ mod tests {
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
 
-        let outcome = m.handle(&key(KeyCode::Char('x')), &b());
+        let outcome = m.handle(&key(KeyCode::Char('x')), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.host, "devpod-go");
         assert_eq!(m.path, "");
 
-        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
 
-        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
     }
 
@@ -1577,7 +1680,7 @@ mod tests {
     fn lock_for_bootstrap_with_esc_emits_cancel_bootstrap() {
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
-        let outcome = m.handle(&key(KeyCode::Esc), &b());
+        let outcome = m.handle(&key(KeyCode::Esc), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::CancelBootstrap);
     }
 
@@ -1587,7 +1690,7 @@ mod tests {
         // it's repurposed to "cancel and let me re-edit the host".
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
-        let outcome = m.handle(&key(KeyCode::Char('@')), &b());
+        let outcome = m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::CancelBootstrap);
     }
 
@@ -1613,7 +1716,7 @@ mod tests {
     fn unlock_back_to_host_preserves_host_text_and_clears_view() {
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
-        m.unlock_back_to_host();
+        m.unlock_back_to_host(&mut local());
         assert!(m.bootstrap_view.is_none());
         assert_eq!(m.host, "devpod-go");
         assert_eq!(m.focused, Zone::Host);
@@ -1624,12 +1727,13 @@ mod tests {
     fn unlock_for_remote_path_switches_path_mode_to_remote() {
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
-        m.unlock_for_remote_path("devpod-go".into(), PathBuf::from("/home/df"));
+        m.unlock_for_remote_path("devpod-go".into(), PathBuf::from("/home/df"), &mut local());
         assert!(m.bootstrap_view.is_none());
         assert!(matches!(m.path_mode, PathMode::Remote { .. }));
         // The path zone is seeded with the remote $HOME (with a
-        // trailing slash) so the wildmenu in Step 7 lists $HOME's
-        // entries directly.
+        // trailing slash); the wildmenu is empty when the supplied
+        // lister is Local — that's the runtime's "RemoteFs::open
+        // failed" fallback path, exercised here for simplicity.
         assert_eq!(m.path, "/home/df/");
         assert_eq!(m.focused, Zone::Path);
     }
@@ -1640,7 +1744,172 @@ mod tests {
         // root). Don't double-slash.
         let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
         m.lock_for_bootstrap("devpod-go".into(), Instant::now());
-        m.unlock_for_remote_path("devpod-go".into(), PathBuf::from("/"));
+        m.unlock_for_remote_path("devpod-go".into(), PathBuf::from("/"), &mut local());
         assert_eq!(m.path, "/");
+    }
+
+    // -- Step 7: remote completion + cache --
+    //
+    // These tests use a fake `RemoteFs` (constructed via the
+    // doc-hidden `for_test` ctor) plus a scripted `CommandRunner`
+    // that intercepts the `ssh -S {socket} -- ls` invocation. The
+    // tests exercise the cache layer in `remote_path_completions`
+    // directly; the integration with `refresh()` is implied by
+    // the existing host/path-zone tests that use `local()`.
+
+    use codemuxd_bootstrap::CommandOutput;
+    use std::sync::Mutex;
+
+    /// Records the args of every `run` call and returns scripted
+    /// outputs in FIFO order. Test fails on under-script (more calls
+    /// than scripted).
+    struct ScriptedRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+        responses: Mutex<Vec<std::io::Result<CommandOutput>>>,
+    }
+
+    impl ScriptedRunner {
+        fn new(stdouts: Vec<&[u8]>) -> Self {
+            let responses = stdouts
+                .into_iter()
+                .map(|s| {
+                    Ok(CommandOutput {
+                        status: 0,
+                        stdout: s.to_vec(),
+                        stderr: Vec::new(),
+                    })
+                })
+                .collect();
+            Self {
+                calls: Mutex::new(Vec::new()),
+                responses: Mutex::new(responses),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(&self, _program: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(args.iter().map(|s| (*s).to_string()).collect());
+            let mut responses = self.responses.lock().unwrap();
+            assert!(
+                !responses.is_empty(),
+                "ScriptedRunner exhausted — more `run` calls than scripted",
+            );
+            responses.remove(0)
+        }
+
+        fn spawn_detached(&self, _: &str, _: &[&str]) -> std::io::Result<std::process::Child> {
+            unreachable!("remote_path_completions never spawns detached subprocesses");
+        }
+    }
+
+    fn fake_fs() -> RemoteFs {
+        RemoteFs::for_test("devpod-go".into(), PathBuf::from("/tmp/codemux-test.sock"))
+    }
+
+    #[test]
+    fn remote_completions_populates_wildmenu_from_list_dir() {
+        let fs = fake_fs();
+        let runner = ScriptedRunner::new(vec![b"bin/\nREADME.md\n.hidden\nsrc/\n"]);
+        let mut cache = HashMap::new();
+        let out = remote_path_completions("/home/df/", &fs, &runner, &mut cache);
+        // Sorted; dotfile filtered (prefix is empty); is_dir gets `/`.
+        assert_eq!(
+            out,
+            vec![
+                "/home/df/README.md".to_string(),
+                "/home/df/bin/".to_string(),
+                "/home/df/src/".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn remote_completions_filters_by_basename_prefix() {
+        let fs = fake_fs();
+        let runner = ScriptedRunner::new(vec![b"bin/\nREADME.md\n.hidden\nsrc/\n"]);
+        let mut cache = HashMap::new();
+        let out = remote_path_completions("/home/df/s", &fs, &runner, &mut cache);
+        // Only the `s`-prefixed entry survives.
+        assert_eq!(out, vec!["/home/df/src/".to_string()]);
+    }
+
+    #[test]
+    fn remote_completions_show_dotfiles_when_prefix_starts_with_dot() {
+        // The dot needs at least one trailing char; `/home/df/.` on
+        // its own normalizes away (Path::file_name returns None on a
+        // bare `.`), matching the local-completion behavior.
+        let fs = fake_fs();
+        let runner = ScriptedRunner::new(vec![b".bashrc\n.config/\nREADME.md\n"]);
+        let mut cache = HashMap::new();
+        let out = remote_path_completions("/home/df/.b", &fs, &runner, &mut cache);
+        assert_eq!(out, vec!["/home/df/.bashrc".to_string()]);
+    }
+
+    #[test]
+    fn remote_completions_caches_listing_and_filters_in_process_on_narrow() {
+        // First call lists `/home/df/`, second narrows to `s` —
+        // the second call must NOT reach the runner because the
+        // entry list for `/home/df/` is already cached.
+        let fs = fake_fs();
+        let runner = ScriptedRunner::new(vec![b"bin/\nREADME.md\nsrc/\n"]);
+        let mut cache = HashMap::new();
+
+        let _ = remote_path_completions("/home/df/", &fs, &runner, &mut cache);
+        assert_eq!(runner.call_count(), 1);
+
+        let out2 = remote_path_completions("/home/df/s", &fs, &runner, &mut cache);
+        assert_eq!(runner.call_count(), 1, "narrow should hit cache");
+        assert_eq!(out2, vec!["/home/df/src/".to_string()]);
+    }
+
+    #[test]
+    fn remote_completions_re_shells_when_user_crosses_a_slash() {
+        // Listing `/home/df/`, then `/home/df/src/` should fire two
+        // separate `list_dir` calls — different parent directories,
+        // distinct cache keys.
+        let fs = fake_fs();
+        let runner = ScriptedRunner::new(vec![b"src/\n", b"main.rs\nlib.rs\n"]);
+        let mut cache = HashMap::new();
+
+        let _ = remote_path_completions("/home/df/", &fs, &runner, &mut cache);
+        let out2 = remote_path_completions("/home/df/src/", &fs, &runner, &mut cache);
+        assert_eq!(runner.call_count(), 2);
+        assert_eq!(
+            out2,
+            vec![
+                "/home/df/src/lib.rs".to_string(),
+                "/home/df/src/main.rs".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn remote_completions_returns_empty_on_list_dir_error() {
+        // ScriptedRunner that errors immediately on first call.
+        let fs = fake_fs();
+        let runner = ScriptedRunner {
+            calls: Mutex::new(Vec::new()),
+            responses: Mutex::new(vec![Err(std::io::Error::other("network down"))]),
+        };
+        let mut cache = HashMap::new();
+        let out = remote_path_completions("/home/df/", &fs, &runner, &mut cache);
+        assert!(
+            out.is_empty(),
+            "list_dir failure must degrade to empty wildmenu"
+        );
+        // The cache must NOT have a stale empty entry — a future
+        // retry should re-attempt the network.
+        assert!(
+            cache.is_empty(),
+            "failed list_dir must not poison the cache"
+        );
     }
 }

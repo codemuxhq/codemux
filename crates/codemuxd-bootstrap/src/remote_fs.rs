@@ -272,6 +272,29 @@ impl RemoteFs {
         &self.host
     }
 
+    /// Construct a [`RemoteFs`] without spawning the ssh master.
+    /// Test-only — production paths must use [`Self::open`].
+    ///
+    /// The returned value behaves like a real `RemoteFs` for
+    /// [`Self::list_dir`] purposes (the `host` and `socket` end up in
+    /// the ssh argv) but [`Drop`] short-circuits because there's no
+    /// child to kill. Pair with a scripted `CommandRunner` so the
+    /// `ssh` invocation is intercepted and never runs.
+    ///
+    /// `#[doc(hidden)]` because this leaks the internal field shape;
+    /// not a stable API. The TUI's spawn-modal tests (in a different
+    /// crate) need this entry point — `#[cfg(test)]` would limit it
+    /// to the defining crate, hence the visibility hack.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_test(host: String, socket: PathBuf) -> Self {
+        Self {
+            socket,
+            host,
+            child: None,
+        }
+    }
+
     /// List a remote directory, returning entries (names + is-dir
     /// flags). Reuses the master via `ssh -S {socket}` so each call
     /// pays only the master's per-message overhead (sub-100 ms typ).
