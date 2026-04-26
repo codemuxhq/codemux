@@ -22,8 +22,14 @@
 //!   `Include config.d/*` work out of the box. Empty host → spawns locally.
 //!
 //! Zone navigation:
-//! - `@` typed in the path zone jumps the cursor to the host zone.
-//! - `Tab` toggles zones in either direction.
+//! - `@` typed in the path zone jumps the cursor to the host zone. The
+//!   only way to cross from path to host — `Tab` in the path zone is
+//!   reserved for completion (see below).
+//! - `Tab` in the path zone applies the highlighted wildmenu candidate to
+//!   the path field (autocomplete). No-op when nothing is selected.
+//! - `Tab` in the host zone with non-empty non-"local" text commits the
+//!   host (emits `PrepareHost`); with empty / "local" text it switches
+//!   focus to the path zone.
 //! - `@` typed in the host zone is a literal char (`user@hostname` works).
 //! - `Down` / `Up` move within the wildmenu. `Enter` spawns using the
 //!   highlighted candidate's value if any, otherwise the literal text.
@@ -404,19 +410,48 @@ impl SpawnMinibuffer {
         }
     }
 
-    /// Tab from host zone with non-empty non-"local" host commits the
-    /// host: emit `PrepareHost` so the runtime can start the prepare
-    /// worker. Tab in any other state just toggles zones.
-    ///
-    /// "local" / empty host stays in pure-local mode — no prepare to
-    /// run, the user just hasn't typed a path yet.
+    /// Tab dispatch. Behavior depends on the focused zone:
+    /// - **Path zone** → apply the highlighted wildmenu candidate to the
+    ///   path field (autocomplete). Never crosses into the host zone —
+    ///   only `@` does that. Reasoning: `@` is the mnemonic for "I'm
+    ///   specifying a host"; Tab in a path field should mean "complete
+    ///   what I just typed", not silently jump out of the field.
+    /// - **Host zone with non-empty non-"local" text** → emit
+    ///   [`ModalOutcome::PrepareHost`] so the runtime can start the
+    ///   prepare worker.
+    /// - **Host zone otherwise (empty or "local")** → switch focus to
+    ///   the path zone. There's no host to commit, so this is just a
+    ///   plain zone toggle.
     fn swap_field_outcome(&mut self, lister: &mut DirLister<'_>) -> ModalOutcome {
-        if self.focused == Zone::Host && self.is_remote_host_committed() {
-            let host = self.commit_resolved_host();
-            return ModalOutcome::PrepareHost { host };
+        match self.focused {
+            Zone::Host if self.is_remote_host_committed() => ModalOutcome::PrepareHost {
+                host: self.commit_resolved_host(),
+            },
+            Zone::Host => {
+                self.focused = Zone::Path;
+                self.refresh(lister);
+                ModalOutcome::None
+            }
+            Zone::Path => {
+                self.apply_path_completion(lister);
+                ModalOutcome::None
+            }
         }
-        self.toggle_zone(lister);
-        ModalOutcome::None
+    }
+
+    /// Replace the path field with the highlighted wildmenu candidate
+    /// and refresh so the wildmenu shows entries inside the new
+    /// directory (typical when the candidate is a directory ending in
+    /// `/`). No-op when nothing is selected — the user can hit Down
+    /// to start cycling, or just type a prefix which auto-highlights
+    /// the first match.
+    fn apply_path_completion(&mut self, lister: &mut DirLister<'_>) {
+        if let Some(idx) = self.selected
+            && let Some(candidate) = self.filtered.get(idx).cloned()
+        {
+            self.path = candidate;
+            self.refresh(lister);
+        }
     }
 
     /// Whether the host field (or its highlighted candidate) names a
@@ -501,16 +536,6 @@ impl SpawnMinibuffer {
             (Zone::Host, Some(h)) => (h, self.path.clone()),
             (Zone::Path, Some(p)) => (self.host.clone(), p),
             (_, None) => (self.host.clone(), self.path.clone()),
-        }
-    }
-
-    fn toggle_zone(&mut self, lister: &mut DirLister<'_>) {
-        match self.focused {
-            Zone::Path => self.enter_host_zone(lister),
-            Zone::Host => {
-                self.focused = Zone::Path;
-                self.refresh(lister);
-            }
         }
     }
 
@@ -801,13 +826,24 @@ impl SpawnMinibuffer {
             true,
         ));
 
-        let hint = format!(
-            "  [{} toggle · {} pick · {} spawn · {} cancel]",
-            bindings.binding_for(ModalAction::SwapField),
-            bindings.binding_for(ModalAction::NextCompletion),
-            bindings.binding_for(ModalAction::Confirm),
-            bindings.binding_for(ModalAction::Cancel),
-        );
+        // Hint reflects what `Tab` does in the focused zone — different
+        // semantics per zone now that path-Tab is autocomplete and
+        // host-Tab commits-or-switches. `@` is also only meaningful in
+        // the path zone (literal char in the host zone), so it shows up
+        // in the path-zone hint only.
+        let tab = bindings.binding_for(ModalAction::SwapField);
+        let pick = bindings.binding_for(ModalAction::NextCompletion);
+        let spawn = bindings.binding_for(ModalAction::Confirm);
+        let cancel = bindings.binding_for(ModalAction::Cancel);
+        let hint = match self.focused {
+            Zone::Path => format!(
+                "  [{tab} complete · {at} host · {pick} pick · {spawn} spawn · {cancel} cancel]",
+                at = bindings.binding_for(ModalAction::SwapToHost),
+            ),
+            Zone::Host => {
+                format!("  [{tab} next · {pick} pick · {spawn} spawn · {cancel} cancel]")
+            }
+        };
         spans.push(Span::styled(hint, placeholder_style));
         Paragraph::new(Line::from(spans))
     }
@@ -1276,17 +1312,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_to_host_does_not_prefill() {
-        // The `@`-jump and Tab-toggle share entry semantics; both must
-        // leave the host field empty so the user explicitly picks.
-        let mut m = mb("", "/tmp", Zone::Path, &["devpod-1"]);
-        m.handle(&key(KeyCode::Tab), &b(), &mut local());
-        assert_eq!(m.focused, Zone::Host);
-        assert_eq!(m.host, "");
-        assert_eq!(m.selected, None);
-    }
-
-    #[test]
     fn typing_in_host_zone_auto_selects_first_match() {
         // Once the user has expressed a prefix, the wildmenu's first match
         // is highlighted — that's normal autocomplete UX. The "no
@@ -1459,13 +1484,37 @@ mod tests {
         assert_eq!(m.host, "@");
     }
 
+    /// Tab in the path zone is autocomplete: it replaces the path
+    /// field with the highlighted wildmenu candidate and stays in the
+    /// path zone. This is the main UX change — Tab no longer crosses
+    /// into the host zone (only `@` does).
     #[test]
-    fn tab_toggles_zones_in_both_directions() {
+    fn tab_in_path_zone_applies_highlighted_candidate() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        m.handle(&key(KeyCode::Tab), &b(), &mut local());
-        assert_eq!(m.focused, Zone::Host);
-        m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        m.filtered = vec!["/tmp/alpha".into(), "/tmp/beta".into()];
+        m.selected = Some(1);
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.focused, Zone::Path, "must stay in the path zone");
+        assert_eq!(
+            m.path, "/tmp/beta",
+            "field must reflect the picked candidate"
+        );
+    }
+
+    /// Tab in the path zone with no selected candidate is a no-op:
+    /// path text and focus are unchanged. The user can hit Down to
+    /// start cycling, or just type a prefix which auto-highlights the
+    /// first match.
+    #[test]
+    fn tab_in_path_zone_with_no_selection_is_noop() {
+        let mut m = mb("", "/tmp", Zone::Path, &[]);
+        m.filtered = vec!["/tmp/alpha".into()];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.focused, Zone::Path);
+        assert_eq!(m.path, "/tmp", "field must be unchanged");
     }
 
     #[test]
@@ -1567,13 +1616,18 @@ mod tests {
     }
 
     #[test]
-    fn toggling_zone_refreshes_wildmenu_to_new_pool() {
+    fn at_into_host_zone_refreshes_wildmenu_to_host_pool() {
+        // The path zone has its own (empty here) wildmenu of path
+        // candidates. Pressing `@` jumps focus to the host zone, which
+        // re-runs the filter against the SSH pool. Note: `@` clears any
+        // host text the user previously typed (per `enter_host_zone`'s
+        // semantics — empty-by-default), so the wildmenu shows the full
+        // pool.
         let mut m = mb("dev", "/tmp", Zone::Path, &["devpod-1", "devpod-2"]);
-        // Path zone: filtered is path-derived (probably non-empty if /tmp exists,
-        // empty otherwise — ignore here).
-        m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
-        // Filtered now reflects the host pool, narrowed by "dev".
+        // Existing host text is preserved by `@` (covered by
+        // `at_does_not_overwrite_existing_host`); narrows the pool.
         assert_eq!(
             m.filtered,
             vec!["devpod-1".to_string(), "devpod-2".to_string()]
@@ -1603,17 +1657,15 @@ mod tests {
     }
 
     #[test]
-    fn toggling_back_to_host_preserves_prefix_and_re_highlights_first_match() {
-        // From Path zone, Tab to Host preserves any host text the user
-        // had typed earlier and re-narrows the wildmenu against it,
-        // re-highlighting the first match. Tab from a non-empty host
-        // commits (PrepareHost), which is covered by a separate test
-        // — this one drives the Path→Host direction.
+    fn at_back_to_host_preserves_prefix_and_re_highlights_first_match() {
+        // `@` in the path zone preserves any host text the user typed
+        // earlier and re-narrows the wildmenu against it, re-highlighting
+        // the first match. (Tab from a non-empty host zone commits via
+        // PrepareHost — covered by a separate test. This one drives the
+        // Path→Host direction, which after the Tab-UX change is the only
+        // job of `@`.)
         let mut m = mb("dev", "/tmp", Zone::Path, &["devpod-go", "devpod-web"]);
-        // Stage the wildmenu state as if "dev" had just been typed in
-        // host before tabbing away — the production path does this
-        // through `refresh()` on each keystroke.
-        m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "dev");
         assert_eq!(

@@ -35,7 +35,7 @@ use std::thread;
 
 use codemux_session::AgentTransport;
 use codemuxd_bootstrap::{
-    self, AttachConfig, CommandOutput, CommandRunner, PreparedHost, RealRunner, Stage,
+    self, AttachConfig, CommandOutput, CommandRunner, PreparedHost, RealRunner, RemoteFs, Stage,
     attach_agent, default_local_socket_dir, prepare_remote,
 };
 use crossbeam_channel::{Receiver, unbounded};
@@ -57,11 +57,28 @@ pub enum PrepareEvent {
     /// (`VersionProbe`, `TarballStage`, `Scp`, `RemoteBuild`); the
     /// fast path that hits a cached host emits only `VersionProbe`.
     Stage(Stage),
-    /// Prepare finished — `Ok(prepared)` carries the remote `$HOME`
-    /// for the modal to seed remote-path autocomplete; `Err` flips
-    /// the modal status row to a stage-tagged error and unlocks back
-    /// to the host zone.
-    Done(Result<PreparedHost, codemuxd_bootstrap::Error>),
+    /// Prepare finished. `Ok` carries a [`PrepareSuccess`] (named
+    /// fields beat a tuple so the call site reads as
+    /// `prepared.host.remote_home` / `prepared.fs` rather than
+    /// positional `.0` / `.1`); `Err` flips the modal status row to a
+    /// stage-tagged error and unlocks back to the host zone.
+    Done(Result<PrepareSuccess, codemuxd_bootstrap::Error>),
+}
+
+/// Success payload of [`PrepareEvent::Done`]. `prepared` is the
+/// [`PreparedHost`] returned by [`prepare_remote`] (carries the remote
+/// `$HOME` so the modal can seed remote-path autocomplete). `fs` is the
+/// ssh `ControlMaster` the worker opened immediately after the
+/// bootstrap stages succeeded so the main thread isn't blocked on a
+/// synchronous [`RemoteFs::open`] during the post-`Done` drain (which
+/// would freeze the spinner for cached hosts where prepare returns in
+/// <100 ms). `None` means [`RemoteFs::open`] failed; the modal then
+/// degrades to literal-path mode (the wildmenu stays empty but Enter
+/// still spawns at the typed path).
+#[derive(Debug)]
+pub struct PrepareSuccess {
+    pub prepared: PreparedHost,
+    pub fs: Option<RemoteFs>,
 }
 
 /// Stream of events emitted by an [`AttachHandle`]'s worker thread, in
@@ -189,7 +206,37 @@ pub fn start_prepare_with_runner(runner: Box<dyn CommandRunner>, host: String) -
         let on_stage = move |stage: Stage| {
             let _ = tx_for_stage.send(PrepareEvent::Stage(stage));
         };
-        let result = prepare_remote(&cancelable, &on_stage, &host);
+        let result = prepare_remote(&cancelable, &on_stage, &host).map(|prepared| {
+            // Open the ssh ControlMaster on the worker thread (rather
+            // than on the main thread after `Done` arrives) so the
+            // 100 ms – 3 s `RemoteFs::open` poll for the control socket
+            // doesn't block the runtime's render loop. On cached hosts
+            // `prepare_remote` finishes in <100 ms with only one
+            // `Stage(VersionProbe)` event; if `RemoteFs::open` runs on
+            // the main thread the spinner freezes on the pre-stage
+            // "starting…" frame for the entire open, then the modal
+            // jumps straight to remote-path mode. Doing it here keeps
+            // the spinner spinning on the last bootstrap stage label
+            // ("probing host" for cached hosts, "building remote
+            // daemon" for fresh hosts) until the open returns.
+            //
+            // Failure is non-fatal: log + degrade to literal-path mode
+            // (matches the runtime's prior behavior — the wildmenu is
+            // best-effort autocomplete, the path field is the source
+            // of truth and Enter still spawns at the typed path).
+            let fs = match RemoteFs::open(&host) {
+                Ok(fs) => Some(fs),
+                Err(e) => {
+                    tracing::warn!(
+                        host = %host,
+                        error = %e,
+                        "RemoteFs::open failed; modal will use literal-path mode",
+                    );
+                    None
+                }
+            };
+            PrepareSuccess { prepared, fs }
+        });
         let _ = tx.send(PrepareEvent::Done(result));
     });
     PrepareHandle { cancel, rx }

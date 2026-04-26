@@ -52,7 +52,8 @@ use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
 
 use crate::bootstrap_worker::{
-    AttachEvent, AttachHandle, PrepareEvent, PrepareHandle, start_attach, start_prepare,
+    AttachEvent, AttachHandle, PrepareEvent, PrepareHandle, PrepareSuccess, start_attach,
+    start_prepare,
 };
 use crate::config::Config;
 use crate::keymap::{Bindings, ModalAction, PopupAction, PrefixAction};
@@ -223,11 +224,14 @@ impl RuntimeAgent {
 /// In-flight prepare worker plus the data it produces. Owned by the
 /// runtime; the spawn modal only sees the prepare's progress through
 /// the [`Stage`] events the runtime forwards via
-/// [`SpawnMinibuffer::set_bootstrap_stage`]. On success we open
-/// [`RemoteFs`] synchronously (sub-second) so the modal's path-zone
-/// autocomplete (Step 7) has a live `ssh -S` `ControlMaster` to query;
-/// on `RemoteFs::open` failure the modal degrades to literal-path
-/// mode rather than blocking the user from typing a path.
+/// [`SpawnMinibuffer::set_bootstrap_stage`]. On success the worker
+/// hands us a [`RemoteFs`] alongside the [`PreparedHost`] (opened on
+/// the worker thread so the main render loop isn't blocked on a
+/// synchronous `ssh -M -N` poll); the modal's path-zone autocomplete
+/// then queries through the live `ssh -S` `ControlMaster`. On
+/// `RemoteFs::open` failure the worker hands us `None` and the modal
+/// degrades to literal-path mode rather than blocking the user from
+/// typing a path.
 struct PendingPrepare {
     host: String,
     handle: PrepareHandle,
@@ -236,10 +240,11 @@ struct PendingPrepare {
     /// `unlock_for_remote_path` and, later, build the `PreparedHost`
     /// the attach worker needs.
     prepared: Option<PreparedHost>,
-    /// `Some` if `RemoteFs::open` succeeded. Held on the runtime side
-    /// so the `ControlMaster`'s `Drop` cleans up when the prepare
-    /// slot is replaced or cancelled. The runtime hands a `&fs` /
-    /// `&runner` pair to the modal per keystroke via `DirLister`.
+    /// `Some` if the worker's `RemoteFs::open` call succeeded. Held
+    /// on the runtime side so the `ControlMaster`'s `Drop` cleans up
+    /// when the prepare slot is replaced or cancelled. The runtime
+    /// hands a `&fs` / `&runner` pair to the modal per keystroke via
+    /// `DirLister`.
     remote_fs: Option<RemoteFs>,
 }
 
@@ -399,7 +404,7 @@ fn event_loop(
         // the modal for a remote-folder pick (success) or unlock back
         // to the host zone with the error visible (failure).
         if let Some(p) = prepare.as_mut() {
-            let mut completion: Option<Result<PreparedHost, codemuxd_bootstrap::Error>> = None;
+            let mut completion = None;
             while let Some(event) = p.handle.try_recv() {
                 match event {
                     PrepareEvent::Stage(stage) => {
@@ -413,59 +418,50 @@ fn event_loop(
                     }
                 }
             }
-            if let Some(result) = completion {
-                match result {
-                    Ok(prepared) => {
-                        // Open the ControlMaster synchronously — it
-                        // takes a single SSH round-trip (sub-second).
-                        // If it fails, fall back to literal-path mode
-                        // rather than blocking the user from typing
-                        // a path; the wildmenu is autocomplete, the
-                        // path field is the source of truth.
-                        match RemoteFs::open(&p.host) {
-                            Ok(fs) => p.remote_fs = Some(fs),
-                            Err(e) => {
-                                tracing::warn!(
-                                    host = %p.host,
-                                    error = %e,
-                                    "RemoteFs::open failed; modal will use literal-path mode",
-                                );
-                            }
-                        }
-                        if let Some(ui) = spawn_ui.as_mut() {
-                            // Once unlocked, the modal sits in
-                            // PathMode::Remote and immediately
-                            // refreshes the wildmenu against the
-                            // remote `$HOME` — pass the live
-                            // ControlMaster (or fall back to Local
-                            // if RemoteFs::open failed) so the first
-                            // listing is real, not empty.
-                            let runner = RealRunner;
-                            let mut lister = match p.remote_fs.as_ref() {
-                                Some(fs) => DirLister::Remote {
-                                    fs,
-                                    runner: &runner,
-                                },
-                                None => DirLister::Local,
-                            };
-                            ui.unlock_for_remote_path(
-                                p.host.clone(),
-                                prepared.remote_home.clone(),
-                                &mut lister,
-                            );
-                        }
-                        p.prepared = Some(prepared);
+            match completion {
+                Some(Ok(PrepareSuccess { prepared, fs })) => {
+                    // The worker opened the ssh `ControlMaster` for us
+                    // (see `start_prepare_with_runner`) so the main
+                    // thread doesn't block on a synchronous
+                    // `RemoteFs::open` poll while the spinner is
+                    // locked. `fs == None` means the open failed; the
+                    // modal degrades to literal-path mode (logged in
+                    // the worker).
+                    if let Some(ui) = spawn_ui.as_mut() {
+                        // Once unlocked, the modal sits in
+                        // PathMode::Remote and immediately refreshes
+                        // the wildmenu against the remote `$HOME` —
+                        // pass the live ControlMaster (or fall back to
+                        // Local if RemoteFs::open failed in the
+                        // worker) so the first listing is real, not
+                        // empty.
+                        let runner = RealRunner;
+                        let mut lister = match fs.as_ref() {
+                            Some(rfs) => DirLister::Remote {
+                                fs: rfs,
+                                runner: &runner,
+                            },
+                            None => DirLister::Local,
+                        };
+                        ui.unlock_for_remote_path(
+                            p.host.clone(),
+                            prepared.remote_home.clone(),
+                            &mut lister,
+                        );
                     }
-                    Err(e) => {
-                        tracing::error!(host = %p.host, "prepare failed: {e}");
-                        if let Some(ui) = spawn_ui.as_mut() {
-                            // Pass the structured error; the modal formats
-                            // via `user_message()` at render time.
-                            ui.unlock_back_to_host(&mut DirLister::Local, Some(e));
-                        }
-                        prepare = None;
-                    }
+                    p.remote_fs = fs;
+                    p.prepared = Some(prepared);
                 }
+                Some(Err(e)) => {
+                    tracing::error!(host = %p.host, "prepare failed: {e}");
+                    if let Some(ui) = spawn_ui.as_mut() {
+                        // Pass the structured error; the modal formats
+                        // via `user_message()` at render time.
+                        ui.unlock_back_to_host(&mut DirLister::Local, Some(e));
+                    }
+                    prepare = None;
+                }
+                None => {}
             }
         }
 
