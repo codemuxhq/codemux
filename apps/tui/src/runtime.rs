@@ -491,7 +491,16 @@ fn event_loop(
 
                 if let Some(ui) = spawn_ui.as_mut() {
                     match ui.handle(&key, &bindings.on_modal) {
-                        ModalOutcome::None => {}
+                        // Step 6 wires the prepare worker + RemoteFs;
+                        // until then PrepareHost / CancelBootstrap are
+                        // unreachable (the modal can't enter the
+                        // locked state without the runtime calling
+                        // `lock_for_bootstrap`). Treat as no-op so the
+                        // modal stays usable if the variants ever
+                        // surface from a stale state.
+                        ModalOutcome::None
+                        | ModalOutcome::PrepareHost { .. }
+                        | ModalOutcome::CancelBootstrap => {}
                         ModalOutcome::Cancel => {
                             spawn_ui = None;
                         }

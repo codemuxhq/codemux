@@ -29,6 +29,29 @@
 //!   highlighted candidate's value if any, otherwise the literal text.
 //! - `Esc` cancels.
 //!
+//! ## Locked path zone (bootstrap in progress)
+//!
+//! When the user "commits" a remote host (Tab from host zone with text, or
+//! Enter on host with empty path), the runtime starts a prepare worker and
+//! locks the path zone via [`SpawnMinibuffer::lock_for_bootstrap`]. While
+//! locked, the path zone renders as a status row (spinner + stage label)
+//! and the only accepted keys are Cancel / `SwapToHost` — both produce a
+//! [`ModalOutcome::CancelBootstrap`] so the runtime can drop the worker
+//! and unlock back to the host zone.
+//!
+//! Once the prepare phase completes, the runtime calls
+//! [`SpawnMinibuffer::unlock_for_remote_path`] which switches the
+//! `path_mode` to [`PathMode::Remote`] and seeds the cursor at the remote
+//! `$HOME`. From there the user picks a remote folder and Enter triggers
+//! the attach phase.
+//!
+//! Path-mode and bootstrap-view are intentionally separate concerns: a
+//! single struct can be in `Local`/`Remote` x `Locked`/`Unlocked`. Locked +
+//! Remote happens during the second lock (attach phase, after the user
+//! picked a folder). The two-axis state stays a single struct because it's
+//! still one *shape* of UI — the comment below about converting to an enum
+//! dispatcher applies only when a second *shape* (e.g. phone view) lands.
+//!
 //! ## Future variants
 //!
 //! When a second spawn-UI variant earns its keep, convert `SpawnMinibuffer`
@@ -44,8 +67,11 @@
 //! otherwise. If the day comes, watch out for `large_enum_variant` clippy
 //! lint and `Box` the heavier variant if needed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use codemuxd_bootstrap::{DirEntry, Stage};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -71,7 +97,75 @@ const PATH_PLACEHOLDER: &str = "<cwd>";
 pub enum ModalOutcome {
     None,
     Cancel,
-    Spawn { host: String, path: String },
+    Spawn {
+        host: String,
+        path: String,
+    },
+    /// User committed a non-local host while the path zone is empty
+    /// (or while focused on the host zone with text). The runtime
+    /// should kick off the prepare phase and call
+    /// [`SpawnMinibuffer::lock_for_bootstrap`] to lock the path zone
+    /// with the in-progress status row.
+    PrepareHost {
+        host: String,
+    },
+    /// User pressed Cancel (Esc) or `SwapToHost` (`@`) while the path
+    /// zone was locked for bootstrap. The runtime should drop the
+    /// in-flight worker and call
+    /// [`SpawnMinibuffer::unlock_back_to_host`] (focus returns to host
+    /// zone with text preserved).
+    CancelBootstrap,
+}
+
+/// Path-zone backing source. `Local` is today's behavior (live
+/// `read_dir`). `Remote` is reached after the prepare phase completes
+/// and carries the remote `$HOME` for cursor seeding plus a
+/// directory-keyed cache so prefix-narrowing keystrokes don't re-shell.
+///
+/// The cache is owned by the modal because it's tied to the modal's
+/// lifetime: closing the modal drops the cache, opening it again
+/// starts fresh. The `RemoteFs` (the actual ssh `ControlMaster`
+/// subprocess) lives in the runtime alongside the prepare worker, and
+/// is borrowed into the modal as a `&mut DirLister` per keystroke once
+/// Step 7 wires the lister abstraction.
+//
+// Step 4 lands the variant + setters; Step 7 reads `remote_home` and
+// `cache` (the lister substitutes a `RemoteFs` lookup against the
+// cache, falling back to the network on miss). `allow(dead_code)` is
+// the bridge.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum PathMode {
+    Local,
+    Remote {
+        /// Remote `$HOME` returned from `prepare_remote`. Used to seed
+        /// the path-zone cursor and as the default scan root when the
+        /// path field is empty.
+        remote_home: PathBuf,
+        /// Directory → entries cache. Hit rate is high because the
+        /// user's typing pattern is mostly prefix-narrowing within one
+        /// directory; we re-shell only when the user crosses `/`.
+        /// Cleared when the modal closes.
+        cache: HashMap<PathBuf, Vec<DirEntry>>,
+    },
+}
+
+/// Pure render state for the path-zone-locked-during-bootstrap UI.
+/// The runtime sets this when it starts a prepare or attach worker
+/// and clears it via [`SpawnMinibuffer::unlock_for_remote_path`] /
+/// [`SpawnMinibuffer::unlock_back_to_host`] when the worker finishes.
+#[derive(Debug)]
+pub struct BootstrapView {
+    /// Host whose bootstrap is in flight. Rendered in the status row
+    /// so the user can confirm what they're waiting on.
+    pub host: String,
+    /// Most-recent stage reported by the worker, fed into the spinner
+    /// label. `None` until the very first event arrives (typically
+    /// within a few ms).
+    pub current_stage: Option<Stage>,
+    /// When the lock started. Drives the spinner phase via
+    /// [`spinner_frame`].
+    pub started_at: Instant,
 }
 
 /// Which zone of the structured prompt is currently accepting input.
@@ -94,6 +188,14 @@ pub struct SpawnMinibuffer {
     /// keystroke and on every zone toggle.
     filtered: Vec<String>,
     selected: Option<usize>,
+    /// Backing source for path-zone autocomplete. `Local` until the
+    /// runtime calls [`Self::unlock_for_remote_path`] with a
+    /// `PreparedHost`'s remote `$HOME`.
+    path_mode: PathMode,
+    /// `Some` while the path zone is locked for an in-flight bootstrap
+    /// worker (prepare or attach). Render data only — the worker
+    /// itself lives in the runtime.
+    bootstrap_view: Option<BootstrapView>,
 }
 
 impl SpawnMinibuffer {
@@ -115,14 +217,100 @@ impl SpawnMinibuffer {
             ssh_hosts: load_ssh_hosts(),
             filtered: Vec::new(),
             selected: None,
+            path_mode: PathMode::Local,
+            bootstrap_view: None,
         };
         m.refresh();
         m
     }
 
+    /// Lock the path zone with a spinner + stage label while the
+    /// runtime drives a prepare or attach worker. Idempotent — calling
+    /// twice in a row replaces the existing view (e.g. switching from
+    /// the prepare lock to the attach lock once the user picks a
+    /// remote folder).
+    //
+    // Reserved for the runtime wiring change in Step 6.
+    #[allow(dead_code)]
+    pub fn lock_for_bootstrap(&mut self, host: String, started_at: Instant) {
+        self.bootstrap_view = Some(BootstrapView {
+            host,
+            current_stage: None,
+            started_at,
+        });
+    }
+
+    /// Update the rendered stage label. Called by the runtime when
+    /// the worker emits a `Stage(_)` event. No-op if the path zone
+    /// is not locked (the runtime has already cancelled).
+    //
+    // Reserved for the runtime wiring change in Step 6.
+    #[allow(dead_code)]
+    pub fn set_bootstrap_stage(&mut self, stage: Stage) {
+        if let Some(view) = self.bootstrap_view.as_mut() {
+            view.current_stage = Some(stage);
+        }
+    }
+
+    /// Unlock the path zone after a successful prepare. Switches the
+    /// path mode to [`PathMode::Remote`] so subsequent keystrokes
+    /// scan the remote filesystem (Step 7 wires the lister); seeds
+    /// the path field with the remote `$HOME` so the user can edit
+    /// from there. The host text is preserved.
+    //
+    // Reserved for the runtime wiring change in Step 6.
+    #[allow(dead_code)]
+    pub fn unlock_for_remote_path(&mut self, _host: String, remote_home: PathBuf) {
+        self.bootstrap_view = None;
+        // Seed the path zone with the remote $HOME as a trailing-slash
+        // path so the wildmenu (once Step 7 is in) lists $HOME's
+        // entries directly. The user can edit forward or backspace
+        // up to /.
+        let home_str = remote_home.to_string_lossy();
+        self.path = if home_str.ends_with('/') {
+            home_str.into_owned()
+        } else {
+            format!("{home_str}/")
+        };
+        self.path_mode = PathMode::Remote {
+            remote_home,
+            cache: HashMap::new(),
+        };
+        self.focused = Zone::Path;
+        self.refresh();
+    }
+
+    /// Unlock the path zone back to the host-pick state. Used on
+    /// cancel or on a prepare error. Preserves the host text so the
+    /// user can edit it; resets `path_mode` to `Local` because the
+    /// remote home is no longer trustworthy.
+    //
+    // Reserved for the runtime wiring change in Step 6.
+    #[allow(dead_code)]
+    pub fn unlock_back_to_host(&mut self) {
+        self.bootstrap_view = None;
+        self.path_mode = PathMode::Local;
+        self.focused = Zone::Host;
+        self.refresh();
+    }
+
     pub fn handle(&mut self, key: &KeyEvent, bindings: &ModalBindings) -> ModalOutcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return ModalOutcome::None;
+        }
+
+        // Path zone locked by an in-flight bootstrap. Only Cancel and
+        // SwapToHost are accepted; both produce CancelBootstrap so the
+        // runtime can drop the worker and unlock back to the host
+        // zone (with text preserved). Every other key is dropped to
+        // make the lock obvious to the user.
+        if self.bootstrap_view.is_some() {
+            return match bindings.lookup(key) {
+                Some(ModalAction::Cancel | ModalAction::SwapToHost) => {
+                    ModalOutcome::CancelBootstrap
+                }
+                _ => ModalOutcome::None,
+            };
         }
 
         // SwapToHost (`@`) is dual-purpose: an action in the path zone
@@ -140,10 +328,7 @@ impl SpawnMinibuffer {
             return match action {
                 ModalAction::Cancel => ModalOutcome::Cancel,
                 ModalAction::Confirm => self.confirm(),
-                ModalAction::SwapField => {
-                    self.toggle_zone();
-                    ModalOutcome::None
-                }
+                ModalAction::SwapField => self.swap_field_outcome(),
                 ModalAction::SwapToHost => {
                     self.enter_host_zone();
                     ModalOutcome::None
@@ -174,7 +359,56 @@ impl SpawnMinibuffer {
         }
     }
 
+    /// Tab from host zone with non-empty non-"local" host commits the
+    /// host: emit `PrepareHost` so the runtime can start the prepare
+    /// worker. Tab in any other state just toggles zones.
+    ///
+    /// "local" / empty host stays in pure-local mode — no prepare to
+    /// run, the user just hasn't typed a path yet.
+    fn swap_field_outcome(&mut self) -> ModalOutcome {
+        if self.focused == Zone::Host && self.is_remote_host_committed() {
+            let host = self.resolved_host();
+            return ModalOutcome::PrepareHost { host };
+        }
+        self.toggle_zone();
+        ModalOutcome::None
+    }
+
+    /// Whether the host field (or its highlighted candidate) names a
+    /// remote SSH host. Empty / "local" / whitespace are local.
+    fn is_remote_host_committed(&self) -> bool {
+        let resolved = self.resolved_host();
+        let trimmed = resolved.trim();
+        !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(HOST_PLACEHOLDER)
+    }
+
+    /// Host text after applying the highlighted wildmenu candidate
+    /// (if any). Used by Tab/Enter logic to decide whether to commit
+    /// or just toggle zones.
+    fn resolved_host(&self) -> String {
+        if self.focused == Zone::Host
+            && let Some(c) = self.selected.and_then(|i| self.filtered.get(i))
+        {
+            return c.clone();
+        }
+        self.host.clone()
+    }
+
     fn confirm(&self) -> ModalOutcome {
+        // Enter on the host zone with an empty path field commits the
+        // host like Tab does — the user wants to pick a remote folder
+        // next, not spawn at the remote $HOME with no further input.
+        // Enter on the host zone with a non-empty path falls through
+        // to Spawn (today's escape hatch for power users).
+        if self.focused == Zone::Host
+            && self.path.trim().is_empty()
+            && self.is_remote_host_committed()
+        {
+            return ModalOutcome::PrepareHost {
+                host: self.resolved_host(),
+            };
+        }
+
         // Apply highlighted wildmenu candidate to the focused field if any —
         // this lets the user arrow-down + Enter without an extra Tab step.
         let (host, path) = self.resolved_values();
@@ -267,7 +501,15 @@ impl SpawnMinibuffer {
 
     fn refresh(&mut self) {
         self.filtered = match self.focused {
-            Zone::Path => path_completions(&self.path),
+            Zone::Path => match &self.path_mode {
+                PathMode::Local => path_completions(&self.path),
+                // Remote autocomplete arrives in Step 7 (DirLister
+                // injection). Until then, the wildmenu is empty in
+                // Remote mode — the dim hint in `wildmenu_view`
+                // makes that visible to the user instead of silently
+                // showing local entries that don't exist on the host.
+                PathMode::Remote { .. } => Vec::new(),
+            },
             Zone::Host => host_completions(&self.host, &self.ssh_hosts),
         };
         // No implicit selection when the focused field is empty: the user
@@ -323,14 +565,34 @@ impl SpawnMinibuffer {
 
     fn wildmenu_view(&self, width: usize) -> Paragraph<'_> {
         let block = Block::default().borders(Borders::TOP);
+
+        // Locked-for-bootstrap takes precedence over everything: the
+        // path zone is showing a status row in the prompt area, so
+        // the wildmenu region renders a dim "preparing remote shell
+        // on {host}…" hint as visual continuity for the lock.
+        if let Some(view) = self.bootstrap_view.as_ref() {
+            let msg = format!(" preparing remote shell on {}…", view.host);
+            return Paragraph::new(Line::styled(
+                msg,
+                Style::default().add_modifier(Modifier::DIM),
+            ))
+            .block(block);
+        }
+
         if self.filtered.is_empty() {
             let msg = match self.focused {
-                Zone::Path => " (no matches — Enter spawns at literal path)",
+                Zone::Path => match &self.path_mode {
+                    PathMode::Local => " (no matches — Enter spawns at literal path)".into(),
+                    PathMode::Remote { .. } => format!(
+                        " (remote: {} — autocomplete pending; Enter spawns at literal path)",
+                        self.bootstrap_host_label()
+                    ),
+                },
                 Zone::Host => {
                     if self.ssh_hosts.is_empty() {
-                        " (no hosts found via ~/.ssh/config + Includes — type a name; SSH lands in P1.4)"
+                        " (no hosts found via ~/.ssh/config + Includes — type a name; SSH lands in P1.4)".into()
                     } else {
-                        " (no matching SSH host — Enter spawns on this literal name)"
+                        " (no matching SSH host — Enter spawns on this literal name)".into()
                     }
                 }
             };
@@ -365,6 +627,20 @@ impl SpawnMinibuffer {
         Paragraph::new(lines).block(block)
     }
 
+    /// Best-effort host label for the "(remote: ...)" wildmenu hint.
+    /// We don't carry the host inside `PathMode::Remote` (the runtime
+    /// owns the canonical host string via the `RemoteFs`), so we fall
+    /// back to the host field. Empty / "local" should be unreachable
+    /// here because `PathMode::Remote` is set only after a successful
+    /// prepare against a real host.
+    fn bootstrap_host_label(&self) -> &str {
+        if self.host.is_empty() {
+            HOST_PLACEHOLDER
+        } else {
+            &self.host
+        }
+    }
+
     fn prompt_view(&self, bindings: &ModalBindings) -> Paragraph<'_> {
         let label_style = Style::default()
             .fg(Color::Cyan)
@@ -379,6 +655,35 @@ impl SpawnMinibuffer {
             Span::styled("spawn: ", label_style),
             Span::styled("@", host_marker_style(self.focused == Zone::Host)),
         ];
+
+        // Path zone is locked: render host plainly, then the spinner +
+        // stage label in place of the path zone. The lock reuses the
+        // host span (so the user can see what host they're targeting)
+        // and replaces the entire `: <path>` segment with the status.
+        if let Some(view) = self.bootstrap_view.as_ref() {
+            spans.extend(zone_spans(
+                false, // host can't be focused while path is locked
+                &self.host,
+                HOST_PLACEHOLDER,
+                placeholder_style,
+                cursor_style,
+            ));
+            spans.push(Span::styled(" : ", separator_style));
+            let frame = spinner_frame(view.started_at);
+            let stage_label = view.current_stage.map_or("starting…", |s| s.label());
+            spans.push(Span::styled(
+                format!("{frame} {stage_label}"),
+                Style::default().fg(Color::Yellow),
+            ));
+            let hint = format!(
+                "  [{} cancel · {} back to host]",
+                bindings.binding_for(ModalAction::Cancel),
+                bindings.binding_for(ModalAction::SwapToHost),
+            );
+            spans.push(Span::styled(hint, placeholder_style));
+            return Paragraph::new(Line::from(spans));
+        }
+
         spans.extend(zone_spans(
             self.focused == Zone::Host,
             &self.host,
@@ -638,6 +943,25 @@ fn centered_rect_with_size(width: u16, height: u16, r: Rect) -> Rect {
     }
 }
 
+/// Single-character braille spinner frame keyed off the elapsed time
+/// since `started_at`. Rotates every `SPINNER_PERIOD_MS`; the runtime
+/// polls render at 20 Hz (`runtime::FRAME_POLL` = 50 ms) which means
+/// every other frame steps the spinner. The start instant is owned by
+/// the caller (typically [`BootstrapView::started_at`]) so concurrent
+/// bootstraps each animate independently.
+//
+// Lives next to `BootstrapView` because it's the only consumer; if a
+// second spinner site appears (e.g. an `AgentState::Failed` reload
+// attempt) it should call this rather than re-deriving the frames.
+fn spinner_frame(started_at: Instant) -> char {
+    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    const SPINNER_PERIOD_MS: u128 = 80;
+    let frames_len = u128::try_from(FRAMES.len()).unwrap_or(1);
+    let idx = usize::try_from(started_at.elapsed().as_millis() / SPINNER_PERIOD_MS % frames_len)
+        .unwrap_or(0);
+    FRAMES[idx]
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -665,6 +989,8 @@ mod tests {
             ssh_hosts: ssh_hosts.iter().map(|s| (*s).to_string()).collect(),
             filtered: Vec::new(),
             selected: None,
+            path_mode: PathMode::Local,
+            bootstrap_view: None,
         };
         m.refresh();
         m
@@ -789,11 +1115,41 @@ mod tests {
     }
 
     #[test]
-    fn tab_back_to_path_does_not_clear_host() {
-        let mut m = mb("custom", "/tmp", Zone::Host, &[]);
-        m.handle(&key(KeyCode::Tab), &b());
+    fn tab_from_host_with_empty_text_toggles_to_path() {
+        // Tab from Host with empty text is *not* a commit — there's
+        // nothing to commit. It's a plain zone toggle.
+        let mut m = mb("", "/tmp", Zone::Host, &[]);
+        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.focused, Zone::Path);
+    }
+
+    #[test]
+    fn tab_from_host_with_text_emits_prepare_host() {
+        // The host field has a non-empty non-"local" value: Tab
+        // commits the host so the runtime can start prepare. The
+        // host text is *not* erased — it stays so the runtime can
+        // re-render the spinner with the host name and the user can
+        // see what they're waiting on.
+        let mut m = mb("custom", "/tmp", Zone::Host, &[]);
+        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        assert_eq!(
+            outcome,
+            ModalOutcome::PrepareHost {
+                host: "custom".into(),
+            },
+        );
         assert_eq!(m.host, "custom");
+    }
+
+    #[test]
+    fn tab_from_host_with_local_value_just_toggles() {
+        // The literal "local" sentinel is the local-spawn marker;
+        // there's no remote to prepare. Tab toggles zones as before.
+        let mut m = mb("local", "/tmp", Zone::Host, &[]);
+        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.focused, Zone::Path);
     }
 
     #[test]
@@ -950,18 +1306,15 @@ mod tests {
 
     #[test]
     fn toggling_back_to_host_preserves_prefix_and_re_highlights_first_match() {
-        // Type "dev" in host, Tab to path, Tab back. The prefix must
-        // survive the round-trip (otherwise the user's typing is wasted)
-        // and the wildmenu must re-narrow + re-highlight the first match
-        // since the field is non-empty.
-        let mut m = mb("", "/tmp", Zone::Host, &["devpod-go", "devpod-web"]);
-        for c in "dev".chars() {
-            m.handle(&key(KeyCode::Char(c)), &b());
-        }
-        assert_eq!(m.host, "dev");
-        assert_eq!(m.selected, Some(0));
-        m.handle(&key(KeyCode::Tab), &b());
-        assert_eq!(m.focused, Zone::Path);
+        // From Path zone, Tab to Host preserves any host text the user
+        // had typed earlier and re-narrows the wildmenu against it,
+        // re-highlighting the first match. Tab from a non-empty host
+        // commits (PrepareHost), which is covered by a separate test
+        // — this one drives the Path→Host direction.
+        let mut m = mb("dev", "/tmp", Zone::Path, &["devpod-go", "devpod-web"]);
+        // Stage the wildmenu state as if "dev" had just been typed in
+        // host before tabbing away — the production path does this
+        // through `refresh()` on each keystroke.
         m.handle(&key(KeyCode::Tab), &b());
         assert_eq!(m.focused, Zone::Host);
         assert_eq!(m.host, "dev");
@@ -1145,5 +1498,149 @@ mod tests {
         let spans = zone_spans(false, "alpha", "local", Style::default(), Style::default());
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "alpha");
+    }
+
+    // -- Step 4: lock_for_bootstrap / unlock_* setters and the
+    // resulting outcomes. Runtime wiring lands in Step 6; these tests
+    // pin the pure modal-side behavior so the runtime can drive it
+    // without surprises.
+
+    #[test]
+    fn enter_on_host_with_empty_path_and_remote_host_emits_prepare_host() {
+        // Per the new flow: confirming the host zone with an empty
+        // path field is a "I want to pick a remote folder" gesture.
+        // Spawn would have to pick a default cwd and the user can't
+        // see what — so commit the host instead.
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        assert_eq!(
+            outcome,
+            ModalOutcome::PrepareHost {
+                host: "devpod-go".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn enter_on_host_with_empty_path_and_local_host_still_spawns_local() {
+        // Empty host + empty path is the local-spawn gesture from
+        // the moment the modal opens. No prepare to run.
+        let mut m = mb("", "", Zone::Host, &[]);
+        m.filtered = vec![];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "local".into(),
+                path: String::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn enter_on_host_with_path_typed_still_spawns_directly() {
+        // Escape hatch for power users who already know the remote
+        // path: Enter from the Host zone with a non-empty path
+        // skips the remote folder picker and spawns straight away.
+        let mut m = mb("devpod-go", "/srv", Zone::Host, &["devpod-go"]);
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "devpod-go".into(),
+                path: "/srv".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn lock_for_bootstrap_drops_typing_keys() {
+        // Once the runtime has locked the path zone, the user can't
+        // type into it — only cancel.
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.lock_for_bootstrap("devpod-go".into(), Instant::now());
+
+        let outcome = m.handle(&key(KeyCode::Char('x')), &b());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.host, "devpod-go");
+        assert_eq!(m.path, "");
+
+        let outcome = m.handle(&key(KeyCode::Tab), &b());
+        assert_eq!(outcome, ModalOutcome::None);
+
+        let outcome = m.handle(&key(KeyCode::Enter), &b());
+        assert_eq!(outcome, ModalOutcome::None);
+    }
+
+    #[test]
+    fn lock_for_bootstrap_with_esc_emits_cancel_bootstrap() {
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.lock_for_bootstrap("devpod-go".into(), Instant::now());
+        let outcome = m.handle(&key(KeyCode::Esc), &b());
+        assert_eq!(outcome, ModalOutcome::CancelBootstrap);
+    }
+
+    #[test]
+    fn lock_for_bootstrap_with_at_emits_cancel_bootstrap() {
+        // `@` is the SwapToHost shortcut elsewhere; while locked,
+        // it's repurposed to "cancel and let me re-edit the host".
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.lock_for_bootstrap("devpod-go".into(), Instant::now());
+        let outcome = m.handle(&key(KeyCode::Char('@')), &b());
+        assert_eq!(outcome, ModalOutcome::CancelBootstrap);
+    }
+
+    #[test]
+    fn set_bootstrap_stage_updates_view_when_locked() {
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.lock_for_bootstrap("devpod-go".into(), Instant::now());
+        m.set_bootstrap_stage(Stage::RemoteBuild);
+        let view = m.bootstrap_view.as_ref().unwrap();
+        assert_eq!(view.current_stage, Some(Stage::RemoteBuild));
+    }
+
+    #[test]
+    fn set_bootstrap_stage_is_a_noop_when_not_locked() {
+        // The runtime might race a Stage event against a cancel that
+        // already cleared the view. Don't panic, just drop it.
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.set_bootstrap_stage(Stage::RemoteBuild);
+        assert!(m.bootstrap_view.is_none());
+    }
+
+    #[test]
+    fn unlock_back_to_host_preserves_host_text_and_clears_view() {
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.lock_for_bootstrap("devpod-go".into(), Instant::now());
+        m.unlock_back_to_host();
+        assert!(m.bootstrap_view.is_none());
+        assert_eq!(m.host, "devpod-go");
+        assert_eq!(m.focused, Zone::Host);
+        assert!(matches!(m.path_mode, PathMode::Local));
+    }
+
+    #[test]
+    fn unlock_for_remote_path_switches_path_mode_to_remote() {
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.lock_for_bootstrap("devpod-go".into(), Instant::now());
+        m.unlock_for_remote_path("devpod-go".into(), PathBuf::from("/home/df"));
+        assert!(m.bootstrap_view.is_none());
+        assert!(matches!(m.path_mode, PathMode::Remote { .. }));
+        // The path zone is seeded with the remote $HOME (with a
+        // trailing slash) so the wildmenu in Step 7 lists $HOME's
+        // entries directly.
+        assert_eq!(m.path, "/home/df/");
+        assert_eq!(m.focused, Zone::Path);
+    }
+
+    #[test]
+    fn unlock_for_remote_path_keeps_trailing_slash_when_already_present() {
+        // Remote $HOME from the probe might already end in `/` (e.g.
+        // root). Don't double-slash.
+        let mut m = mb("devpod-go", "", Zone::Host, &["devpod-go"]);
+        m.lock_for_bootstrap("devpod-go".into(), Instant::now());
+        m.unlock_for_remote_path("devpod-go".into(), PathBuf::from("/"));
+        assert_eq!(m.path, "/");
     }
 }
