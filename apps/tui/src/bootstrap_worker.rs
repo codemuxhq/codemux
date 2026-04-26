@@ -158,6 +158,12 @@ impl Drop for PrepareHandle {
 /// terminates with an [`AgentTransport`] rather than a
 /// [`PreparedHost`]. Also serves as the return type of
 /// [`start_full_pipeline`], the legacy single-handle shim.
+//
+// `rx` and `try_recv` are unused between Step 5 (delete the SSH spawn
+// placeholder) and Step 6 (wire the new prepare + attaches flow into
+// the runtime). Tests in this module exercise both, but `dead_code`
+// only counts non-test usage.
+#[allow(dead_code)]
 pub struct AttachHandle {
     cancel: Arc<AtomicBool>,
     rx: Receiver<AttachEvent>,
@@ -167,6 +173,7 @@ pub struct AttachHandle {
 impl AttachHandle {
     /// Non-blocking poll for the worker's next event. See
     /// [`PrepareHandle::try_recv`].
+    #[allow(dead_code)]
     #[must_use]
     pub fn try_recv(&self) -> Option<AttachEvent> {
         self.rx.try_recv().ok()
@@ -308,10 +315,10 @@ pub fn start_attach_with_runner(
 /// worker thread. Returns an [`AttachHandle`] whose event stream
 /// includes stages from both phases.
 ///
-/// Used by the runtime until the spawn modal owns the prepare phase
-/// explicitly. Once that wiring lands, callers should use
-/// [`start_prepare`] + [`start_attach`] separately so the user can
-/// pick a remote folder between them.
+/// Kept for the smoke test and the test suite while Step 6 of the
+/// spawn-flow refactor is in flight; once that lands the runtime
+/// drives prepare and attach as separate handles.
+#[allow(dead_code)]
 pub fn start_full_pipeline(
     host: String,
     agent_id: String,
@@ -325,6 +332,7 @@ pub fn start_full_pipeline(
 /// Test-friendly entry point: inject a [`CommandRunner`] so the
 /// cancel-mid-bootstrap path can be exercised without touching the
 /// network.
+#[allow(dead_code)]
 pub fn start_full_pipeline_with_runner(
     runner: Box<dyn CommandRunner>,
     host: String,
