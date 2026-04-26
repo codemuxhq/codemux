@@ -35,8 +35,8 @@ use std::thread;
 
 use codemux_session::AgentTransport;
 use codemuxd_bootstrap::{
-    self, CommandOutput, CommandRunner, PreparedHost, RealRunner, Stage, attach_agent,
-    default_local_socket_dir, prepare_remote,
+    self, AttachConfig, CommandOutput, CommandRunner, PreparedHost, RealRunner, Stage,
+    attach_agent, default_local_socket_dir, prepare_remote,
 };
 use crossbeam_channel::{Receiver, unbounded};
 
@@ -246,21 +246,19 @@ pub fn start_attach_with_runner(
                 return;
             }
         };
+        let cfg = AttachConfig {
+            host,
+            agent_id,
+            cwd,
+            local_socket_dir: socket_dir,
+            rows,
+            cols,
+        };
         let tx_for_stage = tx.clone();
         let on_stage = move |stage: Stage| {
             let _ = tx_for_stage.send(AttachEvent::Stage(stage));
         };
-        let result = attach_agent(
-            &cancelable,
-            &on_stage,
-            &prepared,
-            &host,
-            &agent_id,
-            cwd.as_deref(),
-            &socket_dir,
-            rows,
-            cols,
-        );
+        let result = attach_agent(&cancelable, &on_stage, &prepared, &cfg);
         let _ = tx.send(AttachEvent::Done(result));
     });
     AttachHandle { cancel, rx }

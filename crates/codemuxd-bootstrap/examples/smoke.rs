@@ -17,7 +17,9 @@
 
 use std::time::{Duration, Instant};
 
-use codemuxd_bootstrap::{RealRunner, attach_agent, default_local_socket_dir, prepare_remote};
+use codemuxd_bootstrap::{
+    AttachConfig, RealRunner, attach_agent, default_local_socket_dir, prepare_remote,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = std::env::args().nth(1).ok_or(
@@ -37,16 +39,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "✓ prepared (remote $HOME = {})",
         prepared.remote_home.display()
     );
+    let cfg = AttachConfig {
+        host: host.clone(),
+        agent_id: "smoke-agent".into(),
+        cwd: None, // inherit remote $HOME
+        local_socket_dir: socket_dir,
+        rows: 24,
+        cols: 80,
+    };
     let mut transport = attach_agent(
         &RealRunner,
         |stage| eprintln!("  · stage: {stage:?}"),
         &prepared,
-        &host,
-        "smoke-agent",
-        None, // inherit remote $HOME
-        &socket_dir,
-        24,
-        80,
+        &cfg,
     )?;
     eprintln!("✓ transport established in {:.2?}", started.elapsed());
 

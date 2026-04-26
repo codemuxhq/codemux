@@ -247,6 +247,37 @@ pub struct PreparedHost {
     pub remote_home: PathBuf,
 }
 
+/// Inputs to [`attach_agent`] (and the worker entry points around it).
+/// Bundled into a struct because the flat 9-arg signature was a Long
+/// Parameter List smell — six of those were trivially-typed strings /
+/// `u16`s and easy to swap by mistake. Owned fields (no lifetimes) so
+/// the worker thread can move the whole config in a single send.
+#[derive(Debug, Clone)]
+pub struct AttachConfig {
+    /// Hostname (as in `~/.ssh/config`); same string passed to
+    /// [`prepare_remote`].
+    pub host: String,
+    /// Agent identifier — used in socket / pid / log filenames on the
+    /// remote and as the daemon's `--agent-id` value. Must satisfy
+    /// the validator (ASCII alphanumerics + `-._`, ≤ 64 chars), which
+    /// runs at the start of [`attach_agent`].
+    pub agent_id: String,
+    /// Optional remote cwd. `None` → omit `--cwd`, daemon inherits the
+    /// SSH login shell's cwd (`$HOME` on a typical login). `Some` →
+    /// daemon `chdir`s before spawning `claude`; daemon refuses to
+    /// bind if the path doesn't exist on the remote (vision principle
+    /// 6, no silent fallback).
+    pub cwd: Option<PathBuf>,
+    /// Where the local end of the `ssh -L` tunnel binds. Production
+    /// callers pass [`default_local_socket_dir`]; tests pass a tempdir
+    /// to avoid mutating `$HOME`.
+    pub local_socket_dir: PathBuf,
+    /// Initial PTY geometry sent in the wire `Hello`. Resized later by
+    /// the runtime if the terminal changes during the attach.
+    pub rows: u16,
+    pub cols: u16,
+}
+
 /// Phase 1 of the SSH bootstrap: probe the remote and (re)install
 /// `codemuxd` if its installed version doesn't match the embedded
 /// tarball. Idempotent on already-installed hosts — probe matches →
@@ -298,16 +329,8 @@ pub fn prepare_remote(
 /// separable so the spawn modal can let the user navigate the remote
 /// filesystem (via [`RemoteFs`]) between probe/install and daemon spawn.
 ///
-/// `cwd` is interpreted on the **remote** host — when `Some`, the
-/// daemon is launched with `--cwd` and `chdir`'s into it before
-/// spawning `claude`; the daemon refuses to bind if the path doesn't
-/// exist on the remote (vision principle 6, no silent fallback). When
-/// `None`, the `--cwd` flag is omitted and the daemon inherits the
-/// SSH login shell's cwd ($HOME on a typical login).
-///
-/// `local_socket_dir` is where the local end of the `ssh -L` tunnel
-/// binds. Production callers pass [`default_local_socket_dir`]; tests
-/// pass a tempdir to avoid mutating `$HOME`.
+/// `cfg` carries the user-facing inputs (host, agent id, cwd, socket
+/// dir, geometry). See [`AttachConfig`] for field semantics.
 ///
 /// `on_stage` is invoked at the start of stages 5-7. Same callback
 /// semantics as [`prepare_remote`].
@@ -315,38 +338,26 @@ pub fn prepare_remote(
 /// # Errors
 /// Returns [`Error::Bootstrap`] for any of stages 5-7, or
 /// [`Error::Session`] when the post-tunnel wire handshake fails.
-//
-// 9 args is over the clippy default of 7. Each is a real input — the
-// alternative is bundling rows/cols into a `Geometry` struct just to
-// satisfy the lint, which obscures the call site. Flat signature kept
-// deliberately.
-#[allow(clippy::too_many_arguments)]
 pub fn attach_agent(
     runner: &dyn CommandRunner,
     on_stage: impl Fn(Stage),
     prepared: &PreparedHost,
-    host: &str,
-    agent_id: &str,
-    cwd: Option<&Path>,
-    local_socket_dir: &Path,
-    rows: u16,
-    cols: u16,
+    cfg: &AttachConfig,
 ) -> Result<AgentTransport, Error> {
-    let (stream, tunnel) = attach_socket(
-        runner,
-        on_stage,
-        prepared,
-        host,
-        agent_id,
-        cwd,
-        local_socket_dir,
-    )?;
-    let label = format!("{host}:{agent_id}");
-    SshDaemonPty::attach(stream, label, agent_id, rows, cols, Some(tunnel))
-        .map(AgentTransport::SshDaemon)
-        .map_err(|source| Error::Session {
-            source: Box::new(source),
-        })
+    let (stream, tunnel) = attach_socket(runner, on_stage, prepared, cfg)?;
+    let label = format!("{}:{}", cfg.host, cfg.agent_id);
+    SshDaemonPty::attach(
+        stream,
+        label,
+        &cfg.agent_id,
+        cfg.rows,
+        cfg.cols,
+        Some(tunnel),
+    )
+    .map(AgentTransport::SshDaemon)
+    .map_err(|source| Error::Session {
+        source: Box::new(source),
+    })
 }
 
 /// Stages 5-7 without the wire handshake: spawns the daemon, opens
@@ -362,19 +373,22 @@ fn attach_socket(
     runner: &dyn CommandRunner,
     on_stage: impl Fn(Stage),
     prepared: &PreparedHost,
-    host: &str,
-    agent_id: &str,
-    cwd: Option<&Path>,
-    local_socket_dir: &Path,
+    cfg: &AttachConfig,
 ) -> Result<(UnixStream, Child), Error> {
-    validate_agent_id(agent_id)?;
+    validate_agent_id(&cfg.agent_id)?;
 
     on_stage(Stage::DaemonSpawn);
-    spawn_remote_daemon(runner, host, agent_id, cwd)?;
+    spawn_remote_daemon(runner, &cfg.host, &cfg.agent_id, cfg.cwd.as_deref())?;
 
     on_stage(Stage::SocketTunnel);
-    let local_socket = local_socket_path(local_socket_dir, agent_id)?;
-    let tunnel = open_ssh_tunnel(runner, host, agent_id, &local_socket, &prepared.remote_home)?;
+    let local_socket = local_socket_path(&cfg.local_socket_dir, &cfg.agent_id)?;
+    let tunnel = open_ssh_tunnel(
+        runner,
+        &cfg.host,
+        &cfg.agent_id,
+        &local_socket,
+        &prepared.remote_home,
+    )?;
     let tunnel_guard = TunnelGuard::new(tunnel);
 
     on_stage(Stage::SocketConnect);
@@ -1527,16 +1541,15 @@ mod tests {
         let prepared = PreparedHost {
             remote_home: PathBuf::from("/home/fake"),
         };
-        let (stream, mut tunnel) = attach_socket(
-            &runner,
-            |_| {},
-            &prepared,
-            "fake-host",
-            agent_id,
-            Some(Path::new("/some/cwd")),
-            &socket_dir,
-        )
-        .unwrap();
+        let cfg = AttachConfig {
+            host: "fake-host".into(),
+            agent_id: agent_id.into(),
+            cwd: Some(PathBuf::from("/some/cwd")),
+            local_socket_dir: socket_dir,
+            rows: 24,
+            cols: 80,
+        };
+        let (stream, mut tunnel) = attach_socket(&runner, |_| {}, &prepared, &cfg).unwrap();
         let _ = (&stream).write_all(b"x");
         let _ = tunnel.kill();
         let _ = tunnel.wait();
