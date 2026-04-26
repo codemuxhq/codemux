@@ -237,14 +237,10 @@ struct PendingPrepare {
     /// `unlock_for_remote_path` and, later, build the `PreparedHost`
     /// the attach worker needs.
     prepared: Option<PreparedHost>,
-    /// `Some` if `RemoteFs::open` succeeded. Held alongside `prepared`
-    /// purely to keep the `ControlMaster`'s `Drop` semantics on the
-    /// runtime side (Step 7 will hand a `&mut RemoteFs` to the modal
-    /// per keystroke).
-    //
-    // Step 7 wires the lister; until then the field is allocated only
-    // for its drop-on-cancel side effect.
-    #[allow(dead_code)]
+    /// `Some` if `RemoteFs::open` succeeded. Held on the runtime side
+    /// so the `ControlMaster`'s `Drop` cleans up when the prepare
+    /// slot is replaced or cancelled. The runtime hands a `&fs` /
+    /// `&runner` pair to the modal per keystroke via `DirLister`.
     remote_fs: Option<RemoteFs>,
 }
 
