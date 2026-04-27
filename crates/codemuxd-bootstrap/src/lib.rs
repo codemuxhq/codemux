@@ -755,21 +755,26 @@ fn spawn_remote_daemon(
         }
     };
     // When the binary was just updated, send SIGTERM to any existing
-    // daemon for this agent-id, give it 200ms to release the pid file
-    // and socket via its Drop cleanup, then SIGKILL anything still
-    // alive. The `2>/dev/null` swallows "no such process" noise — both
-    // signals are best-effort on a possibly-empty pid file. The `||
-    // true` keeps `set -e` quiet in the wrapping shell.
+    // daemon for this agent-id, give it a second to release the pid
+    // file and socket via its Drop cleanup, then SIGKILL anything still
+    // alive. `sleep 1` (integer) instead of fractional seconds — POSIX
+    // sleep does not accept fractions, so `sleep 0.2` would error on
+    // dash/busybox shells. The extra ~800ms is invisible against the
+    // multi-second cargo build that already ran on the upgrade path.
+    // The `2>/dev/null` swallows "no such process" noise — both signals
+    // are best-effort on a possibly-empty pid file. The `|| true` keeps
+    // `set -e` quiet in the wrapping shell.
     let respawn_prelude = if force_respawn {
-        "if [ -s ~/.cache/codemuxd/pids/{agent_id}.pid ]; then \
-           pid=$(cat ~/.cache/codemuxd/pids/{agent_id}.pid); \
-           kill -TERM $pid 2>/dev/null || true; \
-           sleep 0.2; \
-           kill -KILL $pid 2>/dev/null || true; \
-           rm -f ~/.cache/codemuxd/pids/{agent_id}.pid \
-                 ~/.cache/codemuxd/sockets/{agent_id}.sock; \
-         fi; "
-            .replace("{agent_id}", agent_id)
+        format!(
+            "if [ -s ~/.cache/codemuxd/pids/{agent_id}.pid ]; then \
+               pid=$(cat ~/.cache/codemuxd/pids/{agent_id}.pid); \
+               kill -TERM $pid 2>/dev/null || true; \
+               sleep 1; \
+               kill -KILL $pid 2>/dev/null || true; \
+               rm -f ~/.cache/codemuxd/pids/{agent_id}.pid \
+                     ~/.cache/codemuxd/sockets/{agent_id}.sock; \
+             fi; "
+        )
     } else {
         String::new()
     };
