@@ -778,6 +778,28 @@ fn spawn_remote_daemon(
     } else {
         String::new()
     };
+    // After `setsid -f` returns, poll for the daemon's socket file to
+    // appear. `setsid -f` itself returns 0 as soon as its fork
+    // completes — even if the spawned codemuxd then exits a millisecond
+    // later because `bind()` failed, the wrong --log-file path was
+    // unwritable, the cwd doesn't exist on the remote, etc. Without
+    // this verification the bootstrap reports success, the local
+    // tunnel connects, the wire handshake fails 5s later as a
+    // `SocketConnect` timeout, and the user sees a misleading "could
+    // not connect to remote daemon socket" with no diagnostic. The
+    // verification keeps the failure where it belongs (`DaemonSpawn`)
+    // and surfaces the daemon's log tail so the user knows WHY it
+    // didn't come up.
+    //
+    // Polling is integer-second `sleep` (POSIX) up to 5 iterations =
+    // 5 s, mirroring `connect_socket`'s budget on the local side. A
+    // healthy daemon binds in milliseconds; the 5 s budget is for cold
+    // starts on slow disks, never the steady state.
+    //
+    // The `tail -n 20 log 2>/dev/null` on failure is best-effort: if
+    // the daemon couldn't even open its log file, the tail returns
+    // empty and we still emit the "socket did not appear" message,
+    // which is a strict improvement over silent success.
     let cmd = format!(
         "{respawn_prelude}\
          setsid -f ~/.cache/codemuxd/bin/codemuxd \
@@ -785,7 +807,19 @@ fn spawn_remote_daemon(
          --pid-file ~/.cache/codemuxd/pids/{agent_id}.pid \
          --log-file ~/.cache/codemuxd/logs/{agent_id}.log \
          --agent-id {agent_id}{cwd_flag} \
-         </dev/null >/dev/null 2>&1"
+         </dev/null >/dev/null 2>&1\n\
+         i=0\n\
+         while [ ! -S ~/.cache/codemuxd/sockets/{agent_id}.sock ]; do \
+           i=$((i + 1)); \
+           if [ $i -ge 5 ]; then \
+             echo 'daemon socket did not appear within 5s' >&2; \
+             echo '--- log tail (~/.cache/codemuxd/logs/{agent_id}.log) ---' >&2; \
+             tail -n 20 ~/.cache/codemuxd/logs/{agent_id}.log 2>/dev/null >&2 \
+               || echo '(log file missing or unreadable)' >&2; \
+             exit 1; \
+           fi; \
+           sleep 1; \
+         done"
     );
     let out = runner
         .run("ssh", &["-o", "BatchMode=yes", host, &cmd])
@@ -1548,6 +1582,54 @@ mod tests {
         assert!(
             kill_pos < setsid_pos,
             "kill prelude must precede setsid in the same shell; got: {cmd}",
+        );
+    }
+
+    /// Spawn verification: after `setsid -f` returns, the shell polls
+    /// for the daemon's socket file to appear and exits non-zero with
+    /// a log tail if it doesn't. This catches "setsid forked
+    /// successfully but codemuxd then crashed during `bind()`" — without
+    /// it, the bootstrap reports success and the user sees a
+    /// `SocketConnect` timeout 5 s later with no clue why. Polling
+    /// must use POSIX `sleep <integer>`, not fractional seconds, so
+    /// dash/busybox shells don't reject the script.
+    #[test]
+    fn spawn_remote_daemon_verifies_socket_appearance_post_spawn() {
+        let runner = RecordingRunner::new();
+        spawn_remote_daemon(&runner, "host", "alpha", None, false).unwrap();
+        let cmd = runner.last_run_cmd();
+        // Verification loop must check for the agent's socket path,
+        // bail with a diagnostic if it doesn't appear, and tail the
+        // daemon log so the failure surfaces somewhere actionable.
+        assert!(
+            cmd.contains("[ ! -S ~/.cache/codemuxd/sockets/alpha.sock ]"),
+            "verification must check the agent's socket path exists; got: {cmd}",
+        );
+        assert!(
+            cmd.contains("daemon socket did not appear"),
+            "verification must emit a recognizable failure message; got: {cmd}",
+        );
+        assert!(
+            cmd.contains("tail -n") && cmd.contains("alpha.log"),
+            "verification failure must tail the daemon's log file so the user \
+             sees WHY the socket didn't come up; got: {cmd}",
+        );
+        // POSIX `sleep` accepts only integers. The earlier 0.2-s
+        // version errored on dash; pin the integer form.
+        assert!(
+            cmd.contains("sleep 1"),
+            "verification poll must sleep an integer (POSIX); got: {cmd}",
+        );
+        // Verification block must come AFTER the setsid invocation
+        // (you can't poll for a socket the daemon hasn't been asked
+        // to bind yet).
+        let setsid_pos = cmd.find("setsid -f").unwrap();
+        let verify_pos = cmd
+            .find("[ ! -S ~/.cache/codemuxd/sockets/alpha.sock ]")
+            .unwrap();
+        assert!(
+            setsid_pos < verify_pos,
+            "verification must run after setsid; got: {cmd}",
         );
     }
 
