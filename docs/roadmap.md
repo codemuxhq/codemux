@@ -26,6 +26,7 @@ The minimum to stop reaching for tmux.
 - Spawn SSH agents via `codemuxd` (AD-3) — small per-host Rust daemon shipped with codemux, deployed on first connect
 - Per-agent metadata: status dot (running / idle / needs-input / dead), pwd or repo name, host
 - Keyboard cycling between agents via prefix key (AD-12)
+- Per-agent scrollback (wheel + arrows / PgUp/PgDn / g/G; non-sticky exit) — see AD-25
 - Persistence via `rusqlite` — agents survive app restart
 - Basic process lifecycle: spawn, attach, detach, kill
 

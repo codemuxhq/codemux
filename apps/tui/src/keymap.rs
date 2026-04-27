@@ -315,6 +315,48 @@ impl ModalAction {
     }
 }
 
+/// Actions reachable while the focused agent is scrolled back through
+/// its PTY history (i.e. `vt100::Screen::scrollback() > 0`). Bindings
+/// in this scope are *only* consulted when scroll mode is active; on
+/// the live view, the same chords are forwarded to the agent normally.
+/// `ExitScroll` snaps to the bottom; any non-scroll keystroke also
+/// snaps to the bottom and then forwards through (non-sticky), so the
+/// user never gets trapped in scroll mode by typing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrollAction {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+    ExitScroll,
+}
+
+impl ScrollAction {
+    pub const ALL: &'static [ScrollAction] = &[
+        Self::LineUp,
+        Self::LineDown,
+        Self::PageUp,
+        Self::PageDown,
+        Self::Top,
+        Self::Bottom,
+        Self::ExitScroll,
+    ];
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::LineUp => "scroll up one line",
+            Self::LineDown => "scroll down one line",
+            Self::PageUp => "scroll up one page",
+            Self::PageDown => "scroll down one page",
+            Self::Top => "jump to the top of scrollback",
+            Self::Bottom => "snap to the live view",
+            Self::ExitScroll => "exit scroll mode (snap to live view)",
+        }
+    }
+}
+
 // ---------- Bindings (POD, deserialized from TOML) ----------
 
 #[derive(Clone, Debug, Deserialize)]
@@ -523,6 +565,61 @@ impl ModalBindings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ScrollBindings {
+    pub line_up: KeyChord,
+    pub line_down: KeyChord,
+    pub page_up: KeyChord,
+    pub page_down: KeyChord,
+    pub top: KeyChord,
+    pub bottom: KeyChord,
+    pub exit: KeyChord,
+}
+
+impl Default for ScrollBindings {
+    fn default() -> Self {
+        Self {
+            line_up: KeyChord::plain(KeyCode::Up),
+            line_down: KeyChord::plain(KeyCode::Down),
+            page_up: KeyChord::plain(KeyCode::PageUp),
+            page_down: KeyChord::plain(KeyCode::PageDown),
+            top: KeyChord::plain(KeyCode::Char('g')),
+            bottom: KeyChord::plain(KeyCode::Char('G')),
+            exit: KeyChord::plain(KeyCode::Esc),
+        }
+    }
+}
+
+impl ScrollBindings {
+    pub fn lookup(&self, key: &KeyEvent) -> Option<ScrollAction> {
+        let table: [(KeyChord, ScrollAction); 7] = [
+            (self.line_up, ScrollAction::LineUp),
+            (self.line_down, ScrollAction::LineDown),
+            (self.page_up, ScrollAction::PageUp),
+            (self.page_down, ScrollAction::PageDown),
+            (self.top, ScrollAction::Top),
+            (self.bottom, ScrollAction::Bottom),
+            (self.exit, ScrollAction::ExitScroll),
+        ];
+        table
+            .into_iter()
+            .find_map(|(c, a)| c.matches(key).then_some(a))
+    }
+
+    pub fn binding_for(&self, action: ScrollAction) -> KeyChord {
+        match action {
+            ScrollAction::LineUp => self.line_up,
+            ScrollAction::LineDown => self.line_down,
+            ScrollAction::PageUp => self.page_up,
+            ScrollAction::PageDown => self.page_down,
+            ScrollAction::Top => self.top,
+            ScrollAction::Bottom => self.bottom,
+            ScrollAction::ExitScroll => self.exit,
+        }
+    }
+}
+
 // ---------- DirectBindings (no-prefix, fast-path navigation) ----------
 
 /// Actions reachable without first arming the prefix-key state
@@ -662,6 +759,7 @@ pub struct Bindings {
     pub on_popup: PopupBindings,
     pub on_modal: ModalBindings,
     pub on_direct: DirectBindings,
+    pub on_scroll: ScrollBindings,
 }
 
 impl Default for Bindings {
@@ -672,6 +770,7 @@ impl Default for Bindings {
             on_popup: PopupBindings::default(),
             on_modal: ModalBindings::default(),
             on_direct: DirectBindings::default(),
+            on_scroll: ScrollBindings::default(),
         }
     }
 }
@@ -705,6 +804,13 @@ impl Bindings {
             self.on_modal.swap_to_host,
             self.on_modal.next_completion,
             self.on_modal.prev_completion,
+            self.on_scroll.line_up,
+            self.on_scroll.line_down,
+            self.on_scroll.page_up,
+            self.on_scroll.page_down,
+            self.on_scroll.top,
+            self.on_scroll.bottom,
+            self.on_scroll.exit,
         ];
         if single
             .iter()
@@ -1133,6 +1239,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scroll_lookup_round_trip() {
+        let b = ScrollBindings::default();
+        for action in ScrollAction::ALL {
+            let chord = b.binding_for(*action);
+            let event = KeyEvent::new(chord.code, chord.modifiers);
+            assert_eq!(b.lookup(&event), Some(*action));
+        }
+    }
+
+    #[test]
+    fn scroll_defaults_cover_arrow_pgup_pgdn_g_capital_g_esc() {
+        // Pin the defaults explicitly. The runtime's interception is
+        // gated on these chords matching the user's keypress; if
+        // someone "tidies" the defaults to e.g. `j`/`k` they'd silently
+        // break wheel-then-arrow navigation in scroll mode.
+        let b = ScrollBindings::default();
+        assert_eq!(b.line_up.code, KeyCode::Up);
+        assert_eq!(b.line_down.code, KeyCode::Down);
+        assert_eq!(b.page_up.code, KeyCode::PageUp);
+        assert_eq!(b.page_down.code, KeyCode::PageDown);
+        assert_eq!(b.top.code, KeyCode::Char('g'));
+        assert_eq!(b.bottom.code, KeyCode::Char('G'));
+        assert_eq!(b.exit.code, KeyCode::Esc);
+    }
+
     // --- uses_super_modifier ---
 
     #[test]
@@ -1158,6 +1290,21 @@ mod tests {
         let toml_text = r#"
             [on_prefix]
             quit = "cmd+q"
+        "#;
+        let bindings: Bindings = toml::from_str(toml_text).unwrap();
+        assert!(bindings.uses_super_modifier());
+    }
+
+    #[test]
+    fn cmd_scroll_chord_triggers_super_detection() {
+        // A user who binds Cmd-PgUp to scroll-page-up needs Kitty
+        // Keyboard Protocol negotiation just like any other Cmd
+        // binding. If `on_scroll` is missed in the enumeration, this
+        // test fails — the user's Cmd-PgUp would be silently swallowed
+        // by the terminal.
+        let toml_text = r#"
+            [on_scroll]
+            page_up = "cmd+pageup"
         "#;
         let bindings: Bindings = toml::from_str(toml_text).unwrap();
         assert!(bindings.uses_super_modifier());

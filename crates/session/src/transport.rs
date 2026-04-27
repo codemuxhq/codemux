@@ -166,6 +166,20 @@ impl AgentTransport {
             Self::SshDaemon(p) => p.kill(),
         }
     }
+
+    /// Build a transport backed by a real local PTY running `cat`. Test-only
+    /// seam so downstream crates (e.g. `codemux-tui`) can construct a
+    /// `RuntimeAgent` without a `claude` binary on PATH and without
+    /// matching on `#[non_exhaustive]` `AgentTransport` from outside this
+    /// crate. The `cat` child sits on its TTY waiting for input and is
+    /// reaped on `Drop` of the returned transport.
+    ///
+    /// # Errors
+    /// Same envelope as [`Self::spawn_local`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_test(label: String, rows: u16, cols: u16) -> Result<Self, Error> {
+        LocalPty::spawn("cat", &[], label, None, rows, cols).map(Self::Local)
+    }
 }
 
 /// A child process spawned inside a local PTY.

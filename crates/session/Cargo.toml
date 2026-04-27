@@ -24,5 +24,13 @@ crossbeam-channel.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+[features]
+# Exposes a no-op `AgentTransport::for_test` constructor that backs the
+# transport with a real local PTY running `cat`. Lets downstream crates
+# (e.g. `codemux-tui`) build a `RuntimeAgent` in unit tests without a
+# `claude` binary on PATH or a per-crate seam. Always off in release
+# builds; enabled via the TUI's `[dev-dependencies]`.
+test-util = []
+
 [lints]
 workspace = true

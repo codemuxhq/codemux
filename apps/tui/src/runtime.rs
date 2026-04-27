@@ -34,7 +34,8 @@ use codemuxd_bootstrap::{PreparedHost, RealRunner, RemoteFs};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -56,7 +57,7 @@ use crate::bootstrap_worker::{
     start_prepare,
 };
 use crate::config::Config;
-use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction};
+use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction, ScrollAction};
 use crate::log_tail::LogTail;
 use crate::pty_title::TitleCapture;
 use crate::repo_name;
@@ -70,9 +71,19 @@ const STATUS_BAR_HEIGHT: u16 = 1;
 /// line"); a future scrollable overlay could be N rows behind a
 /// keybinding without changing this constant.
 const LOG_STRIP_HEIGHT: u16 = 1;
+/// Lines moved per wheel-tick. Three matches "feels right" in tmux /
+/// most terminal scrollers; one is too granular, five overshoots when
+/// chasing a specific line. Page-mode scrolling uses the focused
+/// agent's row count instead.
+const WHEEL_STEP: i32 = 3;
+/// Maximum width of the floating scroll indicator badge, in cells.
+/// 24 fits ` ↑ scroll 999999 · esc ` with room to grow; clamps to the
+/// actual pane width when the user runs in a very narrow terminal.
+const SCROLL_INDICATOR_WIDTH: u16 = 24;
 
 struct TerminalGuard {
     enhanced_keyboard: bool,
+    mouse_captured: bool,
 }
 
 impl Drop for TerminalGuard {
@@ -81,6 +92,17 @@ impl Drop for TerminalGuard {
         // and may be on a panic path); the user's terminal may already be in
         // a degraded state, and surfacing an error would clobber whatever the
         // panic backtrace was about to say.
+        //
+        // Drop order is the reverse of acquisition: mouse capture, then
+        // keyboard enhancement, then leave-alt-screen + raw-mode. Mouse
+        // capture and keyboard enhancement are independent escape sequences
+        // (`?1006l` vs `<u`), but mirroring acquisition order is the safe
+        // discipline — and skipping the matching disable when the matching
+        // enable failed avoids generating spurious sequences the terminal
+        // never opted into.
+        if self.mouse_captured {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
         if self.enhanced_keyboard {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
@@ -236,6 +258,7 @@ impl RuntimeAgent {
         transport: AgentTransport,
         rows: u16,
         cols: u16,
+        scrollback_len: usize,
     ) -> Self {
         Self {
             label,
@@ -249,7 +272,7 @@ impl RuntimeAgent {
                 parser: Box::new(Parser::new_with_callbacks(
                     rows,
                     cols,
-                    0,
+                    scrollback_len,
                     TitleCapture::default(),
                 )),
                 transport,
@@ -274,6 +297,48 @@ impl RuntimeAgent {
             rows,
             cols,
             state: AgentState::Failed { error },
+        }
+    }
+
+    /// Current scrollback offset (`0` = live view). Returns `0` for a
+    /// `Failed` agent so callers can check "is this agent in scroll
+    /// mode" without matching on the state.
+    fn scrollback_offset(&self) -> usize {
+        match &self.state {
+            AgentState::Ready { parser, .. } => parser.screen().scrollback(),
+            AgentState::Failed { .. } => 0,
+        }
+    }
+
+    /// Adjust the scrollback offset by `delta` (positive scrolls back
+    /// into history, negative toward the live view). Saturates at zero
+    /// on the bottom; `vt100::Screen::set_scrollback` clamps the top to
+    /// the buffer length, so we don't need to know the cap. No-op for
+    /// `Failed` agents — they have no parser.
+    fn nudge_scrollback(&mut self, delta: i32) {
+        if let AgentState::Ready { parser, .. } = &mut self.state {
+            let screen = parser.screen_mut();
+            let next = screen.scrollback().saturating_add_signed(delta as isize);
+            screen.set_scrollback(next);
+        }
+    }
+
+    /// Snap back to the live view (offset = 0). Used by the
+    /// `ScrollAction::ExitScroll` path and by the non-sticky "any
+    /// forwarded keystroke snaps" rule.
+    fn snap_to_live(&mut self) {
+        if let AgentState::Ready { parser, .. } = &mut self.state {
+            parser.screen_mut().set_scrollback(0);
+        }
+    }
+
+    /// Jump to the top of the buffer. `vt100::Screen::set_scrollback`
+    /// clamps to the buffer length, so passing `usize::MAX` reaches the
+    /// top regardless of the configured `scrollback_len` — no need to
+    /// thread the cap through.
+    fn jump_to_top(&mut self) {
+        if let AgentState::Ready { parser, .. } = &mut self.state {
+            parser.screen_mut().set_scrollback(usize::MAX);
         }
     }
 
@@ -359,11 +424,32 @@ pub fn run(
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
 
-    let initial = spawn_local_agent("agent-1".into(), Some(initial_cwd), pty_rows, pty_cols)?;
+    let initial = spawn_local_agent(
+        "agent-1".into(),
+        Some(initial_cwd),
+        pty_rows,
+        pty_cols,
+        config.scrollback_len,
+    )?;
     let agents = vec![initial];
 
     enable_raw_mode().wrap_err("enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).wrap_err("enter alt screen")?;
+
+    // Mouse capture: needed for `MouseEventKind::ScrollUp/Down` to reach
+    // us as `Event::Mouse`. Without it, terminals running on the
+    // alternate screen translate the wheel into ↑ / ↓ arrow keys via
+    // their `alternateScroll` feature — which Claude Code interprets as
+    // "cycle prompt history," not what the user wants. Apple Terminal is
+    // the documented exception (no SGR mouse support); on every other
+    // mainstream terminal `?1006h` arrives via crossterm's
+    // `EnableMouseCapture`. Cost: native click-and-drag selection now
+    // requires holding ⌥/Alt to bypass capture; the help screen
+    // documents this. See AD-25.
+    let mouse_captured = execute!(io::stdout(), EnableMouseCapture).is_ok();
+    if !mouse_captured {
+        tracing::warn!("EnableMouseCapture failed; scrollback wheel will not work");
+    }
 
     // Auto-detect: enable the Kitty Keyboard Protocol only when the user has
     // bound something to a SUPER (Cmd / Win) chord. Without this, terminals
@@ -382,7 +468,10 @@ pub fn run(
         tracing::debug!("Kitty Keyboard Protocol enabled (binding uses SUPER)");
     }
 
-    let _guard = TerminalGuard { enhanced_keyboard };
+    let _guard = TerminalGuard {
+        enhanced_keyboard,
+        mouse_captured,
+    };
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
@@ -394,6 +483,7 @@ pub fn run(
         &config.bindings,
         log_tail,
         initial_cwd,
+        config.scrollback_len,
     )
 }
 
@@ -420,12 +510,19 @@ fn spawn_local_agent(
     cwd: Option<&Path>,
     rows: u16,
     cols: u16,
+    scrollback_len: usize,
 ) -> Result<RuntimeAgent> {
     let transport = AgentTransport::spawn_local(label.clone(), cwd, rows, cols)
         .wrap_err("spawn local agent")?;
     let repo = cwd.and_then(repo_name::resolve_local);
     Ok(RuntimeAgent::ready(
-        label, repo, None, transport, rows, cols,
+        label,
+        repo,
+        None,
+        transport,
+        rows,
+        cols,
+        scrollback_len,
     ))
 }
 
@@ -506,6 +603,21 @@ fn flag_finished_unfocused(agents: &mut [RuntimeAgent], focused: usize) {
     }
 }
 
+/// True when no overlay is open: spawn modal closed, agent-switcher
+/// popup closed, help screen closed. Mouse-wheel events that should
+/// scroll the focused agent are gated on this — wheel-while-popup-up
+/// would otherwise scroll the agent buried beneath the popup, which is
+/// confusing and undocumented behavior.
+fn no_overlay_active(
+    spawn_ui: Option<&SpawnMinibuffer>,
+    popup_state: PopupState,
+    help_state: HelpState,
+) -> bool {
+    spawn_ui.is_none()
+        && matches!(popup_state, PopupState::Closed)
+        && matches!(help_state, HelpState::Closed)
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut agents: Vec<RuntimeAgent>,
@@ -513,6 +625,7 @@ fn event_loop(
     bindings: &Bindings,
     log_tail: Option<&LogTail>,
     initial_cwd: &Path,
+    scrollback_len: usize,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
@@ -656,6 +769,7 @@ fn event_loop(
                             transport,
                             attach.rows,
                             attach.cols,
+                            scrollback_len,
                         ));
                     }
                     Err(e) => {
@@ -843,7 +957,8 @@ fn event_loop(
                                 } else {
                                     Some(Path::new(&path))
                                 };
-                                match spawn_local_agent(label, cwd_path, rows, cols) {
+                                match spawn_local_agent(label, cwd_path, rows, cols, scrollback_len)
+                                {
                                     Ok(agent) => {
                                         agents.push(agent);
                                         let target = agents.len() - 1;
@@ -977,9 +1092,52 @@ fn event_loop(
                     continue;
                 }
 
+                // Scroll mode: when the focused agent's PTY parser is
+                // showing scrollback (offset > 0), arrow keys / PgUp /
+                // PgDn / g / G / Esc drive the scroll instead of being
+                // forwarded to Claude. We do NOT snap-to-live here for
+                // unmatched keys — that would clobber the offset when
+                // the user presses the prefix (Cmd+B) or a direct nav
+                // chord on their way to switching tabs, losing the
+                // scroll position the moment they reach for it. The
+                // snap is deferred to the `KeyDispatch::Forward` arm
+                // below: only bytes actually being sent to Claude
+                // (typing real text, control sequences) collapse the
+                // view; navigation, popup, help, spawn, and consume
+                // dispatches all leave scroll state untouched. Wheel
+                // down to the bottom is the other common exit; once
+                // `scrollback() == 0` the whole branch is a no-op and
+                // arrow keys flow through normally.
+                if let Some(focused_agent) = agents.get_mut(focused)
+                    && focused_agent.scrollback_offset() > 0
+                    && let Some(action) = bindings.on_scroll.lookup(&key)
+                {
+                    let page = i32::from(focused_agent.rows.saturating_sub(1).max(1));
+                    match action {
+                        ScrollAction::LineUp => focused_agent.nudge_scrollback(1),
+                        ScrollAction::LineDown => focused_agent.nudge_scrollback(-1),
+                        ScrollAction::PageUp => focused_agent.nudge_scrollback(page),
+                        ScrollAction::PageDown => focused_agent.nudge_scrollback(-page),
+                        ScrollAction::Top => focused_agent.jump_to_top(),
+                        ScrollAction::Bottom | ScrollAction::ExitScroll => {
+                            focused_agent.snap_to_live();
+                        }
+                    }
+                    continue;
+                }
+
                 match dispatch_key(&mut prefix_state, &key, bindings) {
                     KeyDispatch::Forward(bytes) => {
+                        // Snap-to-live before forwarding: typing while
+                        // scrolled back would otherwise echo into a
+                        // view the user can't see. Only Forward (real
+                        // bytes to the PTY) triggers the snap; nav /
+                        // popup / help / spawn dispatches preserve the
+                        // per-agent offset so `Cmd-B 2` to switch tabs
+                        // doesn't reset scroll on the agent you just
+                        // left.
                         if let Some(a) = agents.get_mut(focused) {
+                            a.snap_to_live();
                             match &mut a.state {
                                 AgentState::Ready { transport, .. } => {
                                     transport.write(&bytes).wrap_err("write to pty")?;
@@ -1051,6 +1209,47 @@ fn event_loop(
             Event::Resize(cols, rows) => {
                 let (pty_rows, pty_cols) = pty_size_for(nav_style, rows, cols, log_tail.is_some());
                 resize_agents(&mut agents, pty_rows, pty_cols);
+            }
+            Event::Mouse(MouseEvent { kind, .. })
+                if no_overlay_active(spawn_ui.as_ref(), popup_state, help_state) =>
+            {
+                // Wheel events are unconditional — anywhere in the
+                // window is treated as "scroll the focused agent." In
+                // LeftPane mode that means wheel-over-nav scrolls the
+                // agent rather than the (currently un-scrollable)
+                // agent list, which is mildly weird but harmless and
+                // strictly better than the previous behavior of
+                // forwarding wheel-as-arrow into Claude's prompt
+                // history. Revisit if/when the nav pane becomes
+                // independently scrollable.
+                if let Some(agent) = agents.get_mut(focused) {
+                    match kind {
+                        MouseEventKind::ScrollUp => agent.nudge_scrollback(WHEEL_STEP),
+                        MouseEventKind::ScrollDown => agent.nudge_scrollback(-WHEEL_STEP),
+                        // Clicks, drags, motion, side-scroll: ignored. Native
+                        // copy-and-paste in iTerm2 / Alacritty / Ghostty
+                        // requires holding Alt/Option to bypass mouse capture
+                        // — this is documented in the help screen.
+                        _ => {}
+                    }
+                }
+            }
+            Event::Paste(text) if no_overlay_active(spawn_ui.as_ref(), popup_state, help_state) => {
+                // Pasting while scrolled-back: snap to live view first
+                // so the user sees what landed (otherwise the paste is
+                // invisible above the fold), then forward as bytes.
+                // Bracketed paste is on (Claude advertises `?2004h`),
+                // so the agent re-wraps the paste in `\x1b[200~ ...
+                // \x1b[201~` itself if it cares; we just deliver the
+                // raw text.
+                if let Some(agent) = agents.get_mut(focused) {
+                    agent.snap_to_live();
+                    if let AgentState::Ready { transport, .. } = &mut agent.state {
+                        transport
+                            .write(text.as_bytes())
+                            .wrap_err("write pasted bytes to pty")?;
+                    }
+                }
             }
             _ => {}
         }
@@ -1251,17 +1450,59 @@ fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail) {
 /// red, centered. The failure pane intentionally has no border or
 /// title — a bordered placeholder reads as "this is a real UI
 /// element" when in fact the slot is dead.
+///
+/// When the agent's PTY parser is showing scrollback (offset > 0), a
+/// floating "↑ scroll N · esc" badge is painted over the bottom-right
+/// of the pane via [`render_scroll_indicator`]. We deliberately do
+/// NOT shrink the PTY by a row to make space — that would force a
+/// `SIGWINCH` on every scroll-mode entry/exit, and Claude redrawing
+/// its UI on each transition would be much worse UX than the badge
+/// covering ~22 cells of (usually empty) Claude border. See AD-25.
 fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
     match &agent.state {
         AgentState::Ready { parser, .. } => {
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
+            let offset = parser.screen().scrollback();
+            if offset > 0 {
+                render_scroll_indicator(frame, area, offset);
+            }
         }
         AgentState::Failed { error } => {
             let host = agent.host.as_deref().unwrap_or("");
             render_failure_pane(frame, area, host, &error.user_message());
         }
     }
+}
+
+/// Floating one-row badge rendered in the bottom-right of the agent
+/// pane while scroll mode is active. Width caps at
+/// [`SCROLL_INDICATOR_WIDTH`] (24 cells) and clamps to the actual
+/// pane width when the user has shrunk the terminal narrower than
+/// that. `Clear` is essential — without it the underlying screen
+/// content bleeds through the dim text and reads as garbage.
+fn render_scroll_indicator(frame: &mut Frame<'_>, area: Rect, offset: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = SCROLL_INDICATOR_WIDTH.min(area.width);
+    let badge_area = Rect {
+        x: area.x + area.width - width,
+        y: area.y + area.height - 1,
+        width,
+        height: 1,
+    };
+    let text = format!(" ↑ scroll {offset} · esc ");
+    let widget = Paragraph::new(Line::raw(text))
+        .alignment(Alignment::Right)
+        .style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(Clear, badge_area);
+    frame.render_widget(widget, badge_area);
 }
 
 /// Centered failure pane shown when an SSH bootstrap returned an
@@ -1845,7 +2086,7 @@ fn render_switcher_popup(
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, bindings: &Bindings) {
-    let popup_area = centered_rect_with_size(64, 30, area);
+    let popup_area = centered_rect_with_size(64, 50, area);
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1902,6 +2143,27 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, bindings: &Bindings) {
             action.description(),
         ));
     }
+    lines.push(Line::raw(""));
+
+    lines.push(Line::styled("in scroll mode:", header_style));
+    lines.push(binding_line_static(
+        "wheel",
+        "wheel up enters scroll mode; wheel down exits at the bottom",
+    ));
+    for action in ScrollAction::ALL {
+        lines.push(binding_line(
+            bindings.on_scroll.binding_for(*action),
+            action.description(),
+        ));
+    }
+    lines.push(binding_line_static(
+        "type",
+        "typing real text snaps to live and forwards (nav chords preserve scroll)",
+    ));
+    lines.push(binding_line_static(
+        "alt+drag",
+        "select text for native copy/paste (mouse capture is on)",
+    ));
     lines.push(Line::raw(""));
     lines.push(Line::raw("press any key to close"));
 
@@ -2974,15 +3236,261 @@ mod tests {
 
     // RuntimeAgent constructors
     //
-    // The `Ready` constructor needs an `AgentTransport`, and the TUI
-    // crate can't construct `AgentTransport::Local(_)` directly because
-    // the enum is `#[non_exhaustive]`. `AgentTransport::spawn_local`
-    // hardcodes the `claude` binary, so a constructor test would either
-    // depend on a real claude install or pull in a test-only entry
-    // point on the session crate (out of scope here). It's covered
-    // indirectly by the spawn-local path tests in `spawn::tests`.
+    // Ready agents are built via `AgentTransport::for_test` (gated on
+    // the session crate's `test-util` feature, enabled by this crate's
+    // dev-dependencies). The transport is backed by a real local PTY
+    // running `cat`; LocalPty's `Drop` reaps the child cleanly when the
+    // agent is dropped at end-of-test.
 
     // The user-facing message formatting (stage hint + source chain)
     // is tested in `codemuxd_bootstrap::error::tests::user_message_*`,
     // co-located with the `Error` type it formats.
+
+    // ── scrollback (vt100 contract guards) ────────────────────────
+    //
+    // These tests pin the vt100 invariants the runtime's scrollback
+    // methods (`RuntimeAgent::nudge_scrollback`, `snap_to_live`,
+    // `jump_to_top`) depend on. The method-level behavior is tested
+    // directly further below; the contract tests stay because a silent
+    // change in vt100's eviction-while-scrolled behavior or zero-len
+    // clamp would break user-visible scroll mode in ways the method
+    // tests can't pinpoint.
+
+    #[test]
+    fn scrollback_zero_len_means_no_history() {
+        let mut parser = Parser::new(5, 20, 0);
+        for i in 0..50 {
+            parser.process(format!("line-{i}\r\n").as_bytes());
+        }
+        // Even though 45 rows scrolled out of view, scrollback_len = 0
+        // discards them — set_scrollback clamps to 0 because the
+        // VecDeque is empty.
+        parser.screen_mut().set_scrollback(10);
+        assert_eq!(
+            parser.screen().scrollback(),
+            0,
+            "set_scrollback must clamp to 0 when no buffer is configured",
+        );
+    }
+
+    #[test]
+    fn scrollback_set_back_round_trips() {
+        let mut parser = Parser::new(5, 20, 100);
+        for i in 0..50 {
+            parser.process(format!("line-{i}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(20);
+        assert_eq!(parser.screen().scrollback(), 20);
+        // And clamps to the bottom on negative-equivalent reset.
+        parser.screen_mut().set_scrollback(0);
+        assert_eq!(parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn scrollback_offset_auto_bumps_when_new_rows_evict() {
+        // The vt100 invariant codemux's UX leans on: while the user is
+        // looking at scrollback (offset > 0), each evicted row pushes
+        // the offset up by one so the same content stays under the
+        // user's gaze. If vt100 ever stops doing this, scroll mode
+        // would visibly "drift downward" as Claude streams output.
+        let mut parser = Parser::new(5, 20, 100);
+        for i in 0..30 {
+            parser.process(format!("init-{i}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(10);
+        assert_eq!(parser.screen().scrollback(), 10);
+        for i in 0..7 {
+            parser.process(format!("more-{i}\r\n").as_bytes());
+        }
+        assert_eq!(
+            parser.screen().scrollback(),
+            17,
+            "each newly evicted row must bump the offset to hold the view",
+        );
+    }
+
+    #[test]
+    fn scrollback_clamps_to_buffer_length_at_top() {
+        // `jump_to_top` calls set_scrollback(usize::MAX). The vt100
+        // contract is "clamp to scrollback.len()" so the offset never
+        // exceeds the buffer size.
+        let mut parser = Parser::new(5, 20, 100);
+        for i in 0..40 {
+            parser.process(format!("l{i}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let offset = parser.screen().scrollback();
+        assert!(offset > 0, "expected non-zero offset after jumping to top");
+        assert!(
+            offset <= 100,
+            "offset {offset} must not exceed configured scrollback_len of 100",
+        );
+    }
+
+    #[test]
+    fn scrollback_state_is_per_parser() {
+        // Two parsers stand in for two agents; setting scrollback on
+        // one must not perturb the other. Trivially true by
+        // construction (`Parser`s share no state) but pinned
+        // explicitly because the runtime's "scroll persists per agent
+        // across `Cmd-B 2` tab switches" contract leans on it. The
+        // partner regression — pressing the prefix key while scrolled
+        // back inadvertently snapping the source tab — lives at the
+        // dispatcher boundary and is guarded by the snap-only-on-
+        // Forward policy in the event loop. The method-level
+        // independence test below (`nudge_scrollback_only_touches_focused`)
+        // pins the multi-agent guarantee at the codemux layer.
+        let mut a = Parser::new(5, 20, 100);
+        let mut b = Parser::new(5, 20, 100);
+        for i in 0..30 {
+            a.process(format!("a{i}\r\n").as_bytes());
+            b.process(format!("b{i}\r\n").as_bytes());
+        }
+        a.screen_mut().set_scrollback(15);
+        assert_eq!(a.screen().scrollback(), 15);
+        assert_eq!(
+            b.screen().scrollback(),
+            0,
+            "agent b's offset must not move when a is scrolled",
+        );
+        b.screen_mut().set_scrollback(7);
+        assert_eq!(
+            a.screen().scrollback(),
+            15,
+            "agent a's offset must not move when b is scrolled",
+        );
+        assert_eq!(b.screen().scrollback(), 7);
+    }
+
+    #[test]
+    fn no_overlay_active_returns_true_when_nothing_open() {
+        assert!(no_overlay_active(
+            None,
+            PopupState::Closed,
+            HelpState::Closed,
+        ));
+    }
+
+    #[test]
+    fn no_overlay_active_returns_false_when_help_open() {
+        assert!(!no_overlay_active(
+            None,
+            PopupState::Closed,
+            HelpState::Open,
+        ));
+    }
+
+    #[test]
+    fn no_overlay_active_returns_false_when_popup_open() {
+        assert!(!no_overlay_active(
+            None,
+            PopupState::Open { selection: 0 },
+            HelpState::Closed,
+        ));
+    }
+
+    // ── scrollback methods (direct) ───────────────────────────────
+    //
+    // Built on the `AgentTransport::for_test` seam so the methods can
+    // be exercised against a real `RuntimeAgent` without `claude` on
+    // PATH. The transport just sits there — `cat` waits for input —
+    // while the test pokes the parser directly to populate scrollback.
+
+    fn ready_test_agent(scrollback_len: usize) -> RuntimeAgent {
+        let transport =
+            AgentTransport::for_test("scrollback-test".into(), 5, 20).expect("for_test transport");
+        RuntimeAgent::ready("a".into(), None, None, transport, 5, 20, scrollback_len)
+    }
+
+    fn populate(agent: &mut RuntimeAgent, lines: u32) {
+        if let AgentState::Ready { parser, .. } = &mut agent.state {
+            for i in 0..lines {
+                parser.process(format!("l{i}\r\n").as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn nudge_scrollback_moves_offset_into_history_then_back() {
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 50);
+        agent.nudge_scrollback(5);
+        assert_eq!(agent.scrollback_offset(), 5);
+        agent.nudge_scrollback(-2);
+        assert_eq!(agent.scrollback_offset(), 3);
+    }
+
+    #[test]
+    fn nudge_scrollback_saturates_at_zero_on_negative_overflow() {
+        // Wheel-down past the live view must NOT wrap or panic — the
+        // method delegates to `usize::saturating_add_signed`. Pinning
+        // the explicit policy here means a future refactor can't
+        // accidentally regress to wrapping arithmetic without breaking
+        // this test.
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 50);
+        agent.nudge_scrollback(10);
+        agent.nudge_scrollback(i32::MIN);
+        assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn nudge_scrollback_only_touches_focused_agent() {
+        // The runtime's "scroll persists per agent" UX contract: a
+        // wheel tick on the focused tab must not perturb other agents'
+        // offsets. Pins the multi-agent layer that the per-`Parser`
+        // contract test (`scrollback_state_is_per_parser` above)
+        // guarantees underneath.
+        let mut a = ready_test_agent(100);
+        let mut b = ready_test_agent(100);
+        populate(&mut a, 30);
+        populate(&mut b, 30);
+        let mut agents = [a, b];
+        agents[0].nudge_scrollback(7);
+        assert_eq!(agents[0].scrollback_offset(), 7);
+        assert_eq!(agents[1].scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn nudge_scrollback_no_op_on_failed_agent() {
+        let mut agent = failed_agent("dead");
+        agent.nudge_scrollback(5);
+        assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn snap_to_live_resets_offset_to_zero() {
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 50);
+        agent.nudge_scrollback(15);
+        assert_eq!(agent.scrollback_offset(), 15);
+        agent.snap_to_live();
+        assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn snap_to_live_no_op_on_failed_agent() {
+        let mut agent = failed_agent("dead");
+        agent.snap_to_live();
+        assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn jump_to_top_clamps_to_buffer_length() {
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 50);
+        agent.jump_to_top();
+        let offset = agent.scrollback_offset();
+        assert!(offset > 0, "expected non-zero offset after jumping to top");
+        assert!(
+            offset <= 100,
+            "offset {offset} must not exceed configured scrollback_len of 100",
+        );
+    }
+
+    #[test]
+    fn scrollback_offset_returns_zero_for_failed_agent() {
+        let agent = failed_agent("dead");
+        assert_eq!(agent.scrollback_offset(), 0);
+    }
 }

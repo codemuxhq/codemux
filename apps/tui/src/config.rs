@@ -27,10 +27,33 @@ use serde::Deserialize;
 
 use crate::keymap::Bindings;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+/// Per-agent scrollback buffer size, in rows. Default ~5k rows is roughly
+/// 20 MB at a typical 120-col width — comfortable for a personal tool with
+/// 2-4 agents. Documented as the user-facing knob; bumping it costs memory
+/// linearly per Ready agent.
+fn default_scrollback_len() -> usize {
+    5_000
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub bindings: Bindings,
+    /// How many rows of scrollback each agent's PTY parser retains.
+    /// Vt100 only collects rows that scroll off the *primary* screen; this
+    /// works for codemux because Claude Code renders inline (not on the
+    /// alternate screen). See AD-25.
+    #[serde(default = "default_scrollback_len")]
+    pub scrollback_len: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bindings: Bindings::default(),
+            scrollback_len: default_scrollback_len(),
+        }
+    }
 }
 
 /// Load the user config from the canonical XDG location, returning defaults
@@ -86,6 +109,7 @@ mod tests {
         let config: Config = toml::from_str("").unwrap();
         let defaults = Config::default();
         assert_eq!(config.bindings.prefix, defaults.bindings.prefix);
+        assert_eq!(config.scrollback_len, defaults.scrollback_len);
     }
 
     #[test]
@@ -169,5 +193,17 @@ mod tests {
     fn errors_when_neither_xdg_nor_home_is_set() {
         let result = resolve_config_path(None, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn scrollback_len_defaults_to_five_thousand() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.scrollback_len, 5_000);
+    }
+
+    #[test]
+    fn scrollback_len_round_trips_when_set_in_toml() {
+        let config: Config = toml::from_str("scrollback_len = 1500").unwrap();
+        assert_eq!(config.scrollback_len, 1_500);
     }
 }

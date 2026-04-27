@@ -314,6 +314,64 @@ Hand-rolled `KeyChord` parser keeps the user-facing format independent of
 crossterm's internal representation (which has fields like `kind` and `state`
 the user never wants to think about).
 
+### AD-25 — Per-agent scrollback via vt100's primary-grid back buffer
+
+The wheel scrolls the focused agent's transcript history. The
+implementation rests on three observations and one deliberate trade-off.
+
+**Observation 1: Claude Code stays on the primary screen.** Verified by
+PTY-probing the initial output for the alt-screen DEC modes (`?1049h`,
+`?47h`, `?1047h`) — none appear, only `?2004h` (bracketed paste) and
+`?25l` (cursor hide). This matters because vt100's alternate-grid is
+hardcoded to `scrollback_len: 0` and would never collect history; only
+the primary grid does. We're lucky here, and the test in
+`runtime::tests::scrollback_zero_len_means_no_history` guards the
+contract our luck depends on.
+
+**Observation 2: vt100 owns the offset.** When new rows evict the
+top while `scrollback_offset > 0`, vt100 auto-bumps the offset by one
+so the same content stays under the user's gaze. We never store an
+offset in `RuntimeAgent`; we read `screen.scrollback()` and call
+`screen_mut().set_scrollback(cur ± delta)` per wheel tick. Per-agent
+state is implicit in each agent's `Parser`, which means switching focus
+**preserves** scroll position — coming back to a scrolled-back agent
+shows it where you left it. This is intentional; do not "fix" it.
+
+**Observation 3: tui-term renders scrollback automatically.**
+`PseudoTerminal::new(parser.screen())` already calls
+`screen.visible_rows()` (which respects the offset) and shifts the
+cursor row by `screen.scrollback()`. No render-side glue is required
+beyond the floating "scroll mode" indicator badge.
+
+**Trade-off: no PTY resize when scrolled.** A bottom-row "SCROLL"
+status strip would force a PTY `SIGWINCH` on every scroll-mode
+entry/exit, and Claude redrawing its full UI on every transition would
+be much worse UX than the alternative. Instead the indicator is a
+floating widget painted via `Clear` + `Paragraph` over the bottom-right
+of the agent pane — costs ~22 cells of overlap during scroll mode,
+gains zero `SIGWINCH` churn.
+
+**Mouse capture is unconditional**, gated only on the alt-screen entry
+succeeding. `EnableMouseCapture` (`?1006h` SGR mouse) is what makes
+`MouseEventKind::ScrollUp/Down` reach the event loop instead of being
+translated to ↑/↓ arrows by the host terminal's `alternateScroll`
+behavior. Side effect: native click-and-drag selection now requires
+holding ⌥/Alt to bypass capture — the help screen documents this.
+**Apple Terminal does not deliver SGR mouse events**; scroll won't
+work there. Explicit non-goal — codemux works with iTerm2, Alacritty,
+Ghostty, Wezterm, Kitty.
+
+**Scroll mode is non-sticky for typing.** Bytes that would have been
+forwarded to Claude — typing real text, control sequences, anything
+the dispatcher returns as `KeyDispatch::Forward` — first snap the
+focused agent back to the live view (`set_scrollback(0)`), so what
+you type isn't echoed into a window you can't see. **Navigation
+chords preserve scroll**: pressing the prefix, a direct nav bind, or
+hitting digit-1..9 in prefix mode does NOT reset the offset, so a
+`Cmd-B 2` to switch tabs leaves the agent you just left exactly where
+you scrolled it. `Event::Paste` snaps for the same visibility reason
+as forwarded bytes.
+
 ## Deferred ideas
 
 Architecture decisions sketched in earlier drafts but not load-bearing for what
