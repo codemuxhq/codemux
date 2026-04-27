@@ -532,6 +532,7 @@ mod tests {
         let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
         let prepared = PreparedHost {
             remote_home: PathBuf::from("/home/test"),
+            binary_was_updated: false,
         };
         let handle = start_attach_with_runner(
             Box::new(ArcRunner(runner_arc)),
@@ -608,6 +609,7 @@ mod tests {
         let runner_arc: Arc<dyn CommandRunner + Send + Sync> = runner.clone();
         let prepared = PreparedHost {
             remote_home: PathBuf::from("/home/test"),
+            binary_was_updated: false,
         };
         let handle = start_attach_with_runner(
             Box::new(ArcRunner(runner_arc)),

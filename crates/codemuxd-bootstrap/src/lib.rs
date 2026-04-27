@@ -245,6 +245,15 @@ pub struct PreparedHost {
     /// `ssh -L` forward spec (sshd's remote half does not shell-expand
     /// `~`/`$HOME` — see notes on [`open_ssh_tunnel`]).
     pub remote_home: PathBuf,
+    /// Whether the install branch ran (probe saw a version mismatch and
+    /// we scp'd + built a fresh binary). When `true`, any daemon already
+    /// running on the remote for this agent-id is by definition stale —
+    /// it loaded the OLD binary into memory before we replaced the file
+    /// on disk, and `pid_file` exclusivity will block a fresh spawn.
+    /// [`attach_agent`] reads this flag and force-respawns the daemon
+    /// before calling `setsid -f` so the new client doesn't get routed
+    /// to the stale process.
+    pub binary_was_updated: bool,
 }
 
 /// Inputs to [`attach_agent`] (and the worker entry points around it).
@@ -305,7 +314,8 @@ pub fn prepare_remote(
     let target_version = bootstrap_version();
     on_stage(Stage::VersionProbe);
     let probe = probe_remote(runner, host)?;
-    if probe.installed_version.as_deref() != Some(target_version) {
+    let binary_was_updated = probe.installed_version.as_deref() != Some(target_version);
+    if binary_was_updated {
         on_stage(Stage::TarballStage);
         let local_tarball = stage_tarball()?;
         on_stage(Stage::Scp);
@@ -315,6 +325,7 @@ pub fn prepare_remote(
     }
     Ok(PreparedHost {
         remote_home: probe.home,
+        binary_was_updated,
     })
 }
 
@@ -378,7 +389,13 @@ fn attach_socket(
     validate_agent_id(&cfg.agent_id)?;
 
     on_stage(Stage::DaemonSpawn);
-    spawn_remote_daemon(runner, &cfg.host, &cfg.agent_id, cfg.cwd.as_deref())?;
+    spawn_remote_daemon(
+        runner,
+        &cfg.host,
+        &cfg.agent_id,
+        cfg.cwd.as_deref(),
+        prepared.binary_was_updated,
+    )?;
 
     on_stage(Stage::SocketTunnel);
     let local_socket = local_socket_path(&cfg.local_socket_dir, &cfg.agent_id)?;
@@ -677,6 +694,26 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
 /// (apps/daemon/src/bootstrap.rs) handles the "already running" case
 /// — we surface its stderr directly if spawn fails.
 ///
+/// `force_respawn` is set when [`prepare_remote`] just installed a
+/// fresh binary. Any daemon already running for this agent-id is by
+/// definition stale (it loaded the OLD binary into memory before we
+/// replaced the file on disk). Worse, its `pid_file` exclusivity will
+/// silently block the new `setsid -f codemuxd` from binding — `setsid`
+/// itself succeeds (so the outer ssh exits 0), but the new daemon
+/// process exits a moment later when its `bind()` fails. The tunnel
+/// then connects to the old daemon, the wire handshake works, and the
+/// user gets the OLD daemon's behavior on what looks like a fresh
+/// install. Without this kill, every codemux upgrade strands users on
+/// the previous version's daemon until they manually `pkill codemuxd`.
+///
+/// The kill is `kill -TERM` followed by a brief sleep, then `kill
+/// -KILL` if still alive. We give SIGTERM a chance because the daemon
+/// has a `Drop` cleanup path (kills its child PTY, removes pid file)
+/// that SIGKILL skips. The cost: the in-flight Claude session on the
+/// remote dies. That's the right tradeoff at upgrade time — a stale
+/// daemon serving forever is strictly worse than a one-time session
+/// loss when the user knowingly installed a new version.
+///
 /// Stdio redirection (`</dev/null >/dev/null 2>&1`) is **load-bearing**:
 /// `setsid -f` forks but doesn't reopen file descriptors, so without
 /// the redirect the daemon inherits the SSH session's pipes for
@@ -696,6 +733,7 @@ fn spawn_remote_daemon(
     host: &str,
     agent_id: &str,
     cwd: Option<&Path>,
+    force_respawn: bool,
 ) -> Result<(), Error> {
     let cwd_flag = match cwd {
         None => String::new(),
@@ -716,8 +754,28 @@ fn spawn_remote_daemon(
             format!(" --cwd '{cwd_str}'")
         }
     };
+    // When the binary was just updated, send SIGTERM to any existing
+    // daemon for this agent-id, give it 200ms to release the pid file
+    // and socket via its Drop cleanup, then SIGKILL anything still
+    // alive. The `2>/dev/null` swallows "no such process" noise — both
+    // signals are best-effort on a possibly-empty pid file. The `||
+    // true` keeps `set -e` quiet in the wrapping shell.
+    let respawn_prelude = if force_respawn {
+        "if [ -s ~/.cache/codemuxd/pids/{agent_id}.pid ]; then \
+           pid=$(cat ~/.cache/codemuxd/pids/{agent_id}.pid); \
+           kill -TERM $pid 2>/dev/null || true; \
+           sleep 0.2; \
+           kill -KILL $pid 2>/dev/null || true; \
+           rm -f ~/.cache/codemuxd/pids/{agent_id}.pid \
+                 ~/.cache/codemuxd/sockets/{agent_id}.sock; \
+         fi; "
+            .replace("{agent_id}", agent_id)
+    } else {
+        String::new()
+    };
     let cmd = format!(
-        "setsid -f ~/.cache/codemuxd/bin/codemuxd \
+        "{respawn_prelude}\
+         setsid -f ~/.cache/codemuxd/bin/codemuxd \
          --socket ~/.cache/codemuxd/sockets/{agent_id}.sock \
          --pid-file ~/.cache/codemuxd/pids/{agent_id}.pid \
          --log-file ~/.cache/codemuxd/logs/{agent_id}.log \
@@ -1332,8 +1390,8 @@ mod tests {
             &["-o", "BatchMode=yes"],
             fail(2, b"Error: cwd /no/such does not exist"),
         );
-        let err =
-            spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/no/such"))).unwrap_err();
+        let err = spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/no/such")), false)
+            .unwrap_err();
         let Error::Bootstrap { stage, source } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
@@ -1350,8 +1408,14 @@ mod tests {
     fn spawn_remote_daemon_rejects_quote_in_cwd() {
         let runner = FakeRunner::new();
         // No script entries — should error before ssh is invoked.
-        let err = spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp/with'quote")))
-            .unwrap_err();
+        let err = spawn_remote_daemon(
+            &runner,
+            "host",
+            "alpha",
+            Some(Path::new("/tmp/with'quote")),
+            false,
+        )
+        .unwrap_err();
         let Error::Bootstrap { stage, source } = err else {
             panic!("expected Bootstrap, got {err:?}");
         };
@@ -1375,7 +1439,7 @@ mod tests {
     #[test]
     fn spawn_remote_daemon_redirects_stdio_to_devnull() {
         let runner = RecordingRunner::new();
-        spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp"))).unwrap();
+        spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp")), false).unwrap();
         let cmd = runner.last_run_cmd();
         assert!(
             cmd.contains("</dev/null >/dev/null 2>&1"),
@@ -1391,7 +1455,7 @@ mod tests {
     #[test]
     fn spawn_remote_daemon_omits_cwd_flag_when_none() {
         let runner = RecordingRunner::new();
-        spawn_remote_daemon(&runner, "host", "alpha", None).unwrap();
+        spawn_remote_daemon(&runner, "host", "alpha", None, false).unwrap();
         let cmd = runner.last_run_cmd();
         assert!(
             !cmd.contains("--cwd"),
@@ -1405,11 +1469,80 @@ mod tests {
     #[test]
     fn spawn_remote_daemon_includes_cwd_flag_when_some() {
         let runner = RecordingRunner::new();
-        spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/srv/work"))).unwrap();
+        spawn_remote_daemon(
+            &runner,
+            "host",
+            "alpha",
+            Some(Path::new("/srv/work")),
+            false,
+        )
+        .unwrap();
         let cmd = runner.last_run_cmd();
         assert!(
             cmd.contains("--cwd '/srv/work'"),
             "cmd must include --cwd '/srv/work' when cwd is Some; got: {cmd}",
+        );
+    }
+
+    /// `force_respawn = false` keeps the prior recipe verbatim — no kill
+    /// prelude, no rm -f. Reattaching to a same-version daemon must
+    /// preserve the existing process (session continuity, AD-26).
+    #[test]
+    fn spawn_remote_daemon_omits_kill_prelude_when_not_force_respawn() {
+        let runner = RecordingRunner::new();
+        spawn_remote_daemon(&runner, "host", "alpha", None, false).unwrap();
+        let cmd = runner.last_run_cmd();
+        assert!(
+            !cmd.contains("kill"),
+            "non-force-respawn must not kill any running daemon; got: {cmd}",
+        );
+        assert!(
+            !cmd.contains("rm -f"),
+            "non-force-respawn must not remove pid/socket files; got: {cmd}",
+        );
+    }
+
+    /// `force_respawn = true` ⇒ kill prelude precedes the `setsid` line.
+    /// Ordering is load-bearing: SIGTERM first (so the old daemon's Drop
+    /// runs and removes the pid file cleanly), brief sleep, then SIGKILL
+    /// for anything that ignored TERM, then rm -f the pid+socket files
+    /// in case the daemon couldn't clean up. Without this, a stale
+    /// daemon from a previous version keeps its pid lock and the new
+    /// `setsid -f codemuxd` silently fails (`setsid` itself succeeds so
+    /// ssh exits 0). The user then connects to the OLD daemon over the
+    /// pre-existing socket, with no diagnostic that anything went wrong.
+    #[test]
+    fn spawn_remote_daemon_runs_kill_prelude_when_force_respawn() {
+        let runner = RecordingRunner::new();
+        spawn_remote_daemon(&runner, "host", "alpha", None, true).unwrap();
+        let cmd = runner.last_run_cmd();
+        // Both signals must appear and target the pid file by path.
+        assert!(
+            cmd.contains("kill -TERM"),
+            "force-respawn must SIGTERM existing daemon; got: {cmd}",
+        );
+        assert!(
+            cmd.contains("kill -KILL"),
+            "force-respawn must SIGKILL post-grace-period; got: {cmd}",
+        );
+        assert!(
+            cmd.contains("~/.cache/codemuxd/pids/alpha.pid"),
+            "kill must target the agent-id's pid file; got: {cmd}",
+        );
+        // Pre-spawn cleanup of pid file and socket so the new daemon
+        // gets a clean acquire path even if SIGKILL raced with cleanup.
+        assert!(
+            cmd.contains("rm -f"),
+            "force-respawn must rm pid+socket post-kill; got: {cmd}",
+        );
+        // Kill prelude precedes the setsid invocation in the same
+        // ssh shell (one round-trip) — assert the textual order so a
+        // refactor can't accidentally interleave them.
+        let kill_pos = cmd.find("kill -TERM").unwrap();
+        let setsid_pos = cmd.find("setsid -f").unwrap();
+        assert!(
+            kill_pos < setsid_pos,
+            "kill prelude must precede setsid in the same shell; got: {cmd}",
         );
     }
 
@@ -1647,6 +1780,10 @@ mod tests {
 
         let prepared = prepare_remote(&runner, |_| {}, "fake-host").unwrap();
         assert_eq!(prepared.remote_home, PathBuf::from("/home/fake"));
+        assert!(
+            prepared.binary_was_updated,
+            "fresh host runs the install branch; flag must signal that to attach_agent",
+        );
     }
 
     /// `prepare_remote` skip-rebuild path: probe matches the embedded
@@ -1663,6 +1800,11 @@ mod tests {
 
         let prepared = prepare_remote(&runner, |_| {}, "fake-host").unwrap();
         assert_eq!(prepared.remote_home, PathBuf::from("/home/fake"));
+        assert!(
+            !prepared.binary_was_updated,
+            "version-match path must not signal an upgrade — that would force \
+             a daemon kill and break session continuity for unchanged builds",
+        );
     }
 
     /// `attach_socket` happy path: daemon spawn → tunnel → connect,
@@ -1693,6 +1835,7 @@ mod tests {
 
         let prepared = PreparedHost {
             remote_home: PathBuf::from("/home/fake"),
+            binary_was_updated: false,
         };
         let cfg = AttachConfig {
             host: "fake-host".into(),
