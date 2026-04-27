@@ -18,12 +18,15 @@
 //! readable error and exit non-zero before touching the terminal. A typo
 //! silently breaking your bindings would be much worse than refusing to start.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
 use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, eyre};
+use ratatui::style::Color;
 use serde::Deserialize;
+use serde::de::{self, Deserializer, Visitor};
 
 use crate::keymap::Bindings;
 
@@ -80,6 +83,166 @@ pub struct Ui {
     /// deterministic across terminals, and visible on any reasonable
     /// display.
     pub subtle: bool,
+
+    /// Per-host accent colors used for the host prefix on unfocused
+    /// tabs (e.g. `uber-laptop · main-claude`). Hosts not listed fall
+    /// back to the secondary chrome style — quiet by default, opt-in
+    /// distinction for the hosts the user juggles often.
+    ///
+    /// Three accepted formats per value:
+    /// - **Named ANSI**: `"blue"`, `"red"`, `"lightgreen"`, etc.
+    ///   Eight standard names (`black`, `red`, `green`, `yellow`,
+    ///   `blue`, `magenta`, `cyan`, `gray`/`grey`) plus their `light_`
+    ///   or `bright_` variants and `darkgray`/`white`. Honors the
+    ///   user's terminal theme.
+    /// - **xterm-256 index**: `33` (a TOML integer). Picks a specific
+    ///   slot in the 256-color palette. Same color across themes.
+    /// - **Hex RGB**: `"#0080ff"`. True-color. Renders precisely on
+    ///   modern terminals; may degrade on 256-color-only setups.
+    pub host_colors: HashMap<String, ChromeColor>,
+}
+
+/// A user-configurable color for chrome accents. Validated at
+/// deserialize time so a typo in `config.toml` fails loudly with a
+/// readable error before any rendering happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChromeColor {
+    /// One of crossterm's 16 named ANSI colors. Maps to whatever the
+    /// user's terminal theme defines for that slot.
+    Named(Color),
+    /// A specific xterm-256 palette slot (0-255).
+    Indexed(u8),
+    /// True-color RGB triple. Renders on terminals that support
+    /// 24-bit color (most modern ones); lossy on 256-color terminals.
+    Rgb(u8, u8, u8),
+}
+
+impl ChromeColor {
+    /// Convert to the ratatui `Color` used by the renderer. Infallible
+    /// because validation happened at deserialize time.
+    #[must_use]
+    pub fn to_color(self) -> Color {
+        match self {
+            Self::Named(c) => c,
+            Self::Indexed(i) => Color::Indexed(i),
+            Self::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        }
+    }
+}
+
+/// Custom deserialization for `ChromeColor`: TOML scalars come in as
+/// either string or integer, and we want the user to write the natural
+/// form for each case (a name, a number, or a `#rrggbb`) without having
+/// to wrap things in tagged variants.
+impl<'de> Deserialize<'de> for ChromeColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ChromeColorVisitor)
+    }
+}
+
+struct ChromeColorVisitor;
+
+impl Visitor<'_> for ChromeColorVisitor {
+    type Value = ChromeColor;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(
+            "a color: a named ANSI color (\"blue\"), a hex RGB string (\"#0080ff\"), \
+             or an xterm-256 palette index (0-255)",
+        )
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<ChromeColor, E>
+    where
+        E: de::Error,
+    {
+        if let Some(hex) = value.strip_prefix('#') {
+            parse_hex_rgb(hex)
+                .map(|(r, g, b)| ChromeColor::Rgb(r, g, b))
+                .ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "invalid hex color {value:?}; expected #rrggbb (six hex digits)",
+                    ))
+                })
+        } else {
+            parse_named_color(value)
+                .map(ChromeColor::Named)
+                .ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "unknown color name {value:?}; expected one of: \
+                     black, red, green, yellow, blue, magenta, cyan, white, gray, \
+                     darkgray, darkred, darkgreen, darkyellow, darkblue, darkmagenta, \
+                     darkcyan",
+                    ))
+                })
+        }
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<ChromeColor, E>
+    where
+        E: de::Error,
+    {
+        u8::try_from(value)
+            .map(ChromeColor::Indexed)
+            .map_err(|_| de::Error::custom(format!("xterm-256 index {value} out of range (0-255)")))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<ChromeColor, E>
+    where
+        E: de::Error,
+    {
+        u8::try_from(value)
+            .map(ChromeColor::Indexed)
+            .map_err(|_| de::Error::custom(format!("xterm-256 index {value} out of range (0-255)")))
+    }
+}
+
+/// Parse `rrggbb` (six hex digits, no `#` prefix) into an RGB triple.
+/// `None` on any malformed input — the caller wraps that into a
+/// human-readable serde error.
+fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+/// Map a lowercased ANSI color name to ratatui's `Color`. Names follow
+/// the convention TUI configs use elsewhere (kitty, alacritty, helix):
+/// the eight standard ANSI names map to the dim/normal palette
+/// (`Color::Red` etc.); the `light_*` (or `bright_*`) prefix selects
+/// the bright counterpart (`Color::LightRed` etc.). Returns `None` for
+/// an unrecognized name so the caller can produce an error message
+/// that lists the valid alternatives.
+fn parse_named_color(s: &str) -> Option<Color> {
+    // Allow both `lightred` and `bright_red` style; users coming from
+    // different ecosystems write either. Normalize once up front.
+    let normalized = s.to_ascii_lowercase().replace(['_', '-'], "");
+    match normalized.as_str() {
+        "black" => Some(Color::Black),
+        "red" => Some(Color::Red),
+        "green" => Some(Color::Green),
+        "yellow" => Some(Color::Yellow),
+        "blue" => Some(Color::Blue),
+        "magenta" => Some(Color::Magenta),
+        "cyan" => Some(Color::Cyan),
+        "gray" | "grey" => Some(Color::Gray),
+        "darkgray" | "darkgrey" => Some(Color::DarkGray),
+        "lightred" | "brightred" => Some(Color::LightRed),
+        "lightgreen" | "brightgreen" => Some(Color::LightGreen),
+        "lightyellow" | "brightyellow" => Some(Color::LightYellow),
+        "lightblue" | "brightblue" => Some(Color::LightBlue),
+        "lightmagenta" | "brightmagenta" => Some(Color::LightMagenta),
+        "lightcyan" | "brightcyan" => Some(Color::LightCyan),
+        "white" => Some(Color::White),
+        _ => None,
+    }
 }
 
 /// Load the user config from the canonical XDG location, returning defaults
@@ -255,5 +418,137 @@ mod tests {
         let config: Config = toml::from_str("scrollback_len = 100").unwrap();
         assert!(!config.ui.subtle);
         assert_eq!(config.scrollback_len, 100);
+    }
+
+    // ── ChromeColor parsing ──────────────────────────────────────
+    //
+    // Loud failure on bad input: the loader wraps the serde error in
+    // a "parse config at <path>" frame and exits non-zero before any
+    // rendering happens. These tests pin both the happy paths (so the
+    // three accepted formats keep working) and the rejection cases (so
+    // a typo doesn't silently fall back to a wrong color).
+
+    #[test]
+    fn host_colors_named_ansi_round_trips() {
+        let toml_text = r#"
+            [ui.host_colors]
+            uber = "blue"
+            personal = "lightred"
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.ui.host_colors.get("uber"),
+            Some(&ChromeColor::Named(Color::Blue)),
+        );
+        assert_eq!(
+            config.ui.host_colors.get("personal"),
+            Some(&ChromeColor::Named(Color::LightRed)),
+        );
+    }
+
+    #[test]
+    fn host_colors_accepts_bright_underscore_and_dash_variants() {
+        // Different ecosystems write `light_red`, `bright-red`, or
+        // `lightred`. All three should parse identically — typo-friendly
+        // without exploding the named-color enum.
+        for name in [
+            "lightred",
+            "light_red",
+            "light-red",
+            "BrightRed",
+            "bright_red",
+        ] {
+            let toml_text = format!("[ui.host_colors]\nh = \"{name}\"\n");
+            let config: Config =
+                toml::from_str(&toml_text).unwrap_or_else(|e| panic!("name {name:?} failed: {e}"));
+            assert_eq!(
+                config.ui.host_colors.get("h"),
+                Some(&ChromeColor::Named(Color::LightRed)),
+                "name {name:?} should map to LightRed",
+            );
+        }
+    }
+
+    #[test]
+    fn host_colors_xterm_index_round_trips() {
+        let toml_text = r"
+            [ui.host_colors]
+            uber = 33
+            personal = 247
+        ";
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.ui.host_colors.get("uber"),
+            Some(&ChromeColor::Indexed(33)),
+        );
+        assert_eq!(
+            config.ui.host_colors.get("personal"),
+            Some(&ChromeColor::Indexed(247)),
+        );
+    }
+
+    #[test]
+    fn host_colors_hex_rgb_round_trips() {
+        // r##"..."## raw string — the inner `"#...` hex strings would
+        // close a single-hash raw string early.
+        let toml_text = r##"
+            [ui.host_colors]
+            uber = "#0080ff"
+            personal = "#D75F00"
+        "##;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.ui.host_colors.get("uber"),
+            Some(&ChromeColor::Rgb(0x00, 0x80, 0xff)),
+        );
+        assert_eq!(
+            config.ui.host_colors.get("personal"),
+            Some(&ChromeColor::Rgb(0xd7, 0x5f, 0x00)),
+            "uppercase hex digits must parse",
+        );
+    }
+
+    #[test]
+    fn host_colors_unknown_name_is_an_error() {
+        // Loud failure for typos — better than silently falling back
+        // to the default secondary color and leaving the user
+        // wondering why their config had no effect.
+        let toml_text = r#"
+            [ui.host_colors]
+            uber = "burgundy"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml_text);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("burgundy"),
+            "error should mention the bad name; got: {err}",
+        );
+    }
+
+    #[test]
+    fn host_colors_malformed_hex_is_an_error() {
+        // Five digits, eight digits, non-hex chars all fail.
+        for bad in ["#abc", "#abcdefg", "#xyzxyz", "#12345"] {
+            let toml_text = format!("[ui.host_colors]\nh = \"{bad}\"\n");
+            let result: Result<Config, _> = toml::from_str(&toml_text);
+            assert!(result.is_err(), "{bad:?} should fail to parse");
+        }
+    }
+
+    #[test]
+    fn host_colors_xterm_index_out_of_range_is_an_error() {
+        let toml_text = "[ui.host_colors]\nh = 256\n";
+        let result: Result<Config, _> = toml::from_str(toml_text);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("256") && err.contains("0-255"),
+            "error should mention the bad value and the range; got: {err}",
+        );
+    }
+
+    #[test]
+    fn host_colors_defaults_to_empty_map() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.ui.host_colors.is_empty());
     }
 }

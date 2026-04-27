@@ -581,6 +581,7 @@ pub fn run(
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
 
+    let chrome = ChromeStyle::from_ui(&config.ui);
     event_loop(
         &mut terminal,
         agents,
@@ -589,7 +590,7 @@ pub fn run(
         log_tail,
         initial_cwd,
         config.scrollback_len,
-        ChromeStyle::from_ui(&config.ui),
+        &chrome,
     )
 }
 
@@ -844,7 +845,7 @@ fn event_loop(
     log_tail: Option<&LogTail>,
     initial_cwd: &Path,
     scrollback_len: usize,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
@@ -1664,7 +1665,7 @@ fn render_frame(
     prefix_state: PrefixState,
     log_tail: Option<&LogTail>,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     // Cleared at the top of every frame so a stale frame's rects can
@@ -1721,7 +1722,7 @@ fn render_frame(
 /// agent pane for attention. Empty tail (no events yet) renders as a
 /// single dash so the row is visually present and the user can tell
 /// the strip is live.
-fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail, chrome: ChromeStyle) {
+fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail, chrome: &ChromeStyle) {
     let line = tail.latest().unwrap_or_else(|| "—".to_string());
     let widget = Paragraph::new(Line::raw(line)).style(chrome.secondary);
     // Clear so a previous frame's longer line doesn't leave trailing
@@ -1841,7 +1842,7 @@ fn render_left_pane(
     agents: &[RuntimeAgent],
     focused: usize,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     let [nav_area, pty_area] = Layout::default()
@@ -1905,7 +1906,7 @@ fn render_popup_style(
     bindings: &Bindings,
     prefix_state: PrefixState,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     let [pty_area, status_area] = Layout::default()
@@ -1954,7 +1955,7 @@ fn render_status_bar(
     bindings: &Bindings,
     prefix_state: PrefixState,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     // Compute the hint as both rendered Line (with styling) and a
@@ -2032,7 +2033,7 @@ fn render_status_bar(
 fn build_hint(
     bindings: &Bindings,
     prefix_state: PrefixState,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
 ) -> (Line<'static>, u16) {
     match prefix_state {
         PrefixState::Idle => {
@@ -2097,7 +2098,7 @@ fn build_tab_strip(
     agents: &[RuntimeAgent],
     focused: usize,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
 ) -> Vec<TabSpec> {
     agents
         .iter()
@@ -2119,7 +2120,7 @@ fn build_tab_strip(
         .collect()
 }
 
-fn tab_index_style(focused: bool, chrome: ChromeStyle) -> Style {
+fn tab_index_style(focused: bool, chrome: &ChromeStyle) -> Style {
     if focused {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
@@ -2155,12 +2156,23 @@ struct AnimationPhase {
 /// the style at every span site would either duplicate the if-else or
 /// scatter helper calls. One central conversion keeps the
 /// "what-does-subtle-mean" decision in exactly one place.
-#[derive(Clone, Copy, Debug)]
+///
+/// Threaded by reference (`&ChromeStyle`) rather than by value because
+/// the per-host accent map prevents `Copy`. Cloning a `HashMap` each
+/// frame would be silly for what is fundamentally configuration.
+#[derive(Clone, Debug)]
 struct ChromeStyle {
-    /// Used for separators, hints, host prefix, log strip, unfocused
-    /// tab body — anything that should read as "ambient context" rather
-    /// than primary content. See [`Self::from_ui`] for the two modes.
+    /// Used for separators, hints, host prefix on hosts without an
+    /// explicit accent, log strip, unfocused tab body — anything that
+    /// should read as "ambient context" rather than primary content.
+    /// See [`Self::from_ui`] for the two modes.
     secondary: Style,
+    /// Pre-computed per-host accent styles, indexed by host name. The
+    /// host prefix on an *unfocused* tab uses
+    /// [`Self::host_style`], which falls back to `secondary` when the
+    /// host isn't configured. Focused tabs ignore this and inherit the
+    /// reverse-video tab highlight regardless.
+    host_styles: std::collections::HashMap<String, Style>,
 }
 
 impl ChromeStyle {
@@ -2175,6 +2187,10 @@ impl ChromeStyle {
     /// iTerm2 uses a slightly darker color, some terminals ignore it)
     /// so it's a poor default but a fine opt-in for users who like the
     /// quieter look on a high-contrast display.
+    ///
+    /// Per-host accents are pre-computed into `Style` values once here
+    /// so lookups in the render hot path are O(1) `HashMap` reads with no
+    /// per-frame conversion.
     fn from_ui(ui: &crate::config::Ui) -> Self {
         let secondary = if ui.subtle {
             Style::default()
@@ -2183,7 +2199,26 @@ impl ChromeStyle {
         } else {
             Style::default().fg(Color::Indexed(247))
         };
-        Self { secondary }
+        let host_styles = ui
+            .host_colors
+            .iter()
+            .map(|(host, color)| (host.clone(), Style::default().fg(color.to_color())))
+            .collect();
+        Self {
+            secondary,
+            host_styles,
+        }
+    }
+
+    /// Style for a host prefix on an unfocused tab. Returns the
+    /// configured accent if the user assigned one to this host;
+    /// otherwise the secondary chrome style (so unconfigured hosts
+    /// quietly blend with the rest of the chrome rather than shouting).
+    fn host_style(&self, host: &str) -> Style {
+        self.host_styles
+            .get(host)
+            .copied()
+            .unwrap_or(self.secondary)
     }
 }
 
@@ -2278,7 +2313,7 @@ fn agent_label_spans(
     agent: &RuntimeAgent,
     focused: bool,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
 ) -> Vec<Span<'static>> {
     // Attention only applies to unfocused tabs; the &&!focused guard
     // is belt-and-braces against a stale flag (the per-frame
@@ -2307,21 +2342,22 @@ fn label_spans(
     attention: bool,
     focused: bool,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
 ) -> Vec<Span<'static>> {
     let body_style = body_style(focused, attention, phase, chrome);
-    let host_style = if focused {
-        // Reversed already; keep it readable by inheriting the same
-        // reverse style (no extra fg/bg) so the host doesn't blend
-        // into the highlight.
-        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-    } else {
-        chrome.secondary
-    };
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
 
     if let Some(host) = host {
+        // Focused tabs inherit the reverse-video tab highlight so the
+        // host doesn't fight it; unfocused tabs use the per-host accent
+        // (or fall back to secondary chrome when the user hasn't
+        // configured a color for this host).
+        let host_style = if focused {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            chrome.host_style(host)
+        };
         spans.push(Span::styled(format!("{host} · "), host_style));
     }
 
@@ -2369,7 +2405,12 @@ fn label_spans(
 /// resulting pulse stays well above the surrounding chrome siblings
 /// so the cue is unmistakable, but the swing between the two ends
 /// is small enough to read as a heartbeat rather than a strobe.
-fn body_style(focused: bool, attention: bool, phase: AnimationPhase, chrome: ChromeStyle) -> Style {
+fn body_style(
+    focused: bool,
+    attention: bool,
+    phase: AnimationPhase,
+    chrome: &ChromeStyle,
+) -> Style {
     if focused {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else if attention {
@@ -2410,7 +2451,7 @@ fn render_switcher_popup(
     agents: &[RuntimeAgent],
     selection: usize,
     phase: AnimationPhase,
-    chrome: ChromeStyle,
+    chrome: &ChromeStyle,
 ) {
     let popup_area = centered_rect(50, 60, area);
     frame.render_widget(Clear, popup_area);
@@ -3302,7 +3343,7 @@ mod tests {
             &agents,
             1,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         assert_eq!(tabs.len(), 3);
         assert_eq!(tabs[0].agent_id, AgentId::new("a"));
@@ -3321,7 +3362,7 @@ mod tests {
             &agents,
             0,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         for tab in &tabs {
             assert!(tab.width() > 0, "tab {} has zero width", tab.agent_id);
@@ -3581,7 +3622,7 @@ mod tests {
             &agent,
             false,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -3601,7 +3642,7 @@ mod tests {
             &agent,
             false,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rendered, "codemux");
@@ -3624,7 +3665,7 @@ mod tests {
             &agent,
             false,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -3644,7 +3685,7 @@ mod tests {
             &agent,
             true,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
@@ -3660,7 +3701,7 @@ mod tests {
             &agent,
             false,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!rendered.contains('●'));
@@ -3681,7 +3722,7 @@ mod tests {
                 spinner_frame: 0,
                 blink_bright: true,
             },
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let dim = body_style(
             false,
@@ -3690,7 +3731,7 @@ mod tests {
                 spinner_frame: 0,
                 blink_bright: false,
             },
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         assert_eq!(bright.fg, Some(BLINK_BRIGHT));
         assert_eq!(dim.fg, Some(BLINK_DIM));
@@ -3710,7 +3751,7 @@ mod tests {
                 spinner_frame: 0,
                 blink_bright: true,
             },
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         assert!(
             focused_with_attention
@@ -3804,7 +3845,7 @@ mod tests {
             false,
             false,
             phase,
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         assert!(
             rendered(&spans).contains(SPINNER_FRAMES[3]),
@@ -3823,7 +3864,7 @@ mod tests {
             false,
             false,
             phase,
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let out = rendered(&spans);
         for frame in SPINNER_FRAMES {
@@ -3844,7 +3885,7 @@ mod tests {
             false,
             true,
             phase,
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         let spinner_span = spans
             .iter()
@@ -3862,7 +3903,7 @@ mod tests {
             false,
             false,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         assert!(rendered(&spans).contains("devpod-01"));
     }
@@ -3876,7 +3917,7 @@ mod tests {
             false,
             false,
             AnimationPhase::default(),
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         assert_eq!(rendered(&spans), "codemux");
     }
@@ -3955,7 +3996,7 @@ mod tests {
 
     #[test]
     fn tab_index_style_focused_is_reverse_bold() {
-        let s = tab_index_style(true, ChromeStyle::default());
+        let s = tab_index_style(true, &ChromeStyle::default());
         assert!(s.add_modifier.contains(Modifier::REVERSED));
         assert!(s.add_modifier.contains(Modifier::BOLD));
     }
@@ -3966,7 +4007,7 @@ mod tests {
         // gray (Indexed 247) with no DIM modifier. Without this pin the
         // unfocused tab index could silently regress back to a
         // terminal-defined dim that disappears on poor monitors.
-        let s = tab_index_style(false, ChromeStyle::default());
+        let s = tab_index_style(false, &ChromeStyle::default());
         assert!(!s.add_modifier.contains(Modifier::REVERSED));
         assert_eq!(s.fg, Some(Color::Indexed(247)));
         assert!(!s.add_modifier.contains(Modifier::DIM));
@@ -3978,10 +4019,113 @@ mod tests {
         // look. Pinning both the color and the modifier guards the
         // contract from a future refactor that flips one but not the
         // other.
-        let chrome = ChromeStyle::from_ui(&crate::config::Ui { subtle: true });
-        let s = tab_index_style(false, chrome);
+        let chrome = ChromeStyle::from_ui(&crate::config::Ui {
+            subtle: true,
+            ..Default::default()
+        });
+        let s = tab_index_style(false, &chrome);
         assert_eq!(s.fg, Some(Color::DarkGray));
         assert!(s.add_modifier.contains(Modifier::DIM));
+    }
+
+    // ── chrome.host_style — per-host accent ──────────────────────
+
+    #[test]
+    fn host_style_falls_back_to_secondary_when_host_is_unconfigured() {
+        // Hosts without an entry in `[ui.host_colors]` quietly inherit
+        // the secondary chrome style. Without this, an unconfigured
+        // host would either crash on lookup or render in a default
+        // accent the user didn't pick.
+        let chrome = ChromeStyle::from_ui(&crate::config::Ui::default());
+        assert_eq!(chrome.host_style("unknown-host"), chrome.secondary);
+    }
+
+    #[test]
+    fn host_style_uses_configured_color_when_host_is_known() {
+        // Configured accent overrides secondary chrome for that host.
+        // Pin all three formats so a future refactor of the parser or
+        // ChromeStyle::from_ui can't silently drop one branch.
+        let mut host_colors = std::collections::HashMap::new();
+        host_colors.insert(
+            "uber".to_string(),
+            crate::config::ChromeColor::Named(Color::Blue),
+        );
+        host_colors.insert(
+            "personal".to_string(),
+            crate::config::ChromeColor::Indexed(33),
+        );
+        host_colors.insert(
+            "devpod".to_string(),
+            crate::config::ChromeColor::Rgb(0xd7, 0x5f, 0x00),
+        );
+        let chrome = ChromeStyle::from_ui(&crate::config::Ui {
+            host_colors,
+            ..Default::default()
+        });
+        assert_eq!(chrome.host_style("uber").fg, Some(Color::Blue));
+        assert_eq!(chrome.host_style("personal").fg, Some(Color::Indexed(33)));
+        assert_eq!(
+            chrome.host_style("devpod").fg,
+            Some(Color::Rgb(0xd7, 0x5f, 0x00)),
+        );
+    }
+
+    #[test]
+    fn label_spans_unfocused_host_prefix_uses_per_host_accent() {
+        // The whole user-facing point of `[ui.host_colors]`: an
+        // unfocused tab's host prefix renders in the configured
+        // accent. Focused tabs deliberately ignore the accent (they
+        // inherit reverse-video tab highlight); that path is covered
+        // by `label_spans_renders_focused_spinner_with_reverse_style`.
+        let mut host_colors = std::collections::HashMap::new();
+        host_colors.insert(
+            "uber".to_string(),
+            crate::config::ChromeColor::Named(Color::Blue),
+        );
+        let chrome = ChromeStyle::from_ui(&crate::config::Ui {
+            host_colors,
+            ..Default::default()
+        });
+        let spans = label_spans(
+            Some("uber"),
+            "claude",
+            false,
+            false,
+            false,
+            AnimationPhase::default(),
+            &chrome,
+        );
+        let host_span = spans
+            .iter()
+            .find(|s| s.content.contains("uber"))
+            .expect("host prefix span present");
+        assert_eq!(
+            host_span.style.fg,
+            Some(Color::Blue),
+            "unfocused host prefix must use configured accent",
+        );
+    }
+
+    #[test]
+    fn label_spans_unconfigured_host_falls_back_to_secondary() {
+        // Symmetric guard: when the user hasn't picked an accent for
+        // a host, the prefix renders in secondary chrome. Ensures the
+        // fallback path (most users on most hosts) actually runs.
+        let chrome = ChromeStyle::from_ui(&crate::config::Ui::default());
+        let spans = label_spans(
+            Some("random-host"),
+            "claude",
+            false,
+            false,
+            false,
+            AnimationPhase::default(),
+            &chrome,
+        );
+        let host_span = spans
+            .iter()
+            .find(|s| s.content.contains("random-host"))
+            .expect("host prefix span present");
+        assert_eq!(host_span.style, chrome.secondary);
     }
 
     // build_hint state-driven branch — the user's visible cue that
@@ -3992,11 +4136,11 @@ mod tests {
     #[test]
     fn build_hint_idle_and_awaiting_command_produce_different_widths() {
         let bindings = defaults();
-        let (_, idle_width) = build_hint(&bindings, PrefixState::Idle, ChromeStyle::default());
+        let (_, idle_width) = build_hint(&bindings, PrefixState::Idle, &ChromeStyle::default());
         let (_, nav_width) = build_hint(
             &bindings,
             PrefixState::AwaitingCommand,
-            ChromeStyle::default(),
+            &ChromeStyle::default(),
         );
         // The NAV-mode hint includes a `[NAV]` badge plus a sticky-mode
         // reminder, so it's strictly wider than the idle help reminder.
@@ -4438,7 +4582,7 @@ mod tests {
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
-                    ChromeStyle::default(),
+                    &ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4475,7 +4619,7 @@ mod tests {
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
-                    ChromeStyle::default(),
+                    &ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4534,7 +4678,7 @@ mod tests {
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
-                    ChromeStyle::default(),
+                    &ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4568,7 +4712,7 @@ mod tests {
                     &agents,
                     1,
                     AnimationPhase::default(),
-                    ChromeStyle::default(),
+                    &ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4602,7 +4746,7 @@ mod tests {
                     &agents,
                     0,
                     AnimationPhase::default(),
-                    ChromeStyle::default(),
+                    &ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4642,7 +4786,7 @@ mod tests {
                     &agents,
                     0,
                     AnimationPhase::default(),
-                    ChromeStyle::default(),
+                    &ChromeStyle::default(),
                     &mut hb,
                 );
             })
