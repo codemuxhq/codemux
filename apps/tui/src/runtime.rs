@@ -30,13 +30,14 @@ use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use codemux_session::AgentTransport;
+use codemux_shared_kernel::AgentId;
 use codemuxd_bootstrap::{PreparedHost, RealRunner, RemoteFs};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -153,6 +154,64 @@ enum HelpState {
     Open,
 }
 
+/// One clickable region recorded by the tab-strip / nav renderer. The
+/// `agent_id` is the stable identity (not a `Vec` index) so the
+/// gesture survives reorders, reaps, and resizes between Down and Up:
+/// the event loop resolves `agent_id → index` at the moment of the
+/// state mutation, returning gracefully if the agent is gone.
+#[derive(Clone, Debug)]
+struct Hitbox {
+    rect: Rect,
+    agent_id: AgentId,
+}
+
+impl Hitbox {
+    fn contains(&self, col: u16, row: u16) -> bool {
+        col >= self.rect.x
+            && col < self.rect.x.saturating_add(self.rect.width)
+            && row >= self.rect.y
+            && row < self.rect.y.saturating_add(self.rect.height)
+    }
+}
+
+/// Per-frame mouse hitboxes for the tab strip (`Popup` mode) and nav
+/// rows (`LeftPane` mode). The two leaf renderers (`render_status_bar`,
+/// `render_left_pane`) populate this; the event loop reads it on
+/// `MouseEventKind::Down`/`Up(Left)` to translate screen coordinates
+/// to an agent identity.
+///
+/// The struct is owned by `event_loop` and cleared at the top of every
+/// `render_frame` so a stale frame's rects can never bleed into the
+/// next event hit-test if the layout changed (e.g. terminal resize,
+/// nav-style toggle).
+#[derive(Default)]
+struct TabHitboxes {
+    rects: Vec<Hitbox>,
+}
+
+impl TabHitboxes {
+    fn clear(&mut self) {
+        self.rects.clear();
+    }
+
+    fn record(&mut self, rect: Rect, agent_id: AgentId) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.rects.push(Hitbox { rect, agent_id });
+    }
+
+    /// Return the agent id whose hitbox contains the given screen
+    /// cell, or `None` if the cell is outside every recorded rect
+    /// (the buddy tail, the right-aligned hint, the agent pane, etc).
+    fn at(&self, col: u16, row: u16) -> Option<AgentId> {
+        self.rects
+            .iter()
+            .find(|h| h.contains(col, row))
+            .map(|h| h.agent_id.clone())
+    }
+}
+
 /// What the prefix-key dispatcher tells the event loop to do. Distinct from
 /// `keymap::PrefixAction` because some dispatches (forwarding bytes,
 /// addressing an agent by index) carry payload that the binding itself does
@@ -173,6 +232,15 @@ enum KeyDispatch {
 }
 
 struct RuntimeAgent {
+    /// Stable identity for this agent — invariant for the agent's
+    /// entire lifetime, regardless of its position in the navigator
+    /// `Vec`. The renderer records hitboxes by `id`, the mouse handler
+    /// stores `id` in `mouse_press`, and the click/drag-reorder
+    /// dispatcher returns `id`s. Resolving `id → index` happens at the
+    /// last possible moment so a reap or reorder between Down and Up
+    /// can't silently retarget the gesture (the resolution returns
+    /// `None` and the gesture cancels gracefully).
+    id: AgentId,
     /// Static fallback shown when the foreground process hasn't yet
     /// emitted an OSC title (and as a debugging breadcrumb in
     /// tracing). User-visible labels render via [`agent_label_spans`]
@@ -255,7 +323,14 @@ enum AgentState {
 }
 
 impl RuntimeAgent {
+    // 8 args after AD-27 added the stable id; the identity, label,
+    // working dir, host, transport, geometry, and scrollback budget
+    // are all distinct concerns that the single call site sets at
+    // once. A builder would add code without making any of these
+    // optional or composable.
+    #[allow(clippy::too_many_arguments)]
     fn ready(
+        id: AgentId,
         label: String,
         repo: Option<String>,
         host: Option<String>,
@@ -265,6 +340,7 @@ impl RuntimeAgent {
         scrollback_len: usize,
     ) -> Self {
         Self {
+            id,
             label,
             repo,
             host,
@@ -285,6 +361,7 @@ impl RuntimeAgent {
     }
 
     fn failed(
+        id: AgentId,
         label: String,
         repo: Option<String>,
         host: String,
@@ -293,6 +370,7 @@ impl RuntimeAgent {
         cols: u16,
     ) -> Self {
         Self {
+            id,
             label,
             repo,
             host: Some(host),
@@ -400,6 +478,13 @@ struct PendingPrepare {
 /// `Option<_>` so a future flow where the user dismisses the modal
 /// during attach can leave the handle running in the background.
 struct PendingAttach {
+    /// Stable identity for the agent that this attach will produce.
+    /// Plumbed through here so the eventual `RuntimeAgent::ready` /
+    /// `RuntimeAgent::failed` constructor — which fires on the
+    /// daemon-bootstrap thread's response — uses the same id the
+    /// spawn site already chose, rather than rederiving one from a
+    /// possibly-stale `spawn_counter`.
+    agent_id: AgentId,
     label: String,
     host: String,
     /// Repo name resolved from the user-typed remote cwd (basename).
@@ -429,6 +514,7 @@ pub fn run(
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
 
     let initial = spawn_local_agent(
+        AgentId::new("agent-1"),
         "agent-1".into(),
         Some(initial_cwd),
         pty_rows,
@@ -525,6 +611,7 @@ fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16, log_strip: bool
 /// keeps the renderable [`Parser`] alongside, since rendering is the
 /// runtime's job (AD-1) and not the transport's.
 fn spawn_local_agent(
+    id: AgentId,
     label: String,
     cwd: Option<&Path>,
     rows: u16,
@@ -535,6 +622,7 @@ fn spawn_local_agent(
         .wrap_err("spawn local agent")?;
     let repo = cwd.and_then(repo_name::resolve_local);
     Ok(RuntimeAgent::ready(
+        id,
         label,
         repo,
         None,
@@ -606,6 +694,116 @@ fn change_focus(
     }
 }
 
+/// Move the agent at `from` to position `to`, sliding the agents in
+/// between by one slot. Browser-tab semantics — drag tab 1 onto slot 4
+/// inserts at slot 4 (it does NOT swap with slot 4). No-op if either
+/// index is out of range or `from == to`.
+///
+/// Caller is responsible for re-deriving `focused` and `previous_focused`
+/// via [`shift_index`] after the move so the same agent stays focused
+/// (and the alt-tab buddy still points at the same agent) across the
+/// reorder.
+fn reorder_agents(agents: &mut Vec<RuntimeAgent>, from: usize, to: usize) {
+    if from == to || from >= agents.len() || to >= agents.len() {
+        return;
+    }
+    let agent = agents.remove(from);
+    agents.insert(to, agent);
+}
+
+/// Compute the new index of an existing slot after a `remove(from) +
+/// insert(to)` reorder. The four cases:
+///
+/// - `i == from`: this is the moved slot; it lands at `to`.
+/// - moved right (`from < to`) and `from < i <= to`: each in-between
+///   slot shifted left by one to fill the gap.
+/// - moved left (`from > to`) and `to <= i < from`: each in-between
+///   slot shifted right by one to make room.
+/// - otherwise: untouched.
+///
+/// Applied to both `focused` and `previous_focused` so the same agent
+/// remains focused (and the alt-tab buddy stays on the same agent)
+/// across a reorder.
+fn shift_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < to && i > from && i <= to {
+        i - 1
+    } else if from > to && i >= to && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
+/// Outcome of a left-button mouse event over the tab strip / nav rows.
+/// The event loop translates each variant into the matching state
+/// mutation; pulling the decision into a return value keeps the wiring
+/// pure-functional and unit-testable without an event-loop harness.
+/// Returned wrapped in `Option` so the dispatcher can signal "nothing
+/// to do" (wheel, motion, drag, right/middle button, stray release)
+/// without a dedicated `None` enum variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TabMouseDispatch {
+    /// Left press over a tab — the loop should record the agent id
+    /// in `mouse_press` so the eventual release knows what was grabbed.
+    PressTab(AgentId),
+    /// Left release over the same tab the press grabbed: focus it.
+    Click(AgentId),
+    /// Left release over a different tab from the press: reorder by
+    /// moving `from` to `to`, then re-derive `focused` /
+    /// `previous_focused` via [`shift_index`]. Identities, not slot
+    /// indices — the loop resolves both to current `Vec` positions
+    /// at the moment of the mutation, so a reap or background reorder
+    /// between Down and Up cancels gracefully instead of mis-targeting.
+    Reorder { from: AgentId, to: AgentId },
+    /// Left release outside any tab while a press was active: cancel
+    /// the gesture (no focus, no reorder). The loop should clear
+    /// `mouse_press`.
+    Cancel,
+}
+
+/// Resolve a left-button mouse event against the recorded tab
+/// hitboxes. Crossterm only fires `Drag` on motion, so a same-cell
+/// down→up generates a clean `Down`/`Up` pair with no intervening
+/// drag — the click and reorder gestures share this dispatcher.
+///
+/// `mouse_press` is the agent id grabbed on the most recent
+/// `Down(Left)`, or `None` if the user isn't currently holding the
+/// mouse over a tab. Storing the *id* (not coords or index) at press
+/// time means a terminal resize, agent reap, or background reorder
+/// between Down and Up still resolves the gesture to the same agent
+/// — its hitbox may have moved cells, its slot may have shifted, but
+/// the press's identity is preserved (and a reap turns into a clean
+/// no-op at apply time when `position` returns `None`).
+fn tab_mouse_dispatch(
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    hitboxes: &TabHitboxes,
+    mouse_press: Option<&AgentId>,
+) -> Option<TabMouseDispatch> {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            hitboxes.at(column, row).map(TabMouseDispatch::PressTab)
+        }
+        MouseEventKind::Up(MouseButton::Left) => match (mouse_press, hitboxes.at(column, row)) {
+            (Some(from), Some(to)) if &to == from => Some(TabMouseDispatch::Click(to)),
+            (Some(from), Some(to)) => Some(TabMouseDispatch::Reorder {
+                from: from.clone(),
+                to,
+            }),
+            (Some(_), None) => Some(TabMouseDispatch::Cancel),
+            (None, _) => None,
+        },
+        // Drag and other kinds (motion, right/middle, side scroll):
+        // no-op. Native copy-and-paste in iTerm2 / Alacritty / Ghostty
+        // / WezTerm / Kitty requires holding Alt/Option to bypass
+        // mouse capture — this is documented in the help screen.
+        _ => None,
+    }
+}
+
 /// Detect working→idle transitions on unfocused agents and flag them for
 /// the slow-blink attention cue. Called once per tick after the PTY drain
 /// so the title parser sees the freshest state. Focused agents are skipped
@@ -671,6 +869,16 @@ fn event_loop(
     // the agent it points to is reaped (the user explicitly quit it
     // or the transport died) so the bounce never lands on a stale slot.
     let mut previous_focused: Option<usize> = None;
+    // Per-frame click hitboxes for the tab strip / nav rows. Populated
+    // by the leaf renderers, consumed by the mouse handler. Cleared at
+    // the top of every `render_frame` so a stale frame's geometry can
+    // never bleed into a fresh event hit-test.
+    let mut tab_hitboxes = TabHitboxes::default();
+    // Tab grabbed on `MouseEventKind::Down(Left)` — by stable
+    // `AgentId`, not by index, so a reap or background reorder between
+    // Down and Up still resolves to the same agent (or returns `None`
+    // and the gesture cancels gracefully).
+    let mut mouse_press: Option<AgentId> = None;
     let mut spawn_counter: usize = agents.len();
     // Captured once at loop entry so per-tab spinner / blink phases
     // are derived from a stable monotonic origin. The 50 ms event
@@ -782,6 +990,7 @@ fn event_loop(
                         let _ = transport.resize(attach.rows, attach.cols);
                         tracing::info!(label = %attach.label, "attach completed; transport ready");
                         new_agents.push(RuntimeAgent::ready(
+                            attach.agent_id.clone(),
                             attach.label.clone(),
                             attach.repo.clone(),
                             Some(attach.host.clone()),
@@ -794,6 +1003,7 @@ fn event_loop(
                     Err(e) => {
                         tracing::error!(label = %attach.label, "attach failed: {e}");
                         new_agents.push(RuntimeAgent::failed(
+                            attach.agent_id.clone(),
                             attach.label.clone(),
                             attach.repo.clone(),
                             attach.host.clone(),
@@ -890,6 +1100,7 @@ fn event_loop(
                     prefix_state,
                     log_tail,
                     phase,
+                    &mut tab_hitboxes,
                 );
             })
             .wrap_err("draw frame")?;
@@ -971,13 +1182,20 @@ fn event_loop(
                             if host == HOST_PLACEHOLDER {
                                 spawn_ui = None;
                                 let label = format!("agent-{spawn_counter}");
+                                let id = AgentId::new(label.clone());
                                 let cwd_path = if path.is_empty() {
                                     None
                                 } else {
                                     Some(Path::new(&path))
                                 };
-                                match spawn_local_agent(label, cwd_path, rows, cols, scrollback_len)
-                                {
+                                match spawn_local_agent(
+                                    id,
+                                    label,
+                                    cwd_path,
+                                    rows,
+                                    cols,
+                                    scrollback_len,
+                                ) {
                                     Ok(agent) => {
                                         agents.push(agent);
                                         let target = agents.len() - 1;
@@ -1021,6 +1239,7 @@ fn event_loop(
                                 };
                                 let label = format!("{host}:agent-{spawn_counter}");
                                 let agent_id = format!("agent-{spawn_counter}");
+                                let runtime_id = AgentId::new(agent_id.clone());
                                 // Empty path → None: omit `--cwd` on
                                 // the remote daemon and let it
                                 // inherit the remote shell's login
@@ -1065,6 +1284,7 @@ fn event_loop(
                                 // attach phase.
                                 ui.lock_for_bootstrap(host.clone(), Instant::now());
                                 attaches.push(PendingAttach {
+                                    agent_id: runtime_id,
                                     label,
                                     host,
                                     repo,
@@ -1229,9 +1449,9 @@ fn event_loop(
                 let (pty_rows, pty_cols) = pty_size_for(nav_style, rows, cols, log_tail.is_some());
                 resize_agents(&mut agents, pty_rows, pty_cols);
             }
-            Event::Mouse(MouseEvent { kind, .. })
-                if no_overlay_active(spawn_ui.as_ref(), popup_state, help_state) =>
-            {
+            Event::Mouse(MouseEvent {
+                kind, column, row, ..
+            }) if no_overlay_active(spawn_ui.as_ref(), popup_state, help_state) => {
                 // Wheel events are unconditional — anywhere in the
                 // window is treated as "scroll the focused agent." In
                 // LeftPane mode that means wheel-over-nav scrolls the
@@ -1241,15 +1461,52 @@ fn event_loop(
                 // forwarding wheel-as-arrow into Claude's prompt
                 // history. Revisit if/when the nav pane becomes
                 // independently scrollable.
-                if let Some(agent) = agents.get_mut(focused) {
-                    match kind {
-                        MouseEventKind::ScrollUp => agent.nudge_scrollback(WHEEL_STEP),
-                        MouseEventKind::ScrollDown => agent.nudge_scrollback(-WHEEL_STEP),
-                        // Clicks, drags, motion, side-scroll: ignored. Native
-                        // copy-and-paste in iTerm2 / Alacritty / Ghostty
-                        // requires holding Alt/Option to bypass mouse capture
-                        // — this is documented in the help screen.
-                        _ => {}
+                match kind {
+                    MouseEventKind::ScrollUp => {
+                        if let Some(agent) = agents.get_mut(focused) {
+                            agent.nudge_scrollback(WHEEL_STEP);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if let Some(agent) = agents.get_mut(focused) {
+                            agent.nudge_scrollback(-WHEEL_STEP);
+                        }
+                    }
+                    other => {
+                        if let Some(action) = tab_mouse_dispatch(
+                            other,
+                            column,
+                            row,
+                            &tab_hitboxes,
+                            mouse_press.as_ref(),
+                        ) {
+                            match action {
+                                TabMouseDispatch::PressTab(id) => mouse_press = Some(id),
+                                TabMouseDispatch::Click(id) => {
+                                    mouse_press = None;
+                                    if let Some(idx) = agents.iter().position(|a| a.id == id) {
+                                        change_focus(
+                                            &mut agents,
+                                            &mut focused,
+                                            &mut previous_focused,
+                                            idx,
+                                        );
+                                    }
+                                }
+                                TabMouseDispatch::Reorder { from, to } => {
+                                    mouse_press = None;
+                                    let from_idx = agents.iter().position(|a| a.id == from);
+                                    let to_idx = agents.iter().position(|a| a.id == to);
+                                    if let (Some(f), Some(t)) = (from_idx, to_idx) {
+                                        reorder_agents(&mut agents, f, t);
+                                        focused = shift_index(focused, f, t);
+                                        previous_focused =
+                                            previous_focused.map(|p| shift_index(p, f, t));
+                                    }
+                                }
+                                TabMouseDispatch::Cancel => mouse_press = None,
+                            }
+                        }
                     }
                 }
             }
@@ -1406,7 +1663,12 @@ fn render_frame(
     prefix_state: PrefixState,
     log_tail: Option<&LogTail>,
     phase: AnimationPhase,
+    hitboxes: &mut TabHitboxes,
 ) {
+    // Cleared at the top of every frame so a stale frame's rects can
+    // never bleed into the next event hit-test if the layout changed
+    // (terminal resize, nav-style toggle, agent spawn / reap).
+    hitboxes.clear();
     let area = frame.area();
     // Carve off the bottom log strip first, if enabled. The remaining
     // area is what the nav-style render sees, so it doesn't need to
@@ -1422,7 +1684,9 @@ fn render_frame(
         None => (area, None),
     };
     match nav_style {
-        NavStyle::LeftPane => render_left_pane(frame, main_area, agents, focused, phase),
+        NavStyle::LeftPane => {
+            render_left_pane(frame, main_area, agents, focused, phase, hitboxes);
+        }
         NavStyle::Popup => {
             render_popup_style(
                 frame,
@@ -1434,6 +1698,7 @@ fn render_frame(
                 bindings,
                 prefix_state,
                 phase,
+                hitboxes,
             );
         }
     }
@@ -1578,6 +1843,7 @@ fn render_left_pane(
     agents: &[RuntimeAgent],
     focused: usize,
     phase: AnimationPhase,
+    hitboxes: &mut TabHitboxes,
 ) {
     let [nav_area, pty_area] = Layout::default()
         .direction(Direction::Horizontal)
@@ -1598,6 +1864,33 @@ fn render_left_pane(
     let nav = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" agents "));
     frame.render_widget(nav, nav_area);
 
+    // Record one hitbox per agent row for click-to-focus and
+    // drag-to-reorder. The bordered Block reserves the outer cells, so
+    // clickable rows start one cell in from each side and the first
+    // visible row is `nav_area.y + 1`.
+    let inner_x = nav_area.x.saturating_add(1);
+    let inner_w = nav_area.width.saturating_sub(2);
+    let last_row_excl = nav_area.y.saturating_add(nav_area.height).saturating_sub(1);
+    for (i, agent) in agents.iter().enumerate() {
+        let Ok(offset) = u16::try_from(i) else { break };
+        let y = nav_area.y.saturating_add(1).saturating_add(offset);
+        if y >= last_row_excl {
+            // Out of pane: agent list overflowed the nav area. The
+            // unfilled rows have no surface to click; better to drop
+            // them than record bogus rects past the bottom border.
+            break;
+        }
+        hitboxes.record(
+            Rect {
+                x: inner_x,
+                y,
+                width: inner_w,
+                height: 1,
+            },
+            agent.id.clone(),
+        );
+    }
+
     if let Some(agent) = agents.get(focused) {
         render_agent_pane(frame, pty_area, agent);
     }
@@ -1614,6 +1907,7 @@ fn render_popup_style(
     bindings: &Bindings,
     prefix_state: PrefixState,
     phase: AnimationPhase,
+    hitboxes: &mut TabHitboxes,
 ) {
     let [pty_area, status_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -1633,6 +1927,7 @@ fn render_popup_style(
         bindings,
         prefix_state,
         phase,
+        hitboxes,
     );
 
     if let PopupState::Open { selection } = popup {
@@ -1667,6 +1962,7 @@ fn render_status_bar(
     bindings: &Bindings,
     prefix_state: PrefixState,
     phase: AnimationPhase,
+    hitboxes: &mut TabHitboxes,
 ) {
     // Compute the hint as both rendered Line (with styling) and a
     // plain text-width measurement (for the layout split). The two
@@ -1688,13 +1984,47 @@ fn render_status_bar(
         (area, None)
     };
 
-    // Build the left half as a single Line: tabs first, then a
-    // separator and the buddy tail if there's a sensible buddy. Using
-    // one Line lets ratatui clip the whole thing at the area edge as
-    // a unit, instead of splitting tabs vs tail into competing layout
-    // children that would each get half the width regardless of
-    // content length.
-    let mut spans = build_tab_strip_spans(agents, focused, phase);
+    // Build the left half as a single Line: tabs first (with separator
+    // spans between), then a separator and the buddy tail if there's a
+    // sensible buddy. Per-tab structs let us record the screen rect of
+    // each tab into `hitboxes` while concatenating the visual into a
+    // single Line so ratatui clips the whole thing at the area edge as
+    // a unit. Without per-tab geometry, we'd have to re-derive widths
+    // from the flat span list at hit-test time.
+    let separator_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let separator = " │ ";
+    let separator_w = u16::try_from(separator.chars().count()).unwrap_or(3);
+
+    let tabs = build_tab_strip(agents, focused, phase);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(tabs.len().saturating_mul(4));
+    let area_right = left_area.x.saturating_add(left_area.width);
+    let mut x = left_area.x;
+    for (i, tab) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(separator, separator_style));
+            x = x.saturating_add(separator_w);
+        }
+        let tab_w = tab.width();
+        // Clip against the left_area so a tab that bleeds past the
+        // hint's reserved space (or the screen edge) records its
+        // hitbox only over the cells actually drawn. A zero-width
+        // result is dropped by `TabHitboxes::record`.
+        let avail = area_right.saturating_sub(x);
+        let clipped = tab_w.min(avail);
+        hitboxes.record(
+            Rect {
+                x,
+                y: left_area.y,
+                width: clipped,
+                height: 1,
+            },
+            tab.agent_id.clone(),
+        );
+        spans.extend(tab.spans.iter().cloned());
+        x = x.saturating_add(tab_w);
+    }
     if let Some(tail) = buddy_tail_spans(agents, focused, previous_focused) {
         spans.push(Span::styled(
             "    ← ",
@@ -1759,34 +2089,54 @@ fn build_hint(bindings: &Bindings, prefix_state: PrefixState) -> (Line<'static>,
     }
 }
 
-/// Build the styled spans for the tab strip portion of the status
-/// bar. Focused tab gets reverse-video + bold so the eye lands on it
-/// immediately; others render dim so the focused tab pops without
-/// having to look at a marker character. Tabs are separated by a thin
-/// vertical bar — close enough to the browser tab convention to read
-/// as "tabs" rather than "list of items."
-fn build_tab_strip_spans(
-    agents: &[RuntimeAgent],
-    focused: usize,
-    phase: AnimationPhase,
-) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(agents.len().saturating_mul(3));
-    let separator_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM);
-    for (i, agent) in agents.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", separator_style));
-        }
-        let focused_tab = i == focused;
-        spans.push(Span::styled(
-            format!(" {} ", i + 1),
-            tab_index_style(focused_tab),
-        ));
-        spans.extend(agent_label_spans(agent, focused_tab, phase));
-        spans.push(Span::styled(" ", tab_index_style(focused_tab)));
+/// One tab's worth of spans, decoupled from the separators between
+/// tabs. The renderer needs per-tab geometry (to record click hitboxes
+/// against [`TabHitboxes`]) but the eye-friendly Paragraph rendering
+/// still wants the whole strip as a single `Line`. Returning a struct
+/// per tab is the seam: the renderer concatenates with separators, and
+/// it knows the natural width of each tab via [`Self::width`].
+struct TabSpec {
+    agent_id: AgentId,
+    spans: Vec<Span<'static>>,
+}
+
+impl TabSpec {
+    /// Display-cell width of this tab's span sequence (unicode-aware
+    /// via `Span::width`). Sum is `usize` upstream; we clamp to `u16`
+    /// because `Rect` is `u16` everywhere.
+    fn width(&self) -> u16 {
+        let total: usize = self.spans.iter().map(Span::width).sum();
+        u16::try_from(total).unwrap_or(u16::MAX)
     }
-    spans
+}
+
+/// Build the styled spans for each tab in the status-bar tab strip.
+/// Focused tab gets reverse-video + bold so the eye lands on it
+/// immediately; others render dim so the focused tab pops without
+/// having to look at a marker character. The renderer composes these
+/// into a single `Line` with `" │ "` separators between adjacent tabs
+/// — close enough to the browser tab convention to read as "tabs"
+/// rather than "list of items" — while recording per-tab click
+/// hitboxes from the geometry [`TabSpec::width`] exposes.
+fn build_tab_strip(agents: &[RuntimeAgent], focused: usize, phase: AnimationPhase) -> Vec<TabSpec> {
+    agents
+        .iter()
+        .enumerate()
+        .map(|(i, agent)| {
+            let focused_tab = i == focused;
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
+            spans.push(Span::styled(
+                format!(" {} ", i + 1),
+                tab_index_style(focused_tab),
+            ));
+            spans.extend(agent_label_spans(agent, focused_tab, phase));
+            spans.push(Span::styled(" ", tab_index_style(focused_tab)));
+            TabSpec {
+                agent_id: agent.id.clone(),
+                spans,
+            }
+        })
+        .collect()
 }
 
 fn tab_index_style(focused: bool) -> Style {
@@ -2182,6 +2532,17 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, bindings: &Bindings) {
     lines.push(binding_line_static(
         "type",
         "typing real text snaps to live and forwards (nav chords preserve scroll)",
+    ));
+    lines.push(Line::raw(""));
+
+    lines.push(Line::styled("mouse:", header_style));
+    lines.push(binding_line_static(
+        "click",
+        "click a tab to focus it (no prefix needed)",
+    ));
+    lines.push(binding_line_static(
+        "drag",
+        "drag a tab onto another to reorder (browser-tab semantics)",
     ));
     lines.push(binding_line_static(
         "alt+drag",
@@ -2727,6 +3088,445 @@ mod tests {
         assert!(agents[1].needs_attention);
     }
 
+    // shift_index — the four cases of "where does an existing slot
+    // land after a reorder?" Pinned because the focus-follow invariant
+    // depends on these arithmetic branches being exactly right.
+
+    #[test]
+    fn shift_index_moved_slot_lands_at_destination() {
+        // The dragged slot itself: i == from → to.
+        assert_eq!(shift_index(2, 2, 5), 5);
+        assert_eq!(shift_index(5, 5, 0), 0);
+    }
+
+    #[test]
+    fn shift_index_drag_right_squeezes_in_between_slots_left() {
+        // Reorder: 0 1 2 3 4 → drag(1, 3) → 0 2 3 1 4.
+        // Slot 0 unchanged (outside range), 1 → 3 (the moved tab),
+        // 2 → 1 (was right of from, now to the left of the destination),
+        // 3 → 2 (same reason), 4 → 4 (outside range).
+        assert_eq!(shift_index(0, 1, 3), 0);
+        assert_eq!(shift_index(2, 1, 3), 1);
+        assert_eq!(shift_index(3, 1, 3), 2);
+        assert_eq!(shift_index(4, 1, 3), 4);
+    }
+
+    #[test]
+    fn shift_index_drag_left_pushes_in_between_slots_right() {
+        // Reorder: 0 1 2 3 4 → drag(3, 1) → 0 3 1 2 4.
+        // Slot 0 unchanged, 1 → 2 (pushed right by the inserted tab),
+        // 2 → 3, 3 → 1 (the moved tab), 4 → 4.
+        assert_eq!(shift_index(0, 3, 1), 0);
+        assert_eq!(shift_index(1, 3, 1), 2);
+        assert_eq!(shift_index(2, 3, 1), 3);
+        assert_eq!(shift_index(4, 3, 1), 4);
+    }
+
+    #[test]
+    fn shift_index_outside_the_swap_range_is_untouched() {
+        // 0 1 2 3 4 → drag(1, 3): slots 0 and 4 are untouched.
+        assert_eq!(shift_index(0, 1, 3), 0);
+        assert_eq!(shift_index(4, 1, 3), 4);
+        assert_eq!(shift_index(7, 1, 3), 7);
+    }
+
+    #[test]
+    fn shift_index_no_op_when_from_equals_to() {
+        // Degenerate case: drag onto self. Every index unchanged.
+        for i in 0..5 {
+            assert_eq!(shift_index(i, 2, 2), i);
+        }
+    }
+
+    // reorder_agents — verifies the underlying Vec mutation. Identity
+    // is checked via the `label` field since RuntimeAgent has no id.
+
+    #[test]
+    fn reorder_agents_drag_right_inserts_at_destination() {
+        let mut agents = vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+            failed_agent("d"),
+        ];
+        reorder_agents(&mut agents, 0, 2);
+        let labels: Vec<&str> = agents.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, vec!["b", "c", "a", "d"]);
+    }
+
+    #[test]
+    fn reorder_agents_drag_left_inserts_at_destination() {
+        let mut agents = vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+            failed_agent("d"),
+        ];
+        reorder_agents(&mut agents, 3, 1);
+        let labels: Vec<&str> = agents.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(labels, vec!["a", "d", "b", "c"]);
+    }
+
+    #[test]
+    fn reorder_agents_noop_on_self_or_out_of_range() {
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        let snapshot: Vec<String> = agents.iter().map(|a| a.label.clone()).collect();
+        reorder_agents(&mut agents, 0, 0); // self
+        reorder_agents(&mut agents, 5, 0); // from out of range
+        reorder_agents(&mut agents, 0, 5); // to out of range
+        let after: Vec<String> = agents.iter().map(|a| a.label.clone()).collect();
+        assert_eq!(snapshot, after);
+    }
+
+    #[test]
+    fn reorder_followed_by_shift_index_keeps_focus_on_the_moved_agent() {
+        // The end-to-end invariant the renderer relies on: if I drag the
+        // currently-focused tab, focus follows the tab to its new slot.
+        let mut agents = vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+            failed_agent("d"),
+        ];
+        let mut focused = 1; // user is on "b"
+        let mut previous = Some(0); // alt-tab buddy is "a"
+        reorder_agents(&mut agents, 1, 3);
+        focused = shift_index(focused, 1, 3);
+        previous = previous.map(|p| shift_index(p, 1, 3));
+        assert_eq!(
+            agents[focused].label, "b",
+            "focus should follow the moved tab"
+        );
+        assert_eq!(
+            agents[previous.unwrap()].label,
+            "a",
+            "alt-tab buddy should still point at the same agent",
+        );
+    }
+
+    #[test]
+    fn reorder_a_non_focused_tab_past_the_focused_one_keeps_focus_pinned_to_its_agent() {
+        // User is on "c". Drag "a" past "c" to slot 3. The focused
+        // agent is still "c"; its index shifted from 2 → 1 because the
+        // slot to its left got removed.
+        let mut agents = vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+            failed_agent("d"),
+        ];
+        let mut focused = 2;
+        let mut previous: Option<usize> = None;
+        reorder_agents(&mut agents, 0, 3);
+        focused = shift_index(focused, 0, 3);
+        previous = previous.map(|p| shift_index(p, 0, 3));
+        assert_eq!(agents[focused].label, "c");
+        assert_eq!(previous, None);
+    }
+
+    // TabHitboxes — boundary tests for the click hit-test.
+
+    #[test]
+    fn tab_hitboxes_at_finds_recorded_rect() {
+        let mut hb = TabHitboxes::default();
+        let id_a = AgentId::new("a");
+        let id_b = AgentId::new("b");
+        hb.record(
+            Rect {
+                x: 5,
+                y: 10,
+                width: 4,
+                height: 1,
+            },
+            id_a.clone(),
+        );
+        hb.record(
+            Rect {
+                x: 9,
+                y: 10,
+                width: 6,
+                height: 1,
+            },
+            id_b.clone(),
+        );
+        assert_eq!(hb.at(5, 10), Some(id_a.clone())); // left edge of tab a
+        assert_eq!(hb.at(8, 10), Some(id_a)); // last cell of tab a
+        assert_eq!(hb.at(9, 10), Some(id_b.clone())); // first cell of tab b
+        assert_eq!(hb.at(14, 10), Some(id_b)); // last cell of tab b
+    }
+
+    #[test]
+    fn tab_hitboxes_at_misses_outside_recorded_rects() {
+        let mut hb = TabHitboxes::default();
+        hb.record(
+            Rect {
+                x: 5,
+                y: 10,
+                width: 4,
+                height: 1,
+            },
+            AgentId::new("a"),
+        );
+        assert_eq!(hb.at(4, 10), None); // one cell left of tab a
+        assert_eq!(hb.at(9, 10), None); // one past the right edge (exclusive width)
+        assert_eq!(hb.at(5, 9), None); // one row above
+        assert_eq!(hb.at(5, 11), None); // one row below
+    }
+
+    #[test]
+    fn tab_hitboxes_clear_drops_all_recorded_rects() {
+        let mut hb = TabHitboxes::default();
+        hb.record(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 1,
+            },
+            AgentId::new("a"),
+        );
+        assert!(hb.at(0, 0).is_some());
+        hb.clear();
+        assert!(hb.at(0, 0).is_none());
+    }
+
+    #[test]
+    fn tab_hitboxes_record_rejects_zero_sized_rect() {
+        // Zero-width tabs (e.g. a tab that got entirely clipped off
+        // the right edge of the status bar) must not produce a phantom
+        // hitbox at x with width 0.
+        let mut hb = TabHitboxes::default();
+        hb.record(
+            Rect {
+                x: 5,
+                y: 10,
+                width: 0,
+                height: 1,
+            },
+            AgentId::new("a"),
+        );
+        hb.record(
+            Rect {
+                x: 5,
+                y: 10,
+                width: 4,
+                height: 0,
+            },
+            AgentId::new("b"),
+        );
+        assert_eq!(hb.at(5, 10), None);
+    }
+
+    // build_tab_strip + TabSpec::width — pure helpers feeding the
+    // status-bar renderer. These are the functions the renderer relies
+    // on for per-tab geometry; pinning their shape catches regressions
+    // that would silently mis-place hitboxes.
+
+    #[test]
+    fn build_tab_strip_emits_one_spec_per_agent_in_order() {
+        let agents = vec![failed_agent("a"), failed_agent("b"), failed_agent("c")];
+        let tabs = build_tab_strip(&agents, 1, AnimationPhase::default());
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs[0].agent_id, AgentId::new("a"));
+        assert_eq!(tabs[1].agent_id, AgentId::new("b"));
+        assert_eq!(tabs[2].agent_id, AgentId::new("c"));
+    }
+
+    #[test]
+    fn build_tab_strip_each_spec_has_nonzero_width() {
+        // Width is the sum of span display cells — for any non-empty
+        // tab label it must be > 0, otherwise the renderer's clipped
+        // rect would be zero-sized and `TabHitboxes::record` would
+        // drop it.
+        let agents = vec![failed_agent("agent-1"), failed_agent("agent-2")];
+        let tabs = build_tab_strip(&agents, 0, AnimationPhase::default());
+        for tab in &tabs {
+            assert!(tab.width() > 0, "tab {} has zero width", tab.agent_id);
+        }
+    }
+
+    #[test]
+    fn tab_spec_width_sums_span_display_cells() {
+        // Construct directly to lock the contract: width is unicode
+        // display cells, not byte length, not character count. Pinned
+        // because a future refactor that swapped to `.len()` would
+        // silently mis-clip multi-cell glyphs in the hitbox math.
+        let spec = TabSpec {
+            agent_id: AgentId::new("a"),
+            spans: vec![
+                Span::raw(" "),     // 1
+                Span::raw("hello"), // 5
+                Span::raw(" "),     // 1
+            ],
+        };
+        assert_eq!(spec.width(), 7);
+    }
+
+    // tab_mouse_dispatch — every branch of the click/drag state
+    // machine. The wiring inside `event_loop` translates the returned
+    // enum into a state mutation; testing the dispatch directly is the
+    // cheapest way to lock the gesture semantics without an event-loop
+    // harness.
+
+    fn two_tab_hitboxes() -> TabHitboxes {
+        // Tabs at columns 0..5 and 5..10, both on row 23 (e.g. the
+        // bottom status bar). Adjacent — no gap — to mirror how
+        // `render_status_bar` records them with the separator span
+        // sitting in between rather than as a third hitbox.
+        let mut hb = TabHitboxes::default();
+        hb.record(
+            Rect {
+                x: 0,
+                y: 23,
+                width: 5,
+                height: 1,
+            },
+            AgentId::new("a"),
+        );
+        hb.record(
+            Rect {
+                x: 5,
+                y: 23,
+                width: 5,
+                height: 1,
+            },
+            AgentId::new("b"),
+        );
+        hb
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_down_on_tab_returns_press() {
+        let hb = two_tab_hitboxes();
+        assert_eq!(
+            tab_mouse_dispatch(MouseEventKind::Down(MouseButton::Left), 2, 23, &hb, None),
+            Some(TabMouseDispatch::PressTab(AgentId::new("a"))),
+        );
+        assert_eq!(
+            tab_mouse_dispatch(MouseEventKind::Down(MouseButton::Left), 7, 23, &hb, None),
+            Some(TabMouseDispatch::PressTab(AgentId::new("b"))),
+        );
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_down_outside_tabs_returns_none() {
+        // Pressing on the agent pane (or anywhere not over a tab) must
+        // not arm the gesture — otherwise a release back over a tab
+        // would teleport focus from a click that started on the PTY.
+        let hb = two_tab_hitboxes();
+        assert_eq!(
+            tab_mouse_dispatch(MouseEventKind::Down(MouseButton::Left), 50, 10, &hb, None),
+            None,
+        );
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_up_same_tab_is_a_click() {
+        // Same-cell down→up has no Drag in between (crossterm only
+        // fires Drag on motion). Up over the same tab the press
+        // grabbed → focus that tab.
+        let hb = two_tab_hitboxes();
+        let pressed = AgentId::new("a");
+        assert_eq!(
+            tab_mouse_dispatch(
+                MouseEventKind::Up(MouseButton::Left),
+                2,
+                23,
+                &hb,
+                Some(&pressed),
+            ),
+            Some(TabMouseDispatch::Click(AgentId::new("a"))),
+        );
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_up_different_tab_is_a_reorder() {
+        // Press on tab a, release on tab b → reorder(a, b).
+        let hb = two_tab_hitboxes();
+        let pressed = AgentId::new("a");
+        assert_eq!(
+            tab_mouse_dispatch(
+                MouseEventKind::Up(MouseButton::Left),
+                7,
+                23,
+                &hb,
+                Some(&pressed),
+            ),
+            Some(TabMouseDispatch::Reorder {
+                from: AgentId::new("a"),
+                to: AgentId::new("b"),
+            }),
+        );
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_up_outside_tabs_cancels() {
+        // User dragged off the strip — release over the agent pane
+        // (or anywhere with no recorded hitbox) cancels the gesture.
+        let hb = two_tab_hitboxes();
+        let pressed = AgentId::new("a");
+        assert_eq!(
+            tab_mouse_dispatch(
+                MouseEventKind::Up(MouseButton::Left),
+                50,
+                10,
+                &hb,
+                Some(&pressed),
+            ),
+            Some(TabMouseDispatch::Cancel),
+        );
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_up_with_no_press_is_none() {
+        // Stray release with no matching press (e.g. the user pressed
+        // outside any tab and we left `mouse_press` empty). Must be a
+        // no-op — never let an unprovoked Up trigger focus changes.
+        let hb = two_tab_hitboxes();
+        assert_eq!(
+            tab_mouse_dispatch(MouseEventKind::Up(MouseButton::Left), 2, 23, &hb, None),
+            None,
+        );
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_drag_is_none_so_event_loop_keeps_state() {
+        // Drag fires only on motion (per crossterm); we deliberately
+        // ignore it so the dispatcher is stateless across the full
+        // gesture. The decision happens at Up, which has both ends.
+        let hb = two_tab_hitboxes();
+        let pressed = AgentId::new("a");
+        assert_eq!(
+            tab_mouse_dispatch(
+                MouseEventKind::Drag(MouseButton::Left),
+                5,
+                23,
+                &hb,
+                Some(&pressed),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn tab_mouse_dispatch_non_left_buttons_are_ignored() {
+        // Right and middle clicks must not steal tab gestures —
+        // they're reserved for whatever the terminal or app wants
+        // them for, not for us.
+        let hb = two_tab_hitboxes();
+        let pressed = AgentId::new("a");
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            assert_eq!(
+                tab_mouse_dispatch(MouseEventKind::Down(button), 2, 23, &hb, None),
+                None,
+            );
+            assert_eq!(
+                tab_mouse_dispatch(MouseEventKind::Up(button), 2, 23, &hb, Some(&pressed)),
+                None,
+            );
+        }
+    }
+
     // last_non_blank_row — feeds the buddy tail.
 
     #[test]
@@ -2771,7 +3571,15 @@ mod tests {
             stage: codemuxd_bootstrap::Stage::VersionProbe,
             source: Box::new(io::Error::other("test")),
         };
-        RuntimeAgent::failed(label.into(), None, "host".into(), err, 24, 80)
+        RuntimeAgent::failed(
+            AgentId::new(label),
+            label.into(),
+            None,
+            "host".into(),
+            err,
+            24,
+            80,
+        )
     }
 
     fn failed_agent_with(label: &str, repo: Option<&str>, host: Option<&str>) -> RuntimeAgent {
@@ -2780,6 +3588,7 @@ mod tests {
             source: Box::new(io::Error::other("test")),
         };
         let mut agent = RuntimeAgent::failed(
+            AgentId::new(label),
             label.into(),
             repo.map(str::to_string),
             host.unwrap_or("host").into(),
@@ -3496,7 +4305,16 @@ mod tests {
     fn ready_test_agent(scrollback_len: usize) -> RuntimeAgent {
         let transport =
             AgentTransport::for_test("scrollback-test".into(), 5, 20).expect("for_test transport");
-        RuntimeAgent::ready("a".into(), None, None, transport, 5, 20, scrollback_len)
+        RuntimeAgent::ready(
+            AgentId::new("a"),
+            "a".into(),
+            None,
+            None,
+            transport,
+            5,
+            20,
+            scrollback_len,
+        )
     }
 
     fn populate(agent: &mut RuntimeAgent, lines: u32) {
@@ -3589,5 +4407,267 @@ mod tests {
     fn scrollback_offset_returns_zero_for_failed_agent() {
         let agent = failed_agent("dead");
         assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    // Render-fn integration tests via ratatui's TestBackend. These
+    // drive the actual renderers against a synthetic terminal and
+    // inspect the TabHitboxes the renderer populated, locking the
+    // hitbox-recording invariants without resorting to inspecting
+    // the rendered cells. This is the first TestBackend-based test
+    // in this codebase; if more renderers grow hitbox / interaction
+    // surfaces, lift the boilerplate into a small helper.
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn three_failed_agents() -> Vec<RuntimeAgent> {
+        vec![failed_agent("a"), failed_agent("b"), failed_agent("c")]
+    }
+
+    #[test]
+    fn render_status_bar_records_one_hitbox_per_agent_in_order() {
+        // 80-cell-wide status bar at row 23, three agents. Expect
+        // three hitboxes with the agents' ids in left-to-right
+        // order — the tab strip's draw order is agent-vector order.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agents = three_failed_agents();
+        let bindings = Bindings::default();
+        let mut hb = TabHitboxes::default();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 23,
+                        width: 80,
+                        height: 1,
+                    },
+                    &agents,
+                    1,
+                    Some(0),
+                    &bindings,
+                    PrefixState::Idle,
+                    AnimationPhase::default(),
+                    &mut hb,
+                );
+            })
+            .unwrap();
+        let ids: Vec<AgentId> = hb.rects.iter().map(|h| h.agent_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![AgentId::new("a"), AgentId::new("b"), AgentId::new("c")],
+        );
+    }
+
+    #[test]
+    fn render_status_bar_hitboxes_sit_on_the_status_row_and_are_non_overlapping() {
+        // Anchor the geometry: every recorded rect must land on the
+        // status bar's row and have nonzero width, and adjacent tabs
+        // must not overlap (the separator span sits in the gap).
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agents = three_failed_agents();
+        let bindings = Bindings::default();
+        let mut hb = TabHitboxes::default();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 23,
+                        width: 80,
+                        height: 1,
+                    },
+                    &agents,
+                    0,
+                    None,
+                    &bindings,
+                    PrefixState::Idle,
+                    AnimationPhase::default(),
+                    &mut hb,
+                );
+            })
+            .unwrap();
+        for h in &hb.rects {
+            assert_eq!(h.rect.y, 23, "hitbox must sit on the status row");
+            assert_eq!(h.rect.height, 1, "hitbox must be one row tall");
+            assert!(h.rect.width > 0, "hitbox must have nonzero width");
+        }
+        for window in hb.rects.windows(2) {
+            let left = &window[0].rect;
+            let right = &window[1].rect;
+            assert!(
+                left.x.saturating_add(left.width) <= right.x,
+                "tabs must not overlap (got {left:?} then {right:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn render_status_bar_clears_stale_hitboxes_first() {
+        // Even though clearing is render_frame's job, a render that
+        // is called twice in a row should leave hb with the latest
+        // frame's count, not double-recorded entries. The renderer
+        // itself must not append on top of pre-existing rects.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agents = three_failed_agents();
+        let bindings = Bindings::default();
+        // Pre-seed with stale rects from an imaginary previous frame.
+        let mut hb = TabHitboxes::default();
+        let stale = AgentId::new("stale-agent");
+        hb.record(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 99,
+                height: 99,
+            },
+            stale.clone(),
+        );
+        // Caller (render_frame) clears before invoking render_status_bar.
+        hb.clear();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 23,
+                        width: 80,
+                        height: 1,
+                    },
+                    &agents,
+                    0,
+                    None,
+                    &bindings,
+                    PrefixState::Idle,
+                    AnimationPhase::default(),
+                    &mut hb,
+                );
+            })
+            .unwrap();
+        assert_eq!(hb.rects.len(), 3, "stale rect must not leak forward");
+        assert!(
+            hb.rects.iter().all(|h| h.agent_id != stale),
+            "stale agent id must be gone",
+        );
+    }
+
+    #[test]
+    fn render_left_pane_records_one_hitbox_per_agent() {
+        // 80x24 terminal. NAV_PANE_WIDTH is 25; the bordered block
+        // reserves one cell per side and the title row, so agent rows
+        // start at nav_area.y + 1 and span x = 1..NAV_PANE_WIDTH - 1.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agents = three_failed_agents();
+        let mut hb = TabHitboxes::default();
+        terminal
+            .draw(|frame| {
+                render_left_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agents,
+                    1,
+                    AnimationPhase::default(),
+                    &mut hb,
+                );
+            })
+            .unwrap();
+        let ids: Vec<AgentId> = hb.rects.iter().map(|h| h.agent_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![AgentId::new("a"), AgentId::new("b"), AgentId::new("c")],
+        );
+    }
+
+    #[test]
+    fn render_left_pane_hitboxes_skip_borders_and_advance_one_row_per_agent() {
+        // The bordered block consumes one row top/bottom and one
+        // cell left/right; clickable rows must sit *inside* the
+        // border, advancing one row per agent.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agents = three_failed_agents();
+        let mut hb = TabHitboxes::default();
+        terminal
+            .draw(|frame| {
+                render_left_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agents,
+                    0,
+                    AnimationPhase::default(),
+                    &mut hb,
+                );
+            })
+            .unwrap();
+        // x=1: skip the left border. width = NAV_PANE_WIDTH - 2 = 23:
+        // skip both borders. y starts at 1 (skip top border) and
+        // advances by 1 per agent.
+        for (i, h) in hb.rects.iter().enumerate() {
+            assert_eq!(h.rect.x, 1, "agent row must skip the left border");
+            assert_eq!(h.rect.width, NAV_PANE_WIDTH - 2);
+            assert_eq!(h.rect.height, 1);
+            assert_eq!(h.rect.y, 1 + u16::try_from(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn render_left_pane_drops_rows_that_overflow_the_pane() {
+        // Tiny pane: 24 rows total, top + bottom border, fits 22 rows
+        // for agents. Spawning 50 agents must not record bogus
+        // hitboxes past the bottom border.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agents: Vec<RuntimeAgent> = (0..50)
+            .map(|i| failed_agent(&format!("agent-{i}")))
+            .collect();
+        let mut hb = TabHitboxes::default();
+        terminal
+            .draw(|frame| {
+                render_left_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agents,
+                    0,
+                    AnimationPhase::default(),
+                    &mut hb,
+                );
+            })
+            .unwrap();
+        assert!(
+            hb.rects.len() < agents.len(),
+            "overflowing rows must be dropped, got {} hitboxes for {} agents",
+            hb.rects.len(),
+            agents.len(),
+        );
+        // No hitbox may sit on or past the bottom border (y=23).
+        for h in &hb.rects {
+            assert!(
+                h.rect.y < 23,
+                "hitbox at y={} crosses bottom border",
+                h.rect.y,
+            );
+        }
     }
 }

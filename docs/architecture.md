@@ -458,6 +458,72 @@ daemon side would double the memory footprint of every remote session
 for no gain — the client only needs the visible grid restored on
 reconnect; history is already in its own parser.
 
+### AD-27 — Tab affordances on the captured mouse stream
+
+The tab strip is the navigator's single most-used affordance, and
+codemux already captures the mouse stream (AD-25, mouse section): the
+runtime sees `MouseEventKind::Down/Up/Drag` instead of letting the
+terminal own them. With the events already in hand, leaving them
+unbound would have meant the user has to lift their hand off the
+trackpad and reach for `Ctrl-B 1..9` to switch agents — for a
+multiplexer whose whole job is fast switching, that is a pointless
+detour.
+
+**The two gestures.** Click on a tab focuses it (no prefix). Drag a
+tab onto another's slot reorders the agents in browser-tab semantics
+— `Vec::remove(from) + insert(to)`, not swap. Same gesture in both
+nav styles: the bottom strip in Popup mode and the left nav rows in
+LeftPane mode are both clickable.
+
+**Hitboxes are recorded by the renderer.** A `TabHitboxes` struct
+(`apps/tui/src/runtime.rs`) is owned by `event_loop`, cleared at the
+top of every `render_frame`, and passed to the two leaf renderers
+(`render_status_bar`, `render_left_pane`). Each renderer records a
+named `Hitbox { rect, agent_id }` for every tab as it draws it. The
+mouse handler reads the hitboxes back on `Down(Left)` / `Up(Left)` to
+translate `(column, row)` to an agent identity (not an index).
+
+This is the cleanest seam available: the renderer is the only place
+that knows where each tab landed (after layout splits, separator
+spans, hint reservation, area clipping). Recording the rect inline
+during rendering avoids the duplicate-the-width-math trap that any
+post-hoc geometry derivation would have fallen into.
+
+**Press grabs a stable identity, not an index.** `mouse_press:
+Option<AgentId>` stores the agent's id (not its `Vec` slot). Storing
+identity means a terminal resize, agent reap, or background reorder
+between Down and Up still resolves the gesture correctly: the event
+loop runs `agents.iter().position(|a| a.id == id)` at the moment of
+the mutation, returning `None` (and silently cancelling) if the
+agent is gone. An index-based press would have silently re-targeted
+to a different agent in the same slot — the kind of fragility the
+identity boundary exists to prevent. The renderer/dispatcher seam is
+also pure-functional: `tab_mouse_dispatch` returns
+`Option<TabMouseDispatch>` (variants `PressTab(AgentId)` /
+`Click(AgentId)` / `Reorder { from, to }` / `Cancel`), so every
+gesture branch is unit-testable without an event-loop harness.
+
+Release outcomes:
+
+- same id → click → `change_focus`
+- different id → drag → resolve both ids to current indices, then
+  `reorder_agents` followed by `shift_index` on `focused` and
+  `previous_focused` so the same agent stays focused across the
+  reorder
+- released outside any tab → cancel
+
+Crossterm only fires `Drag` on motion, so a same-cell down→up is a
+clean click with no intervening drag — the same code path serves
+both gestures.
+
+**Cost.** Captured clicks and drags can no longer reach the terminal
+for native text selection over the tab strip. The `⌥/Option-drag`
+escape hatch (iTerm2, Ghostty, Alacritty, WezTerm, Kitty) bypasses
+mouse capture per-drag and is documented in the help screen alongside
+the new `click` / `drag` lines. Apple Terminal does not deliver SGR
+mouse anyway — neither tab gestures nor scroll work there. Same
+explicit non-goal as AD-25.
+
 ## Deferred ideas
 
 Architecture decisions sketched in earlier drafts but not load-bearing for what
