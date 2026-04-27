@@ -34,9 +34,9 @@ use codemuxd_bootstrap::{PreparedHost, RealRunner, RemoteFs};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, MouseEvent, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -84,6 +84,7 @@ const SCROLL_INDICATOR_WIDTH: u16 = 24;
 struct TerminalGuard {
     enhanced_keyboard: bool,
     mouse_captured: bool,
+    bracketed_paste: bool,
 }
 
 impl Drop for TerminalGuard {
@@ -93,13 +94,16 @@ impl Drop for TerminalGuard {
         // a degraded state, and surfacing an error would clobber whatever the
         // panic backtrace was about to say.
         //
-        // Drop order is the reverse of acquisition: mouse capture, then
-        // keyboard enhancement, then leave-alt-screen + raw-mode. Mouse
-        // capture and keyboard enhancement are independent escape sequences
-        // (`?1006l` vs `<u`), but mirroring acquisition order is the safe
+        // Drop order is the reverse of acquisition: bracketed paste, mouse
+        // capture, then keyboard enhancement, then leave-alt-screen +
+        // raw-mode. Each is an independent escape sequence (`?2004l`,
+        // `?1006l`, `<u`); mirroring acquisition order is the safe
         // discipline — and skipping the matching disable when the matching
         // enable failed avoids generating spurious sequences the terminal
         // never opted into.
+        if self.bracketed_paste {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+        }
         if self.mouse_captured {
             let _ = execute!(io::stdout(), DisableMouseCapture);
         }
@@ -451,6 +455,20 @@ pub fn run(
         tracing::warn!("EnableMouseCapture failed; scrollback wheel will not work");
     }
 
+    // Bracketed paste: tells the terminal to wrap pasted content in
+    // `\x1b[200~ ... \x1b[201~` so crossterm can deliver it as a single
+    // `Event::Paste` instead of streaming each character as a `KeyEvent`.
+    // Without this, embedded newlines in the paste arrive as
+    // `KeyCode::Enter`, which `key_to_bytes` maps to `\r` — and Claude
+    // submits the message on every line. The paste handler re-wraps the
+    // text in `\x1b[200~ ... \x1b[201~` before forwarding to the inner
+    // PTY because Claude advertises `?2004h` and we are the host
+    // terminal from its perspective.
+    let bracketed_paste = execute!(io::stdout(), EnableBracketedPaste).is_ok();
+    if !bracketed_paste {
+        tracing::warn!("EnableBracketedPaste failed; multi-line pastes may submit early");
+    }
+
     // Auto-detect: enable the Kitty Keyboard Protocol only when the user has
     // bound something to a SUPER (Cmd / Win) chord. Without this, terminals
     // that support the protocol (Ghostty, Kitty, WezTerm, recent Alacritty,
@@ -471,6 +489,7 @@ pub fn run(
     let _guard = TerminalGuard {
         enhanced_keyboard,
         mouse_captured,
+        bracketed_paste,
     };
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -1237,16 +1256,20 @@ fn event_loop(
             Event::Paste(text) if no_overlay_active(spawn_ui.as_ref(), popup_state, help_state) => {
                 // Pasting while scrolled-back: snap to live view first
                 // so the user sees what landed (otherwise the paste is
-                // invisible above the fold), then forward as bytes.
-                // Bracketed paste is on (Claude advertises `?2004h`),
-                // so the agent re-wraps the paste in `\x1b[200~ ...
-                // \x1b[201~` itself if it cares; we just deliver the
-                // raw text.
+                // invisible above the fold), then forward the chunk.
+                //
+                // Claude advertises `?2004h` (bracketed paste) at start-
+                // up. We are the host terminal from its perspective, so
+                // we wrap the chunk in `\x1b[200~ ... \x1b[201~` before
+                // writing — that's how Claude knows the embedded
+                // newlines are pasted text rather than user-typed Enter
+                // keys. Without the wrappers Claude would submit the
+                // message on every newline in the paste.
                 if let Some(agent) = agents.get_mut(focused) {
                     agent.snap_to_live();
                     if let AgentState::Ready { transport, .. } = &mut agent.state {
                         transport
-                            .write(text.as_bytes())
+                            .write(&wrap_paste(&text))
                             .wrap_err("write pasted bytes to pty")?;
                     }
                 }
@@ -2209,6 +2232,21 @@ fn centered_rect_with_size(width: u16, height: u16, r: Rect) -> Rect {
     }
 }
 
+/// Wrap a pasted text chunk in bracketed-paste markers
+/// (`\x1b[200~ ... \x1b[201~`) for forwarding to a child that
+/// advertised `?2004h`.
+///
+/// ESC bytes in the payload are stripped first: an embedded
+/// `\x1b[201~` would close paste mode early in the child and let the
+/// trailing bytes land as live keystrokes — the standard
+/// terminal-injection vector. xterm's `disallowedPasteControls`
+/// default does the same; legitimate text pastes don't carry control
+/// sequences.
+fn wrap_paste(text: &str) -> Vec<u8> {
+    let sanitized: Vec<u8> = text.bytes().filter(|&b| b != 0x1b).collect();
+    [b"\x1b[200~", sanitized.as_slice(), b"\x1b[201~"].concat()
+}
+
 /// Translate a crossterm key event into the bytes a terminal-mode child
 /// process expects.
 fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
@@ -2223,7 +2261,27 @@ fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
             }
             return Some(c.to_string().into_bytes());
         }
-        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Enter => {
+            // Plain Enter submits; any modifier (Shift, Alt, Ctrl, Super)
+            // is the "I want a newline, not submit" intent. Claude reads
+            // `\x1b\r` (the Meta+Enter / Alt+Enter convention) as an
+            // in-input newline — same byte sequence iTerm/Terminal.app
+            // emit for Option+Enter when "Use Option as Meta" is on.
+            //
+            // Without this branch every Cmd/Ctrl/Shift+Enter chord lands
+            // as plain `\r` and submits the message — the same failure
+            // mode users hit when bracketed paste is off.
+            if modifiers.intersects(
+                KeyModifiers::SHIFT
+                    | KeyModifiers::ALT
+                    | KeyModifiers::CONTROL
+                    | KeyModifiers::SUPER,
+            ) {
+                vec![0x1b, b'\r']
+            } else {
+                vec![b'\r']
+            }
+        }
         KeyCode::Tab => vec![b'\t'],
         KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
         KeyCode::Backspace => vec![0x7f],
@@ -2277,6 +2335,45 @@ mod tests {
             key_to_bytes(KeyCode::Enter, KeyModifiers::NONE),
             Some(vec![b'\r'])
         );
+    }
+
+    #[test]
+    fn modified_enter_emits_meta_enter_for_in_input_newline() {
+        // Plain `\r` would submit; `ESC + \r` is the universal
+        // Meta/Alt+Enter sequence Claude treats as a newline within
+        // input. Each modifier the user might pair with Enter must take
+        // this branch — Shift, Alt, Ctrl, Super (Cmd/Win).
+        for modifier in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER,
+        ] {
+            assert_eq!(
+                key_to_bytes(KeyCode::Enter, modifier),
+                Some(vec![0x1b, b'\r']),
+                "wrong bytes for modified Enter ({modifier:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_paste_emits_brackets_around_plain_text() {
+        assert_eq!(
+            wrap_paste("hello\nworld"),
+            b"\x1b[200~hello\nworld\x1b[201~".to_vec(),
+        );
+    }
+
+    #[test]
+    fn wrap_paste_strips_embedded_esc_to_block_end_marker_injection() {
+        // Without sanitization, the embedded `\x1b[201~` would close
+        // paste mode in the child PTY and the bytes after it would
+        // land as live keystrokes — the standard injection vector.
+        let wrapped = wrap_paste("ok\x1b[201~rm -rf");
+        let s = String::from_utf8(wrapped).unwrap();
+        assert_eq!(s, "\x1b[200~ok[201~rm -rf\x1b[201~");
+        assert_eq!(s.matches("\x1b[201~").count(), 1);
     }
 
     #[test]
