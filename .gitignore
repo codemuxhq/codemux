@@ -10,3 +10,9 @@
 
 # OS
 .DS_Store
+
+# Local agent state
+.claude/
+
+# Local debug output
+*.log
