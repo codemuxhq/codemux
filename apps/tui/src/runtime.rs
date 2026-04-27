@@ -1093,7 +1093,6 @@ fn event_loop(
                     frame,
                     &agents,
                     focused,
-                    previous_focused,
                     nav_style,
                     popup_state,
                     help_state,
@@ -1657,7 +1656,6 @@ fn render_frame(
     frame: &mut Frame<'_>,
     agents: &[RuntimeAgent],
     focused: usize,
-    previous_focused: Option<usize>,
     nav_style: NavStyle,
     popup: PopupState,
     help: HelpState,
@@ -1697,7 +1695,6 @@ fn render_frame(
                 main_area,
                 agents,
                 focused,
-                previous_focused,
                 popup,
                 bindings,
                 prefix_state,
@@ -1904,7 +1901,6 @@ fn render_popup_style(
     area: Rect,
     agents: &[RuntimeAgent],
     focused: usize,
-    previous_focused: Option<usize>,
     popup: PopupState,
     bindings: &Bindings,
     prefix_state: PrefixState,
@@ -1926,7 +1922,6 @@ fn render_popup_style(
         status_area,
         agents,
         focused,
-        previous_focused,
         bindings,
         prefix_state,
         phase,
@@ -1939,18 +1934,12 @@ fn render_popup_style(
     }
 }
 
-/// Render the bottom status bar in Popup mode: tab strip (left,
-/// styled spans), buddy tail (middle, dim) showing the last non-blank
-/// line of the previously-focused agent's screen, and the prefix hint
-/// right-aligned. Splitting into discrete areas means each section
-/// can be styled and clipped independently; the previous flat-string
-/// approach forced uniform style and made it awkward to highlight the
-/// focused tab without rendering a custom widget.
-///
-/// The buddy tail is the codemux-specific affordance: tmux can't show
-/// what an unfocused window is doing without a custom integration,
-/// because it doesn't parse the child's output. We already do (for
-/// rendering), so the last visible line is free.
+/// Render the bottom status bar in Popup mode: tab strip on the left
+/// and the prefix hint right-aligned. Splitting into discrete areas
+/// means each section can be styled and clipped independently; the
+/// previous flat-string approach forced uniform style and made it
+/// awkward to highlight the focused tab without rendering a custom
+/// widget.
 ///
 /// The hint at the right swaps based on `prefix_state`: idle shows
 /// the help reminder; `AwaitingCommand` shows a `[NAV]` badge plus a
@@ -1962,7 +1951,6 @@ fn render_status_bar(
     area: Rect,
     agents: &[RuntimeAgent],
     focused: usize,
-    previous_focused: Option<usize>,
     bindings: &Bindings,
     prefix_state: PrefixState,
     phase: AnimationPhase,
@@ -1989,13 +1977,13 @@ fn render_status_bar(
         (area, None)
     };
 
-    // Build the left half as a single Line: tabs first (with separator
-    // spans between), then a separator and the buddy tail if there's a
-    // sensible buddy. Per-tab structs let us record the screen rect of
-    // each tab into `hitboxes` while concatenating the visual into a
-    // single Line so ratatui clips the whole thing at the area edge as
-    // a unit. Without per-tab geometry, we'd have to re-derive widths
-    // from the flat span list at hit-test time.
+    // Build the left half as a single Line: tab specs (each carrying its
+    // own hitbox geometry) joined by separator spans. Per-tab structs let
+    // us record the screen rect of each tab into `hitboxes` while
+    // concatenating the visual into a single Line so ratatui clips the
+    // whole thing at the area edge as a unit. Without per-tab geometry,
+    // we'd have to re-derive widths from the flat span list at hit-test
+    // time.
     let separator = " │ ";
     let separator_w = u16::try_from(separator.chars().count()).unwrap_or(3);
 
@@ -2026,10 +2014,6 @@ fn render_status_bar(
         );
         spans.extend(tab.spans.iter().cloned());
         x = x.saturating_add(tab_w);
-    }
-    if let Some(tail) = buddy_tail_spans(agents, focused, previous_focused, chrome) {
-        spans.push(Span::styled("    ← ", chrome.secondary));
-        spans.extend(tail);
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
 
@@ -2418,59 +2402,6 @@ fn body_text(title: Option<&str>, repo: Option<&str>, fallback: &str) -> String 
         (None, Some(title)) => title.to_string(),
         (None, None) => fallback.to_string(),
     }
-}
-
-/// Build the spans for the buddy tail — the last non-blank line of
-/// the previously-focused agent's screen. Returns `None` when there's
-/// nothing useful to show: no previous, previous index out of range,
-/// previous agent isn't a `Ready` (no parser), or all rows are blank.
-/// The "prev != focused" guard is belt-and-braces; `change_focus`
-/// already filters that out, but the renderer shouldn't trust it.
-fn buddy_tail_spans(
-    agents: &[RuntimeAgent],
-    focused: usize,
-    previous_focused: Option<usize>,
-    chrome: ChromeStyle,
-) -> Option<Vec<Span<'static>>> {
-    let prev = previous_focused?;
-    if prev == focused {
-        return None;
-    }
-    let agent = agents.get(prev)?;
-    let parser = match &agent.state {
-        AgentState::Ready { parser, .. } => parser,
-        AgentState::Failed { .. } => return None,
-    };
-    let (rows, cols) = parser.screen().size();
-    let line = last_non_blank_row(parser, rows, cols)?;
-    Some(vec![
-        Span::styled(format!("[{}] ", prev + 1), chrome.secondary),
-        Span::styled(line, chrome.secondary.add_modifier(Modifier::ITALIC)),
-    ])
-}
-
-/// Walk the visible screen and return the last row whose trimmed
-/// contents aren't empty. Used by [`buddy_tail_spans`] to find the
-/// most recent meaningful output of an unfocused agent. Returns `None`
-/// if every row is blank (fresh PTY before any output).
-///
-/// Generic over the callbacks type so the existing `Parser::new(...)`
-/// tests (which use `Parser<()>`) keep compiling alongside the
-/// `Parser<TitleCapture>` the runtime uses in production.
-fn last_non_blank_row<CB: vt100::Callbacks>(
-    parser: &Parser<CB>,
-    rows: u16,
-    cols: u16,
-) -> Option<String> {
-    if rows == 0 || cols == 0 {
-        return None;
-    }
-    parser
-        .screen()
-        .rows(0, cols)
-        .filter(|line| !line.trim().is_empty())
-        .last()
-        .map(|line| line.trim_end().to_string())
 }
 
 fn render_switcher_popup(
@@ -3579,45 +3510,6 @@ mod tests {
         }
     }
 
-    // last_non_blank_row — feeds the buddy tail.
-
-    #[test]
-    fn last_non_blank_row_returns_none_for_a_fresh_parser() {
-        // No bytes processed: every row is blank.
-        let parser = Parser::new(10, 40, 0);
-        assert_eq!(last_non_blank_row(&parser, 10, 40), None);
-    }
-
-    #[test]
-    fn last_non_blank_row_finds_the_most_recent_meaningful_line() {
-        let mut parser = Parser::new(5, 20, 0);
-        parser.process(b"first\r\n");
-        parser.process(b"second\r\n");
-        parser.process(b"third\r\n");
-        // VT terminals don't naturally append blank lines after the
-        // cursor — we just expect the last *written* line to come back.
-        assert_eq!(last_non_blank_row(&parser, 5, 20).as_deref(), Some("third"),);
-    }
-
-    #[test]
-    fn last_non_blank_row_skips_trailing_whitespace_rows() {
-        let mut parser = Parser::new(5, 20, 0);
-        parser.process(b"useful output\r\n\r\n\r\n");
-        // Last meaningful line is still `useful output`, not the
-        // empty rows pushed by the trailing newlines.
-        assert_eq!(
-            last_non_blank_row(&parser, 5, 20).as_deref(),
-            Some("useful output"),
-        );
-    }
-
-    // buddy_tail_spans gating — protect the renderer from stale or
-    // missing previous slots. The "renders the right styled spans for
-    // a Ready agent" path requires constructing an AgentTransport,
-    // which the TUI crate can't build directly (see RuntimeAgent
-    // constructors note); we cover the None gates here and rely on
-    // last_non_blank_row tests for the data-extraction half.
-
     fn failed_agent(label: &str) -> RuntimeAgent {
         let err = codemuxd_bootstrap::Error::Bootstrap {
             stage: codemuxd_bootstrap::Stage::VersionProbe,
@@ -4092,36 +3984,6 @@ mod tests {
         assert!(s.add_modifier.contains(Modifier::DIM));
     }
 
-    #[test]
-    fn buddy_tail_spans_returns_none_when_no_previous() {
-        let agents = vec![failed_agent("a"), failed_agent("b")];
-        assert!(buddy_tail_spans(&agents, 0, None, ChromeStyle::default()).is_none());
-    }
-
-    #[test]
-    fn buddy_tail_spans_returns_none_when_previous_equals_focused() {
-        // Belt-and-braces: change_focus already filters this, but the
-        // renderer mustn't crash if the invariant ever slips.
-        let agents = vec![failed_agent("a"), failed_agent("b")];
-        assert!(buddy_tail_spans(&agents, 1, Some(1), ChromeStyle::default()).is_none());
-    }
-
-    #[test]
-    fn buddy_tail_spans_returns_none_when_previous_index_is_out_of_range() {
-        // The per-frame clamp clears stale slots, but a transient
-        // out-of-range value (mid-reap) must still produce no output.
-        let agents = vec![failed_agent("a")];
-        assert!(buddy_tail_spans(&agents, 0, Some(7), ChromeStyle::default()).is_none());
-    }
-
-    #[test]
-    fn buddy_tail_spans_returns_none_when_previous_agent_is_failed() {
-        // A Failed agent has no Parser, so there's no last-line to
-        // surface. The buddy tail just stays hidden in this case.
-        let agents = vec![failed_agent("a"), failed_agent("b")];
-        assert!(buddy_tail_spans(&agents, 0, Some(1), ChromeStyle::default()).is_none());
-    }
-
     // build_hint state-driven branch — the user's visible cue that
     // sticky nav mode is active. The two branches must produce
     // distinguishable output (different widths) so the layout reserves
@@ -4573,7 +4435,6 @@ mod tests {
                     },
                     &agents,
                     1,
-                    Some(0),
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
@@ -4611,7 +4472,6 @@ mod tests {
                     },
                     &agents,
                     0,
-                    None,
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
@@ -4671,7 +4531,6 @@ mod tests {
                     },
                     &agents,
                     0,
-                    None,
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
