@@ -589,6 +589,7 @@ pub fn run(
         log_tail,
         initial_cwd,
         config.scrollback_len,
+        ChromeStyle::from_ui(&config.ui),
     )
 }
 
@@ -843,12 +844,13 @@ fn event_loop(
     log_tail: Option<&LogTail>,
     initial_cwd: &Path,
     scrollback_len: usize,
+    chrome: ChromeStyle,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
     // arm into its own helper would require threading >5 mutable references
     // through the helper and gain little.
-    #![allow(clippy::too_many_lines)]
+    #![allow(clippy::too_many_lines, clippy::too_many_arguments)]
     let mut prefix_state = PrefixState::default();
     let mut popup_state = PopupState::default();
     let mut help_state = HelpState::default();
@@ -1100,6 +1102,7 @@ fn event_loop(
                     prefix_state,
                     log_tail,
                     phase,
+                    chrome,
                     &mut tab_hitboxes,
                 );
             })
@@ -1663,6 +1666,7 @@ fn render_frame(
     prefix_state: PrefixState,
     log_tail: Option<&LogTail>,
     phase: AnimationPhase,
+    chrome: ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     // Cleared at the top of every frame so a stale frame's rects can
@@ -1685,7 +1689,7 @@ fn render_frame(
     };
     match nav_style {
         NavStyle::LeftPane => {
-            render_left_pane(frame, main_area, agents, focused, phase, hitboxes);
+            render_left_pane(frame, main_area, agents, focused, phase, chrome, hitboxes);
         }
         NavStyle::Popup => {
             render_popup_style(
@@ -1698,12 +1702,13 @@ fn render_frame(
                 bindings,
                 prefix_state,
                 phase,
+                chrome,
                 hitboxes,
             );
         }
     }
     if let (Some(tail), Some(area)) = (log_tail, log_area) {
-        render_log_strip(frame, area, tail);
+        render_log_strip(frame, area, tail, chrome);
     }
     if let Some(ui) = spawn_ui {
         ui.render(frame, area, &bindings.on_modal);
@@ -1719,13 +1724,9 @@ fn render_frame(
 /// agent pane for attention. Empty tail (no events yet) renders as a
 /// single dash so the row is visually present and the user can tell
 /// the strip is live.
-fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail) {
+fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail, chrome: ChromeStyle) {
     let line = tail.latest().unwrap_or_else(|| "—".to_string());
-    let widget = Paragraph::new(Line::raw(line)).style(
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    );
+    let widget = Paragraph::new(Line::raw(line)).style(chrome.secondary);
     // Clear so a previous frame's longer line doesn't leave trailing
     // characters when the latest line is shorter.
     frame.render_widget(Clear, area);
@@ -1843,6 +1844,7 @@ fn render_left_pane(
     agents: &[RuntimeAgent],
     focused: usize,
     phase: AnimationPhase,
+    chrome: ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     let [nav_area, pty_area] = Layout::default()
@@ -1857,7 +1859,7 @@ fn render_left_pane(
             let prefix = if i == focused { "> " } else { "  " };
             let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
             spans.push(Span::raw(format!("{prefix}[{}] ", i + 1)));
-            spans.extend(agent_label_spans(a, false, phase));
+            spans.extend(agent_label_spans(a, false, phase, chrome));
             Line::from(spans)
         })
         .collect();
@@ -1907,6 +1909,7 @@ fn render_popup_style(
     bindings: &Bindings,
     prefix_state: PrefixState,
     phase: AnimationPhase,
+    chrome: ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     let [pty_area, status_area] = Layout::default()
@@ -1927,11 +1930,12 @@ fn render_popup_style(
         bindings,
         prefix_state,
         phase,
+        chrome,
         hitboxes,
     );
 
     if let PopupState::Open { selection } = popup {
-        render_switcher_popup(frame, area, agents, selection, phase);
+        render_switcher_popup(frame, area, agents, selection, phase, chrome);
     }
 }
 
@@ -1962,12 +1966,13 @@ fn render_status_bar(
     bindings: &Bindings,
     prefix_state: PrefixState,
     phase: AnimationPhase,
+    chrome: ChromeStyle,
     hitboxes: &mut TabHitboxes,
 ) {
     // Compute the hint as both rendered Line (with styling) and a
     // plain text-width measurement (for the layout split). The two
     // need to stay in sync — the alternative was to render twice.
-    let (hint_line, hint_width) = build_hint(bindings, prefix_state);
+    let (hint_line, hint_width) = build_hint(bindings, prefix_state, chrome);
 
     // Reserve space for the hint on the right when there's room.
     // Below a small threshold (just enough for one tab plus the hint),
@@ -1991,19 +1996,16 @@ fn render_status_bar(
     // single Line so ratatui clips the whole thing at the area edge as
     // a unit. Without per-tab geometry, we'd have to re-derive widths
     // from the flat span list at hit-test time.
-    let separator_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::DIM);
     let separator = " │ ";
     let separator_w = u16::try_from(separator.chars().count()).unwrap_or(3);
 
-    let tabs = build_tab_strip(agents, focused, phase);
+    let tabs = build_tab_strip(agents, focused, phase, chrome);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(tabs.len().saturating_mul(4));
     let area_right = left_area.x.saturating_add(left_area.width);
     let mut x = left_area.x;
     for (i, tab) in tabs.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(separator, separator_style));
+            spans.push(Span::styled(separator, chrome.secondary));
             x = x.saturating_add(separator_w);
         }
         let tab_w = tab.width();
@@ -2025,13 +2027,8 @@ fn render_status_bar(
         spans.extend(tab.spans.iter().cloned());
         x = x.saturating_add(tab_w);
     }
-    if let Some(tail) = buddy_tail_spans(agents, focused, previous_focused) {
-        spans.push(Span::styled(
-            "    ← ",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ));
+    if let Some(tail) = buddy_tail_spans(agents, focused, previous_focused, chrome) {
+        spans.push(Span::styled("    ← ", chrome.secondary));
         spans.extend(tail);
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
@@ -2048,17 +2045,16 @@ fn render_status_bar(
 /// `Line` plus the plain-text width — the caller needs both because
 /// ratatui's layout splits need a numeric width while rendering
 /// uses the styled `Line`.
-fn build_hint(bindings: &Bindings, prefix_state: PrefixState) -> (Line<'static>, u16) {
+fn build_hint(
+    bindings: &Bindings,
+    prefix_state: PrefixState,
+    chrome: ChromeStyle,
+) -> (Line<'static>, u16) {
     match prefix_state {
         PrefixState::Idle => {
             let text = format!("{} {} for help", bindings.prefix, bindings.on_prefix.help);
             let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
-            let line = Line::styled(
-                text,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            );
+            let line = Line::styled(text, chrome.secondary);
             (line, width)
         }
         PrefixState::AwaitingCommand => {
@@ -2077,12 +2073,7 @@ fn build_hint(bindings: &Bindings, prefix_state: PrefixState) -> (Line<'static>,
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    body,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                ),
+                Span::styled(body, chrome.secondary),
             ]);
             (line, width)
         }
@@ -2118,7 +2109,12 @@ impl TabSpec {
 /// — close enough to the browser tab convention to read as "tabs"
 /// rather than "list of items" — while recording per-tab click
 /// hitboxes from the geometry [`TabSpec::width`] exposes.
-fn build_tab_strip(agents: &[RuntimeAgent], focused: usize, phase: AnimationPhase) -> Vec<TabSpec> {
+fn build_tab_strip(
+    agents: &[RuntimeAgent],
+    focused: usize,
+    phase: AnimationPhase,
+    chrome: ChromeStyle,
+) -> Vec<TabSpec> {
     agents
         .iter()
         .enumerate()
@@ -2127,10 +2123,10 @@ fn build_tab_strip(agents: &[RuntimeAgent], focused: usize, phase: AnimationPhas
             let mut spans: Vec<Span<'static>> = Vec::with_capacity(3);
             spans.push(Span::styled(
                 format!(" {} ", i + 1),
-                tab_index_style(focused_tab),
+                tab_index_style(focused_tab, chrome),
             ));
-            spans.extend(agent_label_spans(agent, focused_tab, phase));
-            spans.push(Span::styled(" ", tab_index_style(focused_tab)));
+            spans.extend(agent_label_spans(agent, focused_tab, phase, chrome));
+            spans.push(Span::styled(" ", tab_index_style(focused_tab, chrome)));
             TabSpec {
                 agent_id: agent.id.clone(),
                 spans,
@@ -2139,11 +2135,11 @@ fn build_tab_strip(agents: &[RuntimeAgent], focused: usize, phase: AnimationPhas
         .collect()
 }
 
-fn tab_index_style(focused: bool) -> Style {
+fn tab_index_style(focused: bool, chrome: ChromeStyle) -> Style {
     if focused {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
-        Style::default().add_modifier(Modifier::DIM)
+        chrome.secondary
     }
 }
 
@@ -2163,6 +2159,58 @@ struct AnimationPhase {
     /// 1500 ms (3-second full period). Slow heartbeat: noticeable
     /// in peripheral vision but never feels jittery.
     blink_bright: bool,
+}
+
+/// Pre-computed styles for the codemux chrome (status bar, tab strip,
+/// hints, log strip — everything *around* the agent pane). Built once
+/// at startup from [`crate::config::Ui`] and passed by value (it's
+/// `Copy`) to every chrome renderer.
+///
+/// The reason it exists as a struct instead of threading the raw config
+/// bool: every renderer needs the *style*, not the flag, and computing
+/// the style at every span site would either duplicate the if-else or
+/// scatter helper calls. One central conversion keeps the
+/// "what-does-subtle-mean" decision in exactly one place.
+#[derive(Clone, Copy, Debug)]
+struct ChromeStyle {
+    /// Used for separators, hints, host prefix, log strip, unfocused
+    /// tab body — anything that should read as "ambient context" rather
+    /// than primary content. See [`Self::from_ui`] for the two modes.
+    secondary: Style,
+}
+
+impl ChromeStyle {
+    /// Default chrome (`subtle = false`): a fixed xterm-256 gray
+    /// (`Indexed(247)`, the same value [`BLINK_DIM`] uses for the
+    /// attention pulse). Deterministic across terminals and visible on
+    /// poor monitors — the conservative choice.
+    ///
+    /// Subtle chrome (`subtle = true`): the original `DarkGray + DIM`
+    /// look. `DIM` is ANSI's "decreased intensity" but each terminal
+    /// renders it differently (Alacritty blends fg with bg at ~66 %,
+    /// iTerm2 uses a slightly darker color, some terminals ignore it)
+    /// so it's a poor default but a fine opt-in for users who like the
+    /// quieter look on a high-contrast display.
+    fn from_ui(ui: &crate::config::Ui) -> Self {
+        let secondary = if ui.subtle {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::Indexed(247))
+        };
+        Self { secondary }
+    }
+}
+
+#[cfg(test)]
+impl Default for ChromeStyle {
+    /// Tests construct chrome by default; the value matches
+    /// `from_ui(&Ui::default())`. Production code never hits this —
+    /// the runtime always builds chrome from the actual user config.
+    fn default() -> Self {
+        Self::from_ui(&crate::config::Ui::default())
+    }
 }
 
 /// Half-period of the "needs attention" blink, in milliseconds. A
@@ -2246,6 +2294,7 @@ fn agent_label_spans(
     agent: &RuntimeAgent,
     focused: bool,
     phase: AnimationPhase,
+    chrome: ChromeStyle,
 ) -> Vec<Span<'static>> {
     // Attention only applies to unfocused tabs; the &&!focused guard
     // is belt-and-braces against a stale flag (the per-frame
@@ -2258,6 +2307,7 @@ fn agent_label_spans(
         attention,
         focused,
         phase,
+        chrome,
     )
 }
 
@@ -2273,17 +2323,16 @@ fn label_spans(
     attention: bool,
     focused: bool,
     phase: AnimationPhase,
+    chrome: ChromeStyle,
 ) -> Vec<Span<'static>> {
-    let body_style = body_style(focused, attention, phase);
+    let body_style = body_style(focused, attention, phase, chrome);
     let host_style = if focused {
         // Reversed already; keep it readable by inheriting the same
         // reverse style (no extra fg/bg) so the host doesn't blend
         // into the highlight.
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM)
+        chrome.secondary
     };
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
@@ -2328,14 +2377,15 @@ fn label_spans(
 ///   is already there; the blink is moot)
 /// - **unfocused, attention, bright phase** → [`BLINK_BRIGHT`]
 /// - **unfocused, attention, dim phase** → [`BLINK_DIM`]
-/// - **unfocused, no attention** → `DIM` (current default)
+/// - **unfocused, no attention** → [`ChromeStyle::secondary`] (default
+///   chrome: a fixed gray; subtle chrome: `DarkGray + DIM`)
 ///
 /// Both blink ends sit in the light-grey range (256-color indices
 /// 252 / 247 — the upper third of the xterm grayscale ramp). The
-/// resulting pulse stays well above the surrounding `DIM` siblings
+/// resulting pulse stays well above the surrounding chrome siblings
 /// so the cue is unmistakable, but the swing between the two ends
 /// is small enough to read as a heartbeat rather than a strobe.
-fn body_style(focused: bool, attention: bool, phase: AnimationPhase) -> Style {
+fn body_style(focused: bool, attention: bool, phase: AnimationPhase, chrome: ChromeStyle) -> Style {
     if focused {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else if attention {
@@ -2346,7 +2396,7 @@ fn body_style(focused: bool, attention: bool, phase: AnimationPhase) -> Style {
         };
         Style::default().fg(fg)
     } else {
-        Style::default().add_modifier(Modifier::DIM)
+        chrome.secondary
     }
 }
 
@@ -2380,6 +2430,7 @@ fn buddy_tail_spans(
     agents: &[RuntimeAgent],
     focused: usize,
     previous_focused: Option<usize>,
+    chrome: ChromeStyle,
 ) -> Option<Vec<Span<'static>>> {
     let prev = previous_focused?;
     if prev == focused {
@@ -2393,18 +2444,8 @@ fn buddy_tail_spans(
     let (rows, cols) = parser.screen().size();
     let line = last_non_blank_row(parser, rows, cols)?;
     Some(vec![
-        Span::styled(
-            format!("[{}] ", prev + 1),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        ),
-        Span::styled(
-            line,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM | Modifier::ITALIC),
-        ),
+        Span::styled(format!("[{}] ", prev + 1), chrome.secondary),
+        Span::styled(line, chrome.secondary.add_modifier(Modifier::ITALIC)),
     ])
 }
 
@@ -2438,6 +2479,7 @@ fn render_switcher_popup(
     agents: &[RuntimeAgent],
     selection: usize,
     phase: AnimationPhase,
+    chrome: ChromeStyle,
 ) {
     let popup_area = centered_rect(50, 60, area);
     frame.render_widget(Clear, popup_area);
@@ -2448,7 +2490,7 @@ fn render_switcher_popup(
             let prefix = if i == selection { "> " } else { "  " };
             let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
             spans.push(Span::raw(format!("{prefix}[{}] ", i + 1)));
-            spans.extend(agent_label_spans(a, false, phase));
+            spans.extend(agent_label_spans(a, false, phase, chrome));
             Line::from(spans)
         })
         .collect();
@@ -3325,7 +3367,12 @@ mod tests {
     #[test]
     fn build_tab_strip_emits_one_spec_per_agent_in_order() {
         let agents = vec![failed_agent("a"), failed_agent("b"), failed_agent("c")];
-        let tabs = build_tab_strip(&agents, 1, AnimationPhase::default());
+        let tabs = build_tab_strip(
+            &agents,
+            1,
+            AnimationPhase::default(),
+            ChromeStyle::default(),
+        );
         assert_eq!(tabs.len(), 3);
         assert_eq!(tabs[0].agent_id, AgentId::new("a"));
         assert_eq!(tabs[1].agent_id, AgentId::new("b"));
@@ -3339,7 +3386,12 @@ mod tests {
         // rect would be zero-sized and `TabHitboxes::record` would
         // drop it.
         let agents = vec![failed_agent("agent-1"), failed_agent("agent-2")];
-        let tabs = build_tab_strip(&agents, 0, AnimationPhase::default());
+        let tabs = build_tab_strip(
+            &agents,
+            0,
+            AnimationPhase::default(),
+            ChromeStyle::default(),
+        );
         for tab in &tabs {
             assert!(tab.width() > 0, "tab {} has zero width", tab.agent_id);
         }
@@ -3633,7 +3685,12 @@ mod tests {
     #[test]
     fn agent_label_spans_includes_host_prefix_for_ssh() {
         let agent = failed_agent_with("agent-1", Some("codemux"), Some("devpod-01"));
-        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let spans = agent_label_spans(
+            &agent,
+            false,
+            AnimationPhase::default(),
+            ChromeStyle::default(),
+        );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             rendered.contains("devpod-01"),
@@ -3648,7 +3705,12 @@ mod tests {
     #[test]
     fn agent_label_spans_omits_host_prefix_for_local() {
         let agent = failed_agent_with("agent-1", Some("codemux"), None);
-        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let spans = agent_label_spans(
+            &agent,
+            false,
+            AnimationPhase::default(),
+            ChromeStyle::default(),
+        );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rendered, "codemux");
     }
@@ -3666,7 +3728,12 @@ mod tests {
     fn agent_label_spans_renders_attention_dot_when_unfocused_and_flagged() {
         let mut agent = failed_agent_with("agent-1", Some("codemux"), None);
         agent.needs_attention = true;
-        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let spans = agent_label_spans(
+            &agent,
+            false,
+            AnimationPhase::default(),
+            ChromeStyle::default(),
+        );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             rendered.contains('●'),
@@ -3681,7 +3748,12 @@ mod tests {
         // the renderer also defends against a transient stale flag.
         let mut agent = failed_agent_with("agent-1", Some("codemux"), None);
         agent.needs_attention = true;
-        let spans = agent_label_spans(&agent, true, AnimationPhase::default());
+        let spans = agent_label_spans(
+            &agent,
+            true,
+            AnimationPhase::default(),
+            ChromeStyle::default(),
+        );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             !rendered.contains('●'),
@@ -3692,7 +3764,12 @@ mod tests {
     #[test]
     fn agent_label_spans_omits_attention_dot_when_not_flagged() {
         let agent = failed_agent_with("agent-1", Some("codemux"), None);
-        let spans = agent_label_spans(&agent, false, AnimationPhase::default());
+        let spans = agent_label_spans(
+            &agent,
+            false,
+            AnimationPhase::default(),
+            ChromeStyle::default(),
+        );
         let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(!rendered.contains('●'));
     }
@@ -3712,6 +3789,7 @@ mod tests {
                 spinner_frame: 0,
                 blink_bright: true,
             },
+            ChromeStyle::default(),
         );
         let dim = body_style(
             false,
@@ -3720,6 +3798,7 @@ mod tests {
                 spinner_frame: 0,
                 blink_bright: false,
             },
+            ChromeStyle::default(),
         );
         assert_eq!(bright.fg, Some(BLINK_BRIGHT));
         assert_eq!(dim.fg, Some(BLINK_DIM));
@@ -3739,6 +3818,7 @@ mod tests {
                 spinner_frame: 0,
                 blink_bright: true,
             },
+            ChromeStyle::default(),
         );
         assert!(
             focused_with_attention
@@ -3825,7 +3905,15 @@ mod tests {
             spinner_frame: 3,
             blink_bright: true,
         };
-        let spans = label_spans(None, "codemux", true, false, false, phase);
+        let spans = label_spans(
+            None,
+            "codemux",
+            true,
+            false,
+            false,
+            phase,
+            ChromeStyle::default(),
+        );
         assert!(
             rendered(&spans).contains(SPINNER_FRAMES[3]),
             "spinner glyph missing: {:?}",
@@ -3836,7 +3924,15 @@ mod tests {
     #[test]
     fn label_spans_omits_spinner_when_not_working() {
         let phase = AnimationPhase::default();
-        let spans = label_spans(None, "codemux", false, false, false, phase);
+        let spans = label_spans(
+            None,
+            "codemux",
+            false,
+            false,
+            false,
+            phase,
+            ChromeStyle::default(),
+        );
         let out = rendered(&spans);
         for frame in SPINNER_FRAMES {
             assert!(!out.contains(frame), "stray spinner glyph: {out:?}");
@@ -3849,7 +3945,15 @@ mod tests {
         // rather than the unfocused gray. Otherwise the spinner would
         // visually drop out of the highlighted tab.
         let phase = AnimationPhase::default();
-        let spans = label_spans(None, "codemux", true, false, true, phase);
+        let spans = label_spans(
+            None,
+            "codemux",
+            true,
+            false,
+            true,
+            phase,
+            ChromeStyle::default(),
+        );
         let spinner_span = spans
             .iter()
             .find(|s| SPINNER_FRAMES.iter().any(|g| s.content.contains(g)))
@@ -3866,6 +3970,7 @@ mod tests {
             false,
             false,
             AnimationPhase::default(),
+            ChromeStyle::default(),
         );
         assert!(rendered(&spans).contains("devpod-01"));
     }
@@ -3879,6 +3984,7 @@ mod tests {
             false,
             false,
             AnimationPhase::default(),
+            ChromeStyle::default(),
         );
         assert_eq!(rendered(&spans), "codemux");
     }
@@ -3957,22 +4063,39 @@ mod tests {
 
     #[test]
     fn tab_index_style_focused_is_reverse_bold() {
-        let s = tab_index_style(true);
+        let s = tab_index_style(true, ChromeStyle::default());
         assert!(s.add_modifier.contains(Modifier::REVERSED));
         assert!(s.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn tab_index_style_unfocused_is_dim() {
-        let s = tab_index_style(false);
-        assert!(s.add_modifier.contains(Modifier::DIM));
+    fn tab_index_style_unfocused_uses_secondary_chrome() {
+        // Default chrome is the readable-on-any-monitor mode: a fixed
+        // gray (Indexed 247) with no DIM modifier. Without this pin the
+        // unfocused tab index could silently regress back to a
+        // terminal-defined dim that disappears on poor monitors.
+        let s = tab_index_style(false, ChromeStyle::default());
         assert!(!s.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(s.fg, Some(Color::Indexed(247)));
+        assert!(!s.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn tab_index_style_unfocused_subtle_keeps_dim() {
+        // Subtle chrome opt-in restores the original DarkGray + DIM
+        // look. Pinning both the color and the modifier guards the
+        // contract from a future refactor that flips one but not the
+        // other.
+        let chrome = ChromeStyle::from_ui(&crate::config::Ui { subtle: true });
+        let s = tab_index_style(false, chrome);
+        assert_eq!(s.fg, Some(Color::DarkGray));
+        assert!(s.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
     fn buddy_tail_spans_returns_none_when_no_previous() {
         let agents = vec![failed_agent("a"), failed_agent("b")];
-        assert!(buddy_tail_spans(&agents, 0, None).is_none());
+        assert!(buddy_tail_spans(&agents, 0, None, ChromeStyle::default()).is_none());
     }
 
     #[test]
@@ -3980,7 +4103,7 @@ mod tests {
         // Belt-and-braces: change_focus already filters this, but the
         // renderer mustn't crash if the invariant ever slips.
         let agents = vec![failed_agent("a"), failed_agent("b")];
-        assert!(buddy_tail_spans(&agents, 1, Some(1)).is_none());
+        assert!(buddy_tail_spans(&agents, 1, Some(1), ChromeStyle::default()).is_none());
     }
 
     #[test]
@@ -3988,7 +4111,7 @@ mod tests {
         // The per-frame clamp clears stale slots, but a transient
         // out-of-range value (mid-reap) must still produce no output.
         let agents = vec![failed_agent("a")];
-        assert!(buddy_tail_spans(&agents, 0, Some(7)).is_none());
+        assert!(buddy_tail_spans(&agents, 0, Some(7), ChromeStyle::default()).is_none());
     }
 
     #[test]
@@ -3996,7 +4119,7 @@ mod tests {
         // A Failed agent has no Parser, so there's no last-line to
         // surface. The buddy tail just stays hidden in this case.
         let agents = vec![failed_agent("a"), failed_agent("b")];
-        assert!(buddy_tail_spans(&agents, 0, Some(1)).is_none());
+        assert!(buddy_tail_spans(&agents, 0, Some(1), ChromeStyle::default()).is_none());
     }
 
     // build_hint state-driven branch — the user's visible cue that
@@ -4007,8 +4130,12 @@ mod tests {
     #[test]
     fn build_hint_idle_and_awaiting_command_produce_different_widths() {
         let bindings = defaults();
-        let (_, idle_width) = build_hint(&bindings, PrefixState::Idle);
-        let (_, nav_width) = build_hint(&bindings, PrefixState::AwaitingCommand);
+        let (_, idle_width) = build_hint(&bindings, PrefixState::Idle, ChromeStyle::default());
+        let (_, nav_width) = build_hint(
+            &bindings,
+            PrefixState::AwaitingCommand,
+            ChromeStyle::default(),
+        );
         // The NAV-mode hint includes a `[NAV]` badge plus a sticky-mode
         // reminder, so it's strictly wider than the idle help reminder.
         // If a future edit makes them equal, the cue gets lost — fail
@@ -4450,6 +4577,7 @@ mod tests {
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
+                    ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4487,6 +4615,7 @@ mod tests {
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
+                    ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4546,6 +4675,7 @@ mod tests {
                     &bindings,
                     PrefixState::Idle,
                     AnimationPhase::default(),
+                    ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4579,6 +4709,7 @@ mod tests {
                     &agents,
                     1,
                     AnimationPhase::default(),
+                    ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4612,6 +4743,7 @@ mod tests {
                     &agents,
                     0,
                     AnimationPhase::default(),
+                    ChromeStyle::default(),
                     &mut hb,
                 );
             })
@@ -4651,6 +4783,7 @@ mod tests {
                     &agents,
                     0,
                     AnimationPhase::default(),
+                    ChromeStyle::default(),
                     &mut hb,
                 );
             })

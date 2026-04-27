@@ -45,6 +45,10 @@ pub struct Config {
     /// alternate screen). See AD-25.
     #[serde(default = "default_scrollback_len")]
     pub scrollback_len: usize,
+    /// Visual presentation knobs for the codemux chrome itself (status
+    /// bar, tab strip, hints, log strip — everything *around* the agent
+    /// pane). Agent PTY content is never restyled.
+    pub ui: Ui,
 }
 
 impl Default for Config {
@@ -52,8 +56,30 @@ impl Default for Config {
         Self {
             bindings: Bindings::default(),
             scrollback_len: default_scrollback_len(),
+            ui: Ui::default(),
         }
     }
+}
+
+/// User-facing presentation knobs. Default values are tuned to be
+/// readable on poor monitors (washed-out laptop screens, projectors,
+/// sunlight glare); opt-ins reintroduce the subtler aesthetic for
+/// users who have a high-contrast display and prefer it.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Ui {
+    /// When `true`, secondary chrome (separators, hints, host prefix,
+    /// log strip, unfocused tab body) renders with the ANSI `DIM`
+    /// modifier on top of `DarkGray`. This was the original look — it
+    /// reads as gentle ambient text on a high-contrast monitor but can
+    /// disappear entirely on a poor one (DIM is terminal-defined and
+    /// some renderers blend fg into bg aggressively).
+    ///
+    /// When `false` (the default), secondary chrome renders in a fixed
+    /// xterm-256 gray (`Color::Indexed(247)`) with no `DIM` modifier —
+    /// deterministic across terminals, and visible on any reasonable
+    /// display.
+    pub subtle: bool,
 }
 
 /// Load the user config from the canonical XDG location, returning defaults
@@ -205,5 +231,29 @@ mod tests {
     fn scrollback_len_round_trips_when_set_in_toml() {
         let config: Config = toml::from_str("scrollback_len = 1500").unwrap();
         assert_eq!(config.scrollback_len, 1_500);
+    }
+
+    #[test]
+    fn ui_subtle_defaults_to_false() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(
+            !config.ui.subtle,
+            "default chrome must be readable on any monitor",
+        );
+    }
+
+    #[test]
+    fn ui_subtle_round_trips_when_set_in_toml() {
+        let config: Config = toml::from_str("[ui]\nsubtle = true\n").unwrap();
+        assert!(config.ui.subtle);
+    }
+
+    #[test]
+    fn missing_ui_section_keeps_defaults() {
+        // The whole [ui] table is optional; users on default chrome
+        // never have to write anything to opt in to it.
+        let config: Config = toml::from_str("scrollback_len = 100").unwrap();
+        assert!(!config.ui.subtle);
+        assert_eq!(config.scrollback_len, 100);
     }
 }
