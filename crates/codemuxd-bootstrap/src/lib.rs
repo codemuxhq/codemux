@@ -1035,6 +1035,74 @@ mod tests {
         assert_eq!(on_disk, BOOTSTRAP_TARBALL);
     }
 
+    /// **Drift guard for the bootstrap manifest.** The remote build uses
+    /// a self-contained workspace manifest (`bootstrap-root/Cargo.toml`)
+    /// that mirrors the parent workspace's `[workspace.dependencies]`.
+    /// If a daemon or wire crate gains a new `workspace = true` dep but
+    /// the bootstrap manifest is not updated, `cargo build` on the
+    /// remote fails with "no such workspace dependency", and the user
+    /// sees a `RemoteBuild` error on first SSH attach. This test
+    /// catches that drift at `cargo test` time so the failure mode is
+    /// local, not in front of the user.
+    #[test]
+    fn bootstrap_manifest_mirrors_every_workspace_dep_used_by_daemon() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+        let bootstrap_root = manifest_dir.join("bootstrap-root").join("Cargo.toml");
+        let bootstrap_deps = workspace_dependency_names(&bootstrap_root);
+
+        for crate_relpath in ["apps/daemon", "crates/wire"] {
+            let manifest = workspace_root.join(crate_relpath).join("Cargo.toml");
+            for dep in workspace_true_dependency_names(&manifest) {
+                assert!(
+                    bootstrap_deps.contains(&dep),
+                    "drift: `{crate_relpath}` declares `{dep}.workspace = true`, but \
+                     `bootstrap-root/Cargo.toml` does not list `{dep}` in \
+                     [workspace.dependencies]. Mirror the dep there or the remote \
+                     `cargo build` will fail to resolve it."
+                );
+            }
+        }
+    }
+
+    /// Read a Cargo.toml, return the keys under `[workspace.dependencies]`.
+    fn workspace_dependency_names(manifest: &Path) -> std::collections::HashSet<String> {
+        let raw = std::fs::read_to_string(manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        let value: toml::Value =
+            toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", manifest.display()));
+        value
+            .get("workspace")
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.as_table())
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Read a Cargo.toml, return the keys under `[dependencies]` that
+    /// are declared with `workspace = true` (i.e. inherit version from
+    /// the workspace root). Bare-string deps and explicitly-versioned
+    /// deps are excluded — they don't need to be mirrored.
+    fn workspace_true_dependency_names(manifest: &Path) -> Vec<String> {
+        let raw = std::fs::read_to_string(manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        let value: toml::Value =
+            toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", manifest.display()));
+        let Some(deps) = value.get("dependencies").and_then(|d| d.as_table()) else {
+            return Vec::new();
+        };
+        deps.iter()
+            .filter_map(|(name, spec)| {
+                let workspace_flag = spec
+                    .as_table()
+                    .and_then(|t| t.get("workspace"))
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false);
+                workspace_flag.then(|| name.clone())
+            })
+            .collect()
+    }
+
     /// `validate_agent_id` accepts shell-safe ids and rejects
     /// shell-special chars.
     #[test]

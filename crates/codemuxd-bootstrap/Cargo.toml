@@ -36,6 +36,12 @@ tempfile.workspace = true
 # Cargo doesn't share those with `cfg(test)` — re-declare here.
 tar = "0.4"
 flate2 = "1.0"
+# Drift check: the manifest-consistency test parses both the parent
+# workspace's `Cargo.toml` and `bootstrap-root/Cargo.toml` to verify
+# every `workspace = true` dep the daemon uses is mirrored on the
+# bootstrap side. Without this, adding a new daemon dep silently
+# breaks the remote build (resolver fails on the unknown name).
+toml.workspace = true
 
 [lints]
 workspace = true

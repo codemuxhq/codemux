@@ -7,7 +7,11 @@
 #   (the daemon and the wire crate it depends on). The original
 #   workspace also lists `apps/tui`, `crates/session`, and
 #   `crates/shared-kernel` — none of which the daemon needs and most
-#   of which would force the remote to pull `ratatui`, `vt100`, etc.
+#   of which would force the remote to pull `ratatui`, etc.
+# - The daemon itself does pull `vt100` (per AD-26 it owns a
+#   session-scoped parser for snapshot replay on reattach), so
+#   `vt100` is mirrored here too. It is the one TUI-side dep that
+#   crossed into the daemon by design.
 # - `apps/daemon/Cargo.toml` and `crates/wire/Cargo.toml` use
 #   `workspace = true` for everything; they can't be built without a
 #   workspace root that supplies the same dep names + versions.
@@ -49,6 +53,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 portable-pty = "0.9.0"
 crossbeam-channel = "0.5.15"
 clap = { version = "4.6.1", features = ["derive", "env"] }
+vt100 = "0.16.2"
 tempfile = "3"
 
 [workspace.lints.rust]
