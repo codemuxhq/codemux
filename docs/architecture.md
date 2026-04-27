@@ -372,6 +372,92 @@ hitting digit-1..9 in prefix mode does NOT reset the offset, so a
 you scrolled it. `Event::Paste` snaps for the same visibility reason
 as forwarded bytes.
 
+### AD-26 — Daemon owns a session-scoped vt100 parser for snapshot replay
+
+`codemuxd` is built around session continuity: the PTY child outlives
+any single client connection, so a user can close their TUI, walk
+away, and reattach later to the same Claude. The wire protocol carries
+*new* PTY bytes from daemon to client — but the screen state that came
+before the reattach lived only in Claude's memory and the disconnected
+client's vt100 buffer. On reconnect the new client got a fresh empty
+parser; an idle Claude (sitting at its prompt, no SIGWINCH because the
+geometry hadn't changed) emitted nothing, and the screen stayed blank
+until the user typed something that forced Claude to redraw. Same
+session, different visible state — exactly what session continuity
+was supposed to prevent.
+
+The fix is structural: the daemon mirrors the child's terminal in its
+own `vt100::Parser`, sized to whatever client is currently attached,
+and emits `Screen::state_formatted` (clear + per-cell positioned text
++ attributes + input modes) as the **first PtyData frame** after every
+handshake. The client's parser starts empty; the snapshot leaves it
+in a state byte-equivalent to the daemon's. Live forwarding then
+resumes from the post-snapshot moment, no gap.
+
+Three things make this safe:
+
+**Atomic process+send in the reader thread** (`apps/daemon/src/pty.rs`,
+`spawn_reader_thread`). Each PTY chunk is fed to the parser AND pushed
+to `rx` under a single parser lock acquisition. The invariant the
+snapshot path relies on is "any chunk in `rx` is also in the parser,
+and vice versa." Without atomicity, a chunk arriving between the
+snapshot's drain and its capture would be either silently dropped (in
+the parser but already drained from rx) or duplicated (in rx but not
+yet in parser, so the snapshot misses it and the live forward sends
+it). The daemon's PTY reader pays one mutex acquisition per 8 KiB
+read, which is invisible against the syscall cost.
+
+**Snapshot lives in `Session`, not `conn`** (`apps/daemon/src/session.rs`,
+`take_snapshot`). The connection adapter (`conn::run_io_loops`) only
+deals with sockets, framing, and the inbound/outbound thread scope —
+it never touches `vt100`, the `?1049h` toggle, or `state_formatted`.
+That domain knowledge belongs with the parser, which lives in
+`Session`. `Session::attach` is the orchestrator: it calls
+`conn::perform_handshake` to read the `Hello`, resizes the master to
+the client's geometry, asks itself for a snapshot, writes the snapshot
+frame, then hands the rest off to `conn::run_io_loops`. Keeping the
+escape-sequence specifics out of `conn` avoids the leaky-abstraction
+trap that an earlier draft of this fix fell into.
+
+`Session::take_snapshot` holds the parser lock for the entire atomic
+window: parser resize → drain rx → encode bytes → release. The reader
+thread blocks during this; once released, any new chunks land in the
+parser AND `rx` and the freshly-spawned outbound loop forwards them.
+The order at the client is therefore unambiguous: snapshot first,
+post-snapshot live bytes after, no overlap. The master resize sits
+*outside* the parser lock — it's a `TIOCSWINSZ` ioctl independent of
+the parser, and stalling the reader on it would needlessly delay
+in-flight chunks.
+
+**`?1049h` prefix when alt-screen is active** (`Session::take_snapshot`).
+`Screen::state_formatted` writes the contents of the *active* screen
+but doesn't toggle which screen the receiver should be on. A Claude
+session in alt-screen mode would otherwise have its alt-buffer content
+clear-and-painted onto the client's primary buffer, which is wrong on
+attach (visible content lands on the wrong half) and worse on the
+child's next mode toggle (the misplaced content lingers when the
+child switches back). For primary-mode sessions we deliberately omit
+the toggle — the client parser starts in primary, so a no-op switch
+just adds bytes.
+
+This **breaks AD-1's "codemux never semantically parses Claude
+Code"** on the daemon side specifically, but only structurally. The
+parsing is escape-sequence reproduction (cursor positions, attribute
+runs, mode flags) — not interpretation of Claude's UI semantics.
+There is no reading of "is this a prompt", "is this a tool call",
+"what is the assistant doing"; the parser is downstream of every byte
+and treats them all the same way it would any VT-compatible stream.
+The carve-out exists because the wire protocol cannot transmit screen
+state any other way short of keeping unbounded raw byte history per
+session, which is strictly worse on memory and still wouldn't handle
+parser-state things like attribute carries across line wraps.
+
+The daemon's parser uses `scrollback_len: 0` because the TUI client
+already owns the scrollback buffer (AD-25). Duplicating it on the
+daemon side would double the memory footprint of every remote session
+for no gain — the client only needs the visible grid restored on
+reconnect; history is already in its own parser.
+
 ## Deferred ideas
 
 Architecture decisions sketched in earlier drafts but not load-bearing for what

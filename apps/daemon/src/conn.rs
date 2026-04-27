@@ -37,8 +37,9 @@
 use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -76,56 +77,29 @@ pub struct HelloInfo {
     pub agent_id: String,
 }
 
-/// Drive a single client connection through handshake and bidirectional
-/// framed I/O. Borrows `writer`, `rx`, `master`, and `child` from the
-/// caller (the `Session`) so all four survive across re-attaches. `stream`
-/// is taken by value because `run` semantically owns the connection for
+/// Drive a single client connection through bidirectional framed I/O,
+/// after the handshake and snapshot replay have already happened.
+/// Borrows `writer`, `rx`, `master`, and `child` from the caller (the
+/// `Session`) so all four survive across re-attaches. `stream` is taken
+/// by value because `run_io_loops` semantically owns the connection for
 /// its lifetime: when the function returns, the socket is closed.
 ///
+/// `handshake_buf` carries any bytes the client tucked onto the end of
+/// the `Hello` frame (TCP can deliver "Hello + first `PtyData`" in one
+/// read). It seeds the inbound loop's decode buffer.
+///
 /// # Errors
-/// Returns the handshake error if version negotiation or framing fails;
-/// returns a transport error if the inbound thread panics. Clean EOF in
-/// either direction is `Ok(())`.
+/// Returns a transport error if the inbound thread panics. Clean EOF
+/// in either direction is `Ok(())`.
 #[allow(clippy::needless_pass_by_value)]
-pub fn run(
+pub fn run_io_loops(
     stream: UnixStream,
+    handshake_buf: Vec<u8>,
     writer: &mut (dyn Write + Send),
     rx: &Receiver<Vec<u8>>,
     master: &mut (dyn MasterPty + Send),
     child: &mut (dyn Child + Send + Sync),
 ) -> Result<(), Error> {
-    let mut handshake_buf = Vec::with_capacity(256);
-    let hello = match perform_handshake(&stream, &mut handshake_buf) {
-        Ok(info) => info,
-        Err(e) => {
-            if let Err(shutdown_err) = stream.shutdown(Shutdown::Both)
-                && shutdown_err.kind() != ErrorKind::NotConnected
-            {
-                tracing::debug!("handshake-failure shutdown failed: {shutdown_err}");
-            }
-            return Err(e);
-        }
-    };
-    tracing::info!(
-        protocol_version = hello.protocol_version,
-        rows = hello.rows,
-        cols = hello.cols,
-        agent_id = %hello.agent_id,
-        "handshake complete",
-    );
-
-    // The client's `Hello` advertised an initial geometry. Apply it now so
-    // the child sees the right `winsize` from the first byte instead of
-    // the bootstrap default the daemon was started with.
-    if let Err(e) = master.resize(PtySize {
-        rows: hello.rows,
-        cols: hello.cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        tracing::warn!("initial resize from Hello geometry failed: {e}");
-    }
-
     let stop = Arc::new(AtomicBool::new(false));
     // `Mutex<&UnixStream>` serializes socket WRITES so inbound's `Pong`
     // frames can't interleave with outbound's `PtyData`. Reads do NOT
@@ -187,7 +161,10 @@ pub fn run(
 /// Any bytes the client sent past the `Hello` frame stay in
 /// `handshake_buf` and become the inbound loop's starting buffer — TCP
 /// can deliver a single read covering "Hello + first `PtyData`" together.
-fn perform_handshake(stream: &UnixStream, handshake_buf: &mut Vec<u8>) -> Result<HelloInfo, Error> {
+pub fn perform_handshake(
+    stream: &UnixStream,
+    handshake_buf: &mut Vec<u8>,
+) -> Result<HelloInfo, Error> {
     // Best-effort: setsockopt can return EINVAL on macOS if the peer has
     // already closed the socket between accept() and now. The next read
     // will detect EOF and return HandshakeIncomplete on its own — the

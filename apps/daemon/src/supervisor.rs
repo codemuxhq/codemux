@@ -257,6 +257,146 @@ mod tests {
         Ok(())
     }
 
+    /// **The bug this fix targets.** Without snapshot replay, a
+    /// reattaching client sees a blank screen until something the child
+    /// emits causes a redraw — and an idle Claude doesn't emit until
+    /// the user types. This test reproduces that interactively: the
+    /// first attach echoes a marker through `cat`'s PTY (so the marker
+    /// is part of the screen state); the second attach immediately
+    /// reads bytes WITHOUT writing anything and asserts that the
+    /// marker appears in those bytes. That can only be true if the
+    /// daemon serves the captured screen as the first `PtyData` frame.
+    #[test]
+    fn snapshot_replays_screen_state_on_reattach() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("snapshot.sock");
+        let mut supervisor = supervisor_for(&socket)?;
+
+        let serve = thread::spawn(move || -> Result<(), Error> {
+            supervisor.serve_one()?;
+            supervisor.serve_one()?;
+            Ok(())
+        });
+
+        // First attach: write the marker, drain enough bytes to be
+        // confident `cat` echoed it (line discipline echo + cat's
+        // stdout reply both contain it). The daemon's parser captures
+        // both occurrences as part of the screen.
+        {
+            let mut s1 = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
+            s1.set_read_timeout(Some(Duration::from_secs(1)))?;
+            client_handshake(&mut s1, 24, 80, "snap-agent")?;
+            // Discard the (empty) snapshot frame that gets sent first.
+            // For a fresh session the snapshot is just clear-screen +
+            // cursor home; it doesn't contain the marker yet.
+            let _ = drain_pty_data_until(&mut s1, b"never-matches", 1, Duration::from_millis(100));
+            send_pty_data(&mut s1, b"snapshot-marker\n")?;
+            let got =
+                drain_pty_data_until(&mut s1, b"snapshot-marker", 2, Duration::from_millis(1500));
+            let count = count_occurrences(&got, b"snapshot-marker");
+            assert!(
+                count >= 2,
+                "first attach should echo `snapshot-marker` twice (PTY echo + cat reply); \
+                 got {count} occurrences in {got:?}",
+            );
+        }
+
+        // Second attach: do NOT write anything. The very first PtyData
+        // frame the daemon sends must already contain `snapshot-marker`
+        // — that's the snapshot of the screen the previous attach left
+        // behind. Without the snapshot path, this read would either
+        // time out (idle child = no bytes) or return an empty payload.
+        {
+            let mut s2 = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
+            s2.set_read_timeout(Some(Duration::from_secs(1)))?;
+            client_handshake(&mut s2, 24, 80, "snap-agent")?;
+            let got = drain_pty_data_until(&mut s2, b"snapshot-marker", 1, Duration::from_secs(2));
+            let count = count_occurrences(&got, b"snapshot-marker");
+            assert!(
+                count >= 1,
+                "second attach should receive a snapshot frame containing the marker \
+                 from the previous session's screen, without sending any input; \
+                 got {count} occurrences in {got:?}",
+            );
+        }
+
+        let join_result = serve.join();
+        let Ok(serve_result) = join_result else {
+            panic!("serve thread panicked");
+        };
+        serve_result?;
+        Ok(())
+    }
+
+    /// Companion to `snapshot_replays_screen_state_on_reattach`: the
+    /// snapshot path drains stale bytes from `rx` BEFORE sending so the
+    /// snapshot isn't followed by a duplicate replay of the same data.
+    /// Without the drain, anything the PTY reader buffered between
+    /// attaches (which is also already in the parser) would be sent
+    /// after the snapshot, double-painting the screen.
+    ///
+    /// We can't easily inject bytes into `rx` from here, but we can
+    /// trigger `cat` to produce output during the disconnected window
+    /// (write, then disconnect immediately so the bytes land in `rx`
+    /// without an outbound to drain them). On reattach, the marker
+    /// must appear EXACTLY in the snapshot — it must not also appear a
+    /// second time as a stale `rx` replay.
+    #[test]
+    fn snapshot_drain_avoids_duplicate_replay_of_buffered_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("dedup.sock");
+        let mut supervisor = supervisor_for(&socket)?;
+
+        let serve = thread::spawn(move || -> Result<(), Error> {
+            supervisor.serve_one()?;
+            supervisor.serve_one()?;
+            Ok(())
+        });
+
+        // First attach: write `dedup-marker\n`, then disconnect WITHOUT
+        // draining the echoed bytes. The PTY's echo + `cat`'s reply
+        // both end up in the daemon's `rx` channel after we close.
+        {
+            let mut s1 = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
+            s1.set_read_timeout(Some(Duration::from_millis(50)))?;
+            client_handshake(&mut s1, 24, 80, "dedup-agent")?;
+            send_pty_data(&mut s1, b"dedup-marker\n")?;
+            // Sleep just enough for cat to produce output that's still
+            // being read by the PTY reader thread when we disconnect.
+            // We deliberately do NOT drain — the goal is to leave bytes
+            // in the daemon-side channel.
+            thread::sleep(Duration::from_millis(150));
+        }
+
+        // Second attach: the snapshot must contain the marker, AND it
+        // must contain it the same number of times as the screen would
+        // show (line discipline echo + cat reply = at most 2). What
+        // would fail without `drain` is the marker appearing 3+ times:
+        // once in the snapshot AND once or twice in the stale `rx`
+        // replay that follows.
+        {
+            let mut s2 = wait_for_unix_socket(&socket, Duration::from_secs(2))?;
+            s2.set_read_timeout(Some(Duration::from_millis(500)))?;
+            client_handshake(&mut s2, 24, 80, "dedup-agent")?;
+            let got = drain_pty_data_until(&mut s2, b"dedup-marker", 99, Duration::from_secs(1));
+            let count = count_occurrences(&got, b"dedup-marker");
+            assert!(
+                (1..=2).contains(&count),
+                "snapshot replay should appear at most twice (echo + reply) and never more \
+                 — three or more would indicate a stale `rx` replay leaked through. \
+                 got {count} occurrences in {got:?}",
+            );
+        }
+
+        let join_result = serve.join();
+        let Ok(serve_result) = join_result else {
+            panic!("serve thread panicked");
+        };
+        serve_result?;
+        Ok(())
+    }
+
     /// A client that announces an unsupported protocol version gets an
     /// `Error{VersionMismatch}` frame from the daemon, and the
     /// supervisor's `serve_one` returns `Error::VersionMismatch` rather
