@@ -121,7 +121,6 @@ pub struct Ui {
     /// Set to `false` to opt out — useful on terminals that
     /// interpret BEL as an audible beep rather than a visual cue
     /// and where the sound is disruptive.
-    #[serde(default = "default_true")]
     pub host_bell_on_finish: bool,
 }
 
@@ -130,16 +129,9 @@ impl Default for Ui {
         Self {
             subtle: false,
             host_colors: HashMap::new(),
-            host_bell_on_finish: default_true(),
+            host_bell_on_finish: true,
         }
     }
-}
-
-/// `serde(default = ...)` callback for the `host_bell_on_finish` knob.
-/// Lifted out of the field attribute so the same default flows through
-/// `Default for Ui` without duplicating the literal.
-fn default_true() -> bool {
-    true
 }
 
 /// Default file/dir names that mark a directory as a "code project"
