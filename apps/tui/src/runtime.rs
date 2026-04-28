@@ -1116,17 +1116,20 @@ pub fn run(
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
 
     let chrome = ChromeStyle::from_ui(&config.ui);
+    let ctx = RuntimeContext {
+        bindings: &config.bindings,
+        chrome: &chrome,
+        spawn_config: &config.spawn,
+        scrollback_len: config.scrollback_len,
+        host_bell_on_finish: config.ui.host_bell_on_finish,
+    };
     event_loop(
         &mut terminal,
         agents,
         nav_style,
-        &config.bindings,
         log_tail,
         initial_cwd,
-        config.scrollback_len,
-        &chrome,
-        &config.spawn,
-        config.ui.host_bell_on_finish,
+        &ctx,
     )
 }
 
@@ -1465,23 +1468,57 @@ fn no_overlay_active(
         && matches!(help_state, HelpState::Closed)
 }
 
+/// Static-for-the-duration-of-the-event-loop knobs and styling
+/// references. Bundled into one parameter to keep `event_loop`'s
+/// signature manageable as more presentation / behavior knobs land —
+/// a previous `event_loop` carrying nine positional arguments was
+/// flagged as a Data Clump in code review.
+///
+/// All fields are `Copy`, so the body can destructure into named
+/// locals once at the top and continue using bare names (no
+/// per-site `ctx.` rewrites). Lifetime `'a` is the borrow scope of
+/// the surrounding `Config` — `RuntimeContext` does not own anything
+/// it points to.
+#[derive(Clone, Copy)]
+struct RuntimeContext<'a> {
+    /// User key bindings (prefix + on-prefix + on-modal tables).
+    bindings: &'a Bindings,
+    /// Pre-computed chrome styles + per-host accent map.
+    chrome: &'a ChromeStyle,
+    /// Spawn-modal config (search roots, named projects, project
+    /// markers, per-host SSH search-roots).
+    spawn_config: &'a SpawnConfig,
+    /// Per-agent vt100 scrollback budget, in rows.
+    scrollback_len: usize,
+    /// When true, the event loop emits a host-terminal BEL on every
+    /// agent's working → idle transition. See `[ui]
+    /// host_bell_on_finish` in `Ui` for the user-facing knob.
+    host_bell_on_finish: bool,
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agents: Vec<RuntimeAgent>,
     mut nav_style: NavStyle,
-    bindings: &Bindings,
     log_tail: Option<&LogTail>,
     initial_cwd: &Path,
-    scrollback_len: usize,
-    chrome: &ChromeStyle,
-    spawn_config: &SpawnConfig,
-    host_bell_on_finish: bool,
+    ctx: &RuntimeContext<'_>,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
     // arm into its own helper would require threading >5 mutable references
     // through the helper and gain little.
-    #![allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    #![allow(clippy::too_many_lines)]
+    // Destructure into bare locals so the body — which accesses each
+    // of these in dozens of places — keeps reading naturally instead
+    // of carrying `ctx.` everywhere. All fields are `Copy`.
+    let RuntimeContext {
+        bindings,
+        chrome,
+        spawn_config,
+        scrollback_len,
+        host_bell_on_finish,
+    } = *ctx;
     let mut prefix_state = PrefixState::default();
     let mut help_state = HelpState::default();
     let mut spawn_ui: Option<SpawnMinibuffer> = None;
