@@ -1722,13 +1722,15 @@ fn event_loop(
         // Push the focused agent's title out to the surrounding
         // terminal so Ghostty / iTerm2 / Kitty can label its codemux
         // tab with what's actually on screen. Debounced against the
-        // last-emitted value so steady-state ticks are silent and a
-        // working agent (whose title's spinner glyph is stripped by
-        // `TitleCapture::sanitize` before it reaches us here) doesn't
-        // generate per-frame OSC traffic. Done before `terminal.draw`
-        // so the OSC lands in the same byte stream as the next frame
-        // and there's no inter-buffer flush race.
-        let desired_host_title = host_terminal_title_for_focused(&nav);
+        // last-emitted value: idle agents emit only when the body
+        // changes, while a working agent's title carries the current
+        // spinner frame so the dedup naturally lets one OSC through
+        // per ~100 ms tick — Ghostty / Kitty / WezTerm spin smoothly
+        // in their tab bar; iTerm2 / Terminal.app throttle title
+        // writes and look choppier but still readable. Done before
+        // `terminal.draw` so the OSC lands in the same byte stream as
+        // the next frame and there's no inter-buffer flush race.
+        let desired_host_title = host_terminal_title_for_focused(&nav, phase);
         if desired_host_title != last_emitted_host_title {
             if let Some(title) = desired_host_title.as_deref()
                 && let Err(err) = host_title::write_set_title(&mut io::stdout(), title)
@@ -3396,29 +3398,42 @@ fn body_text(title: Option<&str>, repo: Option<&str>, fallback: &str) -> String 
 
 /// Build the title we want the *outer* terminal emulator (Ghostty,
 /// iTerm2, Kitty, …) to display for its codemux tab. Format is
-/// `host \u{00b7} body` for SSH agents and just `body` for local.
-/// Mirrors the shape of [`agent_label_spans`] (same host prefix,
-/// same body) but drops the per-frame decoration (spinner glyph,
-/// attention dot, accent colors) since the host terminal can't
-/// render any of that in its tab bar anyway.
+/// `[glyph ]host \u{00b7} body` for SSH agents and `[glyph ]body` for
+/// local. Mirrors the shape of [`agent_label_spans`] (same host
+/// prefix, same body, optional leading spinner glyph) but drops the
+/// styling (attention dot, accent colors) the host terminal can't
+/// render in its tab bar anyway.
 ///
-/// Pure on `(host, body)` so tests can exercise the local /
-/// SSH / no-host branches without standing up a `RuntimeAgent`.
-fn host_terminal_title(host: Option<&str>, body: &str) -> String {
+/// `working_glyph` is `Some(frame)` when the focused agent is mid-turn
+/// — the runtime passes the current [`AnimationPhase::spinner_glyph`]
+/// so the host tab title spins in lockstep with the in-app spinner.
+/// `None` produces a steady title; the dedup loop in `event_loop` then
+/// keeps the OSC stream silent until the body text actually changes.
+///
+/// Pure on its inputs so tests can exercise every (working / host /
+/// body) permutation without standing up a `RuntimeAgent` carrying a
+/// live PTY parser.
+fn host_terminal_title(host: Option<&str>, body: &str, working_glyph: Option<&str>) -> String {
+    let prefix = working_glyph.map(|g| format!("{g} ")).unwrap_or_default();
     match host {
-        Some(h) if !h.is_empty() => format!("{h} \u{00b7} {body}"),
-        _ => body.to_string(),
+        Some(h) if !h.is_empty() => format!("{prefix}{h} \u{00b7} {body}"),
+        _ => format!("{prefix}{body}"),
     }
 }
 
 /// Resolve the focused agent's host + body text and compose the title
 /// to ship to the outer terminal. `None` when there are no agents
-/// (the runtime is about to exit and the title is irrelevant).
-fn host_terminal_title_for_focused(nav: &NavState) -> Option<String> {
+/// (the runtime is about to exit and the title is irrelevant). When
+/// the focused agent is mid-turn, prefixes the title with the current
+/// spinner frame from `phase` so the host terminal's tab bar gains
+/// the same animated working cue we render inside the navigator.
+fn host_terminal_title_for_focused(nav: &NavState, phase: AnimationPhase) -> Option<String> {
     let agent = nav.agents.get(nav.focused)?;
+    let working_glyph = agent.is_working().then(|| phase.spinner_glyph());
     Some(host_terminal_title(
         agent.host.as_deref(),
         &agent_body_text(agent),
+        working_glyph,
     ))
 }
 
@@ -5279,12 +5294,15 @@ mod tests {
     // terminal emulator's tab title. SSH agents get the host
     // prefix; local agents (no host) get just the body. Empty
     // host is treated as no host so a malformed config can't
-    // produce a leading " · " orphan.
+    // produce a leading " · " orphan. A working glyph (when set)
+    // sits at the very front so the spinner lands in the same
+    // column whether the agent is local or remote — matches the
+    // in-app tab strip layout.
 
     #[test]
     fn host_terminal_title_prefixes_host_when_remote() {
         assert_eq!(
-            host_terminal_title(Some("dev01"), "codemux: Add tab names"),
+            host_terminal_title(Some("dev01"), "codemux: Add tab names", None),
             "dev01 \u{00b7} codemux: Add tab names"
         );
     }
@@ -5292,7 +5310,7 @@ mod tests {
     #[test]
     fn host_terminal_title_omits_prefix_when_local() {
         assert_eq!(
-            host_terminal_title(None, "codemux: Add tab names"),
+            host_terminal_title(None, "codemux: Add tab names", None),
             "codemux: Add tab names"
         );
     }
@@ -5302,7 +5320,30 @@ mod tests {
         // Defensive: a malformed config / empty hostname must not
         // emit a leading " · " orphan that looks like a render bug
         // in the user's terminal tab bar.
-        assert_eq!(host_terminal_title(Some(""), "body"), "body");
+        assert_eq!(host_terminal_title(Some(""), "body", None), "body");
+    }
+
+    #[test]
+    fn host_terminal_title_prepends_working_glyph_for_remote() {
+        assert_eq!(
+            host_terminal_title(Some("dev01"), "codemux: Working", Some("⣾")),
+            "⣾ dev01 \u{00b7} codemux: Working"
+        );
+    }
+
+    #[test]
+    fn host_terminal_title_prepends_working_glyph_for_local() {
+        assert_eq!(
+            host_terminal_title(None, "codemux: Working", Some("⣾")),
+            "⣾ codemux: Working"
+        );
+    }
+
+    #[test]
+    fn host_terminal_title_prepends_working_glyph_when_host_empty() {
+        // Defensive companion to the empty-host case: glyph still
+        // renders, no orphan separator.
+        assert_eq!(host_terminal_title(Some(""), "body", Some("⣾")), "⣾ body");
     }
 
     #[test]
@@ -5310,7 +5351,7 @@ mod tests {
         // Runtime is about to exit; no focused agent means nothing to
         // ship to the host terminal title bar.
         let nav = NavState::new(vec![]);
-        assert!(host_terminal_title_for_focused(&nav).is_none());
+        assert!(host_terminal_title_for_focused(&nav, AnimationPhase::default()).is_none());
     }
 
     #[test]
@@ -5321,7 +5362,9 @@ mod tests {
         ];
         let mut nav = NavState::new(agents);
         nav.focused = 1;
-        let title = host_terminal_title_for_focused(&nav);
+        let title = host_terminal_title_for_focused(&nav, AnimationPhase::default());
+        // Failed agents are never `is_working()`, so no spinner glyph
+        // even though the phase has one available.
         assert_eq!(title.as_deref(), Some("hostB \u{00b7} repo-b"));
     }
 
@@ -5329,8 +5372,55 @@ mod tests {
     fn host_terminal_title_for_focused_omits_host_for_local_agent() {
         let agents = vec![failed_agent_with("a", Some("repo-a"), None)];
         let nav = NavState::new(agents);
-        let title = host_terminal_title_for_focused(&nav);
+        let title = host_terminal_title_for_focused(&nav, AnimationPhase::default());
         assert_eq!(title.as_deref(), Some("repo-a"));
+    }
+
+    /// Build a Ready agent whose parser has consumed `osc_payload` so
+    /// downstream callers can exercise `is_working() == true` without
+    /// scattering parser-bytes-poking through every test body. Panics
+    /// if the test transport ever stops yielding a Ready agent — that
+    /// would be a regression in `ready_test_agent` itself, not a
+    /// silent skip in the assertion.
+    fn ready_agent_with_osc(osc_payload: &str) -> RuntimeAgent {
+        let mut agent = ready_test_agent(100);
+        let AgentState::Ready { parser, .. } = &mut agent.state else {
+            panic!("ready_test_agent must yield AgentState::Ready");
+        };
+        parser.process(osc_payload.as_bytes());
+        agent
+    }
+
+    #[test]
+    fn host_terminal_title_for_focused_prefixes_spinner_when_agent_is_working() {
+        // Integration check on the wiring `is_working().then(spinner_glyph)`.
+        // Only Ready agents whose parser has seen a status-glyph OSC return
+        // `is_working() == true`, so we feed one through here. Without this
+        // test the working branch of `host_terminal_title_for_focused` is
+        // dead from the unit tests' point of view — `host_terminal_title`
+        // tests cover the prefix shape but not the integration.
+        let nav = NavState::new(vec![ready_agent_with_osc("\x1b]0;⠋ Working\x07")]);
+        // Phase frame 0 → SPINNER_FRAMES[0] = "⣾". Pinning the index keeps
+        // this test resilient to spinner-set tweaks: rebuild the expected
+        // string from the same constant the production code reads.
+        let title = host_terminal_title_for_focused(&nav, AnimationPhase::default());
+        let expected = format!("{} Working", SPINNER_FRAMES[0]);
+        assert_eq!(title.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn host_terminal_title_for_focused_threads_phase_into_spinner_frame() {
+        // Pins that `phase` actually flows through to the glyph — a future
+        // refactor that hard-codes SPINNER_FRAMES[0] would still pass the
+        // previous test but break this one.
+        let nav = NavState::new(vec![ready_agent_with_osc("\x1b]0;⠋ Working\x07")]);
+        let phase = AnimationPhase {
+            spinner_frame: 3,
+            ..AnimationPhase::default()
+        };
+        let title = host_terminal_title_for_focused(&nav, phase);
+        let expected = format!("{} Working", SPINNER_FRAMES[3]);
+        assert_eq!(title.as_deref(), Some(expected.as_str()));
     }
 
     // ── flag_finished_unfocused ──────────────────────────────────
