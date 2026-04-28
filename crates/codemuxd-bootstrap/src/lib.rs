@@ -618,7 +618,7 @@ fn scp_tarball(
     Ok(())
 }
 
-/// Step 4: `ssh host 'cd src && tar -xzf ... && cargo build && mv ...
+/// Step 4: `ssh host 'cd src && tar -xzf ... && cargo build && install ...
 /// && echo {version} > agent.version'`. Long-running. Surfaces a
 /// rustup-install hint when cargo isn't on the remote PATH.
 fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result<(), Error> {
@@ -639,6 +639,18 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
     // failure so the actual compile diagnostic reaches the user
     // (modal banner + tracing log) instead of `mv`'s downstream
     // ENOENT noise.
+    //
+    // Why `install` and not `mv`: cargo hardlinks the produced
+    // binary from `target/release/deps/codemuxd-<hash>` to
+    // `target/release/codemuxd`. Our previous `mv` made
+    // `~/.cache/codemuxd/bin/codemuxd` a third path to that same
+    // inode (rename(2) preserves the inode). On the next bootstrap
+    // run, cargo's incremental build saw the cached binary and
+    // re-hardlinked deps → target/release/codemuxd, so all three
+    // paths shared an inode and GNU `mv`'s pre-rename safety check
+    // refused with "are the same file". `install -m 755` writes a
+    // fresh inode at the destination and is in coreutils on every
+    // distro, so the fix is agnostic to who's installing.
     let cmd = format!(
         "set -e\n\
          cd ~/.cache/codemuxd/src\n\
@@ -651,7 +663,7 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
          exit $cargo_status\n\
          fi\n\
          mkdir -p ~/.cache/codemuxd/bin\n\
-         mv target/release/codemuxd ~/.cache/codemuxd/bin/codemuxd\n\
+         install -m 755 target/release/codemuxd ~/.cache/codemuxd/bin/codemuxd\n\
          echo {version} > ~/.cache/codemuxd/agent.version"
     );
     let out = runner
@@ -1433,6 +1445,29 @@ mod tests {
             panic!("expected Bootstrap, got {err:?}");
         };
         assert_eq!(stage, Stage::RemoteBuild);
+    }
+
+    /// Regression for the "are the same file" bootstrap failure: cargo
+    /// hardlinks `target/release/codemuxd` to `target/release/deps/codemuxd-<hash>`.
+    /// On a second bootstrap with an unchanged source tree, cargo's
+    /// incremental cache re-establishes the hardlink, so the previous
+    /// `mv` would refuse because source and destination shared an inode.
+    /// `install -m 755` writes a fresh inode at the destination, so the
+    /// recipe stays idempotent across rebuilds. Locked in here so a
+    /// future cleanup can't quietly revert to `mv`.
+    #[test]
+    fn remote_build_uses_install_for_hardlink_safety() {
+        let runner = RecordingRunner::new();
+        remote_build(&runner, "host", "v1").unwrap();
+        let cmd = runner.last_run_cmd();
+        assert!(
+            cmd.contains("install -m 755 target/release/codemuxd ~/.cache/codemuxd/bin/codemuxd"),
+            "remote build must install the binary (not mv): {cmd}",
+        );
+        assert!(
+            !cmd.contains("mv target/release/codemuxd"),
+            "remote build must not use mv (cargo's hardlink cache trips its same-file check): {cmd}",
+        );
     }
 
     /// `spawn_remote_daemon` propagates the remote stderr verbatim
