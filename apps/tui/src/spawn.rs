@@ -73,7 +73,7 @@
 //! otherwise. If the day comes, watch out for `large_enum_variant` clippy
 //! lint and `Box` the heavier variant if needed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -85,12 +85,36 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::config::{NamedProject, SearchMode};
+use crate::index_worker::{IndexState, IndexedDir, ProjectKind};
 use crate::keymap::{ModalAction, ModalBindings};
 use crate::ssh_config::load_ssh_hosts;
 
 const WILDMENU_ROWS: u16 = 4;
 const STRIP_ROWS: u16 = WILDMENU_ROWS + 1;
 const MAX_COMPLETIONS: usize = 8;
+/// Cap on fuzzy-mode wildmenu candidates returned per query. The
+/// rendered window only shows ~3 at once, but Down/Up cycles through
+/// the full Vec — a larger cap means richer exploration without
+/// re-querying. nucleo-matcher's score loop is microseconds per
+/// candidate so capping at 50 has negligible cost on a 50k-entry index.
+const MAX_FUZZY_RESULTS: usize = 50;
+/// Score boost added to candidates that match a user-defined named
+/// project (`[[spawn.projects]]`). Highest of the three because named
+/// projects are explicit user intent — when the user typed `cm`
+/// expecting `~/Workbench/repositories/codemux`, that should dominate
+/// any auto-discovered repo.
+const BOOST_NAMED: u32 = 1000;
+/// Score boost added to candidates that are git repositories (have a
+/// `.git` child). Strong enough to lift a fuzzy-matched repo above a
+/// fuzzy-matched non-repo at similar nucleo scores, but not so high
+/// that a clearly better non-repo match (e.g. exact prefix) loses.
+const BOOST_GIT: u32 = 300;
+/// Score boost added to candidates that contain a project marker
+/// file (`Cargo.toml`, `package.json`, etc.) but not `.git`. Lower
+/// than `BOOST_GIT` so a true repo always outranks a marker-only
+/// directory at the same nucleo score.
+const BOOST_MARKER: u32 = 150;
 /// Cap for the synchronous `read_dir` scan that runs on every keystroke in
 /// the path zone. Without this guard, landing the prompt in a huge directory
 /// (`/usr/lib`, `node_modules`, mailbox) would block the render loop.
@@ -101,6 +125,7 @@ const MAX_SCAN_ENTRIES: usize = 1024;
 /// `runtime.rs`'s spawn dispatch for the consumer.
 pub const HOST_PLACEHOLDER: &str = "local";
 const PATH_PLACEHOLDER: &str = "<cwd>";
+const FUZZY_PLACEHOLDER: &str = "<find>";
 
 /// What the spawn UI tells the event loop after handling a key.
 #[derive(Debug, Eq, PartialEq)]
@@ -125,6 +150,12 @@ pub enum ModalOutcome {
     /// [`SpawnMinibuffer::unlock_back_to_host`] (focus returns to host
     /// zone with text preserved).
     CancelBootstrap,
+    /// User pressed `RefreshIndex` (default `ctrl+r`) while in fuzzy
+    /// mode. The runtime should cancel any in-flight index build and
+    /// start a fresh one from the configured search roots. No-op for
+    /// the modal beyond emitting this — the wildmenu reverts to the
+    /// "indexing…" sentinel via the normal `notify_index_state` path.
+    RefreshIndex,
 }
 
 /// Path-zone backing source. `Local` is today's behavior (live
@@ -268,21 +299,48 @@ pub struct SpawnMinibuffer {
     /// path zone always lands ready-to-use, mirroring the SSH flow's
     /// post-prepare reseed with the remote `$HOME`.
     cwd: PathBuf,
+    /// Currently-active path-zone search engine. Diverges from
+    /// [`Self::user_search_mode`] when the runtime forces `Precise` for a
+    /// remote-SSH session (the indexer is local-only). Restored on the
+    /// remote-to-local transition.
+    search_mode: SearchMode,
+    /// User's preferred search mode, sourced from `[spawn].default_mode`
+    /// at `open()` time. Never overridden by remote-host logic — used as
+    /// the restore target on `unlock_back_to_host` after a remote
+    /// session ends.
+    user_search_mode: SearchMode,
+    /// Input buffer for fuzzy mode. Kept separate from `path` so
+    /// toggling Fuzzy ↔ Precise preserves both engines' inputs (the
+    /// path field stays as the user left it; the query field stays as
+    /// the user left it). The runtime feeds this into `nucleo-matcher`
+    /// via [`Self::refresh_fuzzy`] each time the runtime drains an
+    /// index event or an input keystroke arrives.
+    fuzzy_query: String,
+    /// User-curated named projects from `[[spawn.projects]]`. Stashed
+    /// at `open()` because they don't change mid-session. Scored by
+    /// `nucleo-matcher` against `name` (not the full path) and
+    /// boosted above any auto-discovered repository.
+    named_projects: Vec<NamedProject>,
 }
 
 impl SpawnMinibuffer {
-    /// Open the spawn modal seeded with the local TUI's cwd in the
-    /// path zone (with a trailing `/` so the wildmenu lists the cwd's
-    /// subfolders directly). The seed gives the user immediate visual
-    /// confirmation of where a local spawn would land — the previous
-    /// empty default required the runtime to map empty → cwd at spawn
-    /// time, which worked but left the user staring at a `<cwd>`
-    /// placeholder with no idea what that resolved to.
+    /// Open the spawn modal. In Precise mode the path zone is seeded
+    /// with the local TUI's cwd (with a trailing `/` so the wildmenu
+    /// lists the cwd's subfolders directly) — the seed gives the user
+    /// immediate visual confirmation of where a local spawn would land.
+    /// In Fuzzy mode the path zone starts empty and the wildmenu shows
+    /// the indexer state; the user types a query against the
+    /// session-built directory index instead.
+    ///
+    /// `named_projects` is the user's `[[spawn.projects]]` list (cloned
+    /// at open time so the modal owns its copy for the modal's
+    /// lifetime — the list is small).
     ///
     /// The seed is tracked via [`Self::path_origin`] so the SSH
     /// path (`@host` Enter / Tab) can clear it without disturbing a
     /// user-typed path.
-    pub fn open(cwd: &Path) -> Self {
+    #[must_use]
+    pub fn open(cwd: &Path, default_mode: SearchMode, named_projects: Vec<NamedProject>) -> Self {
         let mut m = Self {
             host: String::new(),
             path: String::new(),
@@ -295,20 +353,24 @@ impl SpawnMinibuffer {
             prepare_error: None,
             path_origin: PathOrigin::UserTyped,
             cwd: cwd.to_path_buf(),
+            search_mode: default_mode,
+            user_search_mode: default_mode,
+            fuzzy_query: String::new(),
+            named_projects,
         };
-        m.seed_path_with_cwd();
-        // Initial wildmenu lists the cwd's subfolders (filtered to
-        // directories only — files are not valid spawn targets).
+        if default_mode == SearchMode::Precise {
+            m.seed_path_with_cwd();
+        }
+        // Initial wildmenu lists the cwd's subfolders in Precise mode
+        // (filtered to directories only — files are not valid spawn
+        // targets). In Fuzzy mode `refresh` short-circuits via the
+        // path-zone fuzzy guard at the top; the wildmenu shows the
+        // index-state sentinel until the runtime calls
+        // `notify_index_state` with the first batch of results.
         // Modal opens in `PathMode::Local` so the lister doesn't
         // matter; the local branch in `refresh` calls into the
         // synchronous `read_dir` path.
         m.refresh(&mut DirLister::Local);
-        // Seeded path field is non-empty so `refresh` set
-        // `selected = Some(0)` — leave it. The first highlighted
-        // subfolder is the visual cue: "this is what Enter will
-        // pick". To spawn at the cwd itself the user backspaces the
-        // trailing `/` (which makes the cwd the wildmenu's only
-        // matching candidate, still highlighted).
         m
     }
 
@@ -337,7 +399,11 @@ impl SpawnMinibuffer {
     /// added a new transition and forgot to reseed."
     fn transition_to_path_zone(&mut self, lister: &mut DirLister<'_>) {
         self.focused = Zone::Path;
-        if self.path.is_empty() {
+        // Reseed cwd only in Precise mode. In Fuzzy mode the path field
+        // stays empty (the input lives in `fuzzy_query`); seeding it
+        // would surprise the user with a literal-path-looking value
+        // that the fuzzy engine would then ignore.
+        if self.search_mode == SearchMode::Precise && self.path.is_empty() {
             self.seed_path_with_cwd();
         }
         self.refresh(lister);
@@ -400,6 +466,11 @@ impl SpawnMinibuffer {
             cache: HashMap::new(),
         };
         self.focused = Zone::Path;
+        // Force Precise: the fuzzy indexer is local-only (a remote
+        // `find` over SSH would be too slow to build per-session).
+        // `user_search_mode` is preserved so we can restore on the
+        // remote-to-local transition (cancel / unlock_back_to_host).
+        self.search_mode = SearchMode::Precise;
         self.refresh(lister);
     }
 
@@ -420,6 +491,10 @@ impl SpawnMinibuffer {
         self.path_mode = PathMode::Local;
         self.focused = Zone::Host;
         self.prepare_error = error;
+        // Restore the user's preferred search mode now that we're
+        // back on local. The `unlock_for_remote_path` forced Precise;
+        // the user's choice was preserved in `user_search_mode`.
+        self.search_mode = self.user_search_mode;
         self.refresh(lister);
     }
 
@@ -441,6 +516,24 @@ impl SpawnMinibuffer {
                 }
                 _ => ModalOutcome::None,
             };
+        }
+
+        // Named Ctrl-keyed actions (default ToggleSearchMode = ctrl+t,
+        // RefreshIndex = ctrl+r) need to escape the generic Ctrl
+        // early-exit just below — that exit drops every Ctrl key the
+        // generic shortcut handler doesn't recognise, including these.
+        // Resolve them here and dispatch directly. Bootstrap-locked
+        // state already returned above, so toggle/refresh are correctly
+        // no-op'd while the path zone is locked.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match bindings.lookup(key) {
+                Some(ModalAction::ToggleSearchMode) => {
+                    self.toggle_search_mode(lister);
+                    return ModalOutcome::None;
+                }
+                Some(ModalAction::RefreshIndex) => return ModalOutcome::RefreshIndex,
+                _ => {}
+            }
         }
 
         // Ctrl-modified typing shortcuts. Handled before the action
@@ -487,6 +580,15 @@ impl SpawnMinibuffer {
                     self.move_selection_backward();
                     ModalOutcome::None
                 }
+                // Ctrl-default chords are intercepted by the pre-Ctrl
+                // block above. These arms cover the case where a user
+                // remaps either action to a non-Ctrl chord — the
+                // semantics stay the same.
+                ModalAction::ToggleSearchMode => {
+                    self.toggle_search_mode(lister);
+                    ModalOutcome::None
+                }
+                ModalAction::RefreshIndex => ModalOutcome::RefreshIndex,
             };
         }
 
@@ -581,6 +683,12 @@ impl SpawnMinibuffer {
                 self.transition_to_path_zone(lister);
                 ModalOutcome::None
             }
+            // In Fuzzy mode Tab is a no-op for v1 — Enter is the only
+            // way to commit a fuzzy-matched directory. The zsh-style
+            // "complete then descend" semantics don't carry over to
+            // ranked free-text matching; a future iteration may add
+            // "Tab to drill into the highlighted dir via Precise mode".
+            Zone::Path if self.search_mode == SearchMode::Fuzzy => ModalOutcome::None,
             Zone::Path => {
                 self.apply_path_completion(lister);
                 ModalOutcome::None
@@ -750,6 +858,7 @@ impl SpawnMinibuffer {
     fn current_field(&self) -> &str {
         match self.focused {
             Zone::Host => &self.host,
+            Zone::Path if self.search_mode == SearchMode::Fuzzy => &self.fuzzy_query,
             Zone::Path => &self.path,
         }
     }
@@ -757,6 +866,7 @@ impl SpawnMinibuffer {
     fn current_field_mut(&mut self) -> &mut String {
         match self.focused {
             Zone::Host => &mut self.host,
+            Zone::Path if self.search_mode == SearchMode::Fuzzy => &mut self.fuzzy_query,
             Zone::Path => &mut self.path,
         }
     }
@@ -786,6 +896,14 @@ impl SpawnMinibuffer {
     }
 
     fn refresh(&mut self, lister: &mut DirLister<'_>) {
+        // Fuzzy mode owns its own wildmenu lifecycle: results are
+        // populated by `refresh_fuzzy` (driven by the runtime's index
+        // drain), not by the per-keystroke read_dir below. Bail out
+        // here so a Char/Backspace in fuzzy mode doesn't clobber the
+        // matcher's results with an empty Vec.
+        if self.search_mode == SearchMode::Fuzzy && self.focused == Zone::Path {
+            return;
+        }
         self.filtered = match self.focused {
             Zone::Path => match &mut self.path_mode {
                 PathMode::Local => path_completions(&self.path),
@@ -818,6 +936,65 @@ impl SpawnMinibuffer {
         };
     }
 
+    /// Toggle the path zone between Fuzzy and Precise. Updates the
+    /// user's preferred mode (so a remote→local restore later picks
+    /// the new choice). In Precise mode this re-seeds the cwd if the
+    /// path is empty, mirroring the [`Self::open`] behavior so the
+    /// wildmenu shows immediately-useful candidates instead of a
+    /// blank list.
+    pub fn toggle_search_mode(&mut self, lister: &mut DirLister<'_>) {
+        let next = match self.search_mode {
+            SearchMode::Fuzzy => SearchMode::Precise,
+            SearchMode::Precise => SearchMode::Fuzzy,
+        };
+        self.search_mode = next;
+        self.user_search_mode = next;
+        if next == SearchMode::Precise && self.focused == Zone::Path && self.path.is_empty() {
+            self.seed_path_with_cwd();
+        }
+        // Reset wildmenu state — different engine, different candidates.
+        // Precise mode is repopulated by `refresh`; Fuzzy mode waits
+        // for the runtime's `notify_index_state` callback.
+        self.filtered.clear();
+        self.selected = None;
+        self.refresh(lister);
+        tracing::trace!(mode = ?next, "spawn modal: search mode toggled");
+    }
+
+    /// Runtime entry point. Called once per frame after the index
+    /// drain so the modal can repopulate its fuzzy wildmenu when a new
+    /// `IndexEvent::Done` lands or when the user just typed into the
+    /// query buffer. No-op outside Fuzzy + Path mode.
+    pub fn notify_index_state(&mut self, index: Option<&IndexState>) {
+        if self.search_mode != SearchMode::Fuzzy || self.focused != Zone::Path {
+            return;
+        }
+        self.refresh_fuzzy(index);
+    }
+
+    /// Score the current `fuzzy_query` against the index and populate
+    /// `filtered` with the top results. Called by `notify_index_state`;
+    /// public so tests can drive it without a runtime drain loop.
+    pub fn refresh_fuzzy(&mut self, index: Option<&IndexState>) {
+        // Empty query: clear the wildmenu so Enter doesn't commit a
+        // stale highlighted candidate from a previous query.
+        if self.fuzzy_query.is_empty() {
+            self.filtered.clear();
+            self.selected = None;
+            return;
+        }
+        let Some(IndexState::Ready { dirs }) = index else {
+            // Index not ready (Building / Failed / None). Leave
+            // `filtered` empty so `wildmenu_view` falls into the
+            // index-state sentinel branch.
+            self.filtered.clear();
+            self.selected = None;
+            return;
+        };
+        self.filtered = score_fuzzy(&self.fuzzy_query, dirs, &self.named_projects);
+        self.selected = (!self.filtered.is_empty()).then_some(0);
+    }
+
     /// Render the minibuffer at the bottom of `area`. The widget
     /// self-positions: it carves `STRIP_ROWS` off the bottom and renders
     /// over whatever the parent has already drawn there (typically the
@@ -831,9 +1008,15 @@ impl SpawnMinibuffer {
     /// to the active screen, the same way the help and switcher popups in
     /// `runtime.rs` are. Inverting the control would force the runtime to
     /// know each widget's layout grammar. Trade-off accepted.
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, bindings: &ModalBindings) {
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        bindings: &ModalBindings,
+        index: Option<&IndexState>,
+    ) {
         if area.height < STRIP_ROWS + 4 {
-            self.render_fallback_popup(frame, area, bindings);
+            self.render_fallback_popup(frame, area, bindings, index);
             return;
         }
 
@@ -851,13 +1034,13 @@ impl SpawnMinibuffer {
             .areas(strip);
 
         frame.render_widget(
-            self.wildmenu_view(wildmenu_area.width as usize),
+            self.wildmenu_view(wildmenu_area.width as usize, index),
             wildmenu_area,
         );
         frame.render_widget(self.prompt_view(bindings), prompt_area);
     }
 
-    fn wildmenu_view(&self, width: usize) -> Paragraph<'_> {
+    fn wildmenu_view(&self, width: usize, index: Option<&IndexState>) -> Paragraph<'_> {
         let block = Block::default().borders(Borders::TOP);
 
         // Locked-for-bootstrap takes precedence over everything: the
@@ -897,6 +1080,17 @@ impl SpawnMinibuffer {
             return Paragraph::new(lines).block(block);
         }
 
+        // Fuzzy + Path: render the indexer-state sentinel when there
+        // are no current matches. Either the index is still building,
+        // the user hasn't typed a query yet, the query had no matches,
+        // or the build failed.
+        if self.search_mode == SearchMode::Fuzzy
+            && self.focused == Zone::Path
+            && self.filtered.is_empty()
+        {
+            return self.fuzzy_state_view(width, index, block);
+        }
+
         if self.filtered.is_empty() {
             let msg = match self.focused {
                 Zone::Path => match &self.path_mode {
@@ -923,6 +1117,7 @@ impl SpawnMinibuffer {
 
         let usable = WILDMENU_ROWS as usize - 1; // top border eats one row
         let zone = self.focused;
+        let fuzzy = self.search_mode == SearchMode::Fuzzy;
         let lines: Vec<Line> = self
             .filtered
             .iter()
@@ -939,12 +1134,57 @@ impl SpawnMinibuffer {
                 } else {
                     Style::default()
                 };
-                let display_str = wildmenu_display_text(zone, c);
+                // In fuzzy mode the full path *is* the signal — basename
+                // alone strips the directory context that the user is
+                // searching for. Precise / Host modes keep the existing
+                // basename-or-literal display.
+                let display_str = if fuzzy && zone == Zone::Path {
+                    c.clone()
+                } else {
+                    wildmenu_display_text(zone, c)
+                };
                 let display = clip_middle(&display_str, width.saturating_sub(3));
                 Line::styled(format!("{marker}{display}"), style)
             })
             .collect();
         Paragraph::new(lines).block(block)
+    }
+
+    /// Build the fuzzy-state sentinel paragraph for the wildmenu strip.
+    /// Extracted from [`Self::wildmenu_view`] purely to keep that
+    /// function under clippy's `too_many_lines` threshold; the only
+    /// caller is the fuzzy-empty branch.
+    fn fuzzy_state_view<'a>(
+        &self,
+        width: usize,
+        index: Option<&IndexState>,
+        block: Block<'a>,
+    ) -> Paragraph<'a> {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        match index {
+            None | Some(IndexState::Building { count: 0, .. }) => {
+                Paragraph::new(Line::styled("  ⠋ indexing…".to_string(), dim)).block(block)
+            }
+            Some(IndexState::Building { count, .. }) => {
+                Paragraph::new(Line::styled(format!("  ⠋ indexing… {count} dirs"), dim))
+                    .block(block)
+            }
+            Some(IndexState::Ready { .. }) if self.fuzzy_query.is_empty() => Paragraph::new(
+                Line::styled("  (type to search the directory index)".to_string(), dim),
+            )
+            .block(block),
+            Some(IndexState::Ready { .. }) => {
+                Paragraph::new(Line::styled("  (no matches)".to_string(), dim)).block(block)
+            }
+            Some(IndexState::Failed { message }) => {
+                let display = clip_middle(message, width.saturating_sub(4));
+                Paragraph::new(Line::styled(
+                    format!("  ✗ {display}"),
+                    Style::default().fg(Color::Red),
+                ))
+                .block(block)
+            }
+        }
     }
 
     /// Best-effort host label for the "(remote: ...)" wildmenu hint.
@@ -971,8 +1211,18 @@ impl SpawnMinibuffer {
             .fg(Color::Cyan)
             .add_modifier(Modifier::SLOW_BLINK);
 
+        // In Fuzzy + Path mode the prompt label flips from "spawn:" to
+        // "find:" so the user has an obvious visual cue about which
+        // engine is active. Other states keep "spawn:" (the modal still
+        // ultimately spawns, but the path-zone semantics differ enough
+        // that a label change is justified).
+        let label = if self.search_mode == SearchMode::Fuzzy && self.focused == Zone::Path {
+            "find:  "
+        } else {
+            "spawn: "
+        };
         let mut spans = vec![
-            Span::styled("spawn: ", label_style),
+            Span::styled(label, label_style),
             Span::styled("@", host_marker_style(self.focused == Zone::Host)),
         ];
 
@@ -1014,30 +1264,45 @@ impl SpawnMinibuffer {
             false,
         ));
         spans.push(Span::styled(" : ", separator_style));
+        // Path zone shows whichever input buffer is active for the
+        // current mode: `fuzzy_query` in Fuzzy, `path` in Precise. The
+        // placeholder flips with the mode so the empty state reads
+        // either `<find>` or `<cwd>` depending on what Enter would
+        // commit.
+        let (path_text, path_placeholder) =
+            if self.search_mode == SearchMode::Fuzzy && self.focused == Zone::Path {
+                (self.fuzzy_query.as_str(), FUZZY_PLACEHOLDER)
+            } else {
+                (self.path.as_str(), PATH_PLACEHOLDER)
+            };
         spans.extend(zone_spans(
             self.focused == Zone::Path,
-            &self.path,
-            PATH_PLACEHOLDER,
+            path_text,
+            path_placeholder,
             placeholder_style,
             cursor_style,
             true,
         ));
 
-        // Hint reflects what `Tab` does in the focused zone — different
-        // semantics per zone now that path-Tab is autocomplete and
-        // host-Tab commits-or-switches. `@` is also only meaningful in
-        // the path zone (literal char in the host zone), so it shows up
-        // in the path-zone hint only.
+        // Hint reflects what's actionable in the focused zone. Fuzzy +
+        // Path drops the Tab-complete hint (Tab is a no-op in Fuzzy)
+        // and adds the toggle / refresh chords so the user can find
+        // the escape hatches via the help line.
         let tab = bindings.binding_for(ModalAction::SwapField);
         let pick = bindings.binding_for(ModalAction::NextCompletion);
         let spawn = bindings.binding_for(ModalAction::Confirm);
         let cancel = bindings.binding_for(ModalAction::Cancel);
-        let hint = match self.focused {
-            Zone::Path => format!(
-                "  [{tab} complete · {at} host · {pick} pick · {spawn} spawn · {cancel} cancel]",
-                at = bindings.binding_for(ModalAction::SwapToHost),
+        let toggle = bindings.binding_for(ModalAction::ToggleSearchMode);
+        let refresh = bindings.binding_for(ModalAction::RefreshIndex);
+        let at = bindings.binding_for(ModalAction::SwapToHost);
+        let hint = match (self.focused, self.search_mode) {
+            (Zone::Path, SearchMode::Fuzzy) => format!(
+                "  [{toggle} navigate · {refresh} rebuild · {at} host · {pick} pick · {spawn} spawn · {cancel} cancel]",
             ),
-            Zone::Host => {
+            (Zone::Path, SearchMode::Precise) => format!(
+                "  [{tab} complete · {toggle} fuzzy · {at} host · {pick} pick · {spawn} spawn · {cancel} cancel]",
+            ),
+            (Zone::Host, _) => {
                 format!("  [{tab} next · {pick} pick · {spawn} spawn · {cancel} cancel]")
             }
         };
@@ -1048,7 +1313,13 @@ impl SpawnMinibuffer {
     /// Tiny terminal escape hatch: when the screen is too short for the
     /// minibuffer + wildmenu, fall back to a centered popup so the variant
     /// remains usable.
-    fn render_fallback_popup(&self, frame: &mut Frame<'_>, area: Rect, bindings: &ModalBindings) {
+    fn render_fallback_popup(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        bindings: &ModalBindings,
+        index: Option<&IndexState>,
+    ) {
         let popup = centered_rect_with_size(60, 8, area);
         frame.render_widget(Clear, popup);
         let block = Block::default()
@@ -1060,7 +1331,7 @@ impl SpawnMinibuffer {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .areas(inner);
-        frame.render_widget(self.wildmenu_view(wm.width as usize), wm);
+        frame.render_widget(self.wildmenu_view(wm.width as usize, index), wm);
         frame.render_widget(self.prompt_view(bindings), p);
     }
 }
@@ -1156,6 +1427,92 @@ fn host_marker_style(focused: bool) -> Style {
     } else {
         s.add_modifier(Modifier::DIM)
     }
+}
+
+/// Rank `dirs` and `named` against `query` with `nucleo-matcher`,
+/// returning up to [`MAX_FUZZY_RESULTS`] full-path strings ordered by
+/// `(score + boost) desc, path asc`. The lex tiebreaker matters:
+/// without it, candidates that hash to the same nucleo score swap
+/// positions on every keystroke and the wildmenu visibly flickers.
+///
+/// Boost layering (additive on top of nucleo's score):
+///   * Named project (matched against `name`): [`BOOST_NAMED`] (+1000)
+///   * Indexed dir with `.git`:                [`BOOST_GIT`]   (+300)
+///   * Indexed dir with project marker:        [`BOOST_MARKER`] (+150)
+///   * Plain indexed dir:                      0
+///
+/// Named projects are matched against `NamedProject::name`, NOT path
+/// — that's the alias semantic. If a named project's path also lives
+/// in the indexed search roots, the named entry wins (the indexed dup
+/// is filtered out by path equality).
+#[must_use]
+fn score_fuzzy(query: &str, dirs: &[IndexedDir], named: &[NamedProject]) -> Vec<String> {
+    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+    use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut buf = Vec::new();
+
+    let mut scored: Vec<(u32, String)> = Vec::new();
+    let mut named_paths: HashSet<String> = HashSet::new();
+
+    // Named projects first — score the user-friendly `name`, but emit
+    // the (tilde-expanded) `path` as the spawn target.
+    for np in named {
+        let haystack = Utf32Str::new(&np.name, &mut buf);
+        if let Some(score) = pattern.score(haystack, &mut matcher) {
+            let expanded = expand_named_project_path(&np.path);
+            named_paths.insert(expanded.clone());
+            scored.push((score.saturating_add(BOOST_NAMED), expanded));
+        }
+    }
+
+    // Indexed dirs — score the full path. Skip any path already
+    // emitted by a named project so the same dir doesn't appear twice.
+    for d in dirs {
+        let s = d.path.to_string_lossy();
+        if named_paths.contains(s.as_ref()) {
+            continue;
+        }
+        let haystack = Utf32Str::new(&s, &mut buf);
+        if let Some(score) = pattern.score(haystack, &mut matcher) {
+            let boost = match d.kind {
+                ProjectKind::Git => BOOST_GIT,
+                ProjectKind::Marker => BOOST_MARKER,
+                ProjectKind::Plain => 0,
+            };
+            scored.push((score.saturating_add(boost), s.into_owned()));
+        }
+    }
+
+    // Sort by (score desc, path asc). The path tiebreaker is what
+    // keeps the wildmenu from flickering when two candidates tie.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(MAX_FUZZY_RESULTS)
+        .map(|(_, s)| s)
+        .collect()
+}
+
+/// Tilde-expand a named project's `path`. Mirrors the indexer's
+/// expansion so a `path = "~/foo"` produces the same string the
+/// indexer would have emitted for that dir — keeps the dedup path
+/// equality stable.
+#[must_use]
+fn expand_named_project_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Path::new(&home).join(rest).to_string_lossy().into_owned();
+    }
+    if path == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Path::new(&home).to_string_lossy().into_owned();
+    }
+    path.to_string()
 }
 
 /// Path-zone completions: scan `read_dir(parent)` for entries matching the
@@ -1525,6 +1882,13 @@ mod tests {
             // A stable test cwd. The Esc/Confirm tests that exercise
             // the cwd-reseed behavior assert against this value.
             cwd: PathBuf::from("/test/cwd"),
+            // Default to Precise so the existing test suite (which
+            // pre-dates fuzzy mode) keeps its original semantics. The
+            // fuzzy-mode tests further down opt in explicitly.
+            search_mode: SearchMode::Precise,
+            user_search_mode: SearchMode::Precise,
+            fuzzy_query: String::new(),
+            named_projects: Vec::new(),
         };
         m.refresh(&mut local());
         m
@@ -1615,7 +1979,7 @@ mod tests {
     #[test]
     fn ctrl_backspace_clears_auto_seeded_marker() {
         let dir = tempfile::tempdir().unwrap();
-        let mut m = SpawnMinibuffer::open(dir.path());
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
         assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
         m.handle(&ctrl(KeyCode::Backspace), &b(), &mut local());
         assert_eq!(m.path_origin, PathOrigin::UserTyped);
@@ -1685,7 +2049,7 @@ mod tests {
     #[test]
     fn open_seeds_path_with_cwd_and_marks_auto_seeded() {
         let dir = tempfile::tempdir().unwrap();
-        let m = SpawnMinibuffer::open(dir.path());
+        let m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
         let expected = format!("{}/", dir.path().display());
         assert_eq!(m.path, expected);
         assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
@@ -1696,7 +2060,7 @@ mod tests {
     /// (root, or any path the caller normalized). Don't double-slash.
     #[test]
     fn open_does_not_double_slash_when_cwd_already_ends_in_slash() {
-        let m = SpawnMinibuffer::open(Path::new("/"));
+        let m = SpawnMinibuffer::open(Path::new("/"), SearchMode::Precise, Vec::new());
         assert_eq!(m.path, "/");
     }
 
@@ -1706,7 +2070,7 @@ mod tests {
     #[test]
     fn typing_in_path_zone_clears_auto_seeded() {
         let dir = tempfile::tempdir().unwrap();
-        let mut m = SpawnMinibuffer::open(dir.path());
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
         assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
         m.handle(&key(KeyCode::Char('x')), &b(), &mut local());
         assert_eq!(m.path_origin, PathOrigin::UserTyped);
@@ -1718,7 +2082,7 @@ mod tests {
     #[test]
     fn backspace_in_path_zone_clears_auto_seeded() {
         let dir = tempfile::tempdir().unwrap();
-        let mut m = SpawnMinibuffer::open(dir.path());
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
         m.handle(&key(KeyCode::Backspace), &b(), &mut local());
         assert_eq!(m.path_origin, PathOrigin::UserTyped);
     }
@@ -1746,7 +2110,7 @@ mod tests {
     #[test]
     fn at_into_host_clears_auto_seeded_path() {
         let dir = tempfile::tempdir().unwrap();
-        let mut m = SpawnMinibuffer::open(dir.path());
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
         assert!(!m.path.is_empty());
         m.handle(&key(KeyCode::Char('@')), &b(), &mut local());
         assert_eq!(m.focused, Zone::Host);
@@ -2986,5 +3350,342 @@ mod tests {
             cache.is_empty(),
             "failed list_dir must not poison the cache"
         );
+    }
+
+    /// Build a `Ready` `IndexState` from a slice of plain path strings.
+    /// Tests that need typed kinds construct `IndexedDir` literals
+    /// directly.
+    fn ready_index_plain(paths: &[&str]) -> IndexState {
+        IndexState::Ready {
+            dirs: paths
+                .iter()
+                .map(|p| IndexedDir {
+                    path: PathBuf::from(p),
+                    kind: ProjectKind::Plain,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn open_fuzzy_starts_with_empty_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = SpawnMinibuffer::open(dir.path(), SearchMode::Fuzzy, Vec::new());
+        assert!(
+            m.path.is_empty(),
+            "fuzzy open should leave path empty (got {:?})",
+            m.path,
+        );
+        assert!(m.fuzzy_query.is_empty());
+        assert_eq!(m.search_mode, SearchMode::Fuzzy);
+        assert_eq!(m.user_search_mode, SearchMode::Fuzzy);
+    }
+
+    #[test]
+    fn open_precise_seeds_path_with_cwd() {
+        // Pin: existing behavior. Precise mode should still seed.
+        let dir = tempfile::tempdir().unwrap();
+        let m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
+        assert!(m.path.starts_with(&*dir.path().to_string_lossy()));
+        assert!(m.path.ends_with('/'));
+        assert_eq!(m.search_mode, SearchMode::Precise);
+    }
+
+    #[test]
+    fn ctrl_t_toggles_fuzzy_to_precise_and_seeds_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Fuzzy, Vec::new());
+        let outcome = m.handle(&ctrl(KeyCode::Char('t')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.search_mode, SearchMode::Precise);
+        assert_eq!(m.user_search_mode, SearchMode::Precise);
+        // Toggling to Precise with empty path re-seeds cwd so the
+        // wildmenu has something to show.
+        assert!(m.path.starts_with(&*dir.path().to_string_lossy()));
+    }
+
+    #[test]
+    fn ctrl_t_toggles_precise_to_fuzzy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
+        m.handle(&ctrl(KeyCode::Char('t')), &b(), &mut local());
+        assert_eq!(m.search_mode, SearchMode::Fuzzy);
+        assert_eq!(m.user_search_mode, SearchMode::Fuzzy);
+        // Fuzzy mode owns its own wildmenu lifecycle — toggling should
+        // clear filtered/selected so a stale Precise highlight isn't
+        // committed by an Enter under the new mode.
+        assert!(m.filtered.is_empty());
+        assert_eq!(m.selected, None);
+    }
+
+    #[test]
+    fn tab_is_no_op_in_fuzzy_path_zone() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        // Wipe any precise-mode wildmenu the `mb()` constructor's
+        // refresh left behind so we can assert Tab doesn't repopulate.
+        m.filtered.clear();
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        // Tab in fuzzy must not trigger any wildmenu mutation.
+        assert!(m.filtered.is_empty());
+        assert_eq!(m.focused, Zone::Path);
+    }
+
+    #[test]
+    fn ctrl_r_emits_refresh_index_outcome_in_fuzzy_mode() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        let outcome = m.handle(&ctrl(KeyCode::Char('r')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::RefreshIndex);
+    }
+
+    #[test]
+    fn remote_unlock_forces_precise_and_preserves_user_mode() {
+        // Set the user's preference to Fuzzy, then simulate the runtime
+        // unlocking after a successful prepare.
+        let mut m = mb("devpod-web", "", Zone::Host, &["devpod-web"]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.unlock_for_remote_path(
+            "devpod-web".to_string(),
+            PathBuf::from("/home/df"),
+            &mut local(),
+        );
+        assert_eq!(m.search_mode, SearchMode::Precise, "remote forces precise");
+        assert_eq!(
+            m.user_search_mode,
+            SearchMode::Fuzzy,
+            "user preference preserved",
+        );
+    }
+
+    #[test]
+    fn unlock_back_to_host_restores_user_search_mode() {
+        let mut m = mb("devpod-web", "/home/df/", Zone::Path, &["devpod-web"]);
+        m.search_mode = SearchMode::Precise; // forced by the prepare path
+        m.user_search_mode = SearchMode::Fuzzy; // user's preference
+        m.unlock_back_to_host(&mut local(), None);
+        assert_eq!(m.search_mode, SearchMode::Fuzzy);
+        assert_eq!(m.focused, Zone::Host);
+    }
+
+    #[test]
+    fn refresh_fuzzy_with_ready_index_populates_filtered_with_full_paths() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        let idx = ready_index_plain(&[
+            "/home/df/Workbench/repositories/codemux",
+            "/home/df/Library/something",
+            "/home/df/code-utils",
+        ]);
+        m.refresh_fuzzy(Some(&idx));
+        assert!(!m.filtered.is_empty(), "should have matches for 'code'");
+        assert!(
+            m.filtered
+                .iter()
+                .any(|p| p == "/home/df/Workbench/repositories/codemux"),
+            "codemux should be in matches: {:?}",
+            m.filtered,
+        );
+        assert_eq!(m.selected, Some(0));
+        // Full paths, not basenames.
+        assert!(m.filtered.iter().all(|p| p.contains('/')));
+    }
+
+    #[test]
+    fn refresh_fuzzy_empty_query_clears_wildmenu() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query.clear();
+        m.filtered = vec!["stale".to_string()];
+        m.selected = Some(0);
+        let idx = ready_index_plain(&["/anything"]);
+        m.refresh_fuzzy(Some(&idx));
+        assert!(m.filtered.is_empty());
+        assert_eq!(m.selected, None);
+    }
+
+    #[test]
+    fn refresh_fuzzy_with_building_index_leaves_filtered_empty() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        // None simulates the index not started yet. Both `None` and
+        // the `Building` variant should keep `filtered` empty so the
+        // wildmenu shows the indexer-state sentinel.
+        m.refresh_fuzzy(None);
+        assert!(m.filtered.is_empty());
+    }
+
+    #[test]
+    fn score_fuzzy_sort_is_stable_on_score_ties() {
+        // Two paths with the same query should sort lexicographically
+        // when nucleo gives them the same score, so the wildmenu
+        // doesn't flicker as the user types.
+        let dirs = vec![
+            IndexedDir {
+                path: PathBuf::from("/home/df/zeta-codemux"),
+                kind: ProjectKind::Plain,
+            },
+            IndexedDir {
+                path: PathBuf::from("/home/df/alpha-codemux"),
+                kind: ProjectKind::Plain,
+            },
+        ];
+        let result_a = score_fuzzy("codemux", &dirs, &[]);
+        let result_b = score_fuzzy("codemux", &dirs, &[]);
+        assert_eq!(result_a, result_b, "sort must be deterministic");
+        // Lex order on tie: alpha before zeta.
+        if result_a.len() == 2 {
+            assert!(
+                result_a[0].contains("alpha"),
+                "alpha should sort before zeta on score tie: {result_a:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn score_fuzzy_git_repo_outranks_plain_at_same_match_quality() {
+        // Same fuzzy match quality on both → the .git'd repo wins.
+        let dirs = [
+            ("/a/code", ProjectKind::Plain),
+            ("/b/code", ProjectKind::Git),
+        ];
+        let result = score_fuzzy(
+            "code",
+            &dirs
+                .iter()
+                .map(|(p, k)| IndexedDir {
+                    path: PathBuf::from(p),
+                    kind: *k,
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert_eq!(result.first().map(String::as_str), Some("/b/code"));
+    }
+
+    #[test]
+    fn score_fuzzy_marker_outranks_plain_but_not_git() {
+        let dirs = [
+            ("/x/proj", ProjectKind::Plain),
+            ("/y/proj", ProjectKind::Marker),
+            ("/z/proj", ProjectKind::Git),
+        ];
+        let result = score_fuzzy(
+            "proj",
+            &dirs
+                .iter()
+                .map(|(p, k)| IndexedDir {
+                    path: PathBuf::from(p),
+                    kind: *k,
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert_eq!(result[0], "/z/proj", "git wins: {result:?}");
+        assert_eq!(result[1], "/y/proj", "marker second: {result:?}");
+        assert_eq!(result[2], "/x/proj", "plain last: {result:?}");
+    }
+
+    #[test]
+    fn score_fuzzy_named_project_outranks_git_repo() {
+        let dirs = vec![IndexedDir {
+            path: PathBuf::from("/auto/discovered/codemux"),
+            kind: ProjectKind::Git,
+        }];
+        let named = vec![NamedProject {
+            name: "codemux".to_string(),
+            // Use absolute path so we don't depend on $HOME in test.
+            path: "/explicit/alias/codemux".to_string(),
+        }];
+        let result = score_fuzzy("codemux", &dirs, &named);
+        assert_eq!(
+            result.first().map(String::as_str),
+            Some("/explicit/alias/codemux"),
+            "named project should outrank a git repo: {result:?}",
+        );
+    }
+
+    #[test]
+    fn score_fuzzy_dedupes_named_project_present_in_index() {
+        // If a named project's path also lives in the index, only the
+        // named entry should appear (deduped by path equality).
+        let dirs = vec![IndexedDir {
+            path: PathBuf::from("/work/codemux"),
+            kind: ProjectKind::Git,
+        }];
+        let named = vec![NamedProject {
+            name: "cm".to_string(),
+            path: "/work/codemux".to_string(),
+        }];
+        let result = score_fuzzy("cm", &dirs, &named);
+        let cm_count = result.iter().filter(|s| s == &"/work/codemux").count();
+        assert_eq!(cm_count, 1, "dup not removed: {result:?}");
+    }
+
+    #[test]
+    fn score_fuzzy_named_project_matches_against_name_not_path() {
+        // The name `xy` shouldn't match `codemux` (path) — but it
+        // should match the alias `xy`.
+        let dirs = vec![];
+        let named = vec![NamedProject {
+            name: "xy".to_string(),
+            path: "/some/where/codemux".to_string(),
+        }];
+        let result = score_fuzzy("xy", &dirs, &named);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "/some/where/codemux");
+
+        // Querying for `mux` (a fragment of the path, not the name)
+        // should NOT match the named project — the matcher only
+        // looks at `name`.
+        let result = score_fuzzy("mux", &dirs, &named);
+        assert!(result.is_empty(), "should not match path: {result:?}");
+    }
+
+    #[test]
+    fn bootstrap_locked_drops_ctrl_t_and_ctrl_r() {
+        let mut m = mb("devpod-web", "", Zone::Path, &["devpod-web"]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.lock_for_bootstrap("devpod-web".to_string(), Instant::now());
+        // Both chords should be silently dropped while locked.
+        let outcome_t = m.handle(&ctrl(KeyCode::Char('t')), &b(), &mut local());
+        let outcome_r = m.handle(&ctrl(KeyCode::Char('r')), &b(), &mut local());
+        assert_eq!(outcome_t, ModalOutcome::None);
+        assert_eq!(outcome_r, ModalOutcome::None);
+        // Mode unchanged.
+        assert_eq!(m.search_mode, SearchMode::Fuzzy);
+    }
+
+    #[test]
+    fn fuzzy_path_typing_writes_to_query_not_path() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.handle(&key(KeyCode::Char('c')), &b(), &mut local());
+        m.handle(&key(KeyCode::Char('m')), &b(), &mut local());
+        assert_eq!(m.fuzzy_query, "cm");
+        assert!(
+            m.path.is_empty(),
+            "Precise path field must stay clean in Fuzzy mode (got {:?})",
+            m.path,
+        );
+    }
+
+    #[test]
+    fn notify_index_state_is_no_op_outside_fuzzy_path() {
+        // In Host zone, even if mode is Fuzzy, notify should not touch
+        // filtered (which holds host candidates from `refresh`).
+        let mut m = mb("dev", "", Zone::Host, &["devpod-web"]);
+        m.search_mode = SearchMode::Fuzzy;
+        let before = m.filtered.clone();
+        let idx = ready_index_plain(&["/some/where"]);
+        m.notify_index_state(Some(&idx));
+        assert_eq!(m.filtered, before, "host wildmenu must not be clobbered");
     }
 }

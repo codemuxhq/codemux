@@ -52,6 +52,9 @@ pub struct Config {
     /// bar, tab strip, hints, log strip — everything *around* the agent
     /// pane). Agent PTY content is never restyled.
     pub ui: Ui,
+    /// Knobs for the spawn modal — search engine choice and the roots
+    /// the fuzzy directory indexer walks.
+    pub spawn: SpawnConfig,
 }
 
 impl Default for Config {
@@ -60,6 +63,7 @@ impl Default for Config {
             bindings: Bindings::default(),
             scrollback_len: default_scrollback_len(),
             ui: Ui::default(),
+            spawn: SpawnConfig::default(),
         }
     }
 }
@@ -100,6 +104,135 @@ pub struct Ui {
     /// - **Hex RGB**: `"#0080ff"`. True-color. Renders precisely on
     ///   modern terminals; may degrade on 256-color-only setups.
     pub host_colors: HashMap<String, ChromeColor>,
+}
+
+/// Default file/dir names that mark a directory as a "code project"
+/// for the fuzzy spawn-modal boost. Curated across the ecosystems
+/// codemux's user is likely to spawn agents in.
+///
+/// Names must be **non-hidden** (no leading dot) — the indexer's walker
+/// skips hidden entries by default, so a hidden marker like `.envrc`
+/// would never be detected via file iteration. `.git` is the one
+/// special case: it's checked via an explicit per-directory stat
+/// because it's the strongest project signal we have.
+///
+/// The list is exposed via `[spawn].project_markers` for additions
+/// like `Tiltfile`, `dvc.yaml`, etc. — the user's config completely
+/// replaces this default (no merge), so copy these in when overriding
+/// if you want to keep them.
+fn default_project_markers() -> Vec<String> {
+    [
+        // Rust
+        "Cargo.toml",
+        // JS / TS
+        "package.json",
+        // Go
+        "go.mod",
+        // Python
+        "pyproject.toml",
+        "setup.py",
+        // JVM
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        // Ruby
+        "Gemfile",
+        // PHP
+        "composer.json",
+        // Elixir
+        "mix.exs",
+        // Swift
+        "Package.swift",
+        // Dart / Flutter
+        "pubspec.yaml",
+        // C / C++
+        "CMakeLists.txt",
+        // Generic build tools
+        "Makefile",
+        "Justfile",
+        "justfile",
+        "flake.nix",
+        "BUILD",
+        "BUILD.bazel",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
+}
+
+/// Knobs for the spawn modal, sourced from `[spawn]` in `config.toml`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct SpawnConfig {
+    /// Roots walked by the fuzzy directory indexer. Each entry is
+    /// tilde-expanded at startup. Defaults to `["~"]`, which indexes
+    /// the user's home directory tree.
+    ///
+    /// The indexer respects `.gitignore` (via the `ignore` crate);
+    /// large vendor trees should be excluded with a `.gitignore` entry
+    /// rather than by removing them from this list. There is also a
+    /// hard cap on indexed entries inside the worker — if you hit it,
+    /// add a `.gitignore` to the noisy subtree.
+    pub search_roots: Vec<String>,
+    /// Which path-zone engine the modal opens with. `"fuzzy"` uses the
+    /// session-built directory index with `nucleo-matcher` scoring;
+    /// `"precise"` uses the live `read_dir` prefix-completion engine.
+    /// Toggle at runtime with the `ToggleSearchMode` binding (default
+    /// `ctrl+t`).
+    pub default_mode: SearchMode,
+    /// Filenames that mark a directory as a "code project" — the
+    /// fuzzy matcher boosts these above plain directories. `.git` is
+    /// detected separately (it's hidden) and gets a higher boost than
+    /// any of these markers. The default covers Cargo / npm / Go /
+    /// Python / JVM / Ruby / Elixir / Swift / Dart / C++ / generic
+    /// build tools (Makefile, Justfile, flake.nix, BUILD, .envrc).
+    /// Override to add e.g. `"Tiltfile"`, `"dvc.yaml"` — note that the
+    /// user-supplied list completely replaces the default, so include
+    /// any defaults you want to keep.
+    #[serde(default = "default_project_markers")]
+    pub project_markers: Vec<String>,
+    /// Named projects: explicit user-curated `(name, path)` pairs that
+    /// the fuzzy matcher boosts above any auto-discovered repository.
+    /// The query is matched against `name` (not the full path), so
+    /// short aliases work — `name = "cm"` plus `path = ".../codemux"`
+    /// makes typing `cm` jump straight there. Paths are tilde-expanded
+    /// at use time. If a project's path also lives in the indexed
+    /// search roots, it is deduplicated so the entry only appears once
+    /// (with the named-project boost).
+    pub projects: Vec<NamedProject>,
+}
+
+impl Default for SpawnConfig {
+    fn default() -> Self {
+        Self {
+            search_roots: vec!["~".to_string()],
+            default_mode: SearchMode::default(),
+            project_markers: default_project_markers(),
+            projects: Vec::new(),
+        }
+    }
+}
+
+/// User-curated alias for a project path. Matched by `name` in the
+/// fuzzy modal; spawn target is `path` (tilde-expanded at use site).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct NamedProject {
+    pub name: String,
+    pub path: String,
+}
+
+/// Which path-zone search engine the spawn modal uses.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    /// Session-built directory index, queried via fuzzy matcher.
+    /// Default for new installs — `cmd+t` toggles to precise.
+    #[default]
+    Fuzzy,
+    /// Live `read_dir` + zsh-style Tab autocomplete. The original
+    /// engine. Selected when the user is on a remote SSH host
+    /// (the index walker is local-only) or when explicitly chosen.
+    Precise,
 }
 
 /// A user-configurable color for chrome accents. Validated at
@@ -550,5 +683,120 @@ mod tests {
     fn host_colors_defaults_to_empty_map() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.ui.host_colors.is_empty());
+    }
+
+    #[test]
+    fn spawn_section_defaults_when_absent() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.spawn.search_roots, vec!["~".to_string()]);
+        assert_eq!(config.spawn.default_mode, SearchMode::Fuzzy);
+    }
+
+    #[test]
+    fn spawn_default_mode_fuzzy_round_trips() {
+        let config: Config = toml::from_str("[spawn]\ndefault_mode = \"fuzzy\"\n").unwrap();
+        assert_eq!(config.spawn.default_mode, SearchMode::Fuzzy);
+    }
+
+    #[test]
+    fn spawn_default_mode_precise_round_trips() {
+        let config: Config = toml::from_str("[spawn]\ndefault_mode = \"precise\"\n").unwrap();
+        assert_eq!(config.spawn.default_mode, SearchMode::Precise);
+    }
+
+    #[test]
+    fn spawn_search_roots_round_trips() {
+        let toml_text = r#"
+            [spawn]
+            search_roots = ["~/code", "/work"]
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.spawn.search_roots,
+            vec!["~/code".to_string(), "/work".to_string()],
+        );
+    }
+
+    #[test]
+    fn spawn_unknown_default_mode_is_an_error() {
+        let result: Result<Config, _> = toml::from_str("[spawn]\ndefault_mode = \"hyperdrive\"\n");
+        assert!(
+            result.is_err(),
+            "expected parse error for unknown default_mode, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn spawn_project_markers_default_includes_common_ecosystems() {
+        let config: Config = toml::from_str("").unwrap();
+        let markers = &config.spawn.project_markers;
+        // Spot-check a representative sample — exhaustive listing
+        // would just duplicate the default constant.
+        for required in [
+            "Cargo.toml",
+            "package.json",
+            "go.mod",
+            "pyproject.toml",
+            "Makefile",
+        ] {
+            assert!(
+                markers.iter().any(|m| m == required),
+                "default project_markers missing {required:?}: {markers:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_project_markers_user_override_replaces_default() {
+        let toml_text = r#"
+            [spawn]
+            project_markers = ["Tiltfile", "dvc.yaml"]
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.spawn.project_markers,
+            vec!["Tiltfile".to_string(), "dvc.yaml".to_string()],
+            "user list replaces the default (no merge)",
+        );
+    }
+
+    #[test]
+    fn spawn_named_projects_default_is_empty() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.spawn.projects.is_empty());
+    }
+
+    #[test]
+    fn spawn_named_projects_round_trip() {
+        let toml_text = r#"
+            [[spawn.projects]]
+            name = "cm"
+            path = "~/Workbench/repositories/codemux"
+
+            [[spawn.projects]]
+            name = "dotfiles"
+            path = "~/Workbench/repositories/dotfiles"
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(config.spawn.projects.len(), 2);
+        assert_eq!(config.spawn.projects[0].name, "cm");
+        assert_eq!(
+            config.spawn.projects[0].path,
+            "~/Workbench/repositories/codemux",
+        );
+        assert_eq!(config.spawn.projects[1].name, "dotfiles");
+    }
+
+    #[test]
+    fn spawn_named_project_missing_path_is_an_error() {
+        let toml_text = r#"
+            [[spawn.projects]]
+            name = "no-path"
+        "#;
+        let result: Result<Config, _> = toml::from_str(toml_text);
+        assert!(
+            result.is_err(),
+            "missing required `path` field should fail parse, got {result:?}",
+        );
     }
 }

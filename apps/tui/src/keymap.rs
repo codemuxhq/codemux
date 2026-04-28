@@ -297,6 +297,15 @@ pub enum ModalAction {
     SwapToHost,
     NextCompletion,
     PrevCompletion,
+    /// Toggle the path zone between fuzzy (session-built directory
+    /// index, ranked by `nucleo-matcher`) and precise (live `read_dir`
+    /// with Tab autocomplete). Path zone only — no effect when host
+    /// zone is focused. Default: `ctrl+t`.
+    ToggleSearchMode,
+    /// Force a rebuild of the fuzzy directory index. Useful after
+    /// creating a new project directory mid-session. No-op in precise
+    /// mode. Default: `ctrl+r`.
+    RefreshIndex,
 }
 
 impl ModalAction {
@@ -307,6 +316,8 @@ impl ModalAction {
         Self::SwapToHost,
         Self::NextCompletion,
         Self::PrevCompletion,
+        Self::ToggleSearchMode,
+        Self::RefreshIndex,
     ];
 
     pub const fn description(self) -> &'static str {
@@ -317,6 +328,8 @@ impl ModalAction {
             Self::SwapToHost => "(in path field) jump to host field",
             Self::NextCompletion => "highlight next path completion",
             Self::PrevCompletion => "highlight previous path completion",
+            Self::ToggleSearchMode => "toggle path zone between fuzzy and precise modes",
+            Self::RefreshIndex => "rebuild the fuzzy directory index",
         }
     }
 }
@@ -553,6 +566,8 @@ pub struct ModalBindings {
     pub swap_to_host: KeyChord,
     pub next_completion: KeyChord,
     pub prev_completion: KeyChord,
+    pub toggle_search_mode: KeyChord,
+    pub refresh_index: KeyChord,
 }
 
 impl Default for ModalBindings {
@@ -564,19 +579,23 @@ impl Default for ModalBindings {
             swap_to_host: KeyChord::plain(KeyCode::Char('@')),
             next_completion: KeyChord::plain(KeyCode::Down),
             prev_completion: KeyChord::plain(KeyCode::Up),
+            toggle_search_mode: KeyChord::ctrl(KeyCode::Char('t')),
+            refresh_index: KeyChord::ctrl(KeyCode::Char('r')),
         }
     }
 }
 
 impl ModalBindings {
     pub fn lookup(&self, key: &KeyEvent) -> Option<ModalAction> {
-        let table: [(KeyChord, ModalAction); 6] = [
+        let table: [(KeyChord, ModalAction); 8] = [
             (self.confirm, ModalAction::Confirm),
             (self.cancel, ModalAction::Cancel),
             (self.swap_field, ModalAction::SwapField),
             (self.swap_to_host, ModalAction::SwapToHost),
             (self.next_completion, ModalAction::NextCompletion),
             (self.prev_completion, ModalAction::PrevCompletion),
+            (self.toggle_search_mode, ModalAction::ToggleSearchMode),
+            (self.refresh_index, ModalAction::RefreshIndex),
         ];
         table.iter().find(|(c, _)| c.matches(key)).map(|(_, a)| *a)
     }
@@ -589,6 +608,8 @@ impl ModalBindings {
             ModalAction::SwapToHost => self.swap_to_host,
             ModalAction::NextCompletion => self.next_completion,
             ModalAction::PrevCompletion => self.prev_completion,
+            ModalAction::ToggleSearchMode => self.toggle_search_mode,
+            ModalAction::RefreshIndex => self.refresh_index,
         }
     }
 }
@@ -850,6 +871,8 @@ impl Bindings {
             self.on_modal.swap_to_host,
             self.on_modal.next_completion,
             self.on_modal.prev_completion,
+            self.on_modal.toggle_search_mode,
+            self.on_modal.refresh_index,
             self.on_direct.spawn_agent,
             self.on_scroll.line_up,
             self.on_scroll.line_down,
@@ -1350,6 +1373,28 @@ mod tests {
             let event = KeyEvent::new(chord.code, chord.modifiers);
             assert_eq!(b.lookup(&event), Some(*action));
         }
+    }
+
+    #[test]
+    fn modal_default_toggle_search_mode_is_ctrl_t() {
+        // Pin: the spawn modal's pre-Ctrl handler in spawn.rs intercepts
+        // this chord before the generic Ctrl-shortcut fall-through. If
+        // someone "tidies" the default to plain `t`, every typed `t`
+        // becomes a toggle and the path field stops accepting the letter.
+        let b = ModalBindings::default();
+        assert_eq!(b.toggle_search_mode.code, KeyCode::Char('t'));
+        assert!(
+            b.toggle_search_mode
+                .modifiers
+                .contains(KeyModifiers::CONTROL),
+        );
+    }
+
+    #[test]
+    fn modal_default_refresh_index_is_ctrl_r() {
+        let b = ModalBindings::default();
+        assert_eq!(b.refresh_index.code, KeyCode::Char('r'));
+        assert!(b.refresh_index.modifiers.contains(KeyModifiers::CONTROL));
     }
 
     #[test]

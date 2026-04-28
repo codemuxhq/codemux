@@ -57,8 +57,9 @@ use crate::bootstrap_worker::{
     AttachEvent, AttachHandle, PrepareEvent, PrepareHandle, PrepareSuccess, start_attach,
     start_prepare,
 };
-use crate::config::Config;
+use crate::config::{Config, SearchMode, SpawnConfig};
 use crate::host_title;
+use crate::index_worker::{IndexEvent, IndexState, expand_search_roots, start_index};
 use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction, ScrollAction};
 use crate::log_tail::LogTail;
 use crate::pty_title::TitleCapture;
@@ -1059,6 +1060,7 @@ pub fn run(
         initial_cwd,
         config.scrollback_len,
         &chrome,
+        &config.spawn,
     )
 }
 
@@ -1406,6 +1408,7 @@ fn event_loop(
     initial_cwd: &Path,
     scrollback_len: usize,
     chrome: &ChromeStyle,
+    spawn_config: &SpawnConfig,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
@@ -1423,6 +1426,20 @@ fn event_loop(
     // lifecycle.
     let mut prepare: Option<PendingPrepare> = None;
     let mut attaches: Vec<PendingAttach> = Vec::new();
+    // Session-long fuzzy directory index. `None` until first needed
+    // (lazy build). When `default_mode == Fuzzy`, kick off the build
+    // at session start so the modal has results ready by the first
+    // open. The handle's `Drop` cancels the worker, so a session exit
+    // is clean even mid-walk.
+    let mut index_state: Option<IndexState> = None;
+    if spawn_config.default_mode == SearchMode::Fuzzy {
+        let roots = expand_search_roots(&spawn_config.search_roots);
+        index_state = Some(IndexState::Building {
+            handle: start_index(roots, spawn_config.project_markers.clone()),
+            count: 0,
+        });
+        tracing::debug!("fuzzy index: build started at session start");
+    }
     let initial_count = agents.len();
     // Bundle the four navigation locals (`agents`, `focused`,
     // `previous_focused`, `popup_state`) into a single owned struct.
@@ -1480,6 +1497,35 @@ fn event_loop(
     let mut last_emitted_host_title: Option<String> = None;
 
     loop {
+        // Drain fuzzy index events before the prepare drain — when the
+        // index transitions to Ready the modal's wildmenu should
+        // reflect that on the same frame. Progress events update the
+        // "indexing… N dirs" counter shown by `wildmenu_view`.
+        if let Some(IndexState::Building { handle, count }) = &mut index_state {
+            while let Some(event) = handle.try_recv() {
+                match event {
+                    IndexEvent::Progress(n) => *count = n,
+                    IndexEvent::Done(Ok(dirs)) => {
+                        tracing::info!(n = dirs.len(), "fuzzy index: build complete");
+                        index_state = Some(IndexState::Ready { dirs });
+                        break;
+                    }
+                    IndexEvent::Done(Err(e)) => {
+                        let msg = format!("{e}");
+                        tracing::warn!("fuzzy index: build failed: {msg}");
+                        index_state = Some(IndexState::Failed { message: msg });
+                        break;
+                    }
+                }
+            }
+        }
+        // Refresh the modal's wildmenu from whatever the index state
+        // is now. The modal short-circuits when not in Fuzzy + Path,
+        // so this is cheap on every other frame.
+        if let Some(ui) = spawn_ui.as_mut() {
+            ui.notify_index_state(index_state.as_ref());
+        }
+
         // Drain prepare events first: the modal should reflect the
         // worker's progress on the same frame the events arrive,
         // before any keystroke handling. On `Done` we either unlock
@@ -1714,6 +1760,7 @@ fn event_loop(
                     &mut tab_hitboxes,
                     &mut pane_hitbox,
                     selection.as_ref(),
+                    index_state.as_ref(),
                 );
             })
             .wrap_err("draw frame")?;
@@ -1748,6 +1795,18 @@ fn event_loop(
                     };
                     match ui.handle(&key, &bindings.on_modal, &mut lister) {
                         ModalOutcome::None => {}
+                        ModalOutcome::RefreshIndex => {
+                            // Cancel any in-flight build and start a
+                            // fresh one. Drop on the old `IndexState`
+                            // signals the worker to exit at its next
+                            // entry boundary.
+                            let roots = expand_search_roots(&spawn_config.search_roots);
+                            index_state = Some(IndexState::Building {
+                                handle: start_index(roots, spawn_config.project_markers.clone()),
+                                count: 0,
+                            });
+                            tracing::debug!("fuzzy index: rebuild triggered by user");
+                        }
                         ModalOutcome::Cancel => {
                             // Esc when not locked: dismiss the modal
                             // and tear down any in-flight prepare /
@@ -1917,6 +1976,14 @@ fn event_loop(
                             }
                         }
                     }
+                    // Refresh the fuzzy wildmenu against the current
+                    // index state so a keystroke updates `filtered` on
+                    // the same frame instead of waiting for the next
+                    // loop iteration's drain. Cheap when not in fuzzy
+                    // mode (the modal short-circuits inside).
+                    if let Some(ui) = spawn_ui.as_mut() {
+                        ui.notify_index_state(index_state.as_ref());
+                    }
                     continue;
                 }
 
@@ -2017,7 +2084,23 @@ fn event_loop(
                     KeyDispatch::Consume => {}
                     KeyDispatch::Exit => return Ok(()),
                     KeyDispatch::SpawnAgent => {
-                        spawn_ui = Some(SpawnMinibuffer::open(initial_cwd));
+                        // Lazy-start the index if the user just opted
+                        // into fuzzy mode via config and we haven't
+                        // started a build yet (e.g. previously opened
+                        // the modal in precise then changed config).
+                        if spawn_config.default_mode == SearchMode::Fuzzy && index_state.is_none() {
+                            let roots = expand_search_roots(&spawn_config.search_roots);
+                            index_state = Some(IndexState::Building {
+                                handle: start_index(roots, spawn_config.project_markers.clone()),
+                                count: 0,
+                            });
+                            tracing::debug!("fuzzy index: lazy build started on modal open");
+                        }
+                        spawn_ui = Some(SpawnMinibuffer::open(
+                            initial_cwd,
+                            spawn_config.default_mode,
+                            spawn_config.projects.clone(),
+                        ));
                     }
                     KeyDispatch::FocusNext => {
                         let next = (nav.focused + 1) % nav.agents.len();
@@ -2337,6 +2420,7 @@ fn render_frame(
     hitboxes: &mut TabHitboxes,
     pane_hitbox: &mut PaneHitbox,
     selection: Option<&Selection>,
+    index_state: Option<&IndexState>,
 ) {
     // Cleared at the top of every frame so a stale frame's rects can
     // never bleed into the next event hit-test if the layout changed
@@ -2401,7 +2485,7 @@ fn render_frame(
         render_log_strip(frame, area, tail, chrome);
     }
     if let Some(ui) = spawn_ui {
-        ui.render(frame, area, &bindings.on_modal);
+        ui.render(frame, area, &bindings.on_modal, index_state);
     }
     if matches!(help, HelpState::Open) {
         render_help(frame, area, bindings);

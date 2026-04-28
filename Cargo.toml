@@ -58,6 +58,17 @@ toml = "0.9"
 # resolve `Include config.d/*` style directives in `~/.ssh/config`.
 glob = "0.3"
 
+# Spawn-modal fuzzy directory indexer. `ignore` is the ripgrep walker —
+# respects `.gitignore` / `.ignore` and parallelizes the walk; default
+# features are exactly what we need.
+ignore = "0.4.25"
+
+# Fuzzy matcher used by the spawn modal to rank directories returned
+# from the indexer. `nucleo-matcher` is the engine Helix uses; pure
+# Rust, ~10 µs per match on a 50k haystack — well below the modal's
+# per-keystroke render budget.
+nucleo-matcher = "0.3.1"
+
 # Test-only: scratch directories for filesystem integration tests.
 tempfile = "3"
 
