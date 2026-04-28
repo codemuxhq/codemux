@@ -355,11 +355,25 @@ gains zero `SIGWINCH` churn.
 succeeding. `EnableMouseCapture` (`?1006h` SGR mouse) is what makes
 `MouseEventKind::ScrollUp/Down` reach the event loop instead of being
 translated to ↑/↓ arrows by the host terminal's `alternateScroll`
-behavior. Side effect: native click-and-drag selection now requires
-holding ⌥/Alt to bypass capture — the help screen documents this.
-**Apple Terminal does not deliver SGR mouse events**; scroll won't
-work there. Explicit non-goal — codemux works with iTerm2, Alacritty,
-Ghostty, Wezterm, Kitty.
+behavior. Side effect: terminal-native click-and-drag selection requires
+holding ⌥/Alt to bypass capture. **Apple Terminal does not deliver SGR
+mouse events**; scroll won't work there. Explicit non-goal — codemux
+works with iTerm2, Alacritty, Ghostty, Wezterm, Kitty.
+
+**Selection is implemented in-app, not handed to the terminal.** Because
+mouse capture eats the drag events anyway, codemux paints its own
+selection overlay (reverse-video on the buffer cells in the pane rect)
+and writes the extracted text to the system clipboard via OSC 52
+(`\x1b]52;c;<base64>\x07`) on mouse-up. `vt100::Screen::contents_between`
+does the cell-range → text conversion (it already walks `visible_rows()`
+so scrollback is included automatically). The user gets modifier-free
+drag-to-select that works inside any agent pane; the ⌥-bypass remains
+documented as the fallback for terminals without OSC 52 (Apple Terminal,
+locked-down corp environments). The selection state is per-frame and
+per-focused-agent: a tab switch, agent reap, or terminal resize clears
+it. Same single-pane, single-selection model as tmux's
+`copy-mode-mouse`. Gestures in v1 are drag-only — no double-click word
+or shift-extend; both are deferred until they're asked for.
 
 **Scroll mode is non-sticky for typing.** Bytes that would have been
 forwarded to Claude — typing real text, control sequences, anything

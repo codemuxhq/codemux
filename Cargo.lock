@@ -282,6 +282,7 @@ version = "0.1.0"
 name = "codemux-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "codemux-session",
  "codemux-shared-kernel",

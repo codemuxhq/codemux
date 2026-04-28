@@ -46,7 +46,7 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -336,6 +336,136 @@ impl Hitbox {
             && col < self.rect.x.saturating_add(self.rect.width)
             && row >= self.rect.y
             && row < self.rect.y.saturating_add(self.rect.height)
+    }
+}
+
+/// The single agent pane visible this frame. Recorded by
+/// [`render_agent_pane`] (via [`render_left_pane`] / [`render_popup_style`])
+/// and consumed by the mouse handler to decide whether a `Down(Left)`
+/// arms a selection. Lives in `event_loop`'s state alongside
+/// [`TabHitboxes`] and is cleared at the top of every [`render_frame`]
+/// for the same stale-rect reason.
+///
+/// `Option` because there's no pane to record before the first frame
+/// renders, and because a Failed-only navigator (every agent is in the
+/// `Failed` state) deliberately skips the agent-pane render path.
+#[derive(Default)]
+struct PaneHitbox {
+    rect: Option<Rect>,
+    agent_id: Option<AgentId>,
+}
+
+impl PaneHitbox {
+    fn clear(&mut self) {
+        self.rect = None;
+        self.agent_id = None;
+    }
+
+    fn record(&mut self, rect: Rect, agent_id: AgentId) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        self.rect = Some(rect);
+        self.agent_id = Some(agent_id);
+    }
+
+    /// Translate a screen-cell click into a pane-relative cell, or
+    /// return `None` if the click landed outside the recorded rect.
+    /// Pane-relative means `(0, 0)` is the top-left of the agent's
+    /// PTY area, which is what `vt100::Screen::contents_between`
+    /// expects (it walks `visible_rows()` from row 0).
+    fn cell_at(&self, col: u16, row: u16) -> Option<(AgentId, CellPos)> {
+        let rect = self.rect?;
+        let id = self.agent_id.clone()?;
+        if col < rect.x
+            || col >= rect.x.saturating_add(rect.width)
+            || row < rect.y
+            || row >= rect.y.saturating_add(rect.height)
+        {
+            return None;
+        }
+        Some((
+            id,
+            CellPos {
+                col: col - rect.x,
+                row: row - rect.y,
+            },
+        ))
+    }
+
+    /// Clamp a screen-cell coordinate (e.g. drag continuing past the
+    /// pane edge) into a pane-relative cell on the nearest edge.
+    /// Returns `None` only when the pane wasn't recorded this frame.
+    fn clamped_cell_at(&self, col: u16, row: u16) -> Option<CellPos> {
+        let rect = self.rect?;
+        let last_col = rect.x.saturating_add(rect.width).saturating_sub(1);
+        let last_row = rect.y.saturating_add(rect.height).saturating_sub(1);
+        let clamped_col = col.clamp(rect.x, last_col);
+        let clamped_row = row.clamp(rect.y, last_row);
+        Some(CellPos {
+            col: clamped_col - rect.x,
+            row: clamped_row - rect.y,
+        })
+    }
+}
+
+/// A cell coordinate inside the agent pane (`(0, 0)` is the top-left
+/// of the PTY area, *not* the screen). Stored pane-relative so the
+/// selection survives a renderer reshuffle that moves the pane around
+/// — only a resize / scrollback shift can invalidate the relationship
+/// to the underlying content, and we clear on resize for that reason.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+struct CellPos {
+    row: u16,
+    col: u16,
+}
+
+/// Active drag-to-select gesture. `anchor` is the cell of the original
+/// `Down(Left)`; `head` is updated on every `Drag(Left)` event. Bound
+/// to a stable [`AgentId`] so a tab switch / agent reap mid-gesture
+/// cancels gracefully — the lookup at commit time will return `None`
+/// and we just clear without emitting OSC 52.
+#[derive(Clone, Eq, PartialEq, Debug)]
+struct Selection {
+    agent: AgentId,
+    anchor: CellPos,
+    head: CellPos,
+}
+
+/// Returns `(start, end)` ordered top-left-first regardless of which
+/// direction the user dragged. `vt100::Screen::contents_between`
+/// requires the start cell to be earlier in reading order than the
+/// end cell, so this normalization is mandatory before extraction.
+fn normalized_range(a: CellPos, b: CellPos) -> (CellPos, CellPos) {
+    if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Cell-column bounds for `row` in a multi-row selection. Returns
+/// `(col_lo, col_hi_excl)` so the caller can iterate `col_lo..col_hi`.
+///
+/// Three cases collapse here:
+/// - **Single-row selection** (`start.row == end.row`): `start.col..end.col + 1`.
+/// - **Top row of a multi-row selection**: `start.col..pane_width`.
+/// - **Middle row**: `0..pane_width`.
+/// - **Bottom row**: `0..end.col + 1`.
+///
+/// `pane_width` is exclusive (matches `Rect::width`). The `+ 1` on
+/// the trailing column is because selection bounds are inclusive at
+/// both ends, but iteration is half-open.
+fn row_bounds(start: CellPos, end: CellPos, row: u16, pane_width: u16) -> (u16, u16) {
+    if start.row == end.row {
+        return (start.col, end.col.saturating_add(1).min(pane_width));
+    }
+    if row == start.row {
+        (start.col, pane_width)
+    } else if row == end.row {
+        (0, end.col.saturating_add(1).min(pane_width))
+    } else {
+        (0, pane_width)
     }
 }
 
@@ -1033,6 +1163,122 @@ fn tab_mouse_dispatch(
     }
 }
 
+/// Outcome of a left-button mouse event over the live agent pane.
+/// Same wiring shape as [`TabMouseDispatch`]: pure-functional
+/// translation, the loop owns the state mutation. Returned wrapped in
+/// `Option` so the dispatcher can signal "not for me — let
+/// `tab_mouse_dispatch` look at it" without a dedicated `Skip` variant.
+#[derive(Clone, Eq, PartialEq, Debug)]
+enum PaneMouseDispatch {
+    /// Left press inside the pane: arm a fresh selection at the
+    /// translated cell. Any prior selection is dropped (the loop
+    /// overwrites unconditionally).
+    Arm { agent: AgentId, cell: CellPos },
+    /// Drag while a selection is active: extend the head to the new
+    /// cell. The cell is already pane-clamped — drags continuing past
+    /// the pane edge land on the nearest edge cell, so selecting "to
+    /// the bottom" by overshooting still works.
+    Extend(CellPos),
+    /// Left release while a selection is active: extract text and
+    /// write OSC 52, then clear. The loop performs the side effect
+    /// because it owns `&nav.agents` (and thus the vt100 parser).
+    Commit,
+}
+
+/// Resolve a left-button mouse event against the recorded pane hitbox.
+///
+/// Returns `None` for events that don't concern the pane: wheel (handled
+/// in the wheel arm above), right / middle button, motion without drag,
+/// or any event whose position is outside the recorded pane rect *and*
+/// no active selection exists. When `None`, the loop falls through to
+/// [`tab_mouse_dispatch`] so chrome clicks still work.
+///
+/// `Drag` and `Up` events outside the pane DO produce a dispatch when
+/// a selection is active — drags get clamped (`PaneHitbox::clamped_cell_at`)
+/// so the user can release outside the pane and still get the
+/// selection they visibly drew.
+fn pane_mouse_dispatch(
+    kind: MouseEventKind,
+    column: u16,
+    row: u16,
+    pane_hitbox: &PaneHitbox,
+    selection: Option<&Selection>,
+) -> Option<PaneMouseDispatch> {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let (agent, cell) = pane_hitbox.cell_at(column, row)?;
+            Some(PaneMouseDispatch::Arm { agent, cell })
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Only relevant if a selection is in flight. Without an
+            // anchor, a stray Drag (e.g. drag started in chrome) has
+            // nothing to extend and we let it fall through.
+            selection?;
+            let cell = pane_hitbox.clamped_cell_at(column, row)?;
+            Some(PaneMouseDispatch::Extend(cell))
+        }
+        MouseEventKind::Up(MouseButton::Left) => selection.map(|_| PaneMouseDispatch::Commit),
+        // Right / middle buttons, side-scroll, motion-without-button:
+        // no-op. Right-click context menu is a deliberate non-goal in
+        // v1 (matches the existing AD-25 minimal-mouse posture).
+        _ => None,
+    }
+}
+
+/// Pull text from the focused agent's vt100 parser for the given
+/// selection range and write it to the system clipboard via OSC 52.
+///
+/// Lookup is by stable [`AgentId`], not by index, so a tab switch /
+/// agent reap between Down and Up cancels gracefully — `position`
+/// returns `None` and we silently bail without writing.
+///
+/// `vt100::Screen::contents_between` walks `visible_rows()`, so the
+/// selection respects the parser's current scrollback offset (selection
+/// while scrolled-back yields scrollback text, not live text). Empty
+/// selections (zero-width or all-whitespace cells in trimmed regions)
+/// produce empty strings; we skip the OSC 52 write in that case to
+/// avoid clobbering whatever was on the clipboard before.
+fn commit_selection(sel: &Selection, agents: &[RuntimeAgent]) {
+    let Some(agent) = agents.iter().find(|a| a.id == sel.agent) else {
+        return;
+    };
+    let parser = match &agent.state {
+        AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => parser,
+        AgentState::Failed { .. } => return,
+    };
+    let (start, end) = normalized_range(sel.anchor, sel.head);
+    let text =
+        parser
+            .screen()
+            .contents_between(start.row, start.col, end.row, end.col.saturating_add(1));
+    if text.is_empty() {
+        return;
+    }
+    if let Err(err) = write_clipboard_to(&mut io::stdout(), &text) {
+        tracing::debug!(?err, "OSC 52 clipboard write failed");
+    }
+}
+
+/// Emit an OSC 52 sequence carrying the selection payload. The host
+/// terminal (iTerm2 / Ghostty / Kitty / `WezTerm` / Alacritty / tmux
+/// passthrough) decodes the base64 and writes to the system clipboard.
+///
+/// Apple Terminal does not implement OSC 52; this is a documented
+/// non-goal consistent with the existing AD-25 mouse-capture story.
+/// Best-effort: the caller logs at debug on failure and otherwise
+/// ignores it — losing a clipboard write is a UX wart, not a crash
+/// surface.
+///
+/// Lifted to take `&mut impl Write` so unit tests can capture the
+/// emitted bytes without touching `io::stdout()`.
+fn write_clipboard_to<W: io::Write>(out: &mut W, text: &str) -> io::Result<()> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    let payload = STANDARD.encode(text.as_bytes());
+    write!(out, "\x1b]52;c;{payload}\x07")?;
+    out.flush()
+}
+
 /// True when no overlay is open: spawn modal closed, agent-switcher
 /// popup closed, help screen closed. Mouse-wheel events that should
 /// scroll the focused agent are gated on this — wheel-while-popup-up
@@ -1088,11 +1334,23 @@ fn event_loop(
     // the top of every `render_frame` so a stale frame's geometry can
     // never bleed into a fresh event hit-test.
     let mut tab_hitboxes = TabHitboxes::default();
+    // The currently-painted agent pane, recorded by render_agent_pane
+    // and consumed by the mouse handler when arming / extending a
+    // drag-to-select gesture. Like `tab_hitboxes`, cleared at the top
+    // of every render_frame so a stale rect can never satisfy a
+    // hit-test against a layout that no longer exists.
+    let mut pane_hitbox = PaneHitbox::default();
     // Tab grabbed on `MouseEventKind::Down(Left)` — by stable
     // `AgentId`, not by index, so a reap or background reorder between
     // Down and Up still resolves to the same agent (or returns `None`
     // and the gesture cancels gracefully).
     let mut mouse_press: Option<AgentId> = None;
+    // Active drag-to-select gesture inside an agent pane (separate from
+    // `mouse_press`, which is for the tab strip). Anchored to a stable
+    // AgentId so a tab switch / agent reap mid-gesture cancels cleanly
+    // — the lookup at commit time will return `None` and we just clear
+    // without writing to the clipboard. See AD-25's selection follow-up.
+    let mut selection: Option<Selection> = None;
     let mut spawn_counter: usize = initial_count;
     // Captured once at loop entry so per-tab spinner / blink phases
     // are derived from a stable monotonic origin. The 50 ms event
@@ -1299,6 +1557,19 @@ fn event_loop(
         }
 
         let phase = AnimationPhase::from_elapsed(start.elapsed());
+        // Sync selection lifecycle: a selection only makes sense for
+        // the agent currently focused. Any path that changed focus or
+        // reaped agents (key dispatch, attach completion, dismiss,
+        // popup pick) lands here, so this single check supersedes
+        // per-arm `selection = None` resets.
+        if let Some(sel) = selection.as_ref()
+            && nav
+                .agents
+                .get(nav.focused)
+                .is_none_or(|a| a.id != sel.agent)
+        {
+            selection = None;
+        }
         terminal
             .draw(|frame| {
                 render_frame(
@@ -1315,6 +1586,8 @@ fn event_loop(
                     phase,
                     chrome,
                     &mut tab_hitboxes,
+                    &mut pane_hitbox,
+                    selection.as_ref(),
                 );
             })
             .wrap_err("draw frame")?;
@@ -1659,6 +1932,12 @@ fn event_loop(
             Event::Resize(cols, rows) => {
                 let (pty_rows, pty_cols) = pty_size_for(nav_style, rows, cols, log_tail.is_some());
                 resize_agents(&mut nav.agents, pty_rows, pty_cols);
+                // Selection cells are pane-relative, but a resize
+                // reflows vt100 — the cells under the highlight no
+                // longer correspond to the same content. Clearing is
+                // the cheapest correct answer; the user re-drags if
+                // they still want the same text.
+                selection = None;
             }
             Event::Mouse(MouseEvent {
                 kind, column, row, ..
@@ -1684,6 +1963,45 @@ fn event_loop(
                         }
                     }
                     other => {
+                        // Pane-relative selection takes priority over
+                        // tab dispatch: a Down inside the live PTY
+                        // surface arms / extends / commits a drag-to-
+                        // select. Tabs and nav rows live in chrome
+                        // (outside the pane rect), so they fall through
+                        // to `tab_mouse_dispatch` cleanly.
+                        let pane_dispatch = pane_mouse_dispatch(
+                            other,
+                            column,
+                            row,
+                            &pane_hitbox,
+                            selection.as_ref(),
+                        );
+                        let handled_by_pane = match pane_dispatch {
+                            Some(PaneMouseDispatch::Arm { agent, cell }) => {
+                                selection = Some(Selection {
+                                    agent,
+                                    anchor: cell,
+                                    head: cell,
+                                });
+                                true
+                            }
+                            Some(PaneMouseDispatch::Extend(cell)) => {
+                                if let Some(sel) = selection.as_mut() {
+                                    sel.head = cell;
+                                }
+                                true
+                            }
+                            Some(PaneMouseDispatch::Commit) => {
+                                if let Some(sel) = selection.take() {
+                                    commit_selection(&sel, &nav.agents);
+                                }
+                                true
+                            }
+                            None => false,
+                        };
+                        if handled_by_pane {
+                            continue;
+                        }
                         if let Some(action) = tab_mouse_dispatch(
                             other,
                             column,
@@ -1873,11 +2191,14 @@ fn render_frame(
     phase: AnimationPhase,
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
+    pane_hitbox: &mut PaneHitbox,
+    selection: Option<&Selection>,
 ) {
     // Cleared at the top of every frame so a stale frame's rects can
     // never bleed into the next event hit-test if the layout changed
     // (terminal resize, nav-style toggle, agent spawn / reap).
     hitboxes.clear();
+    pane_hitbox.clear();
     let area = frame.area();
     // Pre-resolve the dismiss-chord label *here*, in the orchestration
     // layer that owns the bindings. The renderer (and its pane helpers)
@@ -1910,6 +2231,8 @@ fn render_frame(
                 phase,
                 chrome,
                 hitboxes,
+                pane_hitbox,
+                selection,
             );
         }
         NavStyle::Popup => {
@@ -1925,6 +2248,8 @@ fn render_frame(
                 phase,
                 chrome,
                 hitboxes,
+                pane_hitbox,
+                selection,
             );
         }
     }
@@ -1974,11 +2299,20 @@ fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail, chrome: &
 /// `SIGWINCH` on every scroll-mode entry/exit, and Claude redrawing
 /// its UI on each transition would be much worse UX than the badge
 /// covering ~22 cells of (usually empty) Claude border. See AD-25.
-fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent, dismiss_label: &str) {
+fn render_agent_pane(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agent: &RuntimeAgent,
+    dismiss_label: &str,
+    pane_hitbox: &mut PaneHitbox,
+    selection: Option<&Selection>,
+) {
     match &agent.state {
         AgentState::Ready { parser, .. } => {
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
+            pane_hitbox.record(area, agent.id.clone());
+            paint_selection_if_active(frame, area, &agent.id, selection);
             let offset = parser.screen().scrollback();
             if offset > 0 {
                 render_scroll_indicator(frame, area, offset);
@@ -1991,6 +2325,8 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent, di
             // frozen.
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
+            pane_hitbox.record(area, agent.id.clone());
+            paint_selection_if_active(frame, area, &agent.id, selection);
             let offset = parser.screen().scrollback();
             if offset > 0 {
                 render_scroll_indicator(frame, area, offset);
@@ -1998,8 +2334,45 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent, di
             render_crash_banner(frame, area, *exit_code, dismiss_label);
         }
         AgentState::Failed { error } => {
+            // No pane hitbox for Failed agents — there is no live PTY
+            // surface to select text from, just an error message.
             let host = agent.host.as_deref().unwrap_or("");
             render_failure_pane(frame, area, host, &error.user_message());
+        }
+    }
+}
+
+/// If `selection` belongs to the agent currently being painted, flip
+/// the `REVERSED` modifier on every cell in the normalized selection
+/// rectangle. Additive on the cell's existing modifier set so bold /
+/// italic / underline / colors pass through unchanged.
+///
+/// Out-of-bounds cells (clipped by a renderer that drew over part of
+/// the area, or coordinates that drifted out during a resize race)
+/// are dropped silently — `Buffer::cell_mut` returns `None` and the
+/// inner branch becomes a no-op.
+fn paint_selection_if_active(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agent_id: &AgentId,
+    selection: Option<&Selection>,
+) {
+    let Some(sel) = selection else {
+        return;
+    };
+    if &sel.agent != agent_id {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let (start, end) = normalized_range(sel.anchor, sel.head);
+    for row in start.row..=end.row {
+        let (col_lo, col_hi) = row_bounds(start, end, row, area.width);
+        for col in col_lo..col_hi {
+            let x = area.x.saturating_add(col);
+            let y = area.y.saturating_add(row);
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.modifier.insert(Modifier::REVERSED);
+            }
         }
     }
 }
@@ -2146,6 +2519,8 @@ fn render_left_pane(
     phase: AnimationPhase,
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
+    pane_hitbox: &mut PaneHitbox,
+    selection: Option<&Selection>,
 ) {
     let [nav_area, pty_area] = Layout::default()
         .direction(Direction::Horizontal)
@@ -2194,7 +2569,14 @@ fn render_left_pane(
     }
 
     if let Some(agent) = agents.get(focused) {
-        render_agent_pane(frame, pty_area, agent, dismiss_label);
+        render_agent_pane(
+            frame,
+            pty_area,
+            agent,
+            dismiss_label,
+            pane_hitbox,
+            selection,
+        );
     }
 }
 
@@ -2211,6 +2593,8 @@ fn render_popup_style(
     phase: AnimationPhase,
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
+    pane_hitbox: &mut PaneHitbox,
+    selection: Option<&Selection>,
 ) {
     let [pty_area, status_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -2218,7 +2602,14 @@ fn render_popup_style(
         .areas(area);
 
     if let Some(agent) = agents.get(focused) {
-        render_agent_pane(frame, pty_area, agent, dismiss_label);
+        render_agent_pane(
+            frame,
+            pty_area,
+            agent,
+            dismiss_label,
+            pane_hitbox,
+            selection,
+        );
     }
 
     render_status_bar(
@@ -2858,12 +3249,16 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, bindings: &Bindings) {
         "click a tab to focus it (no prefix needed)",
     ));
     lines.push(binding_line_static(
-        "drag",
+        "drag tab",
         "drag a tab onto another to reorder (browser-tab semantics)",
     ));
     lines.push(binding_line_static(
+        "drag pane",
+        "select text in the agent pane; release copies via OSC 52",
+    ));
+    lines.push(binding_line_static(
         "alt+drag",
-        "select text for native copy/paste (mouse capture is on)",
+        "fallback to terminal-native selection (works without OSC 52)",
     ));
     lines.push(Line::raw(""));
     lines.push(Line::raw("press any key to close"));
@@ -5336,6 +5731,8 @@ mod tests {
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
+                    &mut PaneHitbox::default(),
+                    None,
                 );
             })
             .unwrap();
@@ -5371,6 +5768,8 @@ mod tests {
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
+                    &mut PaneHitbox::default(),
+                    None,
                 );
             })
             .unwrap();
@@ -5412,6 +5811,8 @@ mod tests {
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
+                    &mut PaneHitbox::default(),
+                    None,
                 );
             })
             .unwrap();
@@ -5460,6 +5861,8 @@ mod tests {
                     },
                     &agent,
                     "d",
+                    &mut PaneHitbox::default(),
+                    None,
                 );
             })
             .unwrap();
@@ -5492,6 +5895,8 @@ mod tests {
                     },
                     &agent,
                     "d",
+                    &mut PaneHitbox::default(),
+                    None,
                 );
             })
             .unwrap();
@@ -5520,6 +5925,8 @@ mod tests {
                     },
                     &agent,
                     "d",
+                    &mut PaneHitbox::default(),
+                    None,
                 );
             })
             .unwrap();
@@ -5556,6 +5963,8 @@ mod tests {
                     },
                     &agent,
                     "ctrl+x",
+                    &mut PaneHitbox::default(),
+                    None,
                 );
             })
             .unwrap();
@@ -5564,5 +5973,454 @@ mod tests {
             row.contains("ctrl+x to dismiss"),
             "banner must interpolate the supplied chord label, got: {row:?}",
         );
+    }
+
+    // ── selection (cell math + dispatch state machine) ────────────
+    //
+    // End-to-end clipboard delivery is verified manually — OSC 52
+    // lands on the user's host terminal, not on a `TestBackend`.
+
+    fn cell(row: u16, col: u16) -> CellPos {
+        CellPos { row, col }
+    }
+
+    #[test]
+    fn normalized_range_handles_inverted_drag() {
+        // Anchor below-and-right of head: must normalize so `start` is
+        // top-left and `end` is bottom-right, the order
+        // `vt100::Screen::contents_between` requires.
+        let (start, end) = normalized_range(cell(5, 12), cell(2, 3));
+        assert_eq!(start, cell(2, 3));
+        assert_eq!(end, cell(5, 12));
+    }
+
+    #[test]
+    fn normalized_range_preserves_already_ordered_drag() {
+        let (start, end) = normalized_range(cell(2, 3), cell(5, 12));
+        assert_eq!(start, cell(2, 3));
+        assert_eq!(end, cell(5, 12));
+    }
+
+    #[test]
+    fn row_bounds_single_row_selection_is_inclusive_at_both_ends() {
+        // Single-row drag from col 4 to col 9 must yield iter
+        // `4..10` so the cell at col 9 is included.
+        let (lo, hi) = row_bounds(cell(2, 4), cell(2, 9), 2, 80);
+        assert_eq!((lo, hi), (4, 10));
+    }
+
+    #[test]
+    fn row_bounds_top_row_of_multirow_runs_to_pane_edge() {
+        let (lo, hi) = row_bounds(cell(2, 4), cell(5, 9), 2, 80);
+        assert_eq!((lo, hi), (4, 80));
+    }
+
+    #[test]
+    fn row_bounds_middle_row_spans_full_pane_width() {
+        let (lo, hi) = row_bounds(cell(2, 4), cell(5, 9), 3, 80);
+        assert_eq!((lo, hi), (0, 80));
+    }
+
+    #[test]
+    fn row_bounds_bottom_row_runs_from_zero_to_end_col_inclusive() {
+        let (lo, hi) = row_bounds(cell(2, 4), cell(5, 9), 5, 80);
+        assert_eq!((lo, hi), (0, 10));
+    }
+
+    #[test]
+    fn row_bounds_single_row_clamps_end_col_to_pane_width() {
+        // Defensive: pane shrank between Drag and render, end.col is
+        // past the right edge. Must not produce a hi past pane_width.
+        let (lo, hi) = row_bounds(cell(2, 4), cell(2, 100), 2, 80);
+        assert_eq!((lo, hi), (4, 80));
+    }
+
+    #[test]
+    fn pane_hitbox_cell_at_translates_to_pane_relative() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        // Click at screen (30, 5) with pane origin (25, 0) → cell (5, 5).
+        let (id, c) = hb.cell_at(30, 5).unwrap();
+        assert_eq!(id, AgentId::new("a"));
+        assert_eq!(c, cell(5, 5));
+    }
+
+    #[test]
+    fn pane_hitbox_cell_at_returns_none_outside_pane() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        // Click in the nav strip (x < 25): not in the pane.
+        assert!(hb.cell_at(10, 5).is_none());
+    }
+
+    #[test]
+    fn pane_hitbox_clamped_cell_at_clamps_to_nearest_edge() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        // Drag continued past the right edge of the pane: head ends
+        // up clamped to pane_width - 1 (col 79 in pane-relative).
+        let c = hb.clamped_cell_at(200, 50).unwrap();
+        assert_eq!(c, cell(23, 79));
+        // Drag dragged off the left + above the pane: clamps to (0, 0).
+        let c = hb.clamped_cell_at(0, 0).unwrap();
+        assert_eq!(c, cell(0, 0));
+    }
+
+    #[test]
+    fn pane_hitbox_no_record_means_no_dispatch() {
+        let hb = PaneHitbox::default();
+        assert!(hb.cell_at(30, 5).is_none());
+        assert!(hb.clamped_cell_at(30, 5).is_none());
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_down_inside_pane_arms_selection() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let dispatch =
+            pane_mouse_dispatch(MouseEventKind::Down(MouseButton::Left), 30, 5, &hb, None);
+        assert_eq!(
+            dispatch,
+            Some(PaneMouseDispatch::Arm {
+                agent: AgentId::new("a"),
+                cell: cell(5, 5),
+            }),
+        );
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_down_outside_pane_returns_none() {
+        // Click in chrome (e.g. tab strip): pane dispatcher must
+        // return None so the loop falls through to tab_mouse_dispatch.
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let dispatch =
+            pane_mouse_dispatch(MouseEventKind::Down(MouseButton::Left), 10, 5, &hb, None);
+        assert_eq!(dispatch, None);
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_drag_extends_when_selection_active() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let sel = Selection {
+            agent: AgentId::new("a"),
+            anchor: cell(5, 5),
+            head: cell(5, 5),
+        };
+        let dispatch = pane_mouse_dispatch(
+            MouseEventKind::Drag(MouseButton::Left),
+            40,
+            10,
+            &hb,
+            Some(&sel),
+        );
+        assert_eq!(dispatch, Some(PaneMouseDispatch::Extend(cell(10, 15))));
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_drag_outside_pane_clamps() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let sel = Selection {
+            agent: AgentId::new("a"),
+            anchor: cell(5, 5),
+            head: cell(5, 5),
+        };
+        // Drag continued off the right edge: head clamps to pane edge
+        // so the user can release outside the pane and still get the
+        // selection they visibly drew.
+        let dispatch = pane_mouse_dispatch(
+            MouseEventKind::Drag(MouseButton::Left),
+            300,
+            5,
+            &hb,
+            Some(&sel),
+        );
+        assert_eq!(dispatch, Some(PaneMouseDispatch::Extend(cell(5, 79))));
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_drag_without_selection_is_none() {
+        // Stray drag with nothing armed (e.g. drag started in chrome,
+        // then crossed into the pane): pane dispatcher returns None
+        // so the loop falls through. tab_mouse_dispatch will also
+        // return None for Drag → harmless no-op.
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let dispatch =
+            pane_mouse_dispatch(MouseEventKind::Drag(MouseButton::Left), 30, 5, &hb, None);
+        assert_eq!(dispatch, None);
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_up_with_selection_commits() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let sel = Selection {
+            agent: AgentId::new("a"),
+            anchor: cell(5, 5),
+            head: cell(5, 9),
+        };
+        let dispatch = pane_mouse_dispatch(
+            MouseEventKind::Up(MouseButton::Left),
+            34,
+            5,
+            &hb,
+            Some(&sel),
+        );
+        assert_eq!(dispatch, Some(PaneMouseDispatch::Commit));
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_up_without_selection_is_none() {
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let dispatch = pane_mouse_dispatch(MouseEventKind::Up(MouseButton::Left), 30, 5, &hb, None);
+        assert_eq!(dispatch, None);
+    }
+
+    #[test]
+    fn pane_mouse_dispatch_right_button_is_none() {
+        // Right-click context menu is a deliberate v1 non-goal.
+        let mut hb = PaneHitbox::default();
+        hb.record(
+            Rect {
+                x: 25,
+                y: 0,
+                width: 80,
+                height: 24,
+            },
+            AgentId::new("a"),
+        );
+        let dispatch =
+            pane_mouse_dispatch(MouseEventKind::Down(MouseButton::Right), 30, 5, &hb, None);
+        assert_eq!(dispatch, None);
+    }
+
+    #[test]
+    fn write_clipboard_to_emits_osc_52_with_base64_payload() {
+        // Exact byte shape: ESC ] 5 2 ; c ; <base64> BEL.
+        // "hi" → "aGk=" in standard base64.
+        let mut buf: Vec<u8> = Vec::new();
+        write_clipboard_to(&mut buf, "hi").unwrap();
+        assert_eq!(buf, b"\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn write_clipboard_to_handles_empty_string_as_empty_payload() {
+        // Empty selection emits OSC 52 with an empty body, which most
+        // terminals treat as a clipboard clear. commit_selection guards
+        // against this by skipping the call when text is empty, but the
+        // helper itself is permissive — same as a Vec<u8> writer.
+        let mut buf: Vec<u8> = Vec::new();
+        write_clipboard_to(&mut buf, "").unwrap();
+        assert_eq!(buf, b"\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn write_clipboard_to_round_trips_multibyte_utf8() {
+        // Selection text may contain emoji / CJK / accents — base64
+        // operates on bytes, so any UTF-8 string round-trips. Just
+        // verify the call succeeds and the prefix/suffix are intact.
+        let mut buf: Vec<u8> = Vec::new();
+        write_clipboard_to(&mut buf, "olá 🦀").unwrap();
+        assert!(buf.starts_with(b"\x1b]52;c;"));
+        assert!(buf.ends_with(b"\x07"));
+    }
+
+    #[test]
+    fn vt100_contents_between_extracts_selection_substring() {
+        // End-to-end pin on the vt100 boundary: given a Parser with
+        // known content and a normalized cell range, contents_between
+        // must return the substring the selection covers — including
+        // the +1 offset on end_col that commit_selection applies to
+        // make the bound inclusive.
+        let mut parser = Parser::new(5, 20, 100);
+        parser.process(b"hello world\r\n");
+        let sel = Selection {
+            agent: AgentId::new("a"),
+            anchor: cell(0, 0),
+            head: cell(0, 4),
+        };
+        let (start, end) = normalized_range(sel.anchor, sel.head);
+        let text = parser.screen().contents_between(
+            start.row,
+            start.col,
+            end.row,
+            end.col.saturating_add(1),
+        );
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn vt100_contents_between_handles_multirow_selection() {
+        // Top row from start.col to width, full middle rows, bottom
+        // row 0 to end.col + 1.
+        let mut parser = Parser::new(5, 20, 100);
+        parser.process(b"row0 starts here\r\nrow1 fully covered\r\nrow2 ends here");
+        let sel = Selection {
+            agent: AgentId::new("a"),
+            anchor: cell(0, 5),
+            head: cell(2, 3),
+        };
+        let (start, end) = normalized_range(sel.anchor, sel.head);
+        let text = parser.screen().contents_between(
+            start.row,
+            start.col,
+            end.row,
+            end.col.saturating_add(1),
+        );
+        assert!(text.starts_with("starts here"));
+        assert!(text.contains("row1 fully covered"));
+        assert!(text.ends_with("row2"));
+    }
+
+    #[test]
+    fn paint_selection_if_active_flips_reversed_modifier_on_selected_cells() {
+        // TestBackend lets us inspect the rendered buffer cell-by-cell.
+        // A 1-row selection from col 2 to col 5 in a 0,0,10,3 area must
+        // leave only those four cells with the REVERSED modifier set.
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        };
+        let agent_id = AgentId::new("a");
+        let sel = Selection {
+            agent: agent_id.clone(),
+            anchor: cell(0, 2),
+            head: cell(0, 5),
+        };
+        terminal
+            .draw(|frame| {
+                paint_selection_if_active(frame, area, &agent_id, Some(&sel));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        for x in 0..10u16 {
+            let modifier = buf[(x, 0)].modifier;
+            let in_selection = (2..=5).contains(&x);
+            assert_eq!(
+                modifier.contains(Modifier::REVERSED),
+                in_selection,
+                "cell at x={x} expected_in_selection={in_selection}",
+            );
+        }
+    }
+
+    #[test]
+    fn paint_selection_if_active_skips_when_agent_id_does_not_match() {
+        // Selection bound to agent "a" must not paint over a frame
+        // being rendered for agent "b" — common case when the user
+        // switches tabs but the per-frame sync hasn't run yet.
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        };
+        let sel = Selection {
+            agent: AgentId::new("a"),
+            anchor: cell(0, 0),
+            head: cell(0, 9),
+        };
+        terminal
+            .draw(|frame| {
+                paint_selection_if_active(frame, area, &AgentId::new("b"), Some(&sel));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        for x in 0..10u16 {
+            assert!(
+                !buf[(x, 0)].modifier.contains(Modifier::REVERSED),
+                "no cell should be flipped when agent id does not match",
+            );
+        }
     }
 }

@@ -33,6 +33,11 @@ serde.workspace = true
 toml.workspace = true
 glob.workspace = true
 
+# Base64 — needed to encode the OSC 52 clipboard payload emitted on
+# selection-release. The hand-rolled alternative is ~30 lines, but
+# adds an unsafe nibble surface; the crate is ~5 KB compiled.
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile.workspace = true
 # `test-util` exposes `AgentTransport::for_test`, used by runtime unit
