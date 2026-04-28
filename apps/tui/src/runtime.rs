@@ -58,6 +58,7 @@ use crate::bootstrap_worker::{
     start_prepare,
 };
 use crate::config::Config;
+use crate::host_title;
 use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction, ScrollAction};
 use crate::log_tail::LogTail;
 use crate::pty_title::TitleCapture;
@@ -82,10 +83,21 @@ const WHEEL_STEP: i32 = 3;
 /// actual pane width when the user runs in a very narrow terminal.
 const SCROLL_INDICATOR_WIDTH: u16 = 24;
 
+// Each bool tracks an independent terminal capability we may have
+// failed to enable (so we can skip the matching disable on drop).
+// Modeling them as a state machine or pair of two-variant enums
+// would just be ceremony — they're four orthogonal flags.
+#[allow(clippy::struct_excessive_bools)]
 struct TerminalGuard {
     enhanced_keyboard: bool,
     mouse_captured: bool,
     bracketed_paste: bool,
+    /// Whether we attempted to push the host terminal's title via
+    /// `XTWINOPS 22 ; 0`. We always issue the matching pop on drop —
+    /// terminals that ignored the push also ignore the pop, so the
+    /// flag only exists so a future "skip on bad terminal" branch
+    /// has somewhere to live.
+    host_title_pushed: bool,
 }
 
 impl Drop for TerminalGuard {
@@ -110,6 +122,14 @@ impl Drop for TerminalGuard {
         }
         if self.enhanced_keyboard {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        // Pop the host terminal title before leaving the alt-screen so
+        // the user sees their original title back on the primary
+        // screen as soon as we exit. Done before raw-mode disable so
+        // the bytes flush through the same stdout the rest of the
+        // teardown uses.
+        if self.host_title_pushed {
+            let _ = host_title::pop_title(&mut io::stdout());
         }
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
@@ -1012,10 +1032,18 @@ pub fn run(
         tracing::debug!("Kitty Keyboard Protocol enabled (binding uses SUPER)");
     }
 
+    // Save the user's pre-codemux terminal title onto the emulator's
+    // internal stack so the matching pop in `TerminalGuard::drop`
+    // restores it. Tracked separately on the guard for symmetry with
+    // the other reverse-on-drop sequences. Any I/O failure here is
+    // benign: it just means we won't restore the title on exit.
+    let host_title_pushed = host_title::push_title(&mut io::stdout()).is_ok();
+
     let _guard = TerminalGuard {
         enhanced_keyboard,
         mouse_captured,
         bracketed_paste,
+        host_title_pushed,
     };
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -1443,6 +1471,13 @@ fn event_loop(
     // happens, so the wall-clock derivation is enough — no extra
     // wakeup machinery needed.
     let start = Instant::now();
+    // Last title we emitted to the surrounding terminal emulator via
+    // OSC 0. The render tick computes the desired title from the
+    // focused agent and only emits when it actually changed — so a
+    // working spinner ticking through Braille frames inside the agent
+    // (which the title parser strips out before storage) doesn't
+    // produce a per-frame escape stream.
+    let mut last_emitted_host_title: Option<String> = None;
 
     loop {
         // Drain prepare events first: the modal should reflect the
@@ -1642,6 +1677,24 @@ fn event_loop(
                 .is_none_or(|a| a.id != sel.agent)
         {
             selection = None;
+        }
+        // Push the focused agent's title out to the surrounding
+        // terminal so Ghostty / iTerm2 / Kitty can label its codemux
+        // tab with what's actually on screen. Debounced against the
+        // last-emitted value so steady-state ticks are silent and a
+        // working agent (whose title's spinner glyph is stripped by
+        // `TitleCapture::sanitize` before it reaches us here) doesn't
+        // generate per-frame OSC traffic. Done before `terminal.draw`
+        // so the OSC lands in the same byte stream as the next frame
+        // and there's no inter-buffer flush race.
+        let desired_host_title = host_terminal_title_for_focused(&nav);
+        if desired_host_title != last_emitted_host_title {
+            if let Some(title) = desired_host_title.as_deref()
+                && let Err(err) = host_title::write_set_title(&mut io::stdout(), title)
+            {
+                tracing::debug!(?err, "host terminal title write failed");
+            }
+            last_emitted_host_title = desired_host_title;
         }
         terminal
             .draw(|frame| {
@@ -3224,6 +3277,34 @@ fn body_text(title: Option<&str>, repo: Option<&str>, fallback: &str) -> String 
         (None, Some(title)) => title.to_string(),
         (None, None) => fallback.to_string(),
     }
+}
+
+/// Build the title we want the *outer* terminal emulator (Ghostty,
+/// iTerm2, Kitty, …) to display for its codemux tab. Format is
+/// `host \u{00b7} body` for SSH agents and just `body` for local.
+/// Mirrors the shape of [`agent_label_spans`] (same host prefix,
+/// same body) but drops the per-frame decoration (spinner glyph,
+/// attention dot, accent colors) since the host terminal can't
+/// render any of that in its tab bar anyway.
+///
+/// Pure on `(host, body)` so tests can exercise the local /
+/// SSH / no-host branches without standing up a `RuntimeAgent`.
+fn host_terminal_title(host: Option<&str>, body: &str) -> String {
+    match host {
+        Some(h) if !h.is_empty() => format!("{h} \u{00b7} {body}"),
+        _ => body.to_string(),
+    }
+}
+
+/// Resolve the focused agent's host + body text and compose the title
+/// to ship to the outer terminal. `None` when there are no agents
+/// (the runtime is about to exit and the title is irrelevant).
+fn host_terminal_title_for_focused(nav: &NavState) -> Option<String> {
+    let agent = nav.agents.get(nav.focused)?;
+    Some(host_terminal_title(
+        agent.host.as_deref(),
+        &agent_body_text(agent),
+    ))
 }
 
 fn render_switcher_popup(
@@ -5075,6 +5156,66 @@ mod tests {
     #[test]
     fn body_text_falls_back_to_label_when_neither() {
         assert_eq!(body_text(None, None, "fallback"), "fallback");
+    }
+
+    // ── host_terminal_title ──────────────────────────────────────
+    //
+    // The composer that produces what gets shipped to the outer
+    // terminal emulator's tab title. SSH agents get the host
+    // prefix; local agents (no host) get just the body. Empty
+    // host is treated as no host so a malformed config can't
+    // produce a leading " · " orphan.
+
+    #[test]
+    fn host_terminal_title_prefixes_host_when_remote() {
+        assert_eq!(
+            host_terminal_title(Some("dev01"), "codemux: Add tab names"),
+            "dev01 \u{00b7} codemux: Add tab names"
+        );
+    }
+
+    #[test]
+    fn host_terminal_title_omits_prefix_when_local() {
+        assert_eq!(
+            host_terminal_title(None, "codemux: Add tab names"),
+            "codemux: Add tab names"
+        );
+    }
+
+    #[test]
+    fn host_terminal_title_treats_empty_host_as_no_host() {
+        // Defensive: a malformed config / empty hostname must not
+        // emit a leading " · " orphan that looks like a render bug
+        // in the user's terminal tab bar.
+        assert_eq!(host_terminal_title(Some(""), "body"), "body");
+    }
+
+    #[test]
+    fn host_terminal_title_for_focused_returns_none_when_no_agents() {
+        // Runtime is about to exit; no focused agent means nothing to
+        // ship to the host terminal title bar.
+        let nav = NavState::new(vec![]);
+        assert!(host_terminal_title_for_focused(&nav).is_none());
+    }
+
+    #[test]
+    fn host_terminal_title_for_focused_uses_focused_agent_with_host() {
+        let agents = vec![
+            failed_agent_with("a", Some("repo-a"), Some("hostA")),
+            failed_agent_with("b", Some("repo-b"), Some("hostB")),
+        ];
+        let mut nav = NavState::new(agents);
+        nav.focused = 1;
+        let title = host_terminal_title_for_focused(&nav);
+        assert_eq!(title.as_deref(), Some("hostB \u{00b7} repo-b"));
+    }
+
+    #[test]
+    fn host_terminal_title_for_focused_omits_host_for_local_agent() {
+        let agents = vec![failed_agent_with("a", Some("repo-a"), None)];
+        let nav = NavState::new(agents);
+        let title = host_terminal_title_for_focused(&nav);
+        assert_eq!(title.as_deref(), Some("repo-a"));
     }
 
     // ── flag_finished_unfocused ──────────────────────────────────
