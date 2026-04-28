@@ -147,6 +147,171 @@ enum PopupState {
     },
 }
 
+/// Bundle of runtime navigation state that always travels together:
+/// the agent vector, the focused index into it, the bounce slot for
+/// `<prefix> Tab`, and the agent-switcher popup state.
+///
+/// Pre-`NavState` these were four separate `let mut` locals in
+/// [`event_loop`]. Operations like `dismiss_focused` had to take
+/// four parallel `&mut` references — flagged in architecture review
+/// as a data clump / anaemic-domain-model smell. Bundling them into
+/// a single struct lets the mutation invariants (clamp `focused`
+/// after a remove, clear stale `previous_focused`, clamp the popup
+/// selection) live as `&mut self` methods on one boundary.
+///
+/// Field-public is intentional: the central event loop reads each
+/// field directly in dozens of places and a getter wall would only
+/// add noise. The methods below own the *non-trivial* invariants
+/// that affect more than one field at once.
+struct NavState {
+    agents: Vec<RuntimeAgent>,
+    /// Index into `agents` for the focused tab. Always valid as long
+    /// as `agents` is non-empty; methods that shrink the Vec are
+    /// responsible for clamping.
+    focused: usize,
+    /// Last agent the user was focused on, before the most recent
+    /// switch. Lets `<prefix> Tab` (`FocusLast`) bounce between two
+    /// agents — the canonical alt-tab move when juggling a couple of
+    /// workspaces. `None` until the first switch happens; cleared if
+    /// the agent it points to is reaped (so the bounce never lands
+    /// on a stale slot).
+    previous_focused: Option<usize>,
+    /// Switcher overlay state.
+    popup_state: PopupState,
+}
+
+impl NavState {
+    /// Build a fresh state from an initial agent vector. The first
+    /// agent (index 0) is focused.
+    #[must_use]
+    fn new(agents: Vec<RuntimeAgent>) -> Self {
+        Self {
+            agents,
+            focused: 0,
+            previous_focused: None,
+            popup_state: PopupState::default(),
+        }
+    }
+
+    /// Walk the agent list and transition any `Ready` agent whose
+    /// transport has died into [`AgentState::Crashed`] in-place.
+    ///
+    /// We deliberately do NOT shrink the `Vec`: silent removal was
+    /// the prior behavior and made the TUI feel buggy ("did I do
+    /// that? did it crash?"). Keeping the slot lets the renderer
+    /// paint the last frame plus a crash banner so the user knows
+    /// what happened and can dismiss with `<prefix> d`.
+    ///
+    /// Called once per tick after the read loop so the parser has
+    /// already absorbed any final bytes the dying child wrote
+    /// before EOF.
+    fn reap_dead_transports(&mut self) {
+        for agent in &mut self.agents {
+            let exit_code = match &mut agent.state {
+                AgentState::Ready { transport, .. } => transport.try_wait(),
+                _ => None,
+            };
+            if let Some(code) = exit_code {
+                agent.mark_crashed(code);
+            }
+        }
+    }
+
+    /// Detect working→idle transitions on unfocused agents and flag
+    /// them for the slow-blink attention cue. Called once per tick
+    /// after the PTY drain so the title parser sees the freshest
+    /// state. The currently-focused agent is skipped — the user is
+    /// already looking; nothing to alert about — and any agent
+    /// caught in this window has its blink cleared on the next focus
+    /// change via [`Self::change_focus`].
+    fn flag_finished_unfocused(&mut self) {
+        for (i, agent) in self.agents.iter_mut().enumerate() {
+            let cur = agent.is_working();
+            if agent.last_working && !cur && i != self.focused {
+                agent.needs_attention = true;
+            }
+            agent.last_working = cur;
+        }
+    }
+
+    /// Move focus to `new`, recording the prior focus index for
+    /// `<prefix> Tab` (alt-tab) bouncing. No-op if focus is already
+    /// on `new` — that keeps a double-tap of the same direct-bind
+    /// from clobbering the bounce slot. Centralized here so the six
+    /// focus-mutation sites in the event loop don't each open-code
+    /// the bounce-slot bookkeeping.
+    ///
+    /// Also clears [`RuntimeAgent::needs_attention`] on the newly-
+    /// focused agent so the slow-blink dismisses the moment the user
+    /// actually looks at it.
+    ///
+    /// Bounds are the caller's responsibility — every event-loop site
+    /// already checks `new < agents.len()` (`FocusNext`/`FocusPrev` wrap
+    /// via modulo, `FocusAt` and the spawn handler check explicitly,
+    /// the popup confirm clamps via `selection.min(agents.len()-1)`).
+    /// Adding a defensive bounds check here would also reject the
+    /// semantic test cases that exercise the bookkeeping with an
+    /// empty agent vec.
+    fn change_focus(&mut self, new: usize) {
+        if new == self.focused {
+            return;
+        }
+        self.previous_focused = Some(self.focused);
+        self.focused = new;
+        if let Some(a) = self.agents.get_mut(new) {
+            a.needs_attention = false;
+        }
+    }
+
+    /// Remove the focused agent if it's in a terminal state
+    /// (`Failed` or `Crashed`) and clamp the surrounding navigation
+    /// state. No-op on a `Ready` agent so a fat-finger of
+    /// `<prefix> d` can't close a live session.
+    ///
+    /// Returns `true` when an agent was actually removed, so the
+    /// caller can react if needed.
+    ///
+    /// Mutates four pieces of state in concert:
+    /// - `agents` — dismissed entry removed via `Vec::remove` to
+    ///   preserve tab order. `swap_remove` would be O(1) but would
+    ///   silently reshuffle tabs, which reads as a bug.
+    /// - `focused` — clamped down to a valid index when the
+    ///   dismissed agent was the last in the Vec.
+    /// - `previous_focused` — cleared if it now points past the end
+    ///   or onto the same slot as `focused`.
+    /// - `popup_state` — selection clamped to the new last index
+    ///   when the dismiss shrank the addressable range.
+    fn dismiss_focused(&mut self) -> bool {
+        let is_dismissable = self.agents.get(self.focused).is_some_and(|a| {
+            matches!(
+                a.state,
+                AgentState::Failed { .. } | AgentState::Crashed { .. }
+            )
+        });
+        if !is_dismissable {
+            return false;
+        }
+        self.agents.remove(self.focused);
+        if !self.agents.is_empty() {
+            self.focused = self.focused.min(self.agents.len() - 1);
+        }
+        if let Some(prev) = self.previous_focused
+            && (prev >= self.agents.len() || prev == self.focused)
+        {
+            self.previous_focused = None;
+        }
+        if let PopupState::Open { selection } = self.popup_state
+            && !self.agents.is_empty()
+            && selection >= self.agents.len()
+        {
+            self.popup_state = PopupState::Open {
+                selection: self.agents.len() - 1,
+            };
+        }
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum HelpState {
     #[default]
@@ -229,6 +394,7 @@ enum KeyDispatch {
     ToggleNav,
     OpenPopup,
     OpenHelp,
+    DismissAgent,
 }
 
 struct RuntimeAgent {
@@ -282,19 +448,26 @@ struct RuntimeAgent {
     state: AgentState,
 }
 
-/// Per-agent state. `Ready` is the steady state for both local and
-/// SSH transports once they have an [`AgentTransport`] and a
-/// renderable [`Parser`]. `Failed` captures an SSH bootstrap that
-/// completed with an error after the spawn modal closed; the dead
-/// worker handle has already been dropped so the variant only carries
-/// the data the renderer needs.
+/// Per-agent state. The lifecycle has two terminal states reached
+/// from different entry points:
+///
+/// - `(spawn modal) → Ready → Crashed → (dismissed)` when a previously
+///   live agent's transport dies (local claude exit, SSH tunnel drop,
+///   remote daemon death). The parser is preserved so the user can
+///   read what was on screen at the moment of death.
+/// - `(spawn modal) → Failed → (dismissed)` when the SSH bootstrap
+///   itself errors out before there's ever a live transport.
+///
+/// Both terminal states share the same `<prefix> d` dismiss UX. The
+/// runtime never auto-reaps a Crashed or Failed agent — silence on
+/// crash was the prior behavior and made the TUI feel buggy ("did I
+/// do that?"); the user now decides when to close the tab.
 ///
 /// In-flight SSH bootstraps live in the spawn modal (see
 /// [`crate::spawn::SpawnMinibuffer::lock_for_bootstrap`]) rather than
 /// in this enum: the user picks a remote folder *between* prepare and
 /// attach, so the in-flight phase has UX that doesn't fit a per-agent
-/// pane. A `Failed` agent stays `Failed` until the user exits the TUI
-/// (no per-agent dismiss key yet — future P2 lifecycle work).
+/// pane.
 enum AgentState {
     /// Bootstrap returned an error. The dead handle has already been
     /// dropped; the variant carries the structured
@@ -319,6 +492,22 @@ enum AgentState {
         /// renderer.
         parser: Box<Parser<TitleCapture>>,
         transport: AgentTransport,
+    },
+    /// Transport died after the agent had been `Ready`. The parser
+    /// is preserved (boxed for the same reason as in `Ready`) so the
+    /// renderer can still draw the last screen content under the
+    /// crash banner — that's usually the most useful diagnostic for
+    /// the user. `exit_code` distinguishes:
+    ///
+    /// - `0` — clean exit (e.g. user typed `/quit` in claude)
+    /// - `> 0` — non-zero process exit
+    /// - `-1` — `SshDaemonPty` sentinel for socket-level failures
+    ///   (tunnel drop, daemon death, framed-reader I/O error)
+    ///
+    /// The renderer chooses banner color and copy from this code.
+    Crashed {
+        parser: Box<Parser<TitleCapture>>,
+        exit_code: i32,
     },
 }
 
@@ -384,10 +573,15 @@ impl RuntimeAgent {
 
     /// Current scrollback offset (`0` = live view). Returns `0` for a
     /// `Failed` agent so callers can check "is this agent in scroll
-    /// mode" without matching on the state.
+    /// mode" without matching on the state. `Crashed` agents keep
+    /// their parser, so scrollback is meaningful even though the
+    /// transport is gone — the user can still page back through what
+    /// claude was doing pre-crash.
     fn scrollback_offset(&self) -> usize {
         match &self.state {
-            AgentState::Ready { parser, .. } => parser.screen().scrollback(),
+            AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
+                parser.screen().scrollback()
+            }
             AgentState::Failed { .. } => 0,
         }
     }
@@ -396,9 +590,12 @@ impl RuntimeAgent {
     /// into history, negative toward the live view). Saturates at zero
     /// on the bottom; `vt100::Screen::set_scrollback` clamps the top to
     /// the buffer length, so we don't need to know the cap. No-op for
-    /// `Failed` agents — they have no parser.
+    /// `Failed` agents — they have no parser. `Crashed` agents do
+    /// have one, so they scroll normally.
     fn nudge_scrollback(&mut self, delta: i32) {
-        if let AgentState::Ready { parser, .. } = &mut self.state {
+        if let AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } =
+            &mut self.state
+        {
             let screen = parser.screen_mut();
             let next = screen.scrollback().saturating_add_signed(delta as isize);
             screen.set_scrollback(next);
@@ -407,9 +604,13 @@ impl RuntimeAgent {
 
     /// Snap back to the live view (offset = 0). Used by the
     /// `ScrollAction::ExitScroll` path and by the non-sticky "any
-    /// forwarded keystroke snaps" rule.
+    /// forwarded keystroke snaps" rule. Crashed agents have no live
+    /// view per se but the same call resets scrollback to the bottom
+    /// so the crash banner and last frame are aligned.
     fn snap_to_live(&mut self) {
-        if let AgentState::Ready { parser, .. } = &mut self.state {
+        if let AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } =
+            &mut self.state
+        {
             parser.screen_mut().set_scrollback(0);
         }
     }
@@ -419,28 +620,72 @@ impl RuntimeAgent {
     /// top regardless of the configured `scrollback_len` — no need to
     /// thread the cap through.
     fn jump_to_top(&mut self) {
-        if let AgentState::Ready { parser, .. } = &mut self.state {
+        if let AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } =
+            &mut self.state
+        {
             parser.screen_mut().set_scrollback(usize::MAX);
         }
     }
 
     /// Live OSC title from the agent's parser, if any. `None` for
-    /// `Failed` agents and for `Ready` agents whose foreground
-    /// process hasn't emitted a title yet.
+    /// `Failed` agents (no parser) and for agents whose foreground
+    /// process never emitted a title. Crashed agents keep returning
+    /// their last title — the renderer dims/strikes-through the tab
+    /// label separately based on state.
     fn title(&self) -> Option<&str> {
         match &self.state {
-            AgentState::Ready { parser, .. } => parser.callbacks().title(),
+            AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
+                parser.callbacks().title()
+            }
             AgentState::Failed { .. } => None,
         }
     }
 
     /// Whether the foreground process is currently in a working
-    /// state per its OSC title. `false` for `Failed` agents and for
-    /// `Ready` agents whose title doesn't carry a status glyph.
+    /// state per its OSC title. `false` for `Failed` and `Crashed`
+    /// agents — Crashed has no foreground process anymore, regardless
+    /// of what the title was at the moment of death — and `false`
+    /// for Ready agents whose title doesn't carry a status glyph.
     fn is_working(&self) -> bool {
         match &self.state {
             AgentState::Ready { parser, .. } => parser.callbacks().is_working(),
-            AgentState::Failed { .. } => false,
+            AgentState::Failed { .. } | AgentState::Crashed { .. } => false,
+        }
+    }
+
+    /// Transition `Ready → Crashed` in-place, preserving the parser
+    /// so the renderer can still draw the last screen. No-op for
+    /// agents already in a terminal state.
+    ///
+    /// Implementation note: `parser` lives inside the `Ready`
+    /// variant, so we can't move it out behind a `&mut self`
+    /// borrow without first swapping the state. We `mem::replace`
+    /// with a placeholder `Crashed` carrying a tiny throwaway
+    /// parser at the agent's current geometry, then immediately
+    /// overwrite once we own the prior `Ready`. The placeholder
+    /// allocation is paid once per crash event — invisible against
+    /// the per-frame parser/render work.
+    fn mark_crashed(&mut self, exit_code: i32) {
+        let placeholder = AgentState::Crashed {
+            parser: Box::new(Parser::new_with_callbacks(
+                self.rows.max(1),
+                self.cols.max(1),
+                0,
+                TitleCapture::default(),
+            )),
+            exit_code,
+        };
+        let prior = std::mem::replace(&mut self.state, placeholder);
+        match prior {
+            AgentState::Ready { parser, .. } => {
+                self.state = AgentState::Crashed { parser, exit_code };
+            }
+            other => {
+                // Already terminal — restore. The placeholder we
+                // installed above gets dropped here, costing only the
+                // throwaway parser allocation.
+                self.state = other;
+            }
         }
     }
 }
@@ -643,14 +888,23 @@ fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
         // current terminal dimensions.
         a.rows = rows;
         a.cols = cols;
-        if let AgentState::Ready { parser, transport } = &mut a.state {
-            // PTY resize is best-effort: failure here means the child
-            // sees a stale size until next resize, which is a harmless
-            // cosmetic glitch (claude re-lays-out on the next paint
-            // cycle). Surfacing as an error would force callers to
-            // handle a non-actionable failure.
-            let _ = transport.resize(rows, cols);
-            parser.screen_mut().set_size(rows, cols);
+        match &mut a.state {
+            AgentState::Ready { parser, transport } => {
+                // PTY resize is best-effort: failure here means the child
+                // sees a stale size until next resize, which is a harmless
+                // cosmetic glitch (claude re-lays-out on the next paint
+                // cycle). Surfacing as an error would force callers to
+                // handle a non-actionable failure.
+                let _ = transport.resize(rows, cols);
+                parser.screen_mut().set_size(rows, cols);
+            }
+            AgentState::Crashed { parser, .. } => {
+                // No transport to notify, but the parser screen still
+                // needs to track the pane size so the last frame draws
+                // correctly under the crash banner after a window resize.
+                parser.screen_mut().set_size(rows, cols);
+            }
+            AgentState::Failed { .. } => {}
         }
     }
 }
@@ -667,33 +921,6 @@ fn cancel_modal_owned_attach(attaches: &mut Vec<PendingAttach>) {
     // `swap_remove` is fine: we don't care about ordering, just that
     // the slot is gone and its `Drop` (cancels the worker) fires.
     attaches.swap_remove(idx);
-}
-
-/// Move focus to `new`, remembering the previous index for `FocusLast`
-/// Move focus to `new`, recording the prior focus index for `prefix + Tab`
-/// (alt-tab) bouncing. No-op if the focus is already on `new` — that
-/// keeps a double-tap of the same direct-bind from clobbering the
-/// bounce slot. Centralized helper because the event loop has six
-/// focus-mutation sites and open-coding the `previous` update at each
-/// would be the obvious bug source.
-///
-/// Also clears [`RuntimeAgent::needs_attention`] on the newly-focused
-/// agent so the slow-blink dismisses the moment the user actually
-/// looks at it. Done here rather than at each call site for the same
-/// reason as the bounce-slot bookkeeping: one place to reason about.
-fn change_focus(
-    agents: &mut [RuntimeAgent],
-    focused: &mut usize,
-    previous: &mut Option<usize>,
-    new: usize,
-) {
-    if new != *focused {
-        *previous = Some(*focused);
-        *focused = new;
-        if let Some(a) = agents.get_mut(new) {
-            a.needs_attention = false;
-        }
-    }
 }
 
 /// Move the agent at `from` to position `to`, sliding the agents in
@@ -806,22 +1033,6 @@ fn tab_mouse_dispatch(
     }
 }
 
-/// Detect working→idle transitions on unfocused agents and flag them for
-/// the slow-blink attention cue. Called once per tick after the PTY drain
-/// so the title parser sees the freshest state. Focused agents are skipped
-/// — the user is already looking; nothing to alert about — and any agent
-/// caught in this window has its blink cleared on the next focus change
-/// via [`change_focus`].
-fn flag_finished_unfocused(agents: &mut [RuntimeAgent], focused: usize) {
-    for (i, agent) in agents.iter_mut().enumerate() {
-        let cur = agent.is_working();
-        if agent.last_working && !cur && i != focused {
-            agent.needs_attention = true;
-        }
-        agent.last_working = cur;
-    }
-}
-
 /// True when no overlay is open: spawn modal closed, agent-switcher
 /// popup closed, help screen closed. Mouse-wheel events that should
 /// scroll the focused agent are gated on this — wheel-while-popup-up
@@ -839,7 +1050,7 @@ fn no_overlay_active(
 
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mut agents: Vec<RuntimeAgent>,
+    agents: Vec<RuntimeAgent>,
     mut nav_style: NavStyle,
     bindings: &Bindings,
     log_tail: Option<&LogTail>,
@@ -853,7 +1064,6 @@ fn event_loop(
     // through the helper and gain little.
     #![allow(clippy::too_many_lines, clippy::too_many_arguments)]
     let mut prefix_state = PrefixState::default();
-    let mut popup_state = PopupState::default();
     let mut help_state = HelpState::default();
     let mut spawn_ui: Option<SpawnMinibuffer> = None;
     // In-flight SSH bootstrap state. The modal owns the per-stage UX
@@ -864,14 +1074,15 @@ fn event_loop(
     // lifecycle.
     let mut prepare: Option<PendingPrepare> = None;
     let mut attaches: Vec<PendingAttach> = Vec::new();
-    let mut focused: usize = 0;
-    // Last agent the user was focused on, before the most recent
-    // switch. Lets `prefix + Tab` (`FocusLast`) bounce between two
-    // agents — the canonical alt-tab move when juggling a couple of
-    // workspaces. `None` until the first switch happens; cleared if
-    // the agent it points to is reaped (the user explicitly quit it
-    // or the transport died) so the bounce never lands on a stale slot.
-    let mut previous_focused: Option<usize> = None;
+    let initial_count = agents.len();
+    // Bundle the four navigation locals (`agents`, `focused`,
+    // `previous_focused`, `popup_state`) into a single owned struct.
+    // Pre-`NavState` they were four separate `let mut` locals here
+    // and the helpers (`dismiss_focused`, `change_focus`, etc.) had
+    // to take a parallel cluster of `&mut` refs — flagged in
+    // architecture review as a data clump. The methods now own their
+    // mutation invariants behind `&mut self`.
+    let mut nav = NavState::new(agents);
     // Per-frame click hitboxes for the tab strip / nav rows. Populated
     // by the leaf renderers, consumed by the mouse handler. Cleared at
     // the top of every `render_frame` so a stale frame's geometry can
@@ -882,7 +1093,7 @@ fn event_loop(
     // Down and Up still resolves to the same agent (or returns `None`
     // and the gesture cancels gracefully).
     let mut mouse_press: Option<AgentId> = None;
-    let mut spawn_counter: usize = agents.len();
+    let mut spawn_counter: usize = initial_count;
     // Captured once at loop entry so per-tab spinner / blink phases
     // are derived from a stable monotonic origin. The 50 ms event
     // poll below already redraws on each tick when nothing else
@@ -960,7 +1171,7 @@ fn event_loop(
 
         // Drain attach events. Each pending attach has its own
         // handle; we batch the ready set, apply transitions outside
-        // the loop so we can mutate `agents`, `attaches`, and
+        // the loop so we can mutate `nav.agents`, `attaches`, and
         // `spawn_ui` without borrow conflicts.
         let mut finished_attaches: Vec<usize> = Vec::new();
         let mut new_agents: Vec<RuntimeAgent> = Vec::new();
@@ -1039,51 +1250,51 @@ fn event_loop(
             }
         }
         let new_count = new_agents.len();
-        agents.extend(new_agents);
+        nav.agents.extend(new_agents);
         if focus_new && new_count > 0 {
-            let target = agents.len() - 1;
-            change_focus(&mut agents, &mut focused, &mut previous_focused, target);
+            let target = nav.agents.len() - 1;
+            nav.change_focus(target);
         }
 
-        for agent in &mut agents {
+        for agent in &mut nav.agents {
             match &mut agent.state {
                 AgentState::Ready { parser, transport } => {
                     for bytes in transport.try_read() {
                         parser.process(&bytes);
                     }
                 }
-                AgentState::Failed { .. } => {}
+                // No transport on Failed/Crashed — nothing to drain.
+                // The Crashed parser still holds the last frame, so the
+                // renderer keeps drawing it; we just don't feed it any
+                // new bytes.
+                AgentState::Failed { .. } | AgentState::Crashed { .. } => {}
             }
         }
 
-        flag_finished_unfocused(&mut agents, focused);
+        nav.flag_finished_unfocused();
 
-        agents.retain_mut(|agent| match &mut agent.state {
-            AgentState::Ready { transport, .. } => transport.try_wait().is_none(),
-            // Failed agents are kept until the user exits — there's no
-            // per-agent dismiss key yet, so auto-reaping a Failed agent
-            // would erase the only place the user sees the error
-            // message. Future P2 work (agent lifecycle keys) can
-            // revisit.
-            AgentState::Failed { .. } => true,
-        });
-        if agents.is_empty() {
+        nav.reap_dead_transports();
+        if nav.agents.is_empty() {
+            // Defensive: with the auto-transition above we never
+            // shrink the Vec here, but the dismiss handler does. If
+            // the user dismissed the last tab on the prior frame this
+            // is the clean exit path.
             return Ok(());
         }
-        focused = focused.min(agents.len() - 1);
+        nav.focused = nav.focused.min(nav.agents.len() - 1);
         // Clear the bounce slot if the agent it pointed to was just
         // reaped — landing alt-tab on a stale index would silently
         // jump to whatever filled that slot, which is worse than no-op.
-        if let Some(prev) = previous_focused
-            && (prev >= agents.len() || prev == focused)
+        if let Some(prev) = nav.previous_focused
+            && (prev >= nav.agents.len() || prev == nav.focused)
         {
-            previous_focused = None;
+            nav.previous_focused = None;
         }
-        if let PopupState::Open { selection } = popup_state
-            && selection >= agents.len()
+        if let PopupState::Open { selection } = nav.popup_state
+            && selection >= nav.agents.len()
         {
-            popup_state = PopupState::Open {
-                selection: agents.len() - 1,
+            nav.popup_state = PopupState::Open {
+                selection: nav.agents.len() - 1,
             };
         }
 
@@ -1092,10 +1303,10 @@ fn event_loop(
             .draw(|frame| {
                 render_frame(
                     frame,
-                    &agents,
-                    focused,
+                    &nav.agents,
+                    nav.focused,
                     nav_style,
-                    popup_state,
+                    nav.popup_state,
                     help_state,
                     spawn_ui.as_ref(),
                     bindings,
@@ -1200,14 +1411,9 @@ fn event_loop(
                                     scrollback_len,
                                 ) {
                                     Ok(agent) => {
-                                        agents.push(agent);
-                                        let target = agents.len() - 1;
-                                        change_focus(
-                                            &mut agents,
-                                            &mut focused,
-                                            &mut previous_focused,
-                                            target,
-                                        );
+                                        nav.agents.push(agent);
+                                        let target = nav.agents.len() - 1;
+                                        nav.change_focus(target);
                                     }
                                     Err(e) => {
                                         tracing::error!("spawn failed: {e}");
@@ -1302,39 +1508,34 @@ fn event_loop(
                     continue;
                 }
 
-                if let PopupState::Open { selection } = popup_state {
+                if let PopupState::Open { selection } = nav.popup_state {
                     if let Some(action) = bindings.on_popup.lookup(&key) {
                         match action {
                             PopupAction::Next => {
-                                let next = (selection + 1) % agents.len();
-                                popup_state = PopupState::Open { selection: next };
+                                let next = (selection + 1) % nav.agents.len();
+                                nav.popup_state = PopupState::Open { selection: next };
                             }
                             PopupAction::Prev => {
                                 let prev = if selection == 0 {
-                                    agents.len() - 1
+                                    nav.agents.len() - 1
                                 } else {
                                     selection - 1
                                 };
-                                popup_state = PopupState::Open { selection: prev };
+                                nav.popup_state = PopupState::Open { selection: prev };
                             }
                             PopupAction::Confirm => {
-                                change_focus(
-                                    &mut agents,
-                                    &mut focused,
-                                    &mut previous_focused,
-                                    selection,
-                                );
-                                popup_state = PopupState::Closed;
+                                nav.change_focus(selection);
+                                nav.popup_state = PopupState::Closed;
                             }
                             PopupAction::Cancel => {
-                                popup_state = PopupState::Closed;
+                                nav.popup_state = PopupState::Closed;
                             }
                         }
                     }
                     continue;
                 }
 
-                // Scroll mode: when the focused agent's PTY parser is
+                // Scroll mode: when the nav.focused agent's PTY parser is
                 // showing scrollback (offset > 0), arrow keys / PgUp /
                 // PgDn / g / G / Esc drive the scroll instead of being
                 // forwarded to Claude. We do NOT snap-to-live here for
@@ -1350,7 +1551,7 @@ fn event_loop(
                 // down to the bottom is the other common exit; once
                 // `scrollback() == 0` the whole branch is a no-op and
                 // arrow keys flow through normally.
-                if let Some(focused_agent) = agents.get_mut(focused)
+                if let Some(focused_agent) = nav.agents.get_mut(nav.focused)
                     && focused_agent.scrollback_offset() > 0
                     && let Some(action) = bindings.on_scroll.lookup(&key)
                 {
@@ -1378,18 +1579,20 @@ fn event_loop(
                         // per-agent offset so `Cmd-B 2` to switch tabs
                         // doesn't reset scroll on the agent you just
                         // left.
-                        if let Some(a) = agents.get_mut(focused) {
+                        if let Some(a) = nav.agents.get_mut(nav.focused) {
                             a.snap_to_live();
                             match &mut a.state {
                                 AgentState::Ready { transport, .. } => {
                                     transport.write(&bytes).wrap_err("write to pty")?;
                                 }
-                                // Drop the bytes — a Failed pane can't
-                                // accept input. tracing::trace because
-                                // this is high-volume during typing if
-                                // the user mistakes a placeholder pane
-                                // for a live one.
-                                AgentState::Failed { .. } => {
+                                // Drop the bytes — a Failed or Crashed
+                                // pane has no transport. tracing::trace
+                                // because this is high-volume during
+                                // typing if the user mistakes a dead
+                                // pane for a live one. The crash banner
+                                // tells them to dismiss with `<prefix>
+                                // d` rather than type into the corpse.
+                                AgentState::Failed { .. } | AgentState::Crashed { .. } => {
                                     tracing::trace!(
                                         label = %a.label,
                                         n = bytes.len(),
@@ -1405,31 +1608,31 @@ fn event_loop(
                         spawn_ui = Some(SpawnMinibuffer::open(initial_cwd));
                     }
                     KeyDispatch::FocusNext => {
-                        let next = (focused + 1) % agents.len();
-                        change_focus(&mut agents, &mut focused, &mut previous_focused, next);
+                        let next = (nav.focused + 1) % nav.agents.len();
+                        nav.change_focus(next);
                     }
                     KeyDispatch::FocusPrev => {
-                        let prev = if focused == 0 {
-                            agents.len() - 1
+                        let prev = if nav.focused == 0 {
+                            nav.agents.len() - 1
                         } else {
-                            focused - 1
+                            nav.focused - 1
                         };
-                        change_focus(&mut agents, &mut focused, &mut previous_focused, prev);
+                        nav.change_focus(prev);
                     }
                     KeyDispatch::FocusLast => {
                         // Bounce. No-op if the previous slot is gone
                         // (already cleared in the per-frame clamp) or
                         // somehow points to current focus.
-                        if let Some(prev) = previous_focused
-                            && prev < agents.len()
-                            && prev != focused
+                        if let Some(prev) = nav.previous_focused
+                            && prev < nav.agents.len()
+                            && prev != nav.focused
                         {
-                            change_focus(&mut agents, &mut focused, &mut previous_focused, prev);
+                            nav.change_focus(prev);
                         }
                     }
                     KeyDispatch::FocusAt(idx) => {
-                        if idx < agents.len() {
-                            change_focus(&mut agents, &mut focused, &mut previous_focused, idx);
+                        if idx < nav.agents.len() {
+                            nav.change_focus(idx);
                         }
                     }
                     KeyDispatch::ToggleNav => {
@@ -1438,25 +1641,30 @@ fn event_loop(
                             crossterm::terminal::size().wrap_err("read terminal size")?;
                         let (rows, cols) =
                             pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
-                        resize_agents(&mut agents, rows, cols);
+                        resize_agents(&mut nav.agents, rows, cols);
                     }
                     KeyDispatch::OpenPopup => {
-                        popup_state = PopupState::Open { selection: focused };
+                        nav.popup_state = PopupState::Open {
+                            selection: nav.focused,
+                        };
                     }
                     KeyDispatch::OpenHelp => {
                         help_state = HelpState::Open;
+                    }
+                    KeyDispatch::DismissAgent => {
+                        nav.dismiss_focused();
                     }
                 }
             }
             Event::Resize(cols, rows) => {
                 let (pty_rows, pty_cols) = pty_size_for(nav_style, rows, cols, log_tail.is_some());
-                resize_agents(&mut agents, pty_rows, pty_cols);
+                resize_agents(&mut nav.agents, pty_rows, pty_cols);
             }
             Event::Mouse(MouseEvent {
                 kind, column, row, ..
-            }) if no_overlay_active(spawn_ui.as_ref(), popup_state, help_state) => {
+            }) if no_overlay_active(spawn_ui.as_ref(), nav.popup_state, help_state) => {
                 // Wheel events are unconditional — anywhere in the
-                // window is treated as "scroll the focused agent." In
+                // window is treated as "scroll the nav.focused agent." In
                 // LeftPane mode that means wheel-over-nav scrolls the
                 // agent rather than the (currently un-scrollable)
                 // agent list, which is mildly weird but harmless and
@@ -1466,12 +1674,12 @@ fn event_loop(
                 // independently scrollable.
                 match kind {
                     MouseEventKind::ScrollUp => {
-                        if let Some(agent) = agents.get_mut(focused) {
+                        if let Some(agent) = nav.agents.get_mut(nav.focused) {
                             agent.nudge_scrollback(WHEEL_STEP);
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        if let Some(agent) = agents.get_mut(focused) {
+                        if let Some(agent) = nav.agents.get_mut(nav.focused) {
                             agent.nudge_scrollback(-WHEEL_STEP);
                         }
                     }
@@ -1487,24 +1695,19 @@ fn event_loop(
                                 TabMouseDispatch::PressTab(id) => mouse_press = Some(id),
                                 TabMouseDispatch::Click(id) => {
                                     mouse_press = None;
-                                    if let Some(idx) = agents.iter().position(|a| a.id == id) {
-                                        change_focus(
-                                            &mut agents,
-                                            &mut focused,
-                                            &mut previous_focused,
-                                            idx,
-                                        );
+                                    if let Some(idx) = nav.agents.iter().position(|a| a.id == id) {
+                                        nav.change_focus(idx);
                                     }
                                 }
                                 TabMouseDispatch::Reorder { from, to } => {
                                     mouse_press = None;
-                                    let from_idx = agents.iter().position(|a| a.id == from);
-                                    let to_idx = agents.iter().position(|a| a.id == to);
+                                    let from_idx = nav.agents.iter().position(|a| a.id == from);
+                                    let to_idx = nav.agents.iter().position(|a| a.id == to);
                                     if let (Some(f), Some(t)) = (from_idx, to_idx) {
-                                        reorder_agents(&mut agents, f, t);
-                                        focused = shift_index(focused, f, t);
-                                        previous_focused =
-                                            previous_focused.map(|p| shift_index(p, f, t));
+                                        reorder_agents(&mut nav.agents, f, t);
+                                        nav.focused = shift_index(nav.focused, f, t);
+                                        nav.previous_focused =
+                                            nav.previous_focused.map(|p| shift_index(p, f, t));
                                     }
                                 }
                                 TabMouseDispatch::Cancel => mouse_press = None,
@@ -1513,7 +1716,9 @@ fn event_loop(
                     }
                 }
             }
-            Event::Paste(text) if no_overlay_active(spawn_ui.as_ref(), popup_state, help_state) => {
+            Event::Paste(text)
+                if no_overlay_active(spawn_ui.as_ref(), nav.popup_state, help_state) =>
+            {
                 // Pasting while scrolled-back: snap to live view first
                 // so the user sees what landed (otherwise the paste is
                 // invisible above the fold), then forward the chunk.
@@ -1525,7 +1730,7 @@ fn event_loop(
                 // newlines are pasted text rather than user-typed Enter
                 // keys. Without the wrappers Claude would submit the
                 // message on every newline in the paste.
-                if let Some(agent) = agents.get_mut(focused) {
+                if let Some(agent) = nav.agents.get_mut(nav.focused) {
                     agent.snap_to_live();
                     if let AgentState::Ready { transport, .. } = &mut agent.state {
                         transport
@@ -1615,6 +1820,7 @@ fn compute_awaiting_dispatch(key: &KeyEvent, bindings: &Bindings) -> KeyDispatch
         Some(PrefixAction::FocusLast) => KeyDispatch::FocusLast,
         Some(PrefixAction::ToggleNav) => KeyDispatch::ToggleNav,
         Some(PrefixAction::OpenSwitcher) => KeyDispatch::OpenPopup,
+        Some(PrefixAction::DismissAgent) => KeyDispatch::DismissAgent,
         Some(PrefixAction::Help) => KeyDispatch::OpenHelp,
         None => KeyDispatch::Consume,
     }
@@ -1673,6 +1879,13 @@ fn render_frame(
     // (terminal resize, nav-style toggle, agent spawn / reap).
     hitboxes.clear();
     let area = frame.area();
+    // Pre-resolve the dismiss-chord label *here*, in the orchestration
+    // layer that owns the bindings. The renderer (and its pane helpers)
+    // never sees `&Bindings` — they only need the formatted string for
+    // the crash banner. Threading the full bindings struct through the
+    // render pipeline would couple presentation to input config and was
+    // flagged in architecture review as tramp data.
+    let dismiss_label = bindings.on_prefix.dismiss_agent.to_string();
     // Carve off the bottom log strip first, if enabled. The remaining
     // area is what the nav-style render sees, so it doesn't need to
     // know the log strip exists.
@@ -1688,7 +1901,16 @@ fn render_frame(
     };
     match nav_style {
         NavStyle::LeftPane => {
-            render_left_pane(frame, main_area, agents, focused, phase, chrome, hitboxes);
+            render_left_pane(
+                frame,
+                main_area,
+                agents,
+                focused,
+                &dismiss_label,
+                phase,
+                chrome,
+                hitboxes,
+            );
         }
         NavStyle::Popup => {
             render_popup_style(
@@ -1699,6 +1921,7 @@ fn render_frame(
                 popup,
                 bindings,
                 prefix_state,
+                &dismiss_label,
                 phase,
                 chrome,
                 hitboxes,
@@ -1731,12 +1954,18 @@ fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail, chrome: &
     frame.render_widget(widget, area);
 }
 
-/// Render an agent's main pane based on its current [`AgentState`]. A
-/// `Ready` agent shows the live PTY through `tui-term`'s
-/// [`PseudoTerminal`]; a `Failed` agent shows the bootstrap error in
-/// red, centered. The failure pane intentionally has no border or
-/// title — a bordered placeholder reads as "this is a real UI
-/// element" when in fact the slot is dead.
+/// Render an agent's main pane based on its current [`AgentState`].
+///
+/// - `Ready`: the live PTY through `tui-term`'s [`PseudoTerminal`].
+/// - `Crashed`: the parser's last frame (so the user can see what
+///   claude was doing right before it died) plus a one-row banner
+///   pinned to the top edge with the exit code and dismiss
+///   instruction. `bindings.prefix` is interpolated into the
+///   banner so a reconfigured prefix shows the correct chord.
+/// - `Failed`: the bootstrap error in red, centered. The failure
+///   pane intentionally has no border or title — a bordered
+///   placeholder reads as "this is a real UI element" when in fact
+///   the slot is dead.
 ///
 /// When the agent's PTY parser is showing scrollback (offset > 0), a
 /// floating "↑ scroll N · esc" badge is painted over the bottom-right
@@ -1745,7 +1974,7 @@ fn render_log_strip(frame: &mut Frame<'_>, area: Rect, tail: &LogTail, chrome: &
 /// `SIGWINCH` on every scroll-mode entry/exit, and Claude redrawing
 /// its UI on each transition would be much worse UX than the badge
 /// covering ~22 cells of (usually empty) Claude border. See AD-25.
-fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
+fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent, dismiss_label: &str) {
     match &agent.state {
         AgentState::Ready { parser, .. } => {
             let widget = PseudoTerminal::new(parser.screen());
@@ -1755,11 +1984,82 @@ fn render_agent_pane(frame: &mut Frame<'_>, area: Rect, agent: &RuntimeAgent) {
                 render_scroll_indicator(frame, area, offset);
             }
         }
+        AgentState::Crashed { parser, exit_code } => {
+            // Draw the last frame underneath — same widget as Ready,
+            // just with no live updates landing in the parser. The
+            // banner overlay below tells the user the screen is
+            // frozen.
+            let widget = PseudoTerminal::new(parser.screen());
+            frame.render_widget(widget, area);
+            let offset = parser.screen().scrollback();
+            if offset > 0 {
+                render_scroll_indicator(frame, area, offset);
+            }
+            render_crash_banner(frame, area, *exit_code, dismiss_label);
+        }
         AgentState::Failed { error } => {
             let host = agent.host.as_deref().unwrap_or("");
             render_failure_pane(frame, area, host, &error.user_message());
         }
     }
+}
+
+/// One-row banner pinned to the top of a Crashed agent's pane. Same
+/// overlay technique as [`render_scroll_indicator`] (`Clear` + a
+/// styled `Paragraph`) so the underlying last-frame doesn't bleed
+/// through. Color and copy depend on the exit code:
+///
+/// - `0` — clean exit. Dim gray bg / white fg, no `✗` glyph. The
+///   user typed `/quit` or claude finished normally; calling that
+///   out as a crash would be alarmist.
+/// - `-1` — `SshDaemonPty` sentinel for socket-level failures
+///   (tunnel drop, daemon death, framed reader I/O error). Red bg,
+///   "connection lost" copy.
+/// - any other — non-zero process exit. Red bg, `✗ session ended
+///   (exit N)` copy.
+///
+/// `dismiss_label` is the pre-formatted dismiss-chord string (e.g.
+/// `"d"` or `"ctrl+x"`), resolved by the orchestration layer rather
+/// than the renderer. Keeps `&Bindings` out of the render path so
+/// the renderer stays decoupled from input config.
+fn render_crash_banner(frame: &mut Frame<'_>, area: Rect, exit_code: i32, dismiss_label: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let banner_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    let (text, style) = match exit_code {
+        0 => (
+            format!(" session ended (exit 0) — {dismiss_label} to dismiss "),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        -1 => (
+            format!(" ✗ connection lost — {dismiss_label} to dismiss "),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+        n => (
+            format!(" ✗ session ended (exit {n}) — {dismiss_label} to dismiss "),
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+    let widget = Paragraph::new(Line::raw(text))
+        .alignment(Alignment::Left)
+        .style(style);
+    frame.render_widget(Clear, banner_area);
+    frame.render_widget(widget, banner_area);
 }
 
 /// Floating one-row badge rendered in the bottom-right of the agent
@@ -1836,11 +2136,13 @@ fn render_failure_pane(frame: &mut Frame<'_>, area: Rect, host: &str, err: &str)
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_left_pane(
     frame: &mut Frame<'_>,
     area: Rect,
     agents: &[RuntimeAgent],
     focused: usize,
+    dismiss_label: &str,
     phase: AnimationPhase,
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
@@ -1892,7 +2194,7 @@ fn render_left_pane(
     }
 
     if let Some(agent) = agents.get(focused) {
-        render_agent_pane(frame, pty_area, agent);
+        render_agent_pane(frame, pty_area, agent, dismiss_label);
     }
 }
 
@@ -1905,6 +2207,7 @@ fn render_popup_style(
     popup: PopupState,
     bindings: &Bindings,
     prefix_state: PrefixState,
+    dismiss_label: &str,
     phase: AnimationPhase,
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
@@ -1915,7 +2218,7 @@ fn render_popup_style(
         .areas(area);
 
     if let Some(agent) = agents.get(focused) {
-        render_agent_pane(frame, pty_area, agent);
+        render_agent_pane(frame, pty_area, agent, dismiss_label);
     }
 
     render_status_bar(
@@ -3027,12 +3330,10 @@ mod tests {
 
     #[test]
     fn change_focus_records_previous_when_focus_moves() {
-        let mut agents: Vec<RuntimeAgent> = Vec::new();
-        let mut focused = 0;
-        let mut previous = None;
-        change_focus(&mut agents, &mut focused, &mut previous, 2);
-        assert_eq!(focused, 2);
-        assert_eq!(previous, Some(0));
+        let mut nav = NavState::new(Vec::new());
+        nav.change_focus(2);
+        assert_eq!(nav.focused, 2);
+        assert_eq!(nav.previous_focused, Some(0));
     }
 
     #[test]
@@ -3040,12 +3341,12 @@ mod tests {
         // Critical: a no-op must not clobber `previous`. Otherwise a
         // double-tap of the same direct-bind (or pressing FocusAt(idx)
         // for an already-focused tab) would erase the bounce slot.
-        let mut agents: Vec<RuntimeAgent> = Vec::new();
-        let mut focused = 1;
-        let mut previous = Some(0);
-        change_focus(&mut agents, &mut focused, &mut previous, 1);
-        assert_eq!(focused, 1);
-        assert_eq!(previous, Some(0));
+        let mut nav = NavState::new(Vec::new());
+        nav.focused = 1;
+        nav.previous_focused = Some(0);
+        nav.change_focus(1);
+        assert_eq!(nav.focused, 1);
+        assert_eq!(nav.previous_focused, Some(0));
     }
 
     #[test]
@@ -3053,19 +3354,18 @@ mod tests {
         // Simulates: focused=0, switch to 2 (FocusAt), then FocusLast
         // bounces back to 0 — and `previous` should now point to 2 so a
         // second FocusLast bounces forward again.
-        let mut agents: Vec<RuntimeAgent> = Vec::new();
-        let mut focused = 0;
-        let mut previous = None;
-        change_focus(&mut agents, &mut focused, &mut previous, 2);
-        assert_eq!((focused, previous), (2, Some(0)));
-        // FocusLast handler reads `previous` then calls change_focus(prev).
-        let bounce_target = previous.unwrap();
-        change_focus(&mut agents, &mut focused, &mut previous, bounce_target);
-        assert_eq!((focused, previous), (0, Some(2)));
+        let mut nav = NavState::new(Vec::new());
+        nav.change_focus(2);
+        assert_eq!((nav.focused, nav.previous_focused), (2, Some(0)));
+        // FocusLast handler reads `previous_focused` then calls
+        // change_focus(prev).
+        let bounce_target = nav.previous_focused.unwrap();
+        nav.change_focus(bounce_target);
+        assert_eq!((nav.focused, nav.previous_focused), (0, Some(2)));
         // Second bounce.
-        let bounce_target = previous.unwrap();
-        change_focus(&mut agents, &mut focused, &mut previous, bounce_target);
-        assert_eq!((focused, previous), (2, Some(0)));
+        let bounce_target = nav.previous_focused.unwrap();
+        nav.change_focus(bounce_target);
+        assert_eq!((nav.focused, nav.previous_focused), (2, Some(0)));
     }
 
     #[test]
@@ -3077,10 +3377,9 @@ mod tests {
         // a calm state — friction we deliberately want to avoid.
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[1].needs_attention = true;
-        let mut focused = 0;
-        let mut previous = None;
-        change_focus(&mut agents, &mut focused, &mut previous, 1);
-        assert!(!agents[1].needs_attention);
+        let mut nav = NavState::new(agents);
+        nav.change_focus(1);
+        assert!(!nav.agents[1].needs_attention);
     }
 
     #[test]
@@ -3091,15 +3390,16 @@ mod tests {
         // attention bit just like to the bounce slot.
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[1].needs_attention = true;
-        let mut focused = 1;
-        let mut previous = Some(0);
-        change_focus(&mut agents, &mut focused, &mut previous, 1);
+        let mut nav = NavState::new(agents);
+        nav.focused = 1;
+        nav.previous_focused = Some(0);
+        nav.change_focus(1);
         // The interesting bit: the re-focus didn't enter the "moved"
         // branch, so the attention flag stays set. The next event-loop
         // tick will see focused==1 and not pulse, but the flag itself
         // is left to the explicit clear path on the *next* real focus
         // change.
-        assert!(agents[1].needs_attention);
+        assert!(nav.agents[1].needs_attention);
     }
 
     // shift_index — the four cases of "where does an existing slot
@@ -3966,9 +4266,10 @@ mod tests {
     fn flag_finished_unfocused_marks_unfocused_agent_that_just_finished() {
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[1].last_working = true;
-        flag_finished_unfocused(&mut agents, 0);
-        assert!(agents[1].needs_attention);
-        assert!(!agents[1].last_working, "last_working must be reset");
+        let mut nav = NavState::new(agents);
+        nav.flag_finished_unfocused();
+        assert!(nav.agents[1].needs_attention);
+        assert!(!nav.agents[1].last_working, "last_working must be reset",);
     }
 
     #[test]
@@ -3978,18 +4279,215 @@ mod tests {
         // consumed (not re-flagged on the next tick).
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[0].last_working = true;
-        flag_finished_unfocused(&mut agents, 0);
-        assert!(!agents[0].needs_attention);
-        assert!(!agents[0].last_working);
+        let mut nav = NavState::new(agents);
+        nav.flag_finished_unfocused();
+        assert!(!nav.agents[0].needs_attention);
+        assert!(!nav.agents[0].last_working);
     }
 
     #[test]
     fn flag_finished_unfocused_no_op_when_state_unchanged() {
-        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        let agents = vec![failed_agent("a"), failed_agent("b")];
+        let mut nav = NavState::new(agents);
         // Both already idle; nothing transitioned.
-        flag_finished_unfocused(&mut agents, 0);
-        assert!(!agents[0].needs_attention);
-        assert!(!agents[1].needs_attention);
+        nav.flag_finished_unfocused();
+        assert!(!nav.agents[0].needs_attention);
+        assert!(!nav.agents[1].needs_attention);
+    }
+
+    // ── reap_dead_transports ─────────────────────────────────────
+    //
+    // The per-frame Ready→Crashed transition. Pulled out of the
+    // event loop so the dead-transport detection can be exercised
+    // without driving the full ratatui draw cycle. Tests use
+    // [`AgentTransport::for_test`] (a real `cat` PTY) and `kill()`
+    // to make `try_wait` return Some.
+
+    /// Spawn a Ready agent backed by a real `cat` PTY, kill the
+    /// child, then poll until `try_wait` reports the death. Returns
+    /// the agent in a state where the next `reap_dead_transports`
+    /// call will transition it to Crashed.
+    fn ready_agent_with_dead_transport() -> RuntimeAgent {
+        let mut agent = ready_test_agent(100);
+        if let AgentState::Ready { transport, .. } = &mut agent.state {
+            transport.kill().expect("kill cat");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while transport.try_wait().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cat did not die within 2s of kill",
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        agent
+    }
+
+    #[test]
+    fn reap_transitions_ready_with_dead_transport_to_crashed() {
+        let mut nav = NavState::new(vec![ready_agent_with_dead_transport()]);
+        nav.reap_dead_transports();
+        assert!(
+            matches!(nav.agents[0].state, AgentState::Crashed { .. }),
+            "expected Crashed after reap, got variant {}",
+            state_variant_name(&nav.agents[0].state),
+        );
+    }
+
+    #[test]
+    fn reap_leaves_alive_ready_agent_in_ready_state() {
+        let mut nav = NavState::new(vec![ready_test_agent(100)]);
+        nav.reap_dead_transports();
+        assert!(
+            matches!(nav.agents[0].state, AgentState::Ready { .. }),
+            "alive Ready agent must stay Ready, got variant {}",
+            state_variant_name(&nav.agents[0].state),
+        );
+    }
+
+    #[test]
+    fn reap_leaves_failed_agent_alone() {
+        let mut nav = NavState::new(vec![failed_agent("dead")]);
+        nav.reap_dead_transports();
+        assert!(
+            matches!(nav.agents[0].state, AgentState::Failed { .. }),
+            "Failed must remain Failed across reap",
+        );
+    }
+
+    #[test]
+    fn reap_leaves_already_crashed_agent_alone() {
+        let mut agents = vec![ready_test_agent(100)];
+        agents[0].mark_crashed(13);
+        let mut nav = NavState::new(agents);
+        nav.reap_dead_transports();
+        match &nav.agents[0].state {
+            AgentState::Crashed { exit_code, .. } => assert_eq!(
+                *exit_code, 13,
+                "reap must not re-transition an already-Crashed agent",
+            ),
+            other => panic!(
+                "expected Crashed, got variant {}",
+                state_variant_name(other),
+            ),
+        }
+    }
+
+    // ── dismiss_focused ──────────────────────────────────────────
+    //
+    // Removes the focused agent if it's in a terminal state and
+    // clamps focus / bounce / popup state. Pulled out of the
+    // dispatch handler so the clamp logic is testable without
+    // driving the event loop.
+
+    #[test]
+    fn dismiss_removes_focused_crashed_agent_and_clamps_focus() {
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(0);
+        let mut nav = NavState::new(vec![failed_agent("a"), agent]);
+        nav.focused = 1;
+
+        let removed = nav.dismiss_focused();
+
+        assert!(removed);
+        assert_eq!(nav.agents.len(), 1);
+        assert_eq!(
+            nav.focused, 0,
+            "focus must clamp to the new last index after removing the tail",
+        );
+    }
+
+    #[test]
+    fn dismiss_removes_focused_failed_agent() {
+        let mut nav = NavState::new(vec![failed_agent("a"), failed_agent("b")]);
+
+        let removed = nav.dismiss_focused();
+
+        assert!(removed, "Failed must be dismissable");
+        assert_eq!(nav.agents.len(), 1);
+    }
+
+    #[test]
+    fn dismiss_no_op_on_focused_ready_agent() {
+        let mut nav = NavState::new(vec![ready_test_agent(100), failed_agent("b")]);
+        let before = nav.agents.len();
+
+        let removed = nav.dismiss_focused();
+
+        assert!(
+            !removed,
+            "Ready must NOT be dismissable (live-session footgun)"
+        );
+        assert_eq!(nav.agents.len(), before);
+        assert_eq!(nav.focused, 0);
+    }
+
+    #[test]
+    fn dismiss_clears_stale_previous_focused() {
+        let mut nav = NavState::new(vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+        ]);
+        nav.focused = 1;
+        nav.previous_focused = Some(2);
+
+        nav.dismiss_focused();
+
+        assert_eq!(nav.agents.len(), 2);
+        assert!(
+            nav.previous_focused.is_none(),
+            "previous_focused pointing past the new end must be cleared, got {:?}",
+            nav.previous_focused,
+        );
+    }
+
+    #[test]
+    fn dismiss_clears_previous_focused_when_it_collides_with_focused() {
+        let mut nav = NavState::new(vec![failed_agent("a"), failed_agent("b")]);
+        nav.focused = 1;
+        nav.previous_focused = Some(0);
+
+        nav.dismiss_focused();
+
+        assert_eq!(nav.agents.len(), 1);
+        assert_eq!(nav.focused, 0);
+        assert!(
+            nav.previous_focused.is_none(),
+            "bouncing onto the same slot as focused is a no-op; clear it",
+        );
+    }
+
+    #[test]
+    fn dismiss_clamps_open_popup_selection() {
+        let mut nav = NavState::new(vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+        ]);
+        nav.popup_state = PopupState::Open { selection: 2 };
+
+        nav.dismiss_focused();
+
+        match nav.popup_state {
+            PopupState::Open { selection } => {
+                assert_eq!(selection, 1, "popup selection must clamp to new last index");
+            }
+            PopupState::Closed => panic!("popup must remain Open, just clamped"),
+        }
+    }
+
+    #[test]
+    fn dismiss_leaves_empty_vec_when_last_agent_dismissed() {
+        let mut nav = NavState::new(vec![failed_agent("only")]);
+
+        let removed = nav.dismiss_focused();
+
+        assert!(removed);
+        assert!(
+            nav.agents.is_empty(),
+            "all-dismissed path leaves the Vec empty",
+        );
     }
 
     // ── tab_index_style ──────────────────────────────────────────
@@ -4458,6 +4956,18 @@ mod tests {
         }
     }
 
+    /// Stringify the [`AgentState`] discriminant for `panic!` messages
+    /// in tests. `AgentState` doesn't derive `Debug` (the `Parser` it
+    /// owns drags in heavy machinery and the state's identity here is
+    /// the variant tag, not its payload), so we map by hand.
+    fn state_variant_name(state: &AgentState) -> &'static str {
+        match state {
+            AgentState::Ready { .. } => "Ready",
+            AgentState::Failed { .. } => "Failed",
+            AgentState::Crashed { .. } => "Crashed",
+        }
+    }
+
     #[test]
     fn nudge_scrollback_moves_offset_into_history_then_back() {
         let mut agent = ready_test_agent(100);
@@ -4540,6 +5050,117 @@ mod tests {
     fn scrollback_offset_returns_zero_for_failed_agent() {
         let agent = failed_agent("dead");
         assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn mark_crashed_transitions_ready_to_crashed_preserving_parser_and_exit_code() {
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 5);
+        agent.mark_crashed(42);
+        match &agent.state {
+            AgentState::Crashed { parser, exit_code } => {
+                assert_eq!(*exit_code, 42, "exit code must round-trip");
+                let last = parser
+                    .screen()
+                    .rows(0, parser.screen().size().1)
+                    .find(|row| !row.trim().is_empty())
+                    .expect("crashed parser must retain at least one populated row");
+                assert!(
+                    last.starts_with('l'),
+                    "preserved screen content should still show a populated row, got {last:?}",
+                );
+            }
+            other => panic!(
+                "expected Crashed after mark_crashed, got variant {}",
+                state_variant_name(other),
+            ),
+        }
+    }
+
+    #[test]
+    fn mark_crashed_no_op_on_failed_agent() {
+        let mut agent = failed_agent("dead");
+        agent.mark_crashed(7);
+        assert!(
+            matches!(agent.state, AgentState::Failed { .. }),
+            "mark_crashed must not promote a Failed agent into Crashed",
+        );
+    }
+
+    #[test]
+    fn mark_crashed_no_op_on_already_crashed_agent() {
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(1);
+        agent.mark_crashed(2);
+        match &agent.state {
+            AgentState::Crashed { exit_code, .. } => assert_eq!(
+                *exit_code, 1,
+                "second mark_crashed must not overwrite the first exit code",
+            ),
+            other => panic!(
+                "expected Crashed, got variant {}",
+                state_variant_name(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn nudge_scrollback_moves_offset_on_crashed_agent() {
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 50);
+        agent.mark_crashed(0);
+        agent.nudge_scrollback(5);
+        assert_eq!(
+            agent.scrollback_offset(),
+            5,
+            "scrollback should still respond on Crashed (parser is preserved)",
+        );
+    }
+
+    #[test]
+    fn snap_to_live_resets_offset_on_crashed_agent() {
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 50);
+        agent.nudge_scrollback(10);
+        agent.mark_crashed(0);
+        assert_eq!(agent.scrollback_offset(), 10);
+        agent.snap_to_live();
+        assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn jump_to_top_works_on_crashed_agent() {
+        let mut agent = ready_test_agent(100);
+        populate(&mut agent, 50);
+        agent.mark_crashed(0);
+        agent.jump_to_top();
+        assert!(
+            agent.scrollback_offset() > 0,
+            "jump_to_top on a Crashed agent should reach a non-zero offset",
+        );
+    }
+
+    #[test]
+    fn is_working_returns_false_for_crashed_agent() {
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(0);
+        assert!(
+            !agent.is_working(),
+            "a Crashed agent has no foreground process — never working",
+        );
+    }
+
+    #[test]
+    fn title_returns_last_title_on_crashed_agent() {
+        // Feed an OSC 0 title sequence, then crash. The last title
+        // must remain readable so the renderer can keep showing the
+        // tab label the user recognizes.
+        let mut agent = ready_test_agent(100);
+        if let AgentState::Ready { parser, .. } = &mut agent.state {
+            parser.process(b"\x1b]0;hello\x07");
+        }
+        agent.mark_crashed(0);
+        assert_eq!(agent.title(), Some("hello"));
     }
 
     // Render-fn integration tests via ratatui's TestBackend. These
@@ -4711,6 +5332,7 @@ mod tests {
                     },
                     &agents,
                     1,
+                    "d",
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
@@ -4745,6 +5367,7 @@ mod tests {
                     },
                     &agents,
                     0,
+                    "d",
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
@@ -4785,6 +5408,7 @@ mod tests {
                     },
                     &agents,
                     0,
+                    "d",
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
@@ -4805,5 +5429,140 @@ mod tests {
                 h.rect.y,
             );
         }
+    }
+
+    /// Helper to scrape the top row of the rendered `TestBackend` buffer
+    /// as a single string. Used by the crash-banner tests below to
+    /// assert the banner copy without coupling to exact column counts.
+    fn top_row_text(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        (area.x..area.x + area.width)
+            .map(|x| buf[(x, area.y)].symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn render_agent_pane_paints_red_banner_for_nonzero_exit_code() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(7);
+        terminal
+            .draw(|frame| {
+                render_agent_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agent,
+                    "d",
+                );
+            })
+            .unwrap();
+        let row = top_row_text(&terminal);
+        assert!(
+            row.contains("session ended (exit 7)"),
+            "non-zero exit banner missing copy, got: {row:?}",
+        );
+        assert!(
+            row.contains("dismiss"),
+            "non-zero exit banner missing dismiss hint, got: {row:?}",
+        );
+    }
+
+    #[test]
+    fn render_agent_pane_paints_connection_lost_banner_for_minus_one() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(-1);
+        terminal
+            .draw(|frame| {
+                render_agent_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agent,
+                    "d",
+                );
+            })
+            .unwrap();
+        let row = top_row_text(&terminal);
+        assert!(
+            row.contains("connection lost"),
+            "minus-one banner must distinguish socket-level failure, got: {row:?}",
+        );
+    }
+
+    #[test]
+    fn render_agent_pane_paints_clean_banner_for_zero_exit_code() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(0);
+        terminal
+            .draw(|frame| {
+                render_agent_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agent,
+                    "d",
+                );
+            })
+            .unwrap();
+        let row = top_row_text(&terminal);
+        assert!(
+            row.contains("session ended (exit 0)"),
+            "clean exit banner missing copy, got: {row:?}",
+        );
+        assert!(
+            !row.contains('\u{2717}'),
+            "clean exit must not show the cross glyph, got: {row:?}",
+        );
+    }
+
+    #[test]
+    fn render_agent_pane_banner_uses_configured_dismiss_chord() {
+        // The orchestrator (render_frame) is responsible for resolving
+        // the bindings to a chord string. Pass a custom label here to
+        // verify the renderer interpolates whatever it's given rather
+        // than hardcoding "d".
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(0);
+        terminal
+            .draw(|frame| {
+                render_agent_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agent,
+                    "ctrl+x",
+                );
+            })
+            .unwrap();
+        let row = top_row_text(&terminal);
+        assert!(
+            row.contains("ctrl+x to dismiss"),
+            "banner must interpolate the supplied chord label, got: {row:?}",
+        );
     }
 }

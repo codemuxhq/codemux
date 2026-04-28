@@ -887,6 +887,19 @@ fn local_socket_path(dir: &Path, agent_id: &str) -> Result<PathBuf, Error> {
 /// Forcing a fresh, non-mux ssh session via these two opts sidesteps
 /// the mux path entirely; verified to bind the local socket within
 /// ~1 s in the same environment.
+///
+/// `ServerAliveInterval=15` + `ServerAliveCountMax=3` are
+/// **resilience opts**: without them, ssh has no liveness probe on
+/// an idle persistent tunnel. A NAT timeout, devpod hibernation, or
+/// transient network drop leaves the tunnel half-open — the kernel
+/// hasn't seen a RST so the socket stays valid, the framed reader
+/// thread blocks indefinitely on `read()`, and the agent appears
+/// frozen with no transition to `Crashed`. With these opts ssh sends
+/// a probe every 15 s and exits after 3 missed responses (~45 s
+/// total), at which point the tunnel `Child` dies, the framed
+/// reader's socket read returns EOF, and `SshDaemonPty::try_wait`
+/// flips to `Some(-1)`. 45 s is short enough to feel responsive and
+/// long enough to ride through normal jitter.
 fn open_ssh_tunnel(
     runner: &dyn CommandRunner,
     host: &str,
@@ -919,6 +932,10 @@ fn open_ssh_tunnel(
                 "ControlPath=none",
                 "-o",
                 "ControlMaster=no",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
                 "-L",
                 &forward,
                 host,
@@ -1640,14 +1657,16 @@ mod tests {
     #[test]
     fn open_ssh_tunnel_uses_absolute_remote_path_in_forward_spec() {
         let runner = RecordingRunner::new();
-        let mut child = open_ssh_tunnel(
-            &runner,
-            "host.example",
-            "agent-x",
-            Path::new("/tmp/codemux/agent-x.sock"),
-            Path::new("/home/me"),
-        )
-        .unwrap();
+        let _guard = SpawnedChildGuard::new(
+            open_ssh_tunnel(
+                &runner,
+                "host.example",
+                "agent-x",
+                Path::new("/tmp/codemux/agent-x.sock"),
+                Path::new("/home/me"),
+            )
+            .unwrap(),
+        );
         let args = runner.last_spawn_args();
         let l_index = args.iter().position(|a| a == "-L").expect("ssh -L missing");
         let forward = &args[l_index + 1];
@@ -1655,8 +1674,6 @@ mod tests {
             forward, "/tmp/codemux/agent-x.sock:/home/me/.cache/codemuxd/sockets/agent-x.sock",
             "forward spec must pin the absolute remote socket path",
         );
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     /// Regression: an active OpenSSH `ControlMaster` mux on the user's machine
@@ -1667,30 +1684,86 @@ mod tests {
     #[test]
     fn open_ssh_tunnel_bypasses_ssh_control_master() {
         let runner = RecordingRunner::new();
-        let mut child = open_ssh_tunnel(
-            &runner,
-            "host.example",
-            "agent-x",
-            Path::new("/tmp/codemux/agent-x.sock"),
-            Path::new("/home/me"),
-        )
-        .unwrap();
+        let _guard = SpawnedChildGuard::new(
+            open_ssh_tunnel(
+                &runner,
+                "host.example",
+                "agent-x",
+                Path::new("/tmp/codemux/agent-x.sock"),
+                Path::new("/home/me"),
+            )
+            .unwrap(),
+        );
         let args = runner.last_spawn_args();
-        let has_pair = |k: &str, v: &str| {
-            args.windows(3).any(|w| {
-                w[0] == "-o" && w[1] == k && w[2] == v || w[0] == "-o" && w[1] == format!("{k}={v}")
-            })
-        };
         assert!(
-            has_pair("ControlPath", "none"),
+            ssh_arg_pair_present(&args, "ControlPath", "none"),
             "ssh tunnel must set ControlPath=none to bypass mux; got: {args:?}",
         );
         assert!(
-            has_pair("ControlMaster", "no"),
+            ssh_arg_pair_present(&args, "ControlMaster", "no"),
             "ssh tunnel must set ControlMaster=no to bypass mux; got: {args:?}",
         );
-        let _ = child.kill();
-        let _ = child.wait();
+    }
+
+    /// Regression: without `ServerAlive` opts, a silent network drop (NAT
+    /// timeout, devpod hibernation) leaves the tunnel half-open and the
+    /// agent appears frozen — the framed reader never sees EOF and
+    /// `try_wait` never flips. With these opts ssh probes every 15 s
+    /// and exits after 3 missed responses (~45 s), which gives the TUI
+    /// a clean transition to `Crashed` instead of a silent hang.
+    #[test]
+    fn open_ssh_tunnel_sets_server_alive_opts() {
+        let runner = RecordingRunner::new();
+        let _guard = SpawnedChildGuard::new(
+            open_ssh_tunnel(
+                &runner,
+                "host.example",
+                "agent-x",
+                Path::new("/tmp/codemux/agent-x.sock"),
+                Path::new("/home/me"),
+            )
+            .unwrap(),
+        );
+        let args = runner.last_spawn_args();
+        assert!(
+            ssh_arg_pair_present(&args, "ServerAliveInterval", "15"),
+            "ssh tunnel must set ServerAliveInterval=15 for liveness; got: {args:?}",
+        );
+        assert!(
+            ssh_arg_pair_present(&args, "ServerAliveCountMax", "3"),
+            "ssh tunnel must set ServerAliveCountMax=3 for liveness; got: {args:?}",
+        );
+    }
+
+    /// RAII guard for a spawned ssh `Child` in tests. Kills and reaps
+    /// the child on drop, including when the test panics partway
+    /// through (which `let _ = child.kill();` after the asserts would
+    /// silently leak as a zombie).
+    struct SpawnedChildGuard(Child);
+
+    impl SpawnedChildGuard {
+        fn new(child: Child) -> Self {
+            Self(child)
+        }
+    }
+
+    impl Drop for SpawnedChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Returns true if the ssh `args` slice contains an `-o key=value`
+    /// pair, accepting both the split form (`-o`, `key`, `value`) and
+    /// the joined form (`-o`, `key=value`). Used by every
+    /// argv-inspection test in this module so each can stay declarative
+    /// instead of redefining the same scan.
+    fn ssh_arg_pair_present(args: &[String], key: &str, value: &str) -> bool {
+        args.windows(3).any(|w| {
+            w[0] == "-o" && w[1] == key && w[2] == value
+                || w[0] == "-o" && w[1] == format!("{key}={value}")
+        })
     }
 
     /// Tiny `CommandRunner` for tests that need to inspect the actual

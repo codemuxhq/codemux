@@ -233,6 +233,7 @@ pub enum PrefixAction {
     FocusLast,
     ToggleNav,
     OpenSwitcher,
+    DismissAgent,
     Help,
 }
 
@@ -245,6 +246,7 @@ impl PrefixAction {
         Self::FocusLast,
         Self::ToggleNav,
         Self::OpenSwitcher,
+        Self::DismissAgent,
         Self::Help,
     ];
 
@@ -257,6 +259,7 @@ impl PrefixAction {
             Self::FocusLast => "bounce to the previously-focused agent",
             Self::ToggleNav => "toggle navigator style",
             Self::OpenSwitcher => "open the agent switcher popup",
+            Self::DismissAgent => "dismiss the focused crashed/failed agent",
             Self::Help => "show this help",
         }
     }
@@ -379,6 +382,13 @@ pub struct PrefixBindings {
     pub focus_last: Vec<KeyChord>,
     pub toggle_nav: KeyChord,
     pub open_switcher: KeyChord,
+    /// Closes the focused agent if it's in a terminal state
+    /// (`Crashed` or `Failed`). No-op on a `Ready` agent so a
+    /// fat-finger can't kill a live session. Default `d` is unbound
+    /// at the prefix layer today; tmux uses `&` for kill-window which
+    /// is harder to reach and means something different (force-kill a
+    /// live pane), so we picked the friendlier mnemonic.
+    pub dismiss_agent: KeyChord,
     pub help: KeyChord,
 }
 
@@ -410,6 +420,7 @@ impl Default for PrefixBindings {
             focus_last: vec![KeyChord::plain(KeyCode::Tab)],
             toggle_nav: KeyChord::plain(KeyCode::Char('v')),
             open_switcher: KeyChord::plain(KeyCode::Char('w')),
+            dismiss_agent: KeyChord::plain(KeyCode::Char('d')),
             help: KeyChord::plain(KeyCode::Char('?')),
         }
     }
@@ -420,11 +431,12 @@ impl PrefixBindings {
         // Single-chord actions checked first via a small fixed-size
         // table — these don't need aliasing and the table form makes
         // the registry read as data declaration.
-        let single: [(KeyChord, PrefixAction); 5] = [
+        let single: [(KeyChord, PrefixAction); _] = [
             (self.quit, PrefixAction::Quit),
             (self.spawn_agent, PrefixAction::SpawnAgent),
             (self.toggle_nav, PrefixAction::ToggleNav),
             (self.open_switcher, PrefixAction::OpenSwitcher),
+            (self.dismiss_agent, PrefixAction::DismissAgent),
             (self.help, PrefixAction::Help),
         ];
         if let Some((_, action)) = single.iter().find(|(c, _)| c.matches(key)) {
@@ -459,6 +471,7 @@ impl PrefixBindings {
             PrefixAction::FocusLast => first_or_default(&self.focus_last, KeyCode::Tab),
             PrefixAction::ToggleNav => self.toggle_nav,
             PrefixAction::OpenSwitcher => self.open_switcher,
+            PrefixAction::DismissAgent => self.dismiss_agent,
             PrefixAction::Help => self.help,
         }
     }
@@ -793,6 +806,7 @@ impl Bindings {
             self.on_prefix.spawn_agent,
             self.on_prefix.toggle_nav,
             self.on_prefix.open_switcher,
+            self.on_prefix.dismiss_agent,
             self.on_prefix.help,
             self.on_popup.confirm,
             self.on_popup.cancel,
@@ -1072,6 +1086,31 @@ mod tests {
             b.lookup(&ev(KeyCode::Char('?'), KeyModifiers::SHIFT)),
             Some(PrefixAction::Help),
         );
+    }
+
+    #[test]
+    fn prefix_lookup_finds_dismiss_agent() {
+        // `d` is the default chord for the dismiss-focused-dead-agent
+        // action — the runtime no-ops it for live agents, so binding it
+        // to a single letter is safe; tested separately to keep the
+        // generic "default bindings work" test stable when actions are
+        // added/removed.
+        let b = PrefixBindings::default();
+        assert_eq!(
+            b.lookup(&ev(KeyCode::Char('d'), KeyModifiers::NONE)),
+            Some(PrefixAction::DismissAgent),
+        );
+    }
+
+    #[test]
+    fn prefix_dismiss_agent_round_trips() {
+        // Pin the round-trip through binding_for so a future config
+        // refactor that drops the action from one of the two tables
+        // (lookup or binding_for) gets caught.
+        let b = PrefixBindings::default();
+        let chord = b.binding_for(PrefixAction::DismissAgent);
+        let event = KeyEvent::new(chord.code, chord.modifiers);
+        assert_eq!(b.lookup(&event), Some(PrefixAction::DismissAgent));
     }
 
     #[test]
