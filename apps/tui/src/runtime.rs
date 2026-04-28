@@ -254,21 +254,44 @@ impl NavState {
         }
     }
 
-    /// Detect working→idle transitions on unfocused agents and flag
-    /// them for the slow-blink attention cue. Called once per tick
-    /// after the PTY drain so the title parser sees the freshest
-    /// state. The currently-focused agent is skipped — the user is
-    /// already looking; nothing to alert about — and any agent
-    /// caught in this window has its blink cleared on the next focus
-    /// change via [`Self::change_focus`].
-    fn flag_finished_unfocused(&mut self) {
+    /// Sweep all agents for working → idle transitions. Two
+    /// responsibilities:
+    ///
+    /// - **Unfocused agents** that just finished are flagged with
+    ///   `needs_attention = true` so the navigator can render the
+    ///   slow-blink attention cue. The currently-focused agent is
+    ///   skipped — the user is already looking; nothing to alert about
+    ///   inside codemux — and any agent caught in this window has its
+    ///   blink cleared on the next focus change via
+    ///   [`Self::change_focus`].
+    /// - **`last_working` is updated for every agent** (focused or
+    ///   not) so the next tick has a fresh baseline for the next
+    ///   transition.
+    ///
+    /// Returns `true` iff at least one agent (focused or not)
+    /// transitioned working → idle this tick. The event loop uses this
+    /// to fire a host-terminal BEL so Ghostty / iTerm2 / Kitty mark
+    /// the codemux tab as needing attention; the focused-agent case is
+    /// included because the host signal matters whenever the user is
+    /// in another window, regardless of which internal tab finished.
+    /// The terminal itself gates the visual treatment on its own focus
+    /// state, so we don't double-gate here.
+    ///
+    /// Called once per tick after the PTY drain so the title parser
+    /// sees the freshest state.
+    fn note_finish_transitions(&mut self) -> bool {
+        let mut any_finished = false;
         for (i, agent) in self.agents.iter_mut().enumerate() {
             let cur = agent.is_working();
-            if agent.last_working && !cur && i != self.focused {
-                agent.needs_attention = true;
+            if agent.last_working && !cur {
+                any_finished = true;
+                if i != self.focused {
+                    agent.needs_attention = true;
+                }
             }
             agent.last_working = cur;
         }
+        any_finished
     }
 
     /// Move focus to `new`, recording the prior focus index for
@@ -1057,6 +1080,7 @@ pub fn run(
         config.scrollback_len,
         &chrome,
         &config.spawn,
+        config.ui.host_bell_on_finish,
     )
 }
 
@@ -1405,6 +1429,7 @@ fn event_loop(
     scrollback_len: usize,
     chrome: &ChromeStyle,
     spawn_config: &SpawnConfig,
+    host_bell_on_finish: bool,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
@@ -1690,7 +1715,18 @@ fn event_loop(
             }
         }
 
-        nav.flag_finished_unfocused();
+        if nav.note_finish_transitions() && host_bell_on_finish {
+            // BEL on any working → idle transition. The host terminal
+            // gates the visual treatment on its own focus state, so
+            // this is silent while the user is inside codemux and
+            // surfaces only when they're in another window or app.
+            // Best-effort: a write failure is logged and dropped, not
+            // surfaced — losing one attention cue is preferable to
+            // taking down the runtime over a stdout hiccup.
+            if let Err(err) = host_title::write_bell(&mut io::stdout()) {
+                tracing::debug!(?err, "host terminal bell write failed");
+            }
+        }
 
         nav.reap_dead_transports();
         if nav.agents.is_empty() {
@@ -5423,44 +5459,69 @@ mod tests {
         assert_eq!(title.as_deref(), Some(expected.as_str()));
     }
 
-    // ── flag_finished_unfocused ──────────────────────────────────
+    // ── note_finish_transitions ──────────────────────────────────
     //
     // The working→idle detector that runs once per tick. Pulled out
     // of the event loop so the transition matrix can be tested with
     // Failed agents (whose `is_working()` is always false; we drive
-    // the input by setting `last_working` directly).
+    // the input by setting `last_working` directly). Two surfaces:
+    // unfocused-only `needs_attention` flagging (drives the slow
+    // blink), and a return value summarizing whether *any* agent
+    // finished this tick (drives the host BEL).
 
     #[test]
-    fn flag_finished_unfocused_marks_unfocused_agent_that_just_finished() {
+    fn note_finish_transitions_marks_unfocused_agent_that_just_finished() {
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[1].last_working = true;
         let mut nav = NavState::new(agents);
-        nav.flag_finished_unfocused();
+        let any = nav.note_finish_transitions();
+        assert!(any, "an unfocused finish must report any_finished=true");
         assert!(nav.agents[1].needs_attention);
         assert!(!nav.agents[1].last_working, "last_working must be reset",);
     }
 
     #[test]
-    fn flag_finished_unfocused_skips_focused_agent() {
+    fn note_finish_transitions_skips_attention_on_focused_agent() {
         // Focused → user is already looking → no slow-blink. The
         // detector still resets last_working so the transition is
         // consumed (not re-flagged on the next tick).
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[0].last_working = true;
         let mut nav = NavState::new(agents);
-        nav.flag_finished_unfocused();
+        let any = nav.note_finish_transitions();
         assert!(!nav.agents[0].needs_attention);
         assert!(!nav.agents[0].last_working);
+        assert!(
+            any,
+            "focused finish must still report any_finished=true so the host BEL fires when the user is in another window",
+        );
     }
 
     #[test]
-    fn flag_finished_unfocused_no_op_when_state_unchanged() {
+    fn note_finish_transitions_no_op_when_state_unchanged() {
         let agents = vec![failed_agent("a"), failed_agent("b")];
         let mut nav = NavState::new(agents);
-        // Both already idle; nothing transitioned.
-        nav.flag_finished_unfocused();
+        let any = nav.note_finish_transitions();
         assert!(!nav.agents[0].needs_attention);
         assert!(!nav.agents[1].needs_attention);
+        assert!(
+            !any,
+            "no transition this tick must report any_finished=false so the host BEL stays silent",
+        );
+    }
+
+    #[test]
+    fn note_finish_transitions_returns_true_for_any_unfocused_finish_even_when_focused_unchanged() {
+        // Mixed scenario: focused agent stays idle (no transition),
+        // unfocused agent transitions. Pins that "any" really means
+        // any — symmetric with the focused-only-finish case above.
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        agents[1].last_working = true;
+        let mut nav = NavState::new(agents);
+        let any = nav.note_finish_transitions();
+        assert!(any);
+        assert!(nav.agents[1].needs_attention);
+        assert!(!nav.agents[0].needs_attention);
     }
 
     // ── reap_dead_transports ─────────────────────────────────────

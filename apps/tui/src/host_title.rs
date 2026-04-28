@@ -86,6 +86,22 @@ pub fn pop_title<W: Write>(out: &mut W) -> io::Result<()> {
     out.flush()
 }
 
+/// Emit a single BEL byte (`\x07`) so the surrounding terminal marks
+/// its codemux tab as needing attention. Every mainstream emulator
+/// (Ghostty, iTerm2, Kitty, `WezTerm`, Terminal.app, Alacritty) gates
+/// the visual treatment on tab-focus state itself: if its tab is
+/// already focused, the BEL is silent; otherwise the tab indicator
+/// flashes / changes color so the user notices from another window.
+/// We do not duplicate that focus check on our side.
+///
+/// Used by the runtime on every working → idle transition (any
+/// agent, focused or not). Cheap one-byte write, flushed so it lands
+/// before the next ratatui draw cycle.
+pub fn write_bell<W: Write>(out: &mut W) -> io::Result<()> {
+    out.write_all(b"\x07")?;
+    out.flush()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -186,5 +202,12 @@ mod tests {
         push_title(&mut buf).unwrap();
         pop_title(&mut buf).unwrap();
         assert_eq!(buf, b"\x1b[22;0t\x1b[23;0t");
+    }
+
+    #[test]
+    fn write_bell_emits_a_single_bel_byte() {
+        let mut buf = Vec::new();
+        write_bell(&mut buf).unwrap();
+        assert_eq!(buf, b"\x07");
     }
 }

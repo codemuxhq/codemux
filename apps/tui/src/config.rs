@@ -72,7 +72,11 @@ impl Default for Config {
 /// readable on poor monitors (washed-out laptop screens, projectors,
 /// sunlight glare); opt-ins reintroduce the subtler aesthetic for
 /// users who have a high-contrast display and prefer it.
-#[derive(Clone, Debug, Default, Deserialize)]
+///
+/// Manual `Default` impl (rather than `derive`d) because
+/// [`Self::host_bell_on_finish`] needs to default to `true`, and the
+/// derived bool default is `false`.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct Ui {
     /// When `true`, secondary chrome (separators, hints, host prefix,
@@ -104,6 +108,38 @@ pub struct Ui {
     /// - **Hex RGB**: `"#0080ff"`. True-color. Renders precisely on
     ///   modern terminals; may degrade on 256-color-only setups.
     pub host_colors: HashMap<String, ChromeColor>,
+
+    /// When `true` (the default), emit a terminal BEL (`\x07`) on
+    /// every agent's working → idle transition so the surrounding
+    /// terminal (Ghostty, iTerm2, Kitty, …) marks its codemux tab
+    /// as needing attention. The terminal handles the visual
+    /// treatment itself: most modern emulators only flash the tab
+    /// when it isn't currently focused, so this stays silent while
+    /// the user is already inside codemux and surfaces only when
+    /// they're in another window or app.
+    ///
+    /// Set to `false` to opt out — useful on terminals that
+    /// interpret BEL as an audible beep rather than a visual cue
+    /// and where the sound is disruptive.
+    #[serde(default = "default_true")]
+    pub host_bell_on_finish: bool,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Self {
+            subtle: false,
+            host_colors: HashMap::new(),
+            host_bell_on_finish: default_true(),
+        }
+    }
+}
+
+/// `serde(default = ...)` callback for the `host_bell_on_finish` knob.
+/// Lifted out of the field attribute so the same default flows through
+/// `Default for Ui` without duplicating the literal.
+fn default_true() -> bool {
+    true
 }
 
 /// Default file/dir names that mark a directory as a "code project"
@@ -605,11 +641,38 @@ mod tests {
     }
 
     #[test]
+    fn ui_host_bell_on_finish_defaults_to_true() {
+        // Opt-out knob: default is on so users get the host tab
+        // attention indicator without writing config. The manual
+        // `Default for Ui` impl exists for this reason — derived
+        // bool defaults are `false`, which would silently break the
+        // intended UX.
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.ui.host_bell_on_finish);
+    }
+
+    #[test]
+    fn ui_host_bell_on_finish_can_be_disabled() {
+        let config: Config = toml::from_str("[ui]\nhost_bell_on_finish = false\n").unwrap();
+        assert!(!config.ui.host_bell_on_finish);
+    }
+
+    #[test]
+    fn ui_host_bell_on_finish_round_trips_explicit_true() {
+        // Explicit `= true` must parse, not just be implied by absence
+        // — pins that the field is wired through serde, not just a
+        // hardcoded default.
+        let config: Config = toml::from_str("[ui]\nhost_bell_on_finish = true\n").unwrap();
+        assert!(config.ui.host_bell_on_finish);
+    }
+
+    #[test]
     fn missing_ui_section_keeps_defaults() {
         // The whole [ui] table is optional; users on default chrome
         // never have to write anything to opt in to it.
         let config: Config = toml::from_str("scrollback_len = 100").unwrap();
         assert!(!config.ui.subtle);
+        assert!(config.ui.host_bell_on_finish);
         assert_eq!(config.scrollback_len, 100);
     }
 
