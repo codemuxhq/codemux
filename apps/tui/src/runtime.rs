@@ -59,7 +59,8 @@ use crate::bootstrap_worker::{
 };
 use crate::config::{Config, SearchMode, SpawnConfig};
 use crate::host_title;
-use crate::index_worker::{IndexEvent, IndexState, expand_search_roots, start_index};
+use crate::index_manager::IndexManager;
+use crate::index_worker::IndexState;
 use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction, ScrollAction};
 use crate::log_tail::LogTail;
 use crate::pty_title::TitleCapture;
@@ -906,17 +907,12 @@ impl RuntimeAgent {
     }
 }
 
-/// In-flight prepare worker plus the data it produces. Owned by the
-/// runtime; the spawn modal only sees the prepare's progress through
-/// the [`Stage`] events the runtime forwards via
-/// [`SpawnMinibuffer::set_bootstrap_stage`]. On success the worker
-/// hands us a [`RemoteFs`] alongside the [`PreparedHost`] (opened on
-/// the worker thread so the main render loop isn't blocked on a
-/// synchronous `ssh -M -N` poll); the modal's path-zone autocomplete
-/// then queries through the live `ssh -S` `ControlMaster`. On
-/// `RemoteFs::open` failure the worker hands us `None` and the modal
-/// degrades to literal-path mode rather than blocking the user from
-/// typing a path.
+/// In-flight prepare worker for an SSH host. Owned by the runtime
+/// across the modal's locked-during-bootstrap state. Replacing this
+/// slot cancels the previous worker via `PrepareHandle::Drop`. On
+/// `Done(Ok(_))` the runtime stashes the result for the subsequent
+/// attach phase; on `Done(Err)` it surfaces the error to the modal
+/// and unlocks back to the host zone.
 struct PendingPrepare {
     host: String,
     handle: PrepareHandle,
@@ -1426,19 +1422,16 @@ fn event_loop(
     // lifecycle.
     let mut prepare: Option<PendingPrepare> = None;
     let mut attaches: Vec<PendingAttach> = Vec::new();
-    // Session-long fuzzy directory index. `None` until first needed
-    // (lazy build). When `default_mode == Fuzzy`, kick off the build
-    // at session start so the modal has results ready by the first
-    // open. The handle's `Drop` cancels the worker, so a session exit
-    // is clean even mid-walk.
-    let mut index_state: Option<IndexState> = None;
+    // Per-host fuzzy directory index. The manager owns the catalog,
+    // disk hydration, walker spawns, drain loop, and disk-save
+    // dispatch — runtime forwards lifecycle requests
+    // (request_local_swr / request_remote_swr / force_rebuild_*)
+    // and queries `state_for(host)` to drive the modal's render.
+    let mut index_mgr = IndexManager::new();
     if spawn_config.default_mode == SearchMode::Fuzzy {
-        let roots = expand_search_roots(&spawn_config.search_roots);
-        index_state = Some(IndexState::Building {
-            handle: start_index(roots, spawn_config.project_markers.clone()),
-            count: 0,
-        });
-        tracing::debug!("fuzzy index: build started at session start");
+        let outcome =
+            index_mgr.request_local_swr(&spawn_config.search_roots, &spawn_config.project_markers);
+        tracing::debug!(?outcome, "fuzzy index: build started at session start");
     }
     let initial_count = agents.len();
     // Bundle the four navigation locals (`agents`, `focused`,
@@ -1497,33 +1490,19 @@ fn event_loop(
     let mut last_emitted_host_title: Option<String> = None;
 
     loop {
-        // Drain fuzzy index events before the prepare drain — when the
-        // index transitions to Ready the modal's wildmenu should
-        // reflect that on the same frame. Progress events update the
-        // "indexing… N dirs" counter shown by `wildmenu_view`.
-        if let Some(IndexState::Building { handle, count }) = &mut index_state {
-            while let Some(event) = handle.try_recv() {
-                match event {
-                    IndexEvent::Progress(n) => *count = n,
-                    IndexEvent::Done(Ok(dirs)) => {
-                        tracing::info!(n = dirs.len(), "fuzzy index: build complete");
-                        index_state = Some(IndexState::Ready { dirs });
-                        break;
-                    }
-                    IndexEvent::Done(Err(e)) => {
-                        let msg = format!("{e}");
-                        tracing::warn!("fuzzy index: build failed: {msg}");
-                        index_state = Some(IndexState::Failed { message: msg });
-                        break;
-                    }
-                }
-            }
-        }
-        // Refresh the modal's wildmenu from whatever the index state
-        // is now. The modal short-circuits when not in Fuzzy + Path,
-        // so this is cheap on every other frame.
+        // Drain in-flight index events for every host (local + each
+        // SSH host the user has spawned to), update states, and
+        // dispatch any completed walks to a detached disk-save
+        // thread. The manager owns this whole pipeline; the runtime
+        // just yields control once per frame.
+        index_mgr.tick();
+        // Refresh the modal's wildmenu from the index for whichever
+        // host the modal is currently targeting. The modal
+        // short-circuits when not in Fuzzy + Path, so this is cheap
+        // on every other frame.
         if let Some(ui) = spawn_ui.as_mut() {
-            ui.notify_index_state(index_state.as_ref());
+            let key = ui.active_host_key().to_string();
+            ui.notify_index_state(index_mgr.state_for(&key));
         }
 
         // Drain prepare events first: the modal should reflect the
@@ -1576,6 +1555,22 @@ fn event_loop(
                             prepared.remote_home.clone(),
                             &mut lister,
                         );
+                    }
+                    // SWR for the SSH host: hydrate from the remote
+                    // disk cache if present, then start a fresh walk
+                    // in the background. Skip cleanly when `fs` is
+                    // `None` (the modal will be in literal-path mode
+                    // anyway).
+                    if let Some(rfs) = fs.as_ref() {
+                        let host_roots = spawn_config.ssh_search_roots(&p.host);
+                        let outcome = index_mgr.request_remote_swr(
+                            &p.host,
+                            rfs.socket_path(),
+                            &prepared.remote_home,
+                            &host_roots,
+                            &spawn_config.project_markers,
+                        );
+                        tracing::debug!(?outcome, host = %p.host, "remote fuzzy index: SWR start");
                     }
                     p.remote_fs = fs;
                     p.prepared = Some(prepared);
@@ -1742,6 +1737,13 @@ fn event_loop(
             }
             last_emitted_host_title = desired_host_title;
         }
+        // Look up the index for whichever host the modal is
+        // targeting. Lifted out of the closure so the borrow ends
+        // before `terminal.draw`'s callback re-borrows the world.
+        let modal_index_state = spawn_ui
+            .as_ref()
+            .map(SpawnMinibuffer::active_host_key)
+            .and_then(|k| index_mgr.state_for(k));
         terminal
             .draw(|frame| {
                 render_frame(
@@ -1760,7 +1762,7 @@ fn event_loop(
                     &mut tab_hitboxes,
                     &mut pane_hitbox,
                     selection.as_ref(),
-                    index_state.as_ref(),
+                    modal_index_state,
                 );
             })
             .wrap_err("draw frame")?;
@@ -1796,15 +1798,42 @@ fn event_loop(
                     match ui.handle(&key, &bindings.on_modal, &mut lister) {
                         ModalOutcome::None => {}
                         ModalOutcome::RefreshIndex => {
-                            // Cancel any in-flight build and start a
-                            // fresh one. Drop on the old `IndexState`
-                            // signals the worker to exit at its next
-                            // entry boundary.
-                            let roots = expand_search_roots(&spawn_config.search_roots);
-                            index_state = Some(IndexState::Building {
-                                handle: start_index(roots, spawn_config.project_markers.clone()),
-                                count: 0,
-                            });
+                            // Force-rebuild for the *active* host
+                            // (local or current SSH host). The
+                            // catalog preserves any cached results
+                            // as `Refreshing { dirs, .. }` so the
+                            // wildmenu doesn't go blank during the
+                            // user-triggered rebuild.
+                            let key = ui.active_host_key().to_string();
+                            if key == HOST_PLACEHOLDER {
+                                index_mgr.force_rebuild_local(
+                                    &spawn_config.search_roots,
+                                    &spawn_config.project_markers,
+                                );
+                            } else if let Some(fs) =
+                                prepare.as_ref().and_then(|p| p.remote_fs.as_ref())
+                            {
+                                let host_roots = spawn_config.ssh_search_roots(&key);
+                                let remote_home = prepare
+                                    .as_ref()
+                                    .and_then(|p| p.prepared.as_ref())
+                                    .map_or_else(
+                                        || PathBuf::from("/"),
+                                        |ph| ph.remote_home.clone(),
+                                    );
+                                index_mgr.force_rebuild_remote(
+                                    &key,
+                                    fs.socket_path(),
+                                    &remote_home,
+                                    &host_roots,
+                                    &spawn_config.project_markers,
+                                );
+                            } else {
+                                tracing::debug!(
+                                    host = %key,
+                                    "RefreshIndex: no live RemoteFs for host; skipping rebuild",
+                                );
+                            }
                             tracing::debug!("fuzzy index: rebuild triggered by user");
                         }
                         ModalOutcome::Cancel => {
@@ -1982,7 +2011,8 @@ fn event_loop(
                     // loop iteration's drain. Cheap when not in fuzzy
                     // mode (the modal short-circuits inside).
                     if let Some(ui) = spawn_ui.as_mut() {
-                        ui.notify_index_state(index_state.as_ref());
+                        let key = ui.active_host_key().to_string();
+                        ui.notify_index_state(index_mgr.state_for(&key));
                     }
                     continue;
                 }
@@ -2084,17 +2114,18 @@ fn event_loop(
                     KeyDispatch::Consume => {}
                     KeyDispatch::Exit => return Ok(()),
                     KeyDispatch::SpawnAgent => {
-                        // Lazy-start the index if the user just opted
-                        // into fuzzy mode via config and we haven't
-                        // started a build yet (e.g. previously opened
-                        // the modal in precise then changed config).
-                        if spawn_config.default_mode == SearchMode::Fuzzy && index_state.is_none() {
-                            let roots = expand_search_roots(&spawn_config.search_roots);
-                            index_state = Some(IndexState::Building {
-                                handle: start_index(roots, spawn_config.project_markers.clone()),
-                                count: 0,
-                            });
-                            tracing::debug!("fuzzy index: lazy build started on modal open");
+                        // SWR trigger: every spawn-modal open kicks
+                        // off a fresh local walk so newly-created
+                        // directories appear within a few seconds.
+                        // The manager preserves cached results as
+                        // `Refreshing { dirs, .. }` so the modal
+                        // opens instantly with stale-but-usable data.
+                        if spawn_config.default_mode == SearchMode::Fuzzy {
+                            let outcome = index_mgr.request_local_swr(
+                                &spawn_config.search_roots,
+                                &spawn_config.project_markers,
+                            );
+                            tracing::debug!(?outcome, "fuzzy index: SWR refresh on modal open");
                         }
                         spawn_ui = Some(SpawnMinibuffer::open(
                             initial_cwd,

@@ -12,6 +12,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod bootstrap_worker;
 mod config;
 mod host_title;
+mod index_cache;
+mod index_manager;
 mod index_worker;
 mod keymap;
 mod log_tail;

@@ -54,6 +54,14 @@ crossbeam-channel = "0.5.15"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "0.9"
 
+# JSON used by the disk-cached fuzzy directory index. Local cache lives
+# at `~/.cache/codemux/index.json`; remote cache is the same shape
+# stored on the SSH host and read/written through the existing
+# ControlMaster socket. JSON over TOML so the file is reasonable at
+# 100k entries (TOML's table-of-arrays gets unwieldy at that volume)
+# and trivially `cat`-able when debugging cache invalidation.
+serde_json = "1.0"
+
 # Filesystem glob expansion. Used by the spawn-modal SSH host loader to
 # resolve `Include config.d/*` style directives in `~/.ssh/config`.
 glob = "0.3"

@@ -200,6 +200,65 @@ pub struct SpawnConfig {
     /// search roots, it is deduplicated so the entry only appears once
     /// (with the named-project boost).
     pub projects: Vec<NamedProject>,
+    /// Per-host SSH search-root configuration. The fuzzy index for
+    /// each SSH host is built by walking these roots on the remote
+    /// machine via the existing `ControlMaster` socket. Lookup is
+    /// per-host first, then falls back to the special `"default"`
+    /// key, then to a hardcoded `["~"]`. The `~` is expanded against
+    /// the remote `$HOME` (captured during the SSH prepare phase),
+    /// not the local one — see [`crate::index_worker::expand_remote_roots`].
+    ///
+    /// Example:
+    /// ```toml
+    /// [spawn.ssh.default]
+    /// search_roots = ["~"]
+    ///
+    /// [spawn.ssh."devpod-go"]
+    /// search_roots = ["~", "/srv/repos"]
+    /// ```
+    #[serde(default)]
+    pub ssh: std::collections::HashMap<String, SshHostSpawnConfig>,
+}
+
+impl SpawnConfig {
+    /// Resolve the search-roots list to use for a given SSH `host`.
+    /// Per-host config wins; otherwise the `"default"` entry; otherwise
+    /// the hardcoded `["~"]` baseline. Centralized here so the runtime
+    /// has one call site (and the lookup rules are pinned by tests).
+    #[must_use]
+    pub fn ssh_search_roots(&self, host: &str) -> Vec<String> {
+        if let Some(per_host) = self.ssh.get(host) {
+            return per_host.search_roots.clone();
+        }
+        if let Some(default) = self.ssh.get("default") {
+            return default.search_roots.clone();
+        }
+        vec!["~".to_string()]
+    }
+}
+
+/// Per-host SSH spawn config. Currently just `search_roots` — this
+/// struct exists as a named type rather than a bare `Vec<String>`
+/// keyed off the `[spawn.ssh.<host>]` table so future per-host knobs
+/// (e.g. host-specific project markers) have somewhere to land
+/// without a config-format break.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct SshHostSpawnConfig {
+    /// Search roots for this host. Same expansion rules as the local
+    /// `search_roots`, but `~` resolves to the remote `$HOME`. Roots
+    /// that are neither absolute nor `~`-prefixed are dropped (no
+    /// client-side cwd to anchor relative paths against on the
+    /// remote side).
+    pub search_roots: Vec<String>,
+}
+
+impl Default for SshHostSpawnConfig {
+    fn default() -> Self {
+        Self {
+            search_roots: vec!["~".to_string()],
+        }
+    }
 }
 
 impl Default for SpawnConfig {
@@ -209,6 +268,7 @@ impl Default for SpawnConfig {
             default_mode: SearchMode::default(),
             project_markers: default_project_markers(),
             projects: Vec::new(),
+            ssh: std::collections::HashMap::new(),
         }
     }
 }
@@ -798,5 +858,67 @@ mod tests {
             result.is_err(),
             "missing required `path` field should fail parse, got {result:?}",
         );
+    }
+
+    // ── ssh per-host search roots ────────────────────────────────
+    //
+    // Lookup precedence is: per-host explicit → "default" → hardcoded
+    // ["~"]. Each rung has a positive test; the order between the
+    // first two is also exercised so a per-host override actually
+    // *wins* over default rather than just shadowing it by accident.
+
+    #[test]
+    fn ssh_search_roots_falls_back_to_tilde_when_no_config() {
+        let config = Config::default();
+        assert_eq!(
+            config.spawn.ssh_search_roots("anyhost"),
+            vec!["~".to_string()]
+        );
+    }
+
+    #[test]
+    fn ssh_search_roots_uses_default_section_when_host_unconfigured() {
+        let toml_text = r#"
+            [spawn.ssh.default]
+            search_roots = ["~", "/srv"]
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.spawn.ssh_search_roots("unknown-host"),
+            vec!["~".to_string(), "/srv".to_string()],
+        );
+    }
+
+    #[test]
+    fn ssh_search_roots_per_host_overrides_default() {
+        let toml_text = r#"
+            [spawn.ssh.default]
+            search_roots = ["~"]
+
+            [spawn.ssh."devpod-go"]
+            search_roots = ["~", "/work/repos"]
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        // Per-host wins; default is shadowed entirely (we don't merge).
+        assert_eq!(
+            config.spawn.ssh_search_roots("devpod-go"),
+            vec!["~".to_string(), "/work/repos".to_string()],
+        );
+        // Other hosts still get the default fallback.
+        assert_eq!(
+            config.spawn.ssh_search_roots("other"),
+            vec!["~".to_string()],
+        );
+    }
+
+    #[test]
+    fn ssh_per_host_config_round_trips() {
+        let toml_text = r#"
+            [spawn.ssh."my-box"]
+            search_roots = ["/projects"]
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        let entry = config.spawn.ssh.get("my-box").unwrap();
+        assert_eq!(entry.search_roots, vec!["/projects".to_string()]);
     }
 }

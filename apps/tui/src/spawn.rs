@@ -466,11 +466,13 @@ impl SpawnMinibuffer {
             cache: HashMap::new(),
         };
         self.focused = Zone::Path;
-        // Force Precise: the fuzzy indexer is local-only (a remote
-        // `find` over SSH would be too slow to build per-session).
-        // `user_search_mode` is preserved so we can restore on the
-        // remote-to-local transition (cancel / unlock_back_to_host).
-        self.search_mode = SearchMode::Precise;
+        // Restore the user's preferred mode rather than forcing
+        // Precise. The remote fuzzy index now exists (built per-host
+        // by the runtime via `start_index_remote`), so SSH spawns
+        // can use the same fuzzy UX as local. If the index isn't
+        // ready yet, the wildmenu falls into its "indexing… N dirs"
+        // sentinel — same first-use UX as local.
+        self.search_mode = self.user_search_mode;
         self.refresh(lister);
     }
 
@@ -972,6 +974,20 @@ impl SpawnMinibuffer {
         self.refresh_fuzzy(index);
     }
 
+    /// Catalog key the runtime should use when looking up the index
+    /// for the modal's *current* path-zone target. Returns
+    /// [`HOST_PLACEHOLDER`] (`"local"`) for local mode and the SSH
+    /// host name for remote mode. The runtime calls this each frame
+    /// to pick the right per-host index out of [`IndexCatalog`] so a
+    /// remote modal queries the SSH index, not the stale local one.
+    #[must_use]
+    pub fn active_host_key(&self) -> &str {
+        match self.path_mode {
+            PathMode::Local => HOST_PLACEHOLDER,
+            PathMode::Remote { .. } => &self.host,
+        }
+    }
+
     /// Score the current `fuzzy_query` against the index and populate
     /// `filtered` with the top results. Called by `notify_index_state`;
     /// public so tests can drive it without a runtime drain loop.
@@ -983,7 +999,12 @@ impl SpawnMinibuffer {
             self.selected = None;
             return;
         }
-        let Some(IndexState::Ready { dirs }) = index else {
+        // Both `Ready` and `Refreshing` carry usable cached results
+        // — the SWR refresh just keeps a worker walking in the
+        // background. Reading via `cached_dirs` keeps this branch
+        // exhaustive over the four-variant enum without enumerating
+        // both arms inline.
+        let Some(dirs) = index.and_then(IndexState::cached_dirs) else {
             // Index not ready (Building / Failed / None). Leave
             // `filtered` empty so `wildmenu_view` falls into the
             // index-state sentinel branch.
@@ -1169,11 +1190,16 @@ impl SpawnMinibuffer {
                 Paragraph::new(Line::styled(format!("  ⠋ indexing… {count} dirs"), dim))
                     .block(block)
             }
-            Some(IndexState::Ready { .. }) if self.fuzzy_query.is_empty() => Paragraph::new(
-                Line::styled("  (type to search the directory index)".to_string(), dim),
-            )
-            .block(block),
-            Some(IndexState::Ready { .. }) => {
+            Some(IndexState::Ready { .. } | IndexState::Refreshing { .. })
+                if self.fuzzy_query.is_empty() =>
+            {
+                Paragraph::new(Line::styled(
+                    "  (type to search the directory index)".to_string(),
+                    dim,
+                ))
+                .block(block)
+            }
+            Some(IndexState::Ready { .. } | IndexState::Refreshing { .. }) => {
                 Paragraph::new(Line::styled("  (no matches)".to_string(), dim)).block(block)
             }
             Some(IndexState::Failed { message }) => {
@@ -3367,6 +3393,23 @@ mod tests {
         }
     }
 
+    /// Build a `Refreshing` index state with the given paths as the
+    /// stale-but-usable cache. The handle is inert (no live worker)
+    /// so the test owns the lifecycle entirely.
+    fn refreshing_index_plain(paths: &[&str]) -> IndexState {
+        IndexState::Refreshing {
+            dirs: paths
+                .iter()
+                .map(|p| IndexedDir {
+                    path: PathBuf::from(p),
+                    kind: ProjectKind::Plain,
+                })
+                .collect(),
+            handle: crate::index_worker::inert_handle_for_test(),
+            count: 0,
+        }
+    }
+
     #[test]
     fn open_fuzzy_starts_with_empty_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -3444,9 +3487,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_unlock_forces_precise_and_preserves_user_mode() {
-        // Set the user's preference to Fuzzy, then simulate the runtime
-        // unlocking after a successful prepare.
+    fn remote_unlock_preserves_user_search_mode() {
+        // SSH spawn no longer forces Precise — the runtime now builds
+        // a per-host fuzzy index over ssh+find, so remote modals can
+        // use the same fuzzy UX as local. The user's preferred mode
+        // wins on remote just like on local.
         let mut m = mb("devpod-web", "", Zone::Host, &["devpod-web"]);
         m.search_mode = SearchMode::Fuzzy;
         m.user_search_mode = SearchMode::Fuzzy;
@@ -3455,12 +3500,31 @@ mod tests {
             PathBuf::from("/home/df"),
             &mut local(),
         );
-        assert_eq!(m.search_mode, SearchMode::Precise, "remote forces precise");
+        assert_eq!(
+            m.search_mode,
+            SearchMode::Fuzzy,
+            "remote preserves user-preferred fuzzy mode",
+        );
         assert_eq!(
             m.user_search_mode,
             SearchMode::Fuzzy,
-            "user preference preserved",
+            "user preference still tracked",
         );
+    }
+
+    #[test]
+    fn remote_unlock_preserves_user_precise_mode() {
+        // The other half of the same contract: a user who toggled to
+        // Precise locally keeps Precise after the remote unlock.
+        let mut m = mb("devpod-web", "", Zone::Host, &["devpod-web"]);
+        m.search_mode = SearchMode::Precise;
+        m.user_search_mode = SearchMode::Precise;
+        m.unlock_for_remote_path(
+            "devpod-web".to_string(),
+            PathBuf::from("/home/df"),
+            &mut local(),
+        );
+        assert_eq!(m.search_mode, SearchMode::Precise);
     }
 
     #[test]
@@ -3687,5 +3751,48 @@ mod tests {
         let idx = ready_index_plain(&["/some/where"]);
         m.notify_index_state(Some(&idx));
         assert_eq!(m.filtered, before, "host wildmenu must not be clobbered");
+    }
+
+    #[test]
+    fn refresh_fuzzy_reads_from_refreshing_dirs() {
+        // The whole point of SWR: while the background rebuild is in
+        // flight, the modal must keep serving results from the cached
+        // `dirs` carried by the `Refreshing` variant. Without the
+        // `cached_dirs` extension, the matcher would see "no usable
+        // index" and the wildmenu would go blank between rebuilds.
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        let idx = refreshing_index_plain(&["/home/df/code-utils", "/home/df/Workbench/codemux"]);
+        m.refresh_fuzzy(Some(&idx));
+        assert!(
+            !m.filtered.is_empty(),
+            "Refreshing dirs must be queryable: {:?}",
+            m.filtered,
+        );
+    }
+
+    // ── active_host_key ──────────────────────────────────────────
+    //
+    // The runtime calls this every frame to look up the right
+    // per-host index out of IndexCatalog. Wrong answer = the modal
+    // shows local results when the user is targeting an SSH host (or
+    // vice versa).
+
+    #[test]
+    fn active_host_key_returns_local_for_local_mode() {
+        let m = mb("", "", Zone::Path, &[]);
+        assert_eq!(m.active_host_key(), HOST_PLACEHOLDER);
+    }
+
+    #[test]
+    fn active_host_key_returns_host_for_remote_mode() {
+        let mut m = mb("devpod-web", "", Zone::Host, &["devpod-web"]);
+        m.unlock_for_remote_path(
+            "devpod-web".to_string(),
+            PathBuf::from("/home/df"),
+            &mut local(),
+        );
+        assert_eq!(m.active_host_key(), "devpod-web");
     }
 }
