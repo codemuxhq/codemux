@@ -193,27 +193,42 @@ impl NavState {
         }
     }
 
-    /// Walk the agent list and transition any `Ready` agent whose
-    /// transport has died into [`AgentState::Crashed`] in-place.
+    /// Walk the agent list and react to any `Ready` agent whose
+    /// transport has died. Two outcomes:
     ///
-    /// We deliberately do NOT shrink the `Vec`: silent removal was
-    /// the prior behavior and made the TUI feel buggy ("did I do
-    /// that? did it crash?"). Keeping the slot lets the renderer
-    /// paint the last frame plus a crash banner so the user knows
-    /// what happened and can dismiss with `<prefix> d`.
+    /// - **Exit code `0`** — clean exit (user typed `/quit` in claude,
+    ///   `Ctrl-D`, etc.). Remove the slot silently. The user
+    ///   initiated this; surfacing a dismiss-this-banner step would
+    ///   be friction the prior banner-keeps-the-slot policy never
+    ///   intended to add for clean exits — that policy was meant for
+    ///   *crashes* that the user might otherwise miss.
+    /// - **Anything else** — non-zero process exit, or the SSH
+    ///   `-1` sentinel for a dropped tunnel / dead daemon. Transition
+    ///   to [`AgentState::Crashed`] in place. The slot stays on
+    ///   screen with the last frame plus a red banner; the user
+    ///   dismisses it explicitly with `<prefix> d`.
     ///
     /// Called once per tick after the read loop so the parser has
     /// already absorbed any final bytes the dying child wrote
-    /// before EOF.
+    /// before EOF. Indices into `clean_exits` are processed
+    /// highest-first so earlier removals don't shift later ones,
+    /// and `remove_at` handles all surrounding focus / popup
+    /// clamping.
     fn reap_dead_transports(&mut self) {
-        for agent in &mut self.agents {
-            let exit_code = match &mut agent.state {
-                AgentState::Ready { transport, .. } => transport.try_wait(),
-                _ => None,
-            };
-            if let Some(code) = exit_code {
-                agent.mark_crashed(code);
+        let mut clean_exits: Vec<usize> = Vec::new();
+        for (i, agent) in self.agents.iter_mut().enumerate() {
+            if let AgentState::Ready { transport, .. } = &mut agent.state
+                && let Some(code) = transport.try_wait()
+            {
+                if code == 0 {
+                    clean_exits.push(i);
+                } else {
+                    agent.mark_crashed(code);
+                }
             }
+        }
+        for i in clean_exits.into_iter().rev() {
+            self.remove_at(i);
         }
     }
 
@@ -266,21 +281,11 @@ impl NavState {
     /// Remove the focused agent if it's in a terminal state
     /// (`Failed` or `Crashed`) and clamp the surrounding navigation
     /// state. No-op on a `Ready` agent so a fat-finger of
-    /// `<prefix> d` can't close a live session.
+    /// `<prefix> d` can't close a live session — the more aggressive
+    /// [`Self::kill_focused`] is the chord that punches through.
     ///
     /// Returns `true` when an agent was actually removed, so the
     /// caller can react if needed.
-    ///
-    /// Mutates four pieces of state in concert:
-    /// - `agents` — dismissed entry removed via `Vec::remove` to
-    ///   preserve tab order. `swap_remove` would be O(1) but would
-    ///   silently reshuffle tabs, which reads as a bug.
-    /// - `focused` — clamped down to a valid index when the
-    ///   dismissed agent was the last in the Vec.
-    /// - `previous_focused` — cleared if it now points past the end
-    ///   or onto the same slot as `focused`.
-    /// - `popup_state` — selection clamped to the new last index
-    ///   when the dismiss shrank the addressable range.
     fn dismiss_focused(&mut self) -> bool {
         let is_dismissable = self.agents.get(self.focused).is_some_and(|a| {
             matches!(
@@ -291,24 +296,83 @@ impl NavState {
         if !is_dismissable {
             return false;
         }
-        self.agents.remove(self.focused);
-        if !self.agents.is_empty() {
-            self.focused = self.focused.min(self.agents.len() - 1);
+        self.remove_at(self.focused);
+        true
+    }
+
+    /// Force-close the focused agent regardless of state. The
+    /// `<prefix> x` chord. Drop semantics on the underlying
+    /// `AgentTransport` (`LocalPty::drop` calls `child.kill`;
+    /// `SshDaemonPty::drop` kills the tunnel) take care of reaping
+    /// the child / tunnel — no explicit `kill()` call needed here.
+    ///
+    /// Returns `true` when an agent was actually removed, `false`
+    /// when called against an empty Vec.
+    fn kill_focused(&mut self) -> bool {
+        if self.focused >= self.agents.len() {
+            return false;
         }
-        if let Some(prev) = self.previous_focused
-            && (prev >= self.agents.len() || prev == self.focused)
-        {
+        self.remove_at(self.focused);
+        true
+    }
+
+    /// Remove the agent at `idx` and clamp every surrounding
+    /// navigation index that the removal could invalidate. Called by
+    /// every site that shrinks the agent Vec — `dismiss_focused`,
+    /// `kill_focused`, and `reap_dead_transports`'s clean-exit path —
+    /// so the four-fold index bookkeeping has a single home.
+    ///
+    /// Mutates four pieces of state in concert:
+    /// - `agents` — entry removed via `Vec::remove` to preserve tab
+    ///   order. `swap_remove` would be O(1) but would silently
+    ///   reshuffle tabs, which reads as a bug.
+    /// - `focused` — decremented when `idx < focused` so the same
+    ///   tab keeps focus across an upstream removal; clamped to the
+    ///   new last index when the removed slot *was* focused.
+    /// - `previous_focused` — decremented when `> idx`, cleared when
+    ///   `== idx` (stale pointer) or when it now collides with
+    ///   `focused` (bouncing onto self is a no-op).
+    /// - `popup_state` — selection decremented when `idx < selection`
+    ///   so the popup keeps highlighting the same agent; clamped to
+    ///   the new last index when the removed slot was the selection.
+    ///
+    /// No-op when `idx` is out of bounds.
+    fn remove_at(&mut self, idx: usize) {
+        if idx >= self.agents.len() {
+            return;
+        }
+        self.agents.remove(idx);
+        if !self.agents.is_empty() {
+            if idx < self.focused {
+                self.focused -= 1;
+            } else if idx == self.focused {
+                self.focused = self.focused.min(self.agents.len() - 1);
+            }
+        }
+        if let Some(prev) = self.previous_focused {
+            if prev == idx {
+                self.previous_focused = None;
+            } else if prev > idx {
+                self.previous_focused = Some(prev - 1);
+            }
+        }
+        if self.previous_focused == Some(self.focused) {
             self.previous_focused = None;
         }
-        if let PopupState::Open { selection } = self.popup_state
-            && !self.agents.is_empty()
-            && selection >= self.agents.len()
-        {
-            self.popup_state = PopupState::Open {
-                selection: self.agents.len() - 1,
-            };
+        if let PopupState::Open { selection } = self.popup_state {
+            if self.agents.is_empty() {
+                self.popup_state = PopupState::Closed;
+            } else {
+                let new_selection = if idx < selection {
+                    selection - 1
+                } else {
+                    selection
+                };
+                self.popup_state = PopupState::Open {
+                    selection: new_selection.min(self.agents.len() - 1),
+                };
+            }
         }
-        true
     }
 }
 
@@ -525,6 +589,7 @@ enum KeyDispatch {
     OpenPopup,
     OpenHelp,
     DismissAgent,
+    KillAgent,
 }
 
 struct RuntimeAgent {
@@ -1533,28 +1598,16 @@ fn event_loop(
 
         nav.reap_dead_transports();
         if nav.agents.is_empty() {
-            // Defensive: with the auto-transition above we never
-            // shrink the Vec here, but the dismiss handler does. If
-            // the user dismissed the last tab on the prior frame this
-            // is the clean exit path.
+            // Reap may have shrunk the Vec via the clean-exit path.
+            // The last tab going away (claude `/quit`'d) is the
+            // primary clean-exit-out-of-the-TUI path; manual dismiss
+            // of the last terminal-state agent goes through this
+            // same return.
             return Ok(());
         }
-        nav.focused = nav.focused.min(nav.agents.len() - 1);
-        // Clear the bounce slot if the agent it pointed to was just
-        // reaped — landing alt-tab on a stale index would silently
-        // jump to whatever filled that slot, which is worse than no-op.
-        if let Some(prev) = nav.previous_focused
-            && (prev >= nav.agents.len() || prev == nav.focused)
-        {
-            nav.previous_focused = None;
-        }
-        if let PopupState::Open { selection } = nav.popup_state
-            && selection >= nav.agents.len()
-        {
-            nav.popup_state = PopupState::Open {
-                selection: nav.agents.len() - 1,
-            };
-        }
+        // No post-reap focus / popup clamping here — `remove_at` (called
+        // by both `reap_dead_transports`'s clean-exit path and
+        // `dismiss_focused`) owns those invariants.
 
         let phase = AnimationPhase::from_elapsed(start.elapsed());
         // Sync selection lifecycle: a selection only makes sense for
@@ -1927,6 +1980,9 @@ fn event_loop(
                     KeyDispatch::DismissAgent => {
                         nav.dismiss_focused();
                     }
+                    KeyDispatch::KillAgent => {
+                        nav.kill_focused();
+                    }
                 }
             }
             Event::Resize(cols, rows) => {
@@ -2139,6 +2195,7 @@ fn compute_awaiting_dispatch(key: &KeyEvent, bindings: &Bindings) -> KeyDispatch
         Some(PrefixAction::ToggleNav) => KeyDispatch::ToggleNav,
         Some(PrefixAction::OpenSwitcher) => KeyDispatch::OpenPopup,
         Some(PrefixAction::DismissAgent) => KeyDispatch::DismissAgent,
+        Some(PrefixAction::KillAgent) => KeyDispatch::KillAgent,
         Some(PrefixAction::Help) => KeyDispatch::OpenHelp,
         None => KeyDispatch::Consume,
     }
@@ -2382,14 +2439,18 @@ fn paint_selection_if_active(
 /// styled `Paragraph`) so the underlying last-frame doesn't bleed
 /// through. Color and copy depend on the exit code:
 ///
-/// - `0` — clean exit. Dim gray bg / white fg, no `✗` glyph. The
-///   user typed `/quit` or claude finished normally; calling that
-///   out as a crash would be alarmist.
 /// - `-1` — `SshDaemonPty` sentinel for socket-level failures
 ///   (tunnel drop, daemon death, framed reader I/O error). Red bg,
 ///   "connection lost" copy.
-/// - any other — non-zero process exit. Red bg, `✗ session ended
-///   (exit N)` copy.
+/// - any other non-zero — non-zero process exit. Red bg, `✗ session
+///   ended (exit N)` copy.
+///
+/// Exit code `0` (clean exit) is auto-reaped in
+/// [`NavState::reap_dead_transports`] before reaching this renderer,
+/// so the `n` arm here will only ever observe non-zero codes in
+/// practice. If a synthetic `Crashed { exit_code: 0 }` ever does
+/// land here (e.g. through tests), the `n` arm formats it correctly
+/// with the red treatment — defensive but unsurprising.
 ///
 /// `dismiss_label` is the pre-formatted dismiss-chord string (e.g.
 /// `"d"` or `"ctrl+x"`), resolved by the orchestration layer rather
@@ -2405,27 +2466,18 @@ fn render_crash_banner(frame: &mut Frame<'_>, area: Rect, exit_code: i32, dismis
         width: area.width,
         height: 1,
     };
+    let red_bg = Style::default()
+        .fg(Color::White)
+        .bg(Color::Red)
+        .add_modifier(Modifier::BOLD);
     let (text, style) = match exit_code {
-        0 => (
-            format!(" session ended (exit 0) — {dismiss_label} to dismiss "),
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
         -1 => (
             format!(" ✗ connection lost — {dismiss_label} to dismiss "),
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            red_bg,
         ),
         n => (
             format!(" ✗ session ended (exit {n}) — {dismiss_label} to dismiss "),
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            red_bg,
         ),
     };
     let widget = Paragraph::new(Line::raw(text))
@@ -3721,6 +3773,28 @@ mod tests {
         assert_eq!(action, KeyDispatch::FocusLast);
     }
 
+    #[test]
+    fn prefix_x_dispatches_kill_agent() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('x'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::KillAgent);
+    }
+
+    #[test]
+    fn prefix_d_dispatches_dismiss_agent() {
+        let mut state = PrefixState::AwaitingCommand;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('d'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::DismissAgent);
+    }
+
     // change_focus semantics — the helper that keeps `previous_focused`
     // in sync with `focused` at every user-initiated switch site.
 
@@ -4803,6 +4877,67 @@ mod tests {
         }
     }
 
+    /// Spawn a Ready agent backed by `sh -c 'exit 0'`, then poll
+    /// until the child has actually exited so the next
+    /// `reap_dead_transports` call is guaranteed to observe `Some(0)`
+    /// from `try_wait`. Returns the agent ready to be reaped.
+    fn ready_agent_with_clean_exit() -> RuntimeAgent {
+        let transport = AgentTransport::for_test_clean_exit("clean-exit-test".into(), 5, 20)
+            .expect("for_test_clean_exit transport");
+        let mut agent = RuntimeAgent::ready(
+            AgentId::new("a"),
+            "a".into(),
+            None,
+            None,
+            transport,
+            5,
+            20,
+            100,
+        );
+        if let AgentState::Ready { transport, .. } = &mut agent.state {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while transport.try_wait().is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sh -c 'exit 0' did not exit within 2s",
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        agent
+    }
+
+    #[test]
+    fn reap_silently_removes_clean_exit() {
+        // The headline of the auto-close work: a Ready agent whose
+        // transport returns `Some(0)` from `try_wait` must be
+        // *removed* from the Vec, not transitioned to Crashed. The
+        // user typed `/quit` (or equivalent) and expects the tab
+        // to vanish without further action.
+        let mut nav = NavState::new(vec![ready_agent_with_clean_exit()]);
+        nav.reap_dead_transports();
+        assert!(
+            nav.agents.is_empty(),
+            "exit 0 must be silently reaped, got {} agent(s) remaining",
+            nav.agents.len(),
+        );
+    }
+
+    #[test]
+    fn reap_clean_exit_clamps_focus_to_surviving_agent() {
+        // Multiple agents, only the first dies cleanly. Focus must
+        // shift to the surviving agent (which slides up to index 0)
+        // rather than pointing past the end of the trimmed Vec.
+        let mut nav = NavState::new(vec![ready_agent_with_clean_exit(), ready_test_agent(100)]);
+        nav.focused = 1;
+        nav.reap_dead_transports();
+        assert_eq!(nav.agents.len(), 1, "only the dead agent should be reaped");
+        assert_eq!(
+            nav.focused, 0,
+            "focus must follow the surviving agent across the upstream removal",
+        );
+    }
+
     // ── dismiss_focused ──────────────────────────────────────────
     //
     // Removes the focused agent if it's in a terminal state and
@@ -4918,6 +5053,218 @@ mod tests {
             nav.agents.is_empty(),
             "all-dismissed path leaves the Vec empty",
         );
+    }
+
+    // ── kill_focused ─────────────────────────────────────────────
+    //
+    // The `<prefix> x` chord — force-close. Mirrors `dismiss_focused`
+    // but works on Ready agents too, since the user's intent is
+    // "remove this tab right now" rather than "clear away the corpse".
+    // Drop on the underlying transport handles child / tunnel cleanup.
+
+    #[test]
+    fn kill_focused_removes_ready_agent() {
+        // The whole point of `kill_focused` over `dismiss_focused`:
+        // the Ready guard is gone. Pin it explicitly so a future
+        // refactor that re-introduces a state check doesn't slip
+        // through silently.
+        let mut nav = NavState::new(vec![ready_test_agent(100), failed_agent("b")]);
+
+        let removed = nav.kill_focused();
+
+        assert!(removed, "kill must work on a live Ready agent");
+        assert_eq!(nav.agents.len(), 1);
+        assert_eq!(nav.focused, 0);
+    }
+
+    #[test]
+    fn kill_focused_removes_failed_agent() {
+        // Symmetric with dismiss for the terminal-state case — the
+        // user can use either chord on a dead tab.
+        let mut nav = NavState::new(vec![failed_agent("a"), failed_agent("b")]);
+
+        let removed = nav.kill_focused();
+
+        assert!(removed);
+        assert_eq!(nav.agents.len(), 1);
+    }
+
+    #[test]
+    fn kill_focused_no_op_on_empty_vec() {
+        let mut nav = NavState::new(Vec::new());
+        let removed = nav.kill_focused();
+        assert!(!removed, "no agent to kill on an empty list");
+    }
+
+    #[test]
+    fn kill_focused_clamps_focus_when_killing_last_tab() {
+        // Killing the rightmost tab from focused=2 must drop focus
+        // to the new last index (1), not leave it pointing past the
+        // end. Same invariant `dismiss_focused` already enforced via
+        // its open-coded clamp; pinned here so the shared `remove_at`
+        // helper keeps honoring it through `kill_focused`.
+        let mut nav = NavState::new(vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            ready_test_agent(100),
+        ]);
+        nav.focused = 2;
+
+        nav.kill_focused();
+
+        assert_eq!(nav.agents.len(), 2);
+        assert_eq!(nav.focused, 1);
+    }
+
+    // ── remove_at ────────────────────────────────────────────────
+    //
+    // Two regression scenarios that the prior open-coded clamp in
+    // `dismiss_focused` handled by accident or didn't handle at all.
+    // `remove_at` is now the single home for these invariants and is
+    // called by every Vec-shrinking site.
+
+    #[test]
+    fn remove_at_decrements_focused_when_removing_an_earlier_index() {
+        // Reap-driven removal of an unfocused agent BEFORE the
+        // focused one. Pre-refactor `dismiss_focused` only ever
+        // removed the focused index, so this case was uncovered;
+        // `reap_dead_transports`'s clean-exit path now drives it.
+        let mut nav = NavState::new(vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+        ]);
+        nav.focused = 2;
+
+        nav.remove_at(0);
+
+        assert_eq!(nav.agents.len(), 2);
+        assert_eq!(
+            nav.focused, 1,
+            "focused must follow the same agent across an upstream removal",
+        );
+    }
+
+    #[test]
+    fn remove_at_decrements_previous_focused_when_removing_an_earlier_index() {
+        // Latent-bug fix from the refactor: pre-`remove_at`, removing
+        // an index *below* `previous_focused` left the bounce slot
+        // pointing one past the agent it should have followed.
+        let mut nav = NavState::new(vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+        ]);
+        nav.focused = 0;
+        nav.previous_focused = Some(2);
+
+        nav.remove_at(1);
+
+        assert_eq!(nav.agents.len(), 2);
+        assert_eq!(
+            nav.previous_focused,
+            Some(1),
+            "bounce slot must follow the same agent across an upstream removal",
+        );
+    }
+
+    #[test]
+    fn remove_at_decrements_popup_selection_when_removing_an_earlier_index() {
+        // Same shape as the focused / previous_focused decrement —
+        // popup selection follows the same agent across an upstream
+        // removal rather than silently jumping to the next one.
+        let mut nav = NavState::new(vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+        ]);
+        nav.popup_state = PopupState::Open { selection: 2 };
+
+        nav.remove_at(0);
+
+        match nav.popup_state {
+            PopupState::Open { selection } => assert_eq!(selection, 1),
+            PopupState::Closed => panic!("popup must stay open, just shifted"),
+        }
+    }
+
+    #[test]
+    fn remove_at_clears_previous_focused_when_it_points_at_removed_slot() {
+        // The bounce slot pointed exactly at the index we're removing
+        // → it can't follow anywhere, so clear it.
+        let mut nav = NavState::new(vec![
+            failed_agent("a"),
+            failed_agent("b"),
+            failed_agent("c"),
+        ]);
+        nav.focused = 0;
+        nav.previous_focused = Some(2);
+
+        nav.remove_at(2);
+
+        assert_eq!(nav.agents.len(), 2);
+        assert!(
+            nav.previous_focused.is_none(),
+            "previous_focused pointing at the removed slot must be cleared",
+        );
+    }
+
+    #[test]
+    fn remove_at_no_op_when_index_out_of_bounds() {
+        let mut nav = NavState::new(vec![failed_agent("a")]);
+        nav.remove_at(5);
+        assert_eq!(nav.agents.len(), 1, "out-of-bounds remove_at must no-op");
+    }
+
+    #[test]
+    fn remove_at_closes_popup_when_last_agent_removed() {
+        // The popup overlay can't show a meaningful selection over an
+        // empty agent list. Closing it on the way out keeps the
+        // PopupState invariant ("Open implies a valid selection")
+        // rather than leaving a stale index for whoever next reopens.
+        let mut nav = NavState::new(vec![failed_agent("only")]);
+        nav.popup_state = PopupState::Open { selection: 0 };
+
+        nav.remove_at(0);
+
+        assert!(nav.agents.is_empty());
+        assert!(
+            matches!(nav.popup_state, PopupState::Closed),
+            "popup must auto-close when the last agent is removed",
+        );
+    }
+
+    // ── reap clean-exit auto-close ───────────────────────────────
+    //
+    // Exit code 0 → silent removal (the "I typed /quit" path). The
+    // live-PTY exit-0 path is awkward to drive in unit tests
+    // (`AgentTransport::for_test` spawns `cat`, which doesn't exit
+    // 0 cleanly on its own), so we exercise the synthetic equivalent:
+    // a `Crashed { exit_code: 0 }` state set up directly via
+    // `mark_crashed`. Note this is a DIFFERENT path from the live
+    // reap — `mark_crashed` itself doesn't auto-remove — so the test
+    // covers the dispatch shape (`remove_at` correctly removes a
+    // crashed-zero slot) rather than the live transport poll.
+    //
+    // The actual reap-time auto-close is exercised end-to-end via
+    // the `RUST_LOG=codemux=debug just run` smoke loop documented
+    // in the plan.
+
+    #[test]
+    fn dismiss_removes_crashed_zero_slot() {
+        // A `Crashed { exit_code: 0 }` slot is reachable today only
+        // through tests / synthetic setup (the live reap path
+        // auto-removes before `Crashed` is constructed for code 0).
+        // But the Crashed variant accepts any code, so dismiss must
+        // handle it correctly if it ever appears.
+        let mut agent = ready_test_agent(100);
+        agent.mark_crashed(0);
+        let mut nav = NavState::new(vec![agent]);
+
+        let removed = nav.dismiss_focused();
+
+        assert!(removed);
+        assert!(nav.agents.is_empty());
     }
 
     // ── tab_index_style ──────────────────────────────────────────
@@ -5943,7 +6290,14 @@ mod tests {
     }
 
     #[test]
-    fn render_agent_pane_paints_clean_banner_for_zero_exit_code() {
+    fn render_agent_pane_falls_through_to_red_banner_for_synthetic_zero_exit() {
+        // The live reap path auto-removes exit-0 agents before they
+        // ever reach `Crashed`, so this scenario is only reachable
+        // via direct `mark_crashed(0)` (tests, future internal calls).
+        // The renderer no longer has a "clean exit" special case;
+        // a synthetic 0 falls through the same red-banner path as any
+        // other code so the rendering stays unsurprising rather than
+        // silently producing a non-routable visual variant.
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut agent = ready_test_agent(100);
@@ -5968,11 +6322,11 @@ mod tests {
         let row = top_row_text(&terminal);
         assert!(
             row.contains("session ended (exit 0)"),
-            "clean exit banner missing copy, got: {row:?}",
+            "synthetic 0-exit must still render its code in copy, got: {row:?}",
         );
         assert!(
-            !row.contains('\u{2717}'),
-            "clean exit must not show the cross glyph, got: {row:?}",
+            row.contains('\u{2717}'),
+            "synthetic 0-exit now shares the red ✗ treatment, got: {row:?}",
         );
     }
 
@@ -5981,11 +6335,13 @@ mod tests {
         // The orchestrator (render_frame) is responsible for resolving
         // the bindings to a chord string. Pass a custom label here to
         // verify the renderer interpolates whatever it's given rather
-        // than hardcoding "d".
+        // than hardcoding "d". Uses a synthetic exit-7 Crashed slot
+        // (live exit-0 agents auto-reap before reaching the renderer,
+        // so we pick a non-zero exit to stay close to the real path).
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut agent = ready_test_agent(100);
-        agent.mark_crashed(0);
+        agent.mark_crashed(7);
         terminal
             .draw(|frame| {
                 render_agent_pane(

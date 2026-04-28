@@ -180,6 +180,27 @@ impl AgentTransport {
     pub fn for_test(label: String, rows: u16, cols: u16) -> Result<Self, Error> {
         LocalPty::spawn("cat", &[], label, None, rows, cols).map(Self::Local)
     }
+
+    /// Build a transport that runs `sh -c 'exit 0'` so the child
+    /// terminates immediately with exit code 0. Lets downstream tests
+    /// drive the clean-exit reap path that the long-running `cat`
+    /// child in [`Self::for_test`] never reaches. Same `Drop`
+    /// semantics; the already-exited child is reaped in `LocalPty::drop`.
+    ///
+    /// # Errors
+    /// Same envelope as [`Self::spawn_local`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_test_clean_exit(label: String, rows: u16, cols: u16) -> Result<Self, Error> {
+        LocalPty::spawn(
+            "sh",
+            &["-c".to_string(), "exit 0".to_string()],
+            label,
+            None,
+            rows,
+            cols,
+        )
+        .map(Self::Local)
+    }
 }
 
 /// A child process spawned inside a local PTY.

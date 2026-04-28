@@ -234,6 +234,7 @@ pub enum PrefixAction {
     ToggleNav,
     OpenSwitcher,
     DismissAgent,
+    KillAgent,
     Help,
 }
 
@@ -247,6 +248,7 @@ impl PrefixAction {
         Self::ToggleNav,
         Self::OpenSwitcher,
         Self::DismissAgent,
+        Self::KillAgent,
         Self::Help,
     ];
 
@@ -260,6 +262,7 @@ impl PrefixAction {
             Self::ToggleNav => "toggle navigator style",
             Self::OpenSwitcher => "open the agent switcher popup",
             Self::DismissAgent => "dismiss the focused crashed/failed agent",
+            Self::KillAgent => "force-close the focused agent (live too)",
             Self::Help => "show this help",
         }
     }
@@ -389,6 +392,15 @@ pub struct PrefixBindings {
     /// is harder to reach and means something different (force-kill a
     /// live pane), so we picked the friendlier mnemonic.
     pub dismiss_agent: KeyChord,
+    /// Force-closes the focused agent regardless of state. Live
+    /// agents have their transport killed (the `Drop` impl on
+    /// `LocalPty`/`SshDaemonPty` reaps the child / tunnel). Default
+    /// `x` mirrors tmux's `kill-pane` chord. The split between this
+    /// and `dismiss_agent` is intentional: `d` is the no-risk
+    /// "clear away the corpse" key; `x` is the "I'm done with this
+    /// tab right now" key. Two separate chords keep the safer one
+    /// free of accidental kill-live-session hazards.
+    pub kill_agent: KeyChord,
     pub help: KeyChord,
 }
 
@@ -421,6 +433,7 @@ impl Default for PrefixBindings {
             toggle_nav: KeyChord::plain(KeyCode::Char('v')),
             open_switcher: KeyChord::plain(KeyCode::Char('w')),
             dismiss_agent: KeyChord::plain(KeyCode::Char('d')),
+            kill_agent: KeyChord::plain(KeyCode::Char('x')),
             help: KeyChord::plain(KeyCode::Char('?')),
         }
     }
@@ -437,6 +450,7 @@ impl PrefixBindings {
             (self.toggle_nav, PrefixAction::ToggleNav),
             (self.open_switcher, PrefixAction::OpenSwitcher),
             (self.dismiss_agent, PrefixAction::DismissAgent),
+            (self.kill_agent, PrefixAction::KillAgent),
             (self.help, PrefixAction::Help),
         ];
         if let Some((_, action)) = single.iter().find(|(c, _)| c.matches(key)) {
@@ -472,6 +486,7 @@ impl PrefixBindings {
             PrefixAction::ToggleNav => self.toggle_nav,
             PrefixAction::OpenSwitcher => self.open_switcher,
             PrefixAction::DismissAgent => self.dismiss_agent,
+            PrefixAction::KillAgent => self.kill_agent,
             PrefixAction::Help => self.help,
         }
     }
@@ -807,6 +822,7 @@ impl Bindings {
             self.on_prefix.toggle_nav,
             self.on_prefix.open_switcher,
             self.on_prefix.dismiss_agent,
+            self.on_prefix.kill_agent,
             self.on_prefix.help,
             self.on_popup.confirm,
             self.on_popup.cancel,
@@ -1111,6 +1127,28 @@ mod tests {
         let chord = b.binding_for(PrefixAction::DismissAgent);
         let event = KeyEvent::new(chord.code, chord.modifiers);
         assert_eq!(b.lookup(&event), Some(PrefixAction::DismissAgent));
+    }
+
+    #[test]
+    fn prefix_lookup_finds_kill_agent() {
+        // `x` is the default chord for the force-close action — works
+        // on live agents as well as terminal-state ones, mirroring
+        // tmux's `kill-pane`. Tested separately so the generic
+        // "default bindings work" test stays stable across action
+        // additions.
+        let b = PrefixBindings::default();
+        assert_eq!(
+            b.lookup(&ev(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(PrefixAction::KillAgent),
+        );
+    }
+
+    #[test]
+    fn prefix_kill_agent_round_trips() {
+        let b = PrefixBindings::default();
+        let chord = b.binding_for(PrefixAction::KillAgent);
+        let event = KeyEvent::new(chord.code, chord.modifiers);
+        assert_eq!(b.lookup(&event), Some(PrefixAction::KillAgent));
     }
 
     #[test]
