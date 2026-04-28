@@ -655,22 +655,24 @@ impl ScrollBindings {
 /// this enum exists for the help screen and the dispatch table, not
 /// because the underlying state mutation differs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-// All three variants are intentionally `Focus*` to mirror the
-// matching `PrefixAction` names — clippy's enum_variant_names lint
-// would have us drop the prefix, which would create a `Next` /
-// `Prev` / `Last` enum that is impossible to read in isolation.
-#[allow(clippy::enum_variant_names)]
 pub enum DirectAction {
+    SpawnAgent,
     FocusNext,
     FocusPrev,
     FocusLast,
 }
 
 impl DirectAction {
-    pub const ALL: &'static [DirectAction] = &[Self::FocusNext, Self::FocusPrev, Self::FocusLast];
+    pub const ALL: &'static [DirectAction] = &[
+        Self::SpawnAgent,
+        Self::FocusNext,
+        Self::FocusPrev,
+        Self::FocusLast,
+    ];
 
     pub const fn description(self) -> &'static str {
         match self {
+            Self::SpawnAgent => "open the spawn modal",
             Self::FocusNext => "focus the next agent",
             Self::FocusPrev => "focus the previous agent",
             Self::FocusLast => "bounce to the previously-focused agent",
@@ -678,35 +680,37 @@ impl DirectAction {
     }
 }
 
-/// Direct (no-prefix) navigation chords. The whole point of this
-/// scope is the fast path: the user pays one chord (e.g. `Cmd-;`)
-/// instead of the two of `Ctrl-B p`. Defaults use the `SUPER` (Cmd
-/// on macOS, Win on most Linux DEs) modifier; the runtime
-/// auto-enables the Kitty Keyboard Protocol whenever any binding
-/// uses `SUPER`, which is what makes Cmd deliverable to a TUI.
+/// Direct (no-prefix) chords. The whole point of this scope is the
+/// fast path: the user pays one chord (e.g. `Cmd-;`) instead of the
+/// two of `Ctrl-B p`. Defaults use the `SUPER` (Cmd on macOS, Win on
+/// most Linux DEs) modifier; the runtime auto-enables the Kitty
+/// Keyboard Protocol whenever any binding uses `SUPER`, which is what
+/// makes Cmd deliverable to a TUI.
 ///
-/// **Two chords only by default**: `Cmd+;` for prev and `Cmd+'` for
-/// next. The wider sticky-mode navigation (hjkl with no modifier)
+/// **Defaults**: `Cmd+;`/`Cmd+'` for prev/next focus and `Cmd+\` for
+/// spawn. The wider sticky-mode navigation (hjkl with no modifier)
 /// lives behind the prefix instead — see `PrefixState` in the
-/// runtime. This is deliberate: the prior multi-chord defaults
-/// (`Cmd+]`, `Cmd+[`, `Cmd+L`, `Cmd+H`, `` Cmd+` ``) ran into a
-/// mess of OS reservations (`Cmd+H` = Hide, `` Cmd+` `` = window
-/// cycle) and terminal claims (Ghostty owns `Cmd+]`/`Cmd+[`). The
-/// two surviving defaults are verified-working and on the right
-/// side of every layout we tested.
+/// runtime. The narrow set of Cmd defaults is deliberate: the prior
+/// multi-chord defaults (`Cmd+]`, `Cmd+[`, `Cmd+L`, `Cmd+H`,
+/// `` Cmd+` ``) ran into a mess of OS reservations (`Cmd+H` = Hide,
+/// `` Cmd+` `` = window cycle) and terminal claims (Ghostty owns
+/// `Cmd+]`/`Cmd+[`). The surviving defaults are verified-working on
+/// every layout we tested. `Cmd+\` was chosen over the more obvious
+/// `Cmd+N` because Terminal.app and several other macOS terminals
+/// claim `Cmd+N` for "New Window" before the application sees it;
+/// backslash sits next to the existing `Cmd+'` / `Cmd+;` chords on
+/// the home row and is unclaimed across Ghostty / iTerm2 / `WezTerm` /
+/// Terminal.app.
 ///
-/// Multi-chord per action — same shape as `PrefixBindings.focus_*` —
+/// Multi-chord per focus action — same shape as `PrefixBindings.focus_*` —
 /// so users on different terminals can add aliases without forking
 /// the schema (`focus_next = ["cmd+'", "cmd+l"]`). Single-string
-/// TOML still parses.
+/// TOML still parses. Spawn is single-chord because it has no
+/// ambiguity to resolve via aliases.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
-// Same rationale as DirectAction: the `focus_` prefix makes each
-// field self-describing and matches the names used in PrefixBindings.
-// Dropping it would land us with `next` / `prev` / `last` which read
-// as ambiguous list-navigation rather than tab-focus moves.
-#[allow(clippy::struct_field_names)]
 pub struct DirectBindings {
+    pub spawn_agent: KeyChord,
     #[serde(deserialize_with = "deserialize_chord_list")]
     pub focus_next: Vec<KeyChord>,
     #[serde(deserialize_with = "deserialize_chord_list")]
@@ -727,8 +731,14 @@ impl Default for DirectBindings {
         // verified free in Ghostty + macOS, both unclaimed across
         // common terminals (iTerm2, WezTerm, Terminal.app). The
         // semicolon was the user-confirmed working chord; the
-        // apostrophe rides next to it.
+        // apostrophe rides next to it. `Cmd+\` rounds out the same
+        // home-row punctuation cluster — full rationale for
+        // picking it over `Cmd+N` lives on the struct's doc comment.
         Self {
+            spawn_agent: KeyChord {
+                code: KeyCode::Char('\\'),
+                modifiers: KeyModifiers::SUPER,
+            },
             focus_next: vec![KeyChord {
                 code: KeyCode::Char('\''),
                 modifiers: KeyModifiers::SUPER,
@@ -744,6 +754,11 @@ impl Default for DirectBindings {
 
 impl DirectBindings {
     pub fn lookup(&self, key: &KeyEvent) -> Option<DirectAction> {
+        // Single-chord SpawnAgent first — checked as a single chord
+        // because it doesn't carry the focus-style alias list.
+        if self.spawn_agent.matches(key) {
+            return Some(DirectAction::SpawnAgent);
+        }
         // Linear scan over each Vec; with ~1 chord per action and
         // 3 actions, it's 3 ops max per keystroke at the 50ms frame
         // cadence — invisible.
@@ -772,6 +787,7 @@ impl DirectBindings {
     /// this method's).
     pub fn binding_for(&self, action: DirectAction) -> KeyChord {
         match action {
+            DirectAction::SpawnAgent => self.spawn_agent,
             DirectAction::FocusNext => first_or_default(&self.focus_next, KeyCode::Char('\'')),
             DirectAction::FocusPrev => first_or_default(&self.focus_prev, KeyCode::Char(';')),
             DirectAction::FocusLast => first_or_default(&self.focus_last, KeyCode::Tab),
@@ -834,6 +850,7 @@ impl Bindings {
             self.on_modal.swap_to_host,
             self.on_modal.next_completion,
             self.on_modal.prev_completion,
+            self.on_direct.spawn_agent,
             self.on_scroll.line_up,
             self.on_scroll.line_down,
             self.on_scroll.page_up,
@@ -1200,9 +1217,13 @@ mod tests {
     #[test]
     fn direct_lookup_finds_default_cmd_bindings() {
         let b = DirectBindings::default();
-        // Two chords by default: Cmd+' for next, Cmd+; for prev.
-        // No focus_last default — that move lives behind the prefix
-        // (Ctrl-B Tab).
+        // Three chords by default: Cmd+\ for spawn, Cmd+' for next,
+        // Cmd+; for prev. No focus_last default — that move lives
+        // behind the prefix (Ctrl-B Tab).
+        assert_eq!(
+            b.lookup(&ev(KeyCode::Char('\\'), KeyModifiers::SUPER)),
+            Some(DirectAction::SpawnAgent),
+        );
         assert_eq!(
             b.lookup(&ev(KeyCode::Char('\''), KeyModifiers::SUPER)),
             Some(DirectAction::FocusNext),
@@ -1245,11 +1266,26 @@ mod tests {
         // doesn't round-trip — that's intentional, see
         // `direct_lookup_focus_last_unbound_by_default`.
         let b = DirectBindings::default();
-        for action in [DirectAction::FocusNext, DirectAction::FocusPrev] {
+        for action in [
+            DirectAction::SpawnAgent,
+            DirectAction::FocusNext,
+            DirectAction::FocusPrev,
+        ] {
             let chord = b.binding_for(action);
             let event = KeyEvent::new(chord.code, chord.modifiers);
             assert_eq!(b.lookup(&event), Some(action));
         }
+    }
+
+    #[test]
+    fn direct_spawn_does_not_match_plain_backslash() {
+        // Plain `\` (no SUPER) must NOT trigger the direct spawn —
+        // otherwise typing `\` into the focused PTY (a common shell
+        // / path character) would pop the spawn modal. The same
+        // protection logic that guards `;` / `'` also has to cover
+        // the spawn chord.
+        let b = DirectBindings::default();
+        assert_eq!(b.lookup(&ev(KeyCode::Char('\\'), KeyModifiers::NONE)), None);
     }
 
     #[test]
@@ -1399,6 +1435,7 @@ mod tests {
             [on_prefix]
             quit = "x"
             [on_direct]
+            spawn_agent = "ctrl+n"
             focus_next = "ctrl+l"
             focus_prev = "ctrl+h"
             focus_last = "ctrl+t"

@@ -1048,6 +1048,16 @@ fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16, log_strip: bool
     }
 }
 
+/// Daemon-facing `agent_id` for an SSH spawn. The TUI's pid namespaces
+/// the id so a relaunch can never collide with a still-live remote
+/// daemon from a previous codemux invocation — the bug being fixed
+/// here was the bootstrap silently re-attaching to the surviving
+/// daemon's socket and replaying its captured Claude PTY snapshot.
+/// See the call site in `event_loop` for the full rationale.
+fn daemon_agent_id_for(tui_pid: u32, spawn_counter: usize) -> String {
+    format!("agent-{tui_pid}-{spawn_counter}")
+}
+
 /// Construct a [`RuntimeAgent`] backed by a local PTY. The transport
 /// owns the PTY shape (master + child + reader thread); the runtime
 /// keeps the renderable [`Parser`] alongside, since rendering is the
@@ -1417,6 +1427,16 @@ fn event_loop(
     // without writing to the clipboard. See AD-25's selection follow-up.
     let mut selection: Option<Selection> = None;
     let mut spawn_counter: usize = initial_count;
+    // PID of this codemux invocation, used to namespace SSH daemon
+    // agent_ids so a relaunch can never collide with a still-running
+    // remote daemon from a previous launch. Without this, the SSH
+    // bootstrap re-attaches to the surviving daemon and replays its
+    // captured PTY snapshot — the user's last Claude session "kinda"
+    // resumes when they wanted a fresh one. `setsid -f codemuxd`
+    // outlives the SSH session by design (session continuity is the
+    // daemon's whole point), so the namespace has to come from the
+    // client side. Session restoring will be a separate explicit flow.
+    let tui_pid = std::process::id();
     // Captured once at loop entry so per-tab spinner / blink phases
     // are derived from a stable monotonic origin. The 50 ms event
     // poll below already redraws on each tick when nothing else
@@ -1773,8 +1793,21 @@ fn event_loop(
                                     continue;
                                 };
                                 let label = format!("{host}:agent-{spawn_counter}");
-                                let agent_id = format!("agent-{spawn_counter}");
-                                let runtime_id = AgentId::new(agent_id.clone());
+                                let runtime_id = AgentId::new(format!("agent-{spawn_counter}"));
+                                // Daemon-facing id is namespaced by the
+                                // TUI's pid so a relaunch never
+                                // collides with a still-live remote
+                                // daemon from a previous codemux
+                                // invocation. Without the prefix the
+                                // bootstrap silently re-attaches to the
+                                // old socket (the new daemon's bind
+                                // fails on the held pid file, but the
+                                // surviving socket is what the poll
+                                // loop sees). The user-visible label
+                                // and in-process AgentId stay short
+                                // intentionally — the prefix is for the
+                                // remote filesystem, not for humans.
+                                let daemon_agent_id = daemon_agent_id_for(tui_pid, spawn_counter);
                                 // Empty path → None: omit `--cwd` on
                                 // the remote daemon and let it
                                 // inherit the remote shell's login
@@ -1808,7 +1841,7 @@ fn event_loop(
                                 let handle = start_attach(
                                     prepared,
                                     host.clone(),
-                                    agent_id,
+                                    daemon_agent_id,
                                     cwd_path,
                                     rows,
                                     cols,
@@ -2136,6 +2169,7 @@ fn dispatch_key(state: &mut PrefixState, key: &KeyEvent, bindings: &Bindings) ->
             // only if they did this on purpose, which they wouldn't.
             if let Some(action) = bindings.on_direct.lookup(key) {
                 return match action {
+                    DirectAction::SpawnAgent => KeyDispatch::SpawnAgent,
                     DirectAction::FocusNext => KeyDispatch::FocusNext,
                     DirectAction::FocusPrev => KeyDispatch::FocusPrev,
                     DirectAction::FocusLast => KeyDispatch::FocusLast,
@@ -3621,6 +3655,38 @@ mod tests {
         );
         assert_eq!(action, KeyDispatch::FocusPrev);
         assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn direct_cmd_backslash_spawns_agent_without_arming_prefix() {
+        let mut state = PrefixState::Idle;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('\\'), KeyModifiers::SUPER),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::SpawnAgent);
+        // SpawnAgent is not a nav dispatch, so state stays Idle —
+        // the user types Cmd+\ once, the modal opens, no sticky
+        // mode lingers.
+        assert_eq!(state, PrefixState::Idle);
+    }
+
+    #[test]
+    fn plain_backslash_without_super_still_forwards_as_a_byte() {
+        // Without the SUPER modifier, `\` is just a typed character
+        // for the focused PTY (paths, escape sequences, shell
+        // continuations all use it). The direct-bind layer only
+        // fires on the configured chord, not bare keys — otherwise
+        // the user couldn't type `\` into Claude Code's prompt
+        // without triggering the spawn modal.
+        let mut state = PrefixState::Idle;
+        let action = dispatch_key(
+            &mut state,
+            &key(KeyCode::Char('\\'), KeyModifiers::NONE),
+            &defaults(),
+        );
+        assert_eq!(action, KeyDispatch::Forward(vec![b'\\']));
     }
 
     #[test]
@@ -6813,5 +6879,16 @@ mod tests {
                 "no cell should be flipped when agent id does not match",
             );
         }
+    }
+
+    /// The PID prefix is the whole point of `daemon_agent_id_for` — it
+    /// is what stops a relaunched codemux from re-attaching to the
+    /// previous run's surviving remote daemon. Lock the shape down so
+    /// a future refactor cannot quietly drop it and reintroduce the
+    /// "kinda resumes my last session" bug.
+    #[test]
+    fn daemon_agent_id_includes_tui_pid_and_counter() {
+        assert_eq!(daemon_agent_id_for(48321, 2), "agent-48321-2");
+        assert_eq!(daemon_agent_id_for(1, 1), "agent-1-1");
     }
 }
