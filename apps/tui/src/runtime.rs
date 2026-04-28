@@ -202,6 +202,35 @@ struct NavState {
     popup_state: PopupState,
 }
 
+/// Snapshot captured by [`NavState::peek_finish_transitions`] and
+/// consumed by [`NavState::apply_finish_transitions`]. Carries the
+/// indices that just transitioned working → idle plus the current
+/// `is_working()` poll for every agent (so `apply` doesn't re-poll
+/// and risk seeing a different value).
+///
+/// Splitting peek + apply this way honors Command-Query Separation:
+/// the query (does anyone need attention?) is answered without
+/// implicitly committing the side effects (`needs_attention`,
+/// `last_working` rotation).
+struct FinishTransitions {
+    /// Indices of agents that transitioned working → idle this tick.
+    /// Empty when nothing changed.
+    finished: Vec<usize>,
+    /// Current `is_working()` for every agent, indexed parallel to
+    /// `NavState.agents`. Apply writes this back to `last_working`.
+    new_working: Vec<bool>,
+}
+
+impl FinishTransitions {
+    /// True iff at least one agent (focused or not) finished a turn
+    /// this tick. Drives the host-terminal BEL — the focused-finish
+    /// case counts because the host signal matters whenever the user
+    /// is in another window, regardless of which internal tab finished.
+    fn any(&self) -> bool {
+        !self.finished.is_empty()
+    }
+}
+
 impl NavState {
     /// Build a fresh state from an initial agent vector. The first
     /// agent (index 0) is focused.
@@ -254,44 +283,61 @@ impl NavState {
         }
     }
 
-    /// Sweep all agents for working → idle transitions. Two
-    /// responsibilities:
+    /// Pure query. Captures every agent's current `is_working()` plus
+    /// the indices that just transitioned working → idle since the
+    /// previous tick. Does **not** mutate any agent — the caller
+    /// commits the side effects (and the `last_working` rotation)
+    /// with a paired [`Self::apply_finish_transitions`] call.
     ///
-    /// - **Unfocused agents** that just finished are flagged with
-    ///   `needs_attention = true` so the navigator can render the
-    ///   slow-blink attention cue. The currently-focused agent is
-    ///   skipped — the user is already looking; nothing to alert about
-    ///   inside codemux — and any agent caught in this window has its
-    ///   blink cleared on the next focus change via
-    ///   [`Self::change_focus`].
-    /// - **`last_working` is updated for every agent** (focused or
-    ///   not) so the next tick has a fresh baseline for the next
-    ///   transition.
-    ///
-    /// Returns `true` iff at least one agent (focused or not)
-    /// transitioned working → idle this tick. The event loop uses this
-    /// to fire a host-terminal BEL so Ghostty / iTerm2 / Kitty mark
-    /// the codemux tab as needing attention; the focused-agent case is
-    /// included because the host signal matters whenever the user is
-    /// in another window, regardless of which internal tab finished.
-    /// The terminal itself gates the visual treatment on its own focus
-    /// state, so we don't double-gate here.
-    ///
-    /// Called once per tick after the PTY drain so the title parser
-    /// sees the freshest state.
-    fn note_finish_transitions(&mut self) -> bool {
-        let mut any_finished = false;
-        for (i, agent) in self.agents.iter_mut().enumerate() {
+    /// Splitting the query (this) from the command (`apply`) honors
+    /// Command-Query Separation: the call site can read whether
+    /// anything finished (via [`FinishTransitions::any`]) without
+    /// implicitly committing the consequences. Both calls are
+    /// expected to happen back-to-back on the same `NavState`; the
+    /// `is_working()` snapshot captured here informs both the
+    /// transition set and the next-tick baseline (no double poll).
+    fn peek_finish_transitions(&self) -> FinishTransitions {
+        let mut finished = Vec::new();
+        let mut new_working = Vec::with_capacity(self.agents.len());
+        for (i, agent) in self.agents.iter().enumerate() {
             let cur = agent.is_working();
             if agent.last_working && !cur {
-                any_finished = true;
-                if i != self.focused {
-                    agent.needs_attention = true;
-                }
+                finished.push(i);
             }
-            agent.last_working = cur;
+            new_working.push(cur);
         }
-        any_finished
+        FinishTransitions {
+            finished,
+            new_working,
+        }
+    }
+
+    /// Pure command. Applies a previously-peeked snapshot:
+    ///
+    /// - **Unfocused agents** that finished get `needs_attention =
+    ///   true` so the navigator renders the slow-blink attention cue.
+    ///   The currently-focused agent is skipped — the user is already
+    ///   looking; nothing to alert about inside codemux — and any
+    ///   agent caught in this window has its blink cleared on the next
+    ///   focus change via [`Self::change_focus`].
+    /// - **`last_working` is rotated** to the captured snapshot for
+    ///   every agent so the next tick has a fresh baseline.
+    ///
+    /// Pairs with [`Self::peek_finish_transitions`] called immediately
+    /// before. Indices outside the current agent vector are silently
+    /// skipped — defensive against any future call site that mutates
+    /// `agents` between peek and apply.
+    fn apply_finish_transitions(&mut self, transitions: &FinishTransitions) {
+        for &i in &transitions.finished {
+            if i != self.focused
+                && let Some(agent) = self.agents.get_mut(i)
+            {
+                agent.needs_attention = true;
+            }
+        }
+        for (agent, &w) in self.agents.iter_mut().zip(transitions.new_working.iter()) {
+            agent.last_working = w;
+        }
     }
 
     /// Move focus to `new`, recording the prior focus index for
@@ -1715,7 +1761,9 @@ fn event_loop(
             }
         }
 
-        if nav.note_finish_transitions() && host_bell_on_finish {
+        let transitions = nav.peek_finish_transitions();
+        nav.apply_finish_transitions(&transitions);
+        if transitions.any() && host_bell_on_finish {
             // BEL on any working → idle transition. The host terminal
             // gates the visual treatment on its own focus state, so
             // this is silent while the user is inside codemux and
@@ -5459,67 +5507,95 @@ mod tests {
         assert_eq!(title.as_deref(), Some(expected.as_str()));
     }
 
-    // ── note_finish_transitions ──────────────────────────────────
+    // ── peek_finish_transitions / apply_finish_transitions ───────
     //
-    // The working→idle detector that runs once per tick. Pulled out
-    // of the event loop so the transition matrix can be tested with
-    // Failed agents (whose `is_working()` is always false; we drive
-    // the input by setting `last_working` directly). Two surfaces:
-    // unfocused-only `needs_attention` flagging (drives the slow
-    // blink), and a return value summarizing whether *any* agent
-    // finished this tick (drives the host BEL).
+    // The working→idle detector that runs once per tick. Split into
+    // a pure query (`peek`) and a pure command (`apply`) so the
+    // call site can ask "did anything finish?" without implicitly
+    // committing the side effects (`needs_attention` flag, the
+    // `last_working` rotation). Pulled out of the event loop so the
+    // transition matrix can be tested with Failed agents (whose
+    // `is_working()` is always false; we drive the input by setting
+    // `last_working` directly).
 
     #[test]
-    fn note_finish_transitions_marks_unfocused_agent_that_just_finished() {
+    fn peek_finish_transitions_does_not_mutate_agent_state() {
+        // Pure-query contract: peek alone must leave both
+        // `last_working` and `needs_attention` untouched. A future
+        // refactor that quietly folded apply back into peek would
+        // pass every other test in this section but break this one.
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[1].last_working = true;
-        let mut nav = NavState::new(agents);
-        let any = nav.note_finish_transitions();
-        assert!(any, "an unfocused finish must report any_finished=true");
-        assert!(nav.agents[1].needs_attention);
-        assert!(!nav.agents[1].last_working, "last_working must be reset",);
+        let nav = NavState::new(agents);
+        let _ = nav.peek_finish_transitions();
+        assert!(
+            nav.agents[1].last_working,
+            "peek must not rotate last_working"
+        );
+        assert!(
+            !nav.agents[1].needs_attention,
+            "peek must not flag attention"
+        );
     }
 
     #[test]
-    fn note_finish_transitions_skips_attention_on_focused_agent() {
+    fn apply_finish_transitions_marks_unfocused_agent_that_just_finished() {
+        let mut agents = vec![failed_agent("a"), failed_agent("b")];
+        agents[1].last_working = true;
+        let mut nav = NavState::new(agents);
+        let transitions = nav.peek_finish_transitions();
+        assert!(
+            transitions.any(),
+            "an unfocused finish must report any()=true"
+        );
+        nav.apply_finish_transitions(&transitions);
+        assert!(nav.agents[1].needs_attention);
+        assert!(!nav.agents[1].last_working, "last_working must be rotated");
+    }
+
+    #[test]
+    fn apply_finish_transitions_skips_attention_on_focused_agent() {
         // Focused → user is already looking → no slow-blink. The
-        // detector still resets last_working so the transition is
+        // command still rotates last_working so the transition is
         // consumed (not re-flagged on the next tick).
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[0].last_working = true;
         let mut nav = NavState::new(agents);
-        let any = nav.note_finish_transitions();
+        let transitions = nav.peek_finish_transitions();
+        assert!(
+            transitions.any(),
+            "focused finish must still report any()=true so the host BEL fires when the user is in another window",
+        );
+        nav.apply_finish_transitions(&transitions);
         assert!(!nav.agents[0].needs_attention);
         assert!(!nav.agents[0].last_working);
-        assert!(
-            any,
-            "focused finish must still report any_finished=true so the host BEL fires when the user is in another window",
-        );
     }
 
     #[test]
-    fn note_finish_transitions_no_op_when_state_unchanged() {
+    fn peek_finish_transitions_reports_no_change_when_state_unchanged() {
         let agents = vec![failed_agent("a"), failed_agent("b")];
         let mut nav = NavState::new(agents);
-        let any = nav.note_finish_transitions();
+        let transitions = nav.peek_finish_transitions();
+        assert!(
+            !transitions.any(),
+            "no transition this tick must report any()=false so the host BEL stays silent",
+        );
+        nav.apply_finish_transitions(&transitions);
         assert!(!nav.agents[0].needs_attention);
         assert!(!nav.agents[1].needs_attention);
-        assert!(
-            !any,
-            "no transition this tick must report any_finished=false so the host BEL stays silent",
-        );
     }
 
     #[test]
-    fn note_finish_transitions_returns_true_for_any_unfocused_finish_even_when_focused_unchanged() {
+    fn peek_finish_transitions_reports_any_for_unfocused_finish_even_when_focused_unchanged() {
         // Mixed scenario: focused agent stays idle (no transition),
         // unfocused agent transitions. Pins that "any" really means
         // any — symmetric with the focused-only-finish case above.
         let mut agents = vec![failed_agent("a"), failed_agent("b")];
         agents[1].last_working = true;
         let mut nav = NavState::new(agents);
-        let any = nav.note_finish_transitions();
-        assert!(any);
+        let transitions = nav.peek_finish_transitions();
+        assert!(transitions.any());
+        nav.apply_finish_transitions(&transitions);
         assert!(nav.agents[1].needs_attention);
         assert!(!nav.agents[0].needs_attention);
     }
