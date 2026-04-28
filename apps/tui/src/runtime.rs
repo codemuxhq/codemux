@@ -2979,14 +2979,14 @@ impl AnimationPhase {
 const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 
 /// Smart per-agent label rendered as styled spans. The shape is
-/// `[host · ][⠋ ][● ]<repo>: <title>`, where:
+/// `[⠋ ][host · ][● ]<repo>: <title>`, where:
 ///
-/// - `host` (dim/gray) is shown only for SSH-backed agents so the
-///   user can tell at a glance which devpod the agent lives on
 /// - `⠋` is a Braille spinner frame, rendered when the foreground
 ///   process is mid-turn (its OSC title carries Claude's spinner /
 ///   ✱ glyph). Cycles via [`AnimationPhase`] at ~10 Hz so the motion
 ///   reads as ambient liveness.
+/// - `host` (dim/gray) is shown only for SSH-backed agents so the
+///   user can tell at a glance which devpod the agent lives on
 /// - `●` is a soft pulsing dot rendered only when an unfocused tab
 ///   needs attention (its agent finished a turn since the user was
 ///   last there). Pulses on the same 1 Hz cycle as the body itself
@@ -3042,6 +3042,26 @@ fn label_spans(
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
 
+    // Spinner is the leftmost glyph so the working cue lands in the
+    // same column on every tab — host-prefixed and not — and so the
+    // motion reads independent of the per-host accent next to it.
+    // `Color::Gray` *without* DIM on unfocused tabs makes the spinner
+    // clearly visible against the surrounding DIM label — the user
+    // reported the previous DarkGray+DIM was too faint to read at a
+    // glance. On focused tabs we inherit the tab's reverse video so
+    // the cue stays visible without breaking the tab-highlight read.
+    if working {
+        let spinner_style = if focused {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(
+            format!("{} ", phase.spinner_glyph()),
+            spinner_style,
+        ));
+    }
+
     if let Some(host) = host {
         // Focused tabs inherit the reverse-video tab highlight so the
         // host doesn't fight it; unfocused tabs use the per-host accent
@@ -3053,25 +3073,6 @@ fn label_spans(
             chrome.host_style(host)
         };
         spans.push(Span::styled(format!("{host} · "), host_style));
-    }
-
-    // Spinner before the body so its position stays put as titles
-    // grow and shrink. `Color::Gray` *without* DIM on unfocused tabs
-    // makes the spinner clearly visible against the surrounding DIM
-    // label — the user reported the previous DarkGray+DIM was too
-    // faint to read at a glance. On focused tabs we inherit the
-    // tab's reverse video so the cue stays visible without breaking
-    // the tab-highlight read.
-    if working {
-        let spinner_style = if focused {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans.push(Span::styled(
-            format!("{} ", phase.spinner_glyph()),
-            spinner_style,
-        ));
     }
 
     // Attention dot pulses with the body — same style → reads as
@@ -4615,6 +4616,40 @@ mod tests {
             &ChromeStyle::default(),
         );
         assert_eq!(rendered(&spans), "codemux");
+    }
+
+    /// Spinner sits at the very front so the working cue lands in the
+    /// same column on every tab — host-prefixed and not. A future
+    /// refactor that swapped the order back would put the spinner in
+    /// a different column on local vs SSH tabs and break the visual
+    /// rhythm the user explicitly asked for.
+    #[test]
+    fn label_spans_renders_spinner_before_host() {
+        let phase = AnimationPhase {
+            spinner_frame: 3,
+            blink_bright: true,
+        };
+        let spans = label_spans(
+            Some("devpod-01"),
+            "codemux",
+            true,
+            false,
+            false,
+            phase,
+            &ChromeStyle::default(),
+        );
+        let spinner_idx = spans
+            .iter()
+            .position(|s| SPINNER_FRAMES.iter().any(|g| s.content.contains(g)))
+            .expect("spinner span present");
+        let host_idx = spans
+            .iter()
+            .position(|s| s.content.contains("devpod-01"))
+            .expect("host span present");
+        assert!(
+            spinner_idx < host_idx,
+            "spinner must render before host: spinner@{spinner_idx} host@{host_idx}",
+        );
     }
 
     // ── body_text (pure formatter) ────────────────────────────────
