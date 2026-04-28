@@ -3409,56 +3409,117 @@ fn wrap_paste(text: &str) -> Vec<u8> {
 
 /// Translate a crossterm key event into the bytes a terminal-mode child
 /// process expects.
+///
+/// Two-layer pipeline (see AD-28):
+///   1. [`translate_readline_shortcut`] — opinionated GUI-chord →
+///      readline-byte-sequence adapter. Recognized shortcuts (Cmd+
+///      Backspace, Shift+Enter, etc.) short-circuit here so the
+///      child sees the byte sequence its readline-style input
+///      handler expects.
+///   2. [`encode_terminal_key`] — pure VT100/ANSI key encoder, no
+///      modifier opinions. Reached only when the chord wasn't a
+///      recognized readline shortcut.
 fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
-    let bytes = match code {
-        KeyCode::Char(c) => {
-            if modifiers.contains(KeyModifiers::CONTROL) {
-                let lower = c.to_ascii_lowercase();
-                if lower.is_ascii_alphabetic() {
-                    return Some(vec![(lower as u8) - b'a' + 1]);
-                }
-                return None;
-            }
-            return Some(c.to_string().into_bytes());
+    translate_readline_shortcut(code, modifiers).or_else(|| encode_terminal_key(code, modifiers))
+}
+
+/// Pure VT100 / ANSI key encoder. **No modifier opinions.** This
+/// function maps a key event to the wire bytes a generic terminal-mode
+/// child expects when there is no special chord meaning to apply —
+/// `Backspace → DEL`, `Up → ESC[A`, `Char('a') → 'a'`, and so on.
+///
+/// `Char + CTRL` is the one place modifiers do alter the encoding,
+/// because `Ctrl-letter` is itself a primitive VT100 control byte
+/// (Ctrl-C = 0x03, etc.) — that's protocol, not opinion.
+///
+/// All higher-level "Cmd+Backspace means delete-line" or "Shift+Enter
+/// means newline-in-input" mappings live in [`translate_readline_shortcut`]
+/// instead. Keeping this layer pristine means readers of the encoder
+/// aren't surprised by GUI-flavored translations bleeding in, and the
+/// shortcut adapter is independently testable / extensible.
+fn encode_terminal_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    match code {
+        KeyCode::Char(c) if modifiers.contains(KeyModifiers::CONTROL) => {
+            let lower = c.to_ascii_lowercase();
+            lower
+                .is_ascii_alphabetic()
+                .then(|| vec![(lower as u8) - b'a' + 1])
         }
-        KeyCode::Enter => {
-            // Plain Enter submits; any modifier (Shift, Alt, Ctrl, Super)
-            // is the "I want a newline, not submit" intent. Claude reads
-            // `\x1b\r` (the Meta+Enter / Alt+Enter convention) as an
-            // in-input newline — same byte sequence iTerm/Terminal.app
-            // emit for Option+Enter when "Use Option as Meta" is on.
-            //
-            // Without this branch every Cmd/Ctrl/Shift+Enter chord lands
-            // as plain `\r` and submits the message — the same failure
-            // mode users hit when bracketed paste is off.
-            if modifiers.intersects(
-                KeyModifiers::SHIFT
-                    | KeyModifiers::ALT
-                    | KeyModifiers::CONTROL
-                    | KeyModifiers::SUPER,
-            ) {
-                vec![0x1b, b'\r']
-            } else {
-                vec![b'\r']
-            }
+        KeyCode::Char(c) => Some(c.to_string().into_bytes()),
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::BackTab => Some(vec![0x1b, b'[', b'Z']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(vec![0x1b, b'[', b'A']),
+        KeyCode::Down => Some(vec![0x1b, b'[', b'B']),
+        KeyCode::Right => Some(vec![0x1b, b'[', b'C']),
+        KeyCode::Left => Some(vec![0x1b, b'[', b'D']),
+        KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
+        KeyCode::End => Some(vec![0x1b, b'[', b'F']),
+        KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
+        KeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
+        KeyCode::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
+        KeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
+        _ => None,
+    }
+}
+
+/// Readline-shortcut adapter — the **deliberately opinionated** layer
+/// that bridges GUI-style keyboard chords (Cmd+Backspace, Shift+Enter,
+/// Ctrl+Backspace, …) to the byte sequences a readline-style TUI text
+/// input understands.
+///
+/// Returns `Some(bytes)` only when `(code, modifiers)` matches a
+/// recognized shortcut; `None` otherwise, signaling the caller to fall
+/// through to plain [`encode_terminal_key`].
+///
+/// **This function leaks GUI conventions onto the wire on purpose.**
+/// Claude (and every other readline-style TUI input we target) speaks
+/// the universal readline byte vocabulary — `Ctrl+U` for line-discard,
+/// `Meta+DEL` for word-rubout, `Meta+Enter` for newline-in-input — but
+/// not the Kitty Keyboard Protocol's CSI-u extended encoding for
+/// modified non-character keys. Preserving "fidelity" by passing
+/// `Cmd+Backspace` through verbatim would land literal escape garbage
+/// in Claude's input field. The job of this layer is precisely to
+/// translate user intent into the bytes the child can act on.
+///
+/// AD-28 captures the rationale and acceptance criteria for adding
+/// new shortcuts here.
+///
+/// Recognized today:
+///
+/// | Chord                           | Bytes        | Readline name        |
+/// |---------------------------------|--------------|----------------------|
+/// | `Cmd+Backspace`                 | `\x15`       | `unix-line-discard`  |
+/// | `Ctrl+Backspace`/`Alt+Backspace`| `\x1b\x7f`   | `unix-word-rubout`   |
+/// | `(Shift\|Alt\|Ctrl\|Cmd)+Enter` | `\x1b\r`     | `meta-enter` newline |
+fn translate_readline_shortcut(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+    // SUPER wins when both Cmd and Ctrl/Alt are held — a Mac user
+    // pressing Cmd+Backspace means "kill the line", not "kill the
+    // word and also Cmd". Cmd events only reach us at all because
+    // the default config triggers Kitty Keyboard Protocol negotiation;
+    // on terminals that can't deliver SUPER the user falls back to
+    // the Ctrl/Alt variants.
+    //
+    // Modified Enter — any of Shift/Alt/Ctrl/Super — is the universal
+    // "I want a newline, not submit" intent. ESC+CR is what
+    // iTerm/Terminal.app emit for Option+Enter when "Use Option as
+    // Meta" is on, and what every readline-style input handler treats
+    // as in-input newline. Without this branch every modified Enter
+    // chord lands as plain `\r` and submits the message.
+    const NEWLINE_INTENT_MODS: KeyModifiers = KeyModifiers::SHIFT
+        .union(KeyModifiers::ALT)
+        .union(KeyModifiers::CONTROL)
+        .union(KeyModifiers::SUPER);
+    match code {
+        KeyCode::Backspace if modifiers.contains(KeyModifiers::SUPER) => Some(vec![0x15]),
+        KeyCode::Backspace if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            Some(vec![0x1b, 0x7f])
         }
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => vec![0x1b, b'[', b'A'],
-        KeyCode::Down => vec![0x1b, b'[', b'B'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'],
-        KeyCode::Left => vec![0x1b, b'[', b'D'],
-        KeyCode::Home => vec![0x1b, b'[', b'H'],
-        KeyCode::End => vec![0x1b, b'[', b'F'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
-        _ => return None,
-    };
-    Some(bytes)
+        KeyCode::Enter if modifiers.intersects(NEWLINE_INTENT_MODS) => Some(vec![0x1b, b'\r']),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -3470,7 +3531,150 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    // key_to_bytes (unchanged from before)
+    // ---- encode_terminal_key (pure VT100 layer, no modifier opinions) ----
+    //
+    // These tests pin the architectural invariant: the encoder must
+    // produce the same bytes regardless of GUI-style modifiers (SUPER,
+    // SHIFT, ALT). Any opinion about how Cmd/Shift/Alt should re-mean
+    // a key belongs in `translate_readline_shortcut`. If a future
+    // change adds modifier-branching here, this layer's contract has
+    // been violated and these tests should fail loud.
+
+    #[test]
+    fn encode_terminal_key_has_no_modifier_opinion_on_backspace() {
+        for modifier in [
+            KeyModifiers::NONE,
+            KeyModifiers::SUPER,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER | KeyModifiers::CONTROL,
+        ] {
+            assert_eq!(
+                encode_terminal_key(KeyCode::Backspace, modifier),
+                Some(vec![0x7f]),
+                "encoder must stay opinion-free for Backspace+{modifier:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn encode_terminal_key_has_no_modifier_opinion_on_enter() {
+        for modifier in [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert_eq!(
+                encode_terminal_key(KeyCode::Enter, modifier),
+                Some(vec![b'\r']),
+                "encoder must stay opinion-free for Enter+{modifier:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn encode_terminal_key_keeps_ctrl_letter_as_protocol() {
+        // The one place modifiers matter at the encoder level: Ctrl+letter
+        // is itself a primitive control byte (Ctrl-C = 0x03). That's
+        // protocol, not opinion, and stays in the encoder.
+        assert_eq!(
+            encode_terminal_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(vec![0x03]),
+        );
+    }
+
+    // ---- translate_readline_shortcut (opinionated GUI→readline layer) ----
+    //
+    // The contract: returns Some(bytes) only for recognized GUI-style
+    // chords; None otherwise so the orchestrator falls through to the
+    // encoder. New shortcuts (Cmd+Right, Cmd+A, etc.) get added here,
+    // never in the encoder. Each test below pins one chord's mapping.
+
+    #[test]
+    fn shortcut_returns_none_for_unmodified_keys() {
+        // Plain Backspace, plain Enter, plain arrows — none are
+        // shortcuts; orchestrator must reach the encoder for them.
+        for code in [
+            KeyCode::Backspace,
+            KeyCode::Enter,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Char('a'),
+        ] {
+            assert_eq!(
+                translate_readline_shortcut(code, KeyModifiers::NONE),
+                None,
+                "{code:?} (no modifiers) must not be a shortcut",
+            );
+        }
+    }
+
+    #[test]
+    fn shortcut_returns_none_for_keys_with_no_registered_shortcut() {
+        // Cmd+Up has no registered shortcut today — falls through to
+        // the encoder, which sends the plain arrow CSI. If a future
+        // change adds a shortcut for it, update this test.
+        assert_eq!(
+            translate_readline_shortcut(KeyCode::Up, KeyModifiers::SUPER),
+            None,
+        );
+    }
+
+    #[test]
+    fn shortcut_cmd_backspace_is_unix_line_discard() {
+        assert_eq!(
+            translate_readline_shortcut(KeyCode::Backspace, KeyModifiers::SUPER),
+            Some(vec![0x15]),
+        );
+    }
+
+    #[test]
+    fn shortcut_ctrl_or_alt_backspace_is_unix_word_rubout() {
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                translate_readline_shortcut(KeyCode::Backspace, modifier),
+                Some(vec![0x1b, 0x7f]),
+                "wrong bytes for {modifier:?}+Backspace",
+            );
+        }
+    }
+
+    #[test]
+    fn shortcut_super_wins_over_ctrl_for_backspace() {
+        // Precedence rule: a Mac user pressing Cmd+Backspace means
+        // "line delete", not "word delete plus extra modifiers".
+        assert_eq!(
+            translate_readline_shortcut(
+                KeyCode::Backspace,
+                KeyModifiers::SUPER | KeyModifiers::CONTROL,
+            ),
+            Some(vec![0x15]),
+        );
+    }
+
+    #[test]
+    fn shortcut_modified_enter_is_meta_enter_for_newline_in_input() {
+        for modifier in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER,
+        ] {
+            assert_eq!(
+                translate_readline_shortcut(KeyCode::Enter, modifier),
+                Some(vec![0x1b, b'\r']),
+                "wrong bytes for {modifier:?}+Enter",
+            );
+        }
+    }
+
+    // ---- key_to_bytes (orchestrator: shortcut first, encoder fallback) ----
+    //
+    // These tests exercise the composed pipeline. They duplicate a
+    // few of the per-layer assertions on purpose — the value is
+    // catching wiring regressions (e.g. someone reordering the
+    // `or_else` chain) that the per-layer tests can't see.
 
     #[test]
     fn plain_ascii_char_passes_through_as_one_byte() {
@@ -3499,10 +3703,11 @@ mod tests {
 
     #[test]
     fn modified_enter_emits_meta_enter_for_in_input_newline() {
-        // Plain `\r` would submit; `ESC + \r` is the universal
-        // Meta/Alt+Enter sequence Claude treats as a newline within
-        // input. Each modifier the user might pair with Enter must take
-        // this branch — Shift, Alt, Ctrl, Super (Cmd/Win).
+        // Pipeline-level pin: a future regression that drops the
+        // Enter arm from the shortcut layer would silently submit
+        // every Cmd/Shift/Ctrl+Enter as a plain `\r`. Per-layer
+        // tests cover the shortcut function directly; this one
+        // covers the wiring.
         for modifier in [
             KeyModifiers::SHIFT,
             KeyModifiers::ALT,
@@ -3545,6 +3750,53 @@ mod tests {
         assert_eq!(
             key_to_bytes(KeyCode::Down, KeyModifiers::NONE),
             Some(vec![0x1b, b'[', b'B'])
+        );
+    }
+
+    #[test]
+    fn plain_backspace_emits_del() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Backspace, KeyModifiers::NONE),
+            Some(vec![0x7f])
+        );
+    }
+
+    #[test]
+    fn ctrl_or_alt_backspace_emits_meta_del_for_word_delete() {
+        // Pipeline-level pin: the shortcut layer's word-rubout
+        // mapping must reach the wire untouched.
+        for modifier in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                key_to_bytes(KeyCode::Backspace, modifier),
+                Some(vec![0x1b, 0x7f]),
+                "wrong bytes for {modifier:?}+Backspace",
+            );
+        }
+        assert_eq!(
+            key_to_bytes(
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            Some(vec![0x1b, 0x7f]),
+        );
+    }
+
+    #[test]
+    fn cmd_backspace_emits_ctrl_u_for_line_delete() {
+        assert_eq!(
+            key_to_bytes(KeyCode::Backspace, KeyModifiers::SUPER),
+            Some(vec![0x15])
+        );
+    }
+
+    #[test]
+    fn cmd_wins_over_ctrl_when_both_modify_backspace() {
+        assert_eq!(
+            key_to_bytes(
+                KeyCode::Backspace,
+                KeyModifiers::SUPER | KeyModifiers::CONTROL,
+            ),
+            Some(vec![0x15]),
         );
     }
 

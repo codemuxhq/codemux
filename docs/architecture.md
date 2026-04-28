@@ -538,6 +538,77 @@ the new `click` / `drag` lines. Apple Terminal does not deliver SGR
 mouse anyway — neither tab gestures nor scroll work there. Same
 explicit non-goal as AD-25.
 
+### AD-28 — Wire encoder vs readline-shortcut adapter (split layers)
+
+Translating a `KeyEvent` into the bytes a terminal-mode child expects
+is two responsibilities, not one, and they live in two named
+functions in `apps/tui/src/runtime.rs`:
+
+1. **`encode_terminal_key`** — pure VT100 / ANSI key encoder. Maps
+   `Backspace → DEL`, `Up → ESC[A`, `Char('a') → 'a'`, etc. The only
+   modifier branching it does is `Ctrl-letter → 0x01..0x1A`, because
+   that's protocol (Ctrl-C *is* 0x03), not opinion. No GUI-style
+   modifier ever changes the output here. Tests pin this invariant
+   explicitly: `encode_terminal_key(Backspace, SUPER)` must equal
+   `encode_terminal_key(Backspace, NONE)` — both `vec![0x7f]`.
+2. **`translate_readline_shortcut`** — the **deliberately
+   opinionated** adapter that bridges GUI-style chords (Cmd+Backspace,
+   Shift+Enter, Ctrl+Backspace, …) to readline byte sequences:
+   `Cmd+Backspace → Ctrl+U` (unix-line-discard), `Ctrl/Alt+Backspace
+   → Meta+DEL` (unix-word-rubout), `(Shift|Alt|Ctrl|Cmd)+Enter →
+   Meta+Enter` (newline-in-input). Returns `Some(bytes)` only when the
+   chord matches a registered shortcut; `None` otherwise.
+
+`key_to_bytes` is now a one-line orchestrator: shortcut first,
+encoder fallback. Wire bytes leaving the function are byte-identical
+to the previous combined implementation; the change is purely
+structural.
+
+**Why split.** The architecture-guide review (NLM, 2026-04-28) flagged
+the previous combined function as a Leaky Abstraction — the byte
+encoder was carrying GUI-flavored opinions about what `Cmd+Backspace`
+or `Shift+Enter` "should" mean, and a reader of the encoder had no
+way to tell where the protocol stopped and the opinion started. The
+same critique had landed earlier against the modified-Enter handler
+inside the old `key_to_bytes` and was carried forward unresolved. The
+split fixes both at once: the encoder is pristine and reads as
+protocol; the shortcut adapter has a docstring whose first
+paragraph is "this layer leaks GUI conventions onto the wire on
+purpose, here's why."
+
+**Why opinionated translation, not raw modifier passthrough.** Claude
+(and every readline-style TUI input we target) speaks the universal
+readline byte vocabulary — `Ctrl+U`, `Meta+DEL`, `Meta+Enter` — but
+not the Kitty Keyboard Protocol's CSI-u extended encoding for
+modified non-character keys. Passing `Cmd+Backspace` through
+verbatim via CSI-u would land literal escape garbage in Claude's
+input. So the adapter's job is precisely to translate user intent
+into the bytes the child can act on; the "fidelity loss" the review
+flagged is the entire point of the layer existing.
+
+**Acceptance criteria for adding a new shortcut.** The chord must:
+(a) be a recognized GUI convention with no ambiguity (Cmd+Right
+for end-of-line, Cmd+A for select-all, etc.), (b) have a
+well-known readline byte sequence on the receiving end, and (c)
+the destination must be readline-style input — not a vt100
+application that interprets the raw chord differently. Anything
+violating (c) belongs in the encoder, not here.
+
+**Why hardcode rather than route through `Bindings`.** The shortcut
+layer is *protocol bridging*, not user policy. `Bindings` (AD-24)
+maps key chords to application intents (`SpawnAgent`, `FocusNext`);
+it is the right home for "what should codemux do when I press X".
+The shortcut adapter answers "what bytes does a readline-style child
+process expect when the user expresses delete-line intent" — a
+separate layer with a separate vocabulary. If a future user wants to
+remap `Cmd+Backspace` to send something other than `Ctrl+U`, the
+shape now makes that an additive change (introduce a
+`ReadlineShortcuts` POD on `Bindings`), not a teardown.
+
+Rejected: a single combined `key_to_bytes` function with modifier
+branching inline (the prior shape). Re-evaluating it would re-stage
+the exact Leaky Abstraction the review fired on, twice.
+
 ## Deferred ideas
 
 Architecture decisions sketched in earlier drafts but not load-bearing for what

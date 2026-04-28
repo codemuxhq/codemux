@@ -23,7 +23,7 @@ Cargo workspace, edition 2024, resolver 3. Three crates:
 - `crates/session` — agent lifecycle bounded context (mostly P1.4+ scope).
 - `crates/shared-kernel` — IDs only (`HostId`, `AgentId`, `GroupId`); zero vendor deps.
 
-Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term/vt100/crossterm`. `session → shared-kernel`. **Never** the other direction; **never** any TUI dep in `crates/*`. Architecture rationale lives in `docs/architecture.md` (AD-1 through AD-24).
+Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term/vt100/crossterm`. `session → shared-kernel`. **Never** the other direction; **never** any TUI dep in `crates/*`. Architecture rationale lives in `docs/architecture.md` (AD-1 through AD-28).
 
 ## Where things live
 
