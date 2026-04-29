@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, eyre};
@@ -246,6 +246,22 @@ pub struct SpawnConfig {
     /// ```
     #[serde(default)]
     pub ssh: std::collections::HashMap<String, SshHostSpawnConfig>,
+    /// Directory the spawn modal opens an agent in when the user
+    /// presses Enter without picking anything (no wildmenu selection,
+    /// no typed query, the path field is empty or still holds the
+    /// auto-seeded cwd / remote `$HOME`). Created on first use if
+    /// missing.
+    ///
+    /// Tilde resolves at use time: against the local `$HOME` for local
+    /// spawns, and against the remote `$HOME` (captured during the
+    /// SSH prepare phase) for remote spawns. Absolute paths pass
+    /// through unchanged on both sides. A non-tilde, non-absolute
+    /// value is treated as an error at use time and the spawn falls
+    /// back to today's "use the platform default cwd" behavior.
+    ///
+    /// Defaults to `"~/.codemux/scratch"` so a fresh install gets a
+    /// dedicated scratch dir without writing config.
+    pub scratch_dir: String,
 }
 
 impl SpawnConfig {
@@ -263,6 +279,59 @@ impl SpawnConfig {
         }
         vec!["~".to_string()]
     }
+
+    /// Resolve [`Self::scratch_dir`] against the local `$HOME`.
+    /// Returns `None` when the configured value uses `~` but `$HOME`
+    /// is unset (the runtime falls back to the platform default cwd
+    /// in that case rather than crashing).
+    ///
+    /// Absolute paths pass through unchanged. Relative paths are
+    /// rejected — there's no obvious anchor to resolve them against
+    /// (the TUI's cwd would be surprising; using `$HOME` would
+    /// duplicate the `~/foo` syntax).
+    #[must_use]
+    pub fn local_scratch_dir(&self) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        expand_scratch(&self.scratch_dir, home.as_deref())
+    }
+
+    /// Resolve [`Self::scratch_dir`] against the remote `$HOME`
+    /// captured during the SSH prepare phase. Same rules as
+    /// [`Self::local_scratch_dir`] but anchored on the remote home
+    /// instead of the local one.
+    #[must_use]
+    pub fn remote_scratch_dir(&self, remote_home: &Path) -> Option<PathBuf> {
+        expand_scratch(&self.scratch_dir, Some(remote_home))
+    }
+}
+
+/// Tilde-expand `value` against `home`. Mirrors the `expand_one`
+/// helper in `index_worker.rs` but returns a single value rather
+/// than walking a list. Centralised here so the runtime has one
+/// call shape regardless of local vs remote context — the caller
+/// just supplies the appropriate `$HOME`.
+///
+/// Returns `None` for tilde-prefixed values when `home` is unset
+/// (the caller falls back to the platform default), and for relative
+/// paths (no obvious anchor — see [`SpawnConfig::local_scratch_dir`]).
+fn expand_scratch(value: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if value == "~" {
+        let h = home?;
+        return Some(h.to_path_buf());
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        let h = home?;
+        return Some(h.join(rest));
+    }
+    let candidate = Path::new(value);
+    if candidate.is_absolute() {
+        return Some(candidate.to_path_buf());
+    }
+    tracing::warn!(
+        scratch_dir = %value,
+        "scratch_dir is neither absolute nor `~`-prefixed; ignoring",
+    );
+    None
 }
 
 /// Per-host SSH spawn config. Currently just `search_roots` — this
@@ -297,6 +366,7 @@ impl Default for SpawnConfig {
             project_markers: default_project_markers(),
             projects: Vec::new(),
             ssh: std::collections::HashMap::new(),
+            scratch_dir: "~/.codemux/scratch".to_string(),
         }
     }
 }
@@ -975,5 +1045,120 @@ mod tests {
         let config: Config = toml::from_str(toml_text).unwrap();
         let entry = config.spawn.ssh.get("my-box").unwrap();
         assert_eq!(entry.search_roots, vec!["/projects".to_string()]);
+    }
+
+    // ── scratch_dir ──────────────────────────────────────────────
+    //
+    // The default lands a fresh install in `~/.codemux/scratch` for
+    // the empty-Enter spawn fallback. Pinned because the runtime
+    // mkdir's whatever path lands here on first use; a typo in the
+    // default would silently send agents into the wrong place.
+
+    #[test]
+    fn spawn_scratch_dir_defaults_to_dotcodemux_scratch() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.spawn.scratch_dir, "~/.codemux/scratch");
+    }
+
+    #[test]
+    fn spawn_scratch_dir_round_trips() {
+        let toml_text = r#"
+            [spawn]
+            scratch_dir = "~/scratch"
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(config.spawn.scratch_dir, "~/scratch");
+    }
+
+    #[test]
+    fn spawn_scratch_dir_accepts_absolute_path() {
+        let toml_text = r#"
+            [spawn]
+            scratch_dir = "/var/codemux/scratch"
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(config.spawn.scratch_dir, "/var/codemux/scratch");
+    }
+
+    // ── scratch dir resolution ───────────────────────────────────
+    //
+    // The path comes off disk as a string; expansion is per-use so
+    // local and remote spawns can both share one config knob. Pin
+    // each branch (tilde/absolute/relative/missing-home) so a future
+    // refactor can't silently change the resolution semantics.
+    //
+    // We test `expand_scratch` directly rather than the public
+    // `local_scratch_dir`/`remote_scratch_dir` wrappers because the
+    // local one reads `$HOME` from the process environment — and
+    // mutating env vars from cargo tests is racy under the default
+    // parallel runner.
+
+    #[test]
+    fn expand_scratch_expands_tilde_against_home() {
+        assert_eq!(
+            expand_scratch("~/.codemux/scratch", Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me/.codemux/scratch")),
+        );
+    }
+
+    #[test]
+    fn expand_scratch_bare_tilde_resolves_to_home() {
+        assert_eq!(
+            expand_scratch("~", Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/home/me")),
+        );
+    }
+
+    #[test]
+    fn expand_scratch_absolute_path_passes_through() {
+        // The "home" arg is intentionally Some — absolute paths must
+        // ignore it. Pinning Some(...) catches the bug where someone
+        // adds a `home.unwrap_or_else(...)` and silently grafts a
+        // home prefix onto every path.
+        assert_eq!(
+            expand_scratch("/var/scratch", Some(Path::new("/home/me"))),
+            Some(PathBuf::from("/var/scratch")),
+        );
+        assert_eq!(
+            expand_scratch("/var/scratch", None),
+            Some(PathBuf::from("/var/scratch")),
+        );
+    }
+
+    #[test]
+    fn expand_scratch_returns_none_for_relative_path() {
+        // Bare `scratch` has no anchor — the runtime falls back to
+        // platform default cwd rather than guessing.
+        assert_eq!(expand_scratch("scratch", Some(Path::new("/home/me"))), None);
+        assert_eq!(
+            expand_scratch("./scratch", Some(Path::new("/home/me"))),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_scratch_returns_none_when_tilde_but_no_home() {
+        // `$HOME` unset on the local side, or a remote where we
+        // somehow lost the captured home (shouldn't happen in
+        // practice — remote home is required to reach this code path
+        // — but pin the branch anyway so we degrade rather than crash).
+        assert_eq!(expand_scratch("~/scratch", None), None);
+        assert_eq!(expand_scratch("~", None), None);
+    }
+
+    #[test]
+    fn remote_scratch_dir_via_public_api() {
+        // Sanity check that the public wrapper passes through to
+        // expand_scratch correctly. Doesn't read $HOME so it's safe
+        // under parallel test execution.
+        let toml_text = r#"
+            [spawn]
+            scratch_dir = "~/.codemux/scratch"
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.spawn.remote_scratch_dir(Path::new("/root")),
+            Some(PathBuf::from("/root/.codemux/scratch")),
+        );
     }
 }

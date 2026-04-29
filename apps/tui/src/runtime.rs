@@ -1184,6 +1184,75 @@ fn spawn_local_agent(
     ))
 }
 
+/// Resolve the configured `[spawn].scratch_dir` against the captured
+/// remote `$HOME` and `mkdir -p` it over the prepare's `RemoteFs`.
+/// Returns the resolved absolute remote path on success, `None` on
+/// any failure so the caller can fall back to today's "use the remote
+/// shell's default cwd" semantics.
+///
+/// Lives next to `spawn_local_agent` because both shapes (local
+/// scratch via `std::fs::create_dir_all`, remote scratch via this
+/// helper) are spawn-time concerns the runtime owns. Extracted from
+/// the `SpawnScratch` arm because nesting four levels of `match` /
+/// `Option` inside a 100+-line match arm trips clippy's
+/// `single_match_else` lint and makes the arm hard to read.
+fn resolve_remote_scratch_cwd(
+    spawn_config: &SpawnConfig,
+    remote_home: &Path,
+    remote_fs: Option<&RemoteFs>,
+    runner: &dyn codemuxd_bootstrap::CommandRunner,
+) -> Option<PathBuf> {
+    let dir = spawn_config.remote_scratch_dir(remote_home)?;
+    let Some(fs) = remote_fs else {
+        // No live `ControlMaster` to mkdir through. The directory
+        // probably already exists (this is the user's habitual
+        // scratch dir), so still send `--cwd` and let the daemon
+        // validate. If validation fails the user sees the standard
+        // SSH-spawn error, not a silent fallback to $HOME.
+        tracing::warn!(
+            scratch_dir = %dir.display(),
+            "no live RemoteFs to mkdir scratch; sending --cwd anyway \
+             and letting the daemon validate",
+        );
+        return Some(dir);
+    };
+    if let Err(e) = fs.mkdir_p(runner, &dir) {
+        // Graceful degradation — the agent still spawns, just at
+        // remote $HOME instead of the configured scratch. Warn
+        // (not error) per the project logging policy: an end-user-
+        // surfaced runbook is the right level for "secondary
+        // infrastructure failed but primary use case continues".
+        tracing::warn!(
+            scratch_dir = %dir.display(),
+            "remote scratch mkdir failed: {e}; falling back to remote $HOME",
+        );
+        return None;
+    }
+    Some(dir)
+}
+
+/// Local twin of [`resolve_remote_scratch_cwd`]. Resolves the
+/// configured `[spawn].scratch_dir` against the local `$HOME` and
+/// `mkdir -p`s it. Returns the resolved absolute local path on
+/// success, `None` on any failure so the caller can fall back to
+/// today's "spawn at the TUI's cwd" semantics.
+///
+/// Extracted for symmetry with the remote helper — both branches
+/// of the `SpawnScratch` arm now read identically (`let cwd =
+/// resolve_*_scratch_cwd(...);`) instead of one being a flat call
+/// and the other a nested `match`.
+fn resolve_local_scratch_cwd(spawn_config: &SpawnConfig) -> Option<PathBuf> {
+    let dir = spawn_config.local_scratch_dir()?;
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            scratch_dir = %dir.display(),
+            "local scratch mkdir failed: {e}; falling back to TUI cwd",
+        );
+        return None;
+    }
+    Some(dir)
+}
+
 fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
     for a in agents {
         // Stash the geometry on every agent — even Failed ones — so a
@@ -2114,6 +2183,121 @@ fn event_loop(
                                 // Re-lock the modal so the spinner
                                 // continues through the ~1-2 s
                                 // attach phase.
+                                ui.lock_for_bootstrap(host.clone(), Instant::now());
+                                attaches.push(PendingAttach {
+                                    agent_id: runtime_id,
+                                    label,
+                                    host,
+                                    repo,
+                                    rows,
+                                    cols,
+                                    handle,
+                                    modal_owner: true,
+                                });
+                            }
+                        }
+                        ModalOutcome::SpawnScratch { host } => {
+                            // "Enter without picking" → land in the
+                            // configured scratch dir (default
+                            // `~/.codemux/scratch`). Resolves the
+                            // tilde against the local $HOME for local
+                            // spawns and against the remote $HOME
+                            // captured during prepare for SSH spawns,
+                            // then `mkdir -p`s the path so the daemon's
+                            // `cwd.exists()` check passes on the
+                            // remote side. On any resolution / mkdir
+                            // failure we fall back to today's "use
+                            // platform default cwd" behavior so the
+                            // user still gets an agent — they just get
+                            // a tracing diagnostic instead of a silent
+                            // failure.
+                            let (term_cols, term_rows) =
+                                crossterm::terminal::size().wrap_err("read terminal size")?;
+                            let (rows, cols) =
+                                pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
+                            spawn_counter += 1;
+                            if host == HOST_PLACEHOLDER {
+                                spawn_ui = None;
+                                let label = format!("agent-{spawn_counter}");
+                                let id = AgentId::new(label.clone());
+                                let cwd = resolve_local_scratch_cwd(spawn_config);
+                                match spawn_local_agent(
+                                    id,
+                                    label,
+                                    cwd.as_deref(),
+                                    rows,
+                                    cols,
+                                    scrollback_len,
+                                ) {
+                                    Ok(agent) => {
+                                        nav.agents.push(agent);
+                                        let target = nav.agents.len() - 1;
+                                        nav.change_focus(target);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("spawn failed: {e}");
+                                    }
+                                }
+                            } else {
+                                // SSH branch: same prepare-slot
+                                // contract as the Spawn arm. Take the
+                                // slot first, then optionally mkdir
+                                // via its still-live `RemoteFs`
+                                // before the slot drops.
+                                let Some(slot) = prepare.take() else {
+                                    tracing::error!(
+                                        %host,
+                                        "remote SpawnScratch without an active \
+                                         prepare slot — dropping (modal state \
+                                         machine bug)",
+                                    );
+                                    spawn_ui = None;
+                                    continue;
+                                };
+                                let Some(prepared) = slot.prepared else {
+                                    tracing::error!(
+                                        %host,
+                                        "remote SpawnScratch before prepare \
+                                         reported Done — dropping (modal state \
+                                         machine bug)",
+                                    );
+                                    spawn_ui = None;
+                                    continue;
+                                };
+                                // Resolve scratch against the captured
+                                // remote $HOME, then mkdir over the
+                                // prepare's `RemoteFs`. If the
+                                // resolution fails or there's no live
+                                // master to mkdir through, fall back
+                                // to `cwd_path = None` so the daemon
+                                // inherits the remote shell's cwd
+                                // ($HOME) — same degradation as today's
+                                // empty-path SSH spawn.
+                                let cwd_path = resolve_remote_scratch_cwd(
+                                    spawn_config,
+                                    &prepared.remote_home,
+                                    slot.remote_fs.as_ref(),
+                                    &runner,
+                                );
+                                let label = format!("{host}:agent-{spawn_counter}");
+                                let runtime_id = AgentId::new(format!("agent-{spawn_counter}"));
+                                let daemon_agent_id = daemon_agent_id_for(tui_pid, spawn_counter);
+                                let repo = cwd_path
+                                    .as_ref()
+                                    .and_then(|p| repo_name::resolve_remote(&p.to_string_lossy()));
+                                let handle = start_attach(
+                                    prepared,
+                                    host.clone(),
+                                    daemon_agent_id,
+                                    cwd_path,
+                                    rows,
+                                    cols,
+                                );
+                                tracing::info!(
+                                    %host,
+                                    label = %label,
+                                    "started SSH attach worker (scratch)",
+                                );
                                 ui.lock_for_bootstrap(host.clone(), Instant::now());
                                 attaches.push(PendingAttach {
                                     agent_id: runtime_id,
@@ -7662,5 +7846,128 @@ mod tests {
     fn daemon_agent_id_includes_tui_pid_and_counter() {
         assert_eq!(daemon_agent_id_for(48321, 2), "agent-48321-2");
         assert_eq!(daemon_agent_id_for(1, 1), "agent-1-1");
+    }
+
+    // ── resolve_remote_scratch_cwd ───────────────────────────────
+    //
+    // The SSH branch of the SpawnScratch arm calls this helper before
+    // consuming the prepare slot's `RemoteFs`. Each branch matters:
+    //
+    //   - Unresolvable scratch_dir → None (caller falls back to
+    //     remote $HOME on the daemon side).
+    //   - No live RemoteFs → still return Some(dir) so the daemon
+    //     can validate; we can't mkdir without ssh, but the dir
+    //     might already exist (it's the user's habitual scratch).
+    //   - mkdir success → Some(dir).
+    //   - mkdir failure → None so the caller falls back rather than
+    //     sending an unwritable cwd to the daemon (which would
+    //     trip its `cwd.exists()` check and surface as "EOF before
+    //     HelloAck").
+
+    /// Minimal `CommandRunner` for testing `resolve_remote_scratch_cwd`
+    /// without spawning real ssh. Records the args and returns a
+    /// scripted `CommandOutput`. Mirrors `remote_fs::tests::ScriptedRunner`
+    /// but lives here because runtime tests can't reach into the
+    /// `remote_fs` module's `#[cfg(test)]` items.
+    struct ScratchRunner {
+        response: std::sync::Mutex<Option<std::io::Result<codemuxd_bootstrap::CommandOutput>>>,
+    }
+
+    impl ScratchRunner {
+        fn ok() -> Self {
+            Self {
+                response: std::sync::Mutex::new(Some(Ok(codemuxd_bootstrap::CommandOutput {
+                    status: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }))),
+            }
+        }
+
+        fn fail(status: i32, stderr: &[u8]) -> Self {
+            Self {
+                response: std::sync::Mutex::new(Some(Ok(codemuxd_bootstrap::CommandOutput {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: stderr.to_vec(),
+                }))),
+            }
+        }
+    }
+
+    impl codemuxd_bootstrap::CommandRunner for ScratchRunner {
+        fn run(
+            &self,
+            _program: &str,
+            _args: &[&str],
+        ) -> std::io::Result<codemuxd_bootstrap::CommandOutput> {
+            self.response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ScratchRunner.run called twice but only one response was scripted")
+        }
+
+        fn spawn_detached(&self, _: &str, _: &[&str]) -> std::io::Result<std::process::Child> {
+            unreachable!("resolve_remote_scratch_cwd does not spawn detached subprocesses")
+        }
+    }
+
+    fn config_with_scratch(scratch_dir: &str) -> SpawnConfig {
+        SpawnConfig {
+            scratch_dir: scratch_dir.to_string(),
+            ..SpawnConfig::default()
+        }
+    }
+
+    #[test]
+    fn resolve_remote_scratch_cwd_returns_none_when_path_unresolvable() {
+        // Relative scratch_dir → expand_scratch returns None →
+        // helper returns None without ever touching the runner.
+        let cfg = config_with_scratch("relative-not-allowed");
+        let fs = RemoteFs::for_test("host.example".into(), PathBuf::from("/tmp/sock"));
+        let runner = ScratchRunner::ok();
+        assert_eq!(
+            resolve_remote_scratch_cwd(&cfg, Path::new("/root"), Some(&fs), &runner),
+            None,
+        );
+    }
+
+    #[test]
+    fn resolve_remote_scratch_cwd_returns_dir_without_mkdir_when_no_remote_fs() {
+        // No live ControlMaster → can't mkdir, but still surface
+        // the resolved dir so the daemon validates. The runner is
+        // never consulted (asserted by ScratchRunner panicking on
+        // double-take if the helper accidentally called .run()).
+        let cfg = config_with_scratch("~/.codemux/scratch");
+        let runner = ScratchRunner::ok();
+        let resolved = resolve_remote_scratch_cwd(&cfg, Path::new("/root"), None, &runner).unwrap();
+        assert_eq!(resolved, PathBuf::from("/root/.codemux/scratch"));
+    }
+
+    #[test]
+    fn resolve_remote_scratch_cwd_returns_dir_on_mkdir_success() {
+        let cfg = config_with_scratch("~/.codemux/scratch");
+        let fs = RemoteFs::for_test("host.example".into(), PathBuf::from("/tmp/sock"));
+        let runner = ScratchRunner::ok();
+        let resolved =
+            resolve_remote_scratch_cwd(&cfg, Path::new("/root"), Some(&fs), &runner).unwrap();
+        assert_eq!(resolved, PathBuf::from("/root/.codemux/scratch"));
+    }
+
+    #[test]
+    fn resolve_remote_scratch_cwd_returns_none_on_mkdir_failure() {
+        // Permission-denied is the realistic failure mode; the
+        // helper logs and returns None so the SpawnScratch arm
+        // falls back to "let the daemon pick remote $HOME" rather
+        // than sending an unwritable cwd that trips the daemon's
+        // cwd.exists() check.
+        let cfg = config_with_scratch("~/.codemux/scratch");
+        let fs = RemoteFs::for_test("host.example".into(), PathBuf::from("/tmp/sock"));
+        let runner = ScratchRunner::fail(1, b"mkdir: Permission denied\n");
+        assert_eq!(
+            resolve_remote_scratch_cwd(&cfg, Path::new("/root"), Some(&fs), &runner),
+            None,
+        );
     }
 }

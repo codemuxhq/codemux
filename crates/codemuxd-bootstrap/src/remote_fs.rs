@@ -134,6 +134,23 @@ pub enum RemoteFsError {
     /// failed (`status=255`). Stderr is included for diagnostics.
     #[error("ssh ls exited with status {status}: {stderr}")]
     ListExit { status: i32, stderr: String },
+
+    /// Failed to invoke `ssh -S {socket} ... mkdir -p ...`. Same shape
+    /// as [`Self::ListSpawn`] but for the [`RemoteFs::mkdir_p`] path —
+    /// kept distinct so the runtime can surface a different
+    /// diagnostic without parsing strings.
+    #[error("ssh mkdir invocation failed")]
+    MkdirSpawn {
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `ssh ... mkdir -p ...` exited non-zero. With `mkdir -p`, the
+    /// only realistic causes are permission denied (`status=1`) or
+    /// the master died and ssh fell back to a fresh connection that
+    /// failed (`status=255`). Stderr is included for diagnostics.
+    #[error("ssh mkdir exited with status {status}: {stderr}")]
+    MkdirExit { status: i32, stderr: String },
 }
 
 /// Long-lived `ssh -M -N` `ControlMaster` connection used to amortize
@@ -382,6 +399,73 @@ impl RemoteFs {
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
     }
+
+    /// Create `path` and any missing parent directories on the remote
+    /// host (`mkdir -p`). Idempotent — succeeds if the directory
+    /// already exists.
+    ///
+    /// Used by the spawn modal's "scratch" fallback so the user-
+    /// configured scratch dir (default `~/.codemux/scratch`, tilde
+    /// pre-expanded against the remote `$HOME`) exists before the
+    /// daemon's `--cwd` validation runs. The runtime calls this
+    /// while it still holds the prepare phase's [`RemoteFs`] —
+    /// piggybacking on the live `ControlMaster` keeps the SSH
+    /// round-trip cost identical to a single `list_dir`.
+    ///
+    /// Same shell-escape policy as [`Self::list_dir`]: the path is
+    /// wrapped in single quotes when forwarded to ssh, so an
+    /// embedded `'` is rejected up-front. UTF-8 paths only.
+    ///
+    /// `runner` lets tests script the `ssh ... mkdir ...` invocation
+    /// without spawning a real subprocess. Production callers pass
+    /// `&RealRunner`.
+    ///
+    /// # Errors
+    /// - [`RemoteFsError::UnsafePath`] for paths containing `'` or
+    ///   non-UTF-8 bytes.
+    /// - [`RemoteFsError::MkdirSpawn`] if the runner can't invoke ssh.
+    /// - [`RemoteFsError::MkdirExit`] if `mkdir -p` exited non-zero
+    ///   (typically permission denied or the master died).
+    pub fn mkdir_p(&self, runner: &dyn CommandRunner, path: &Path) -> Result<(), RemoteFsError> {
+        let path_str = path.to_str().ok_or_else(|| RemoteFsError::UnsafePath {
+            path: path.to_path_buf(),
+            reason: "path is not valid UTF-8",
+        })?;
+        if path_str.contains('\'') {
+            return Err(RemoteFsError::UnsafePath {
+                path: path.to_path_buf(),
+                reason: "single quote",
+            });
+        }
+
+        let socket_str = self.socket.to_string_lossy();
+        let quoted_path = format!("'{path_str}'");
+        // `mkdir -p --` so any future flag added to the path can't
+        // be misinterpreted as a flag (`mkdir -p -- '-rf'`).
+        let remote_cmd = format!("mkdir -p -- {quoted_path}");
+        let output = runner
+            .run(
+                "ssh",
+                &[
+                    "-S",
+                    socket_str.as_ref(),
+                    "-o",
+                    "BatchMode=yes",
+                    &self.host,
+                    "--",
+                    &remote_cmd,
+                ],
+            )
+            .map_err(|source| RemoteFsError::MkdirSpawn { source })?;
+
+        if output.status != 0 {
+            return Err(RemoteFsError::MkdirExit {
+                status: output.status,
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Drop for RemoteFs {
@@ -620,6 +704,83 @@ mod tests {
         let runner = ScriptedRunner::ok(&buf);
         let entries = fs.list_dir(&runner, Path::new("/")).unwrap();
         assert_eq!(entries.len(), MAX_LIST_ENTRIES);
+    }
+
+    // ── mkdir_p ──────────────────────────────────────────────────
+    //
+    // Same shell-escape policy as list_dir: paths are wrapped in
+    // single quotes when forwarded to ssh. The mkdir_p path is hit
+    // by the spawn modal's scratch fallback, so a regression here
+    // would silently fail SSH spawns into the configured scratch
+    // dir.
+
+    /// Happy path: `mkdir -p` succeeds, ssh exits 0, the call returns
+    /// `Ok(())`.
+    #[test]
+    fn mkdir_p_returns_ok_on_success() {
+        let fs = fake_remote_fs("host.example", Path::new("/tmp/host.cm.sock"));
+        let runner = ScriptedRunner::ok(b"");
+        fs.mkdir_p(&runner, Path::new("/home/me/.codemux/scratch"))
+            .unwrap();
+    }
+
+    /// `mkdir_p` invokes ssh with the same `-S {socket} -o BatchMode=yes
+    /// {host} -- mkdir -p '<path>'` shape as `list_dir`. Pinning each
+    /// piece guards against accidental shell-escape bugs (the path
+    /// must be quoted, the `--` separator must be present so a future
+    /// path starting with `-` can't be misparsed as a flag).
+    #[test]
+    fn mkdir_p_invokes_ssh_with_correct_flags() {
+        let fs = fake_remote_fs("host.example", Path::new("/tmp/host.cm.sock"));
+        let runner = ScriptedRunner::ok(b"");
+        fs.mkdir_p(&runner, Path::new("/srv/scratch")).unwrap();
+        let args = runner.last_args();
+        let s_idx = args.iter().position(|a| a == "-S").expect("ssh -S missing");
+        assert_eq!(args[s_idx + 1], "/tmp/host.cm.sock");
+        assert!(args.contains(&"host.example".to_string()));
+        let pair_present = args
+            .windows(2)
+            .any(|w| w[0] == "-o" && w[1] == "BatchMode=yes");
+        assert!(pair_present, "BatchMode=yes missing from {args:?}");
+        let sep_idx = args.iter().position(|a| a == "--").expect("-- missing");
+        let cmd = &args[sep_idx + 1];
+        assert!(
+            cmd.contains("mkdir -p --") && cmd.contains("'/srv/scratch'"),
+            "remote command should be mkdir -p -- '<path>'; got {cmd:?}",
+        );
+    }
+
+    /// Non-zero exit (typically permission denied) surfaces as
+    /// `MkdirExit` with the stderr trimmed and included so the
+    /// runtime can render a useful diagnostic banner.
+    #[test]
+    fn mkdir_p_non_zero_exit_returns_mkdir_exit() {
+        let fs = fake_remote_fs("host.example", Path::new("/tmp/host.cm.sock"));
+        let runner =
+            ScriptedRunner::fail(1, b"mkdir: cannot create directory: Permission denied\n");
+        let err = fs
+            .mkdir_p(&runner, Path::new("/no/perms/scratch"))
+            .unwrap_err();
+        let RemoteFsError::MkdirExit { status, stderr } = err else {
+            panic!("expected MkdirExit, got {err:?}");
+        };
+        assert_eq!(status, 1);
+        assert!(stderr.contains("Permission denied"));
+    }
+
+    /// Mirrors `list_dir_rejects_path_with_single_quote` — the same
+    /// shell-escape policy applies to `mkdir_p`.
+    #[test]
+    fn mkdir_p_rejects_path_with_single_quote() {
+        let fs = fake_remote_fs("host.example", Path::new("/tmp/host.cm.sock"));
+        let runner = ScriptedRunner::ok(b"");
+        let err = fs
+            .mkdir_p(&runner, Path::new("/tmp/with'quote"))
+            .unwrap_err();
+        let RemoteFsError::UnsafePath { reason, .. } = err else {
+            panic!("expected UnsafePath, got {err:?}");
+        };
+        assert_eq!(reason, "single quote");
     }
 
     /// `sanitize_host_for_filename` keeps alphanumerics + `_-`,

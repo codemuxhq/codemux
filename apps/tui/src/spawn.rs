@@ -136,6 +136,21 @@ pub enum ModalOutcome {
         host: String,
         path: String,
     },
+    /// User pressed Enter in the path zone without picking or typing
+    /// anything (no wildmenu selection, empty fuzzy query, and the
+    /// path field is either empty or still holds the auto-seeded
+    /// cwd / remote `$HOME`). The runtime resolves the configured
+    /// `[spawn].scratch_dir` against the local or remote `$HOME`,
+    /// `mkdir -p`s it, and spawns there.
+    ///
+    /// Carried separately from `Spawn` so the runtime can distinguish
+    /// "the user explicitly chose this path" from "the user wants the
+    /// default scratch landing pad" without overloading the meaning
+    /// of an empty `path` (which today maps to "use the platform
+    /// default cwd").
+    SpawnScratch {
+        host: String,
+    },
     /// User committed a non-local host while the path zone is empty
     /// (or while focused on the host zone with text). The runtime
     /// should kick off the prepare phase and call
@@ -798,6 +813,29 @@ impl SpawnMinibuffer {
             return ModalOutcome::None;
         }
 
+        // Path zone with no real choice: no wildmenu pick, no typed
+        // fuzzy query, and the path field is either empty or still
+        // the system-seeded default (local cwd, or remote $HOME after
+        // a successful prepare). Treat that as "user just wants a
+        // sandbox" and emit `SpawnScratch` so the runtime can route
+        // to the configured scratch dir instead of silently spawning
+        // at the platform default cwd.
+        //
+        // Local: `host` is empty / "local" — the runtime resolves
+        // scratch against the local $HOME.
+        // Remote: `host` is the SSH host the user already committed
+        // via PrepareHost — the runtime resolves scratch against the
+        // remote $HOME captured during prepare.
+        if self.focused == Zone::Path && self.is_passive_path_enter() {
+            let trimmed = self.host.trim();
+            let host = if trimmed.is_empty() {
+                HOST_PLACEHOLDER.to_string()
+            } else {
+                trimmed.to_string()
+            };
+            return ModalOutcome::SpawnScratch { host };
+        }
+
         // Apply highlighted wildmenu candidate to the focused field if any —
         // this lets the user arrow-down + Enter without an extra Tab step.
         // Commit the host write first (when focused on Host) so the
@@ -818,6 +856,17 @@ impl SpawnMinibuffer {
         // work without the user typing a remote path explicitly.
         let path = path.trim().to_string();
         ModalOutcome::Spawn { host, path }
+    }
+
+    /// True when the path zone is in its "user opened the modal and
+    /// hit Enter without doing anything" state: no wildmenu pick, no
+    /// typed fuzzy query, and the path field is either empty or still
+    /// the system-seeded default. Used by [`Self::confirm`] to route
+    /// to the scratch-dir spawn instead of the platform default cwd.
+    fn is_passive_path_enter(&self) -> bool {
+        self.selected.is_none()
+            && self.fuzzy_query.is_empty()
+            && (self.path.trim().is_empty() || self.path_origin == PathOrigin::AutoSeeded)
     }
 
     /// Resolve `(host, path)` honoring the highlighted wildmenu item for the
@@ -2417,23 +2466,128 @@ mod tests {
         );
     }
 
-    /// Empty path stays empty on spawn — the runtime maps empty → None so
-    /// the daemon's `--cwd` flag is omitted on the remote (SSH branch
-    /// inherits `$HOME`, local branch inherits the TUI's cwd). Pre-fix,
-    /// `confirm` defaulted an empty path to `std::env::current_dir()`,
-    /// which sent the local laptop path verbatim to the remote daemon and
-    /// tripped its `cwd.exists()` validation — the user-visible "EOF
-    /// before `HelloAck`" failure mode for SSH spawns.
+    /// Path-zone Enter with no selection, no typed query, and an
+    /// empty path field is the "user picked nothing" gesture — the
+    /// modal emits `SpawnScratch` so the runtime can route the
+    /// agent into the configured scratch dir. The host is preserved
+    /// (so the remote-with-no-folder-pick case lands at the remote
+    /// scratch dir, not local).
+    ///
+    /// Replaces the older "empty path passes through to Spawn" test:
+    /// after the scratch fallback landed, this synthetic state is no
+    /// longer reachable as Spawn{path:""}. The runtime still has the
+    /// machinery to translate empty → None for safety, but the modal
+    /// no longer emits it.
     #[test]
-    fn empty_path_stays_empty_on_spawn() {
+    fn empty_path_with_no_selection_emits_spawn_scratch() {
         let mut m = mb("devpod-go", "", Zone::Path, &["devpod-go"]);
         m.filtered = vec![];
         m.selected = None;
         let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
-            ModalOutcome::Spawn {
+            ModalOutcome::SpawnScratch {
                 host: "devpod-go".into(),
+            },
+        );
+    }
+
+    /// Local variant of the same gesture: no host typed, empty path,
+    /// no wildmenu pick. Resolves the placeholder host so the runtime
+    /// knows to mkdir + spawn locally.
+    #[test]
+    fn empty_local_path_with_no_selection_emits_spawn_scratch() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.filtered = vec![];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::SpawnScratch {
+                host: HOST_PLACEHOLDER.into(),
+            },
+        );
+    }
+
+    /// Auto-seeded path field still counts as "passive" — covers the
+    /// real-world Fuzzy-mode flow where the modal opens with cwd /
+    /// remote $HOME pre-filled but the user neither typed nor picked.
+    /// Without this, the post-prepare SSH path would silently spawn at
+    /// remote $HOME instead of the configured scratch dir.
+    #[test]
+    fn auto_seeded_path_with_no_selection_emits_spawn_scratch() {
+        let mut m = mb("devpod-go", "/root/", Zone::Path, &["devpod-go"]);
+        m.path_origin = PathOrigin::AutoSeeded;
+        m.filtered = vec![];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::SpawnScratch {
+                host: "devpod-go".into(),
+            },
+        );
+    }
+
+    /// User typed a path (or applied a Tab completion) → `path_origin`
+    /// is `UserTyped`, even if the field happens to be non-empty. With
+    /// no wildmenu pick that maps to the literal typed path via the
+    /// existing Spawn route — scratch only fires when the user really
+    /// did nothing.
+    #[test]
+    fn user_typed_path_with_no_selection_falls_through_to_spawn() {
+        let mut m = mb("", "/work", Zone::Path, &[]);
+        m.path_origin = PathOrigin::UserTyped;
+        m.filtered = vec![];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "local".into(),
+                path: "/work".into(),
+            },
+        );
+    }
+
+    /// A wildmenu pick beats the scratch fallback. The user explicitly
+    /// chose something — the modal must commit that choice, not shunt
+    /// them into the sandbox dir.
+    #[test]
+    fn highlighted_candidate_overrides_scratch_fallback() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.path_origin = PathOrigin::AutoSeeded;
+        m.filtered = vec!["/tmp/alpha".into()];
+        m.selected = Some(0);
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "local".into(),
+                path: "/tmp/alpha".into(),
+            },
+        );
+    }
+
+    /// A non-empty fuzzy query also overrides the scratch fallback —
+    /// the user is actively searching, even if nothing matches yet.
+    /// Falling through to `Spawn { path: "" }` is the right thing
+    /// here: the runtime treats an empty path as "use platform default
+    /// cwd," matching the long-standing "I typed gibberish, give me
+    /// the default" semantic.
+    #[test]
+    fn typed_fuzzy_query_overrides_scratch_fallback() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "no-match".into();
+        m.filtered = vec![];
+        m.selected = None;
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "local".into(),
                 path: String::new(),
             },
         );
