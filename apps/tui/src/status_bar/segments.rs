@@ -196,11 +196,13 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
-    fn line_style(line: &Line<'_>) -> Style {
+    fn line_style(line: &Line<'_>) -> Option<Style> {
         // Segments must put the style on the span (not the line wrapper)
         // so it survives the span-extraction flatten in render_segments.
         // Each segment renders one styled span; assert against that.
-        line.spans.first().map(|s| s.style).unwrap_or_default()
+        // Returning Option (not unwrap_or_default) so a test can tell
+        // "no span at all" apart from "span exists with default style."
+        line.spans.first().map(|s| s.style)
     }
 
     // ─── ModelSegment ──────────────────────────────────────────────
@@ -266,7 +268,7 @@ mod tests {
             secondary,
         };
         let line = ModelSegment.render(&ctx).unwrap();
-        assert_eq!(line_style(&line), secondary);
+        assert_eq!(line_style(&line), Some(secondary));
     }
 
     // ─── RepoSegment ───────────────────────────────────────────────
@@ -415,7 +417,7 @@ mod tests {
             secondary,
         };
         let line = PrefixHintSegment.render(&ctx).unwrap();
-        assert_eq!(line_style(&line), secondary);
+        assert_eq!(line_style(&line), Some(secondary));
     }
 
     #[test]
