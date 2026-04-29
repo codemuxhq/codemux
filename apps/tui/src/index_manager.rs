@@ -205,6 +205,13 @@ impl IndexManager {
 /// transition. Returns `None` when the worker hasn't sent a terminal
 /// event yet (just `Progress` so far, or nothing).
 ///
+/// While draining, `Progress` events with a non-empty batch are
+/// folded into the live state: `Building.dirs` accumulates so the
+/// fuzzy matcher can search the partial index, while `Refreshing`
+/// drops the batch (the cached `dirs` field is the user-visible
+/// result and stays stable until the terminating `Done(Ok)` swaps
+/// in the freshly-classified version).
+///
 /// The shape of the tuple — `(host, next_state, completed_dirs?,
 /// save_ctx)` — matches what the [`IndexManager::tick`] post-loop
 /// expects so the borrow on the catalog can be released before the
@@ -219,13 +226,47 @@ fn drain_one_host(
         Err(String),
     }
     let term: Option<Term> = match &mut slot.state {
-        IndexState::Building { handle, count } | IndexState::Refreshing { handle, count, .. } => {
+        IndexState::Building {
+            handle,
+            count,
+            dirs,
+        } => {
             let mut t = None;
             while let Some(event) = handle.try_recv() {
                 match event {
-                    IndexEvent::Progress(n) => *count = n,
-                    IndexEvent::Done(Ok(dirs)) => {
-                        t = Some(Term::Ok(dirs));
+                    IndexEvent::Progress { count: c, batch } => {
+                        *count = c;
+                        // Append the new-since-last-event batch so
+                        // the partial index grows monotonically.
+                        // Classification stays Plain; the final
+                        // `Done(Ok)` swaps the entire dirs vec for
+                        // the fully-classified version.
+                        dirs.extend(batch);
+                    }
+                    IndexEvent::Done(Ok(d)) => {
+                        t = Some(Term::Ok(d));
+                        break;
+                    }
+                    IndexEvent::Done(Err(e)) => {
+                        t = Some(Term::Err(format!("{e}")));
+                        break;
+                    }
+                }
+            }
+            t
+        }
+        IndexState::Refreshing { handle, count, .. } => {
+            let mut t = None;
+            while let Some(event) = handle.try_recv() {
+                match event {
+                    IndexEvent::Progress { count: c, .. } => {
+                        // Cache is what's displayed during a refresh;
+                        // dropping the batch keeps the SWR contract
+                        // (stale-but-stable until Done).
+                        *count = c;
+                    }
+                    IndexEvent::Done(Ok(d)) => {
+                        t = Some(Term::Ok(d));
                         break;
                     }
                     IndexEvent::Done(Err(e)) => {
@@ -305,8 +346,8 @@ mod tests {
 
     use super::*;
     use crate::index_worker;
-    use crate::index_worker::{IndexedDir, ProjectKind};
-    use std::path::PathBuf;
+    use crate::index_worker::{IndexError, IndexedDir, ProjectKind};
+    use std::path::{Path, PathBuf};
 
     fn ctx() -> IndexSaveCtx {
         IndexSaveCtx::Local { roots: Vec::new() }
@@ -378,10 +419,183 @@ mod tests {
             save_ctx: ctx(),
         };
         assert!(drain_one_host("local", &mut slot).is_none());
-        // Stale dirs preserved.
         match &slot.state {
             IndexState::Refreshing { dirs, .. } => assert_eq!(dirs.len(), 1),
             _ => panic!("Refreshing state must be preserved"),
         }
+    }
+
+    /// A `Progress { batch }` event arriving on a `Building` slot
+    /// must extend the in-flight `dirs` accumulator and update
+    /// `count`, then return `None` (no terminal event yet) so the
+    /// caller leaves the host in `Building`. This is the pivotal
+    /// behavior behind "search the partial index while the walk
+    /// runs."
+    #[test]
+    fn drain_on_building_appends_progress_batch_to_dirs() {
+        let (handle, tx) = index_worker::handle_with_sender_for_test();
+        tx.send(IndexEvent::Progress {
+            count: 2,
+            batch: vec![
+                IndexedDir {
+                    path: PathBuf::from("/p1"),
+                    kind: ProjectKind::Plain,
+                },
+                IndexedDir {
+                    path: PathBuf::from("/p2"),
+                    kind: ProjectKind::Plain,
+                },
+            ],
+        })
+        .unwrap();
+        let mut slot = HostIndex {
+            state: IndexState::Building {
+                handle,
+                count: 0,
+                dirs: Vec::new(),
+            },
+            save_ctx: ctx(),
+        };
+        assert!(drain_one_host("local", &mut slot).is_none());
+        match &slot.state {
+            IndexState::Building { dirs, count, .. } => {
+                assert_eq!(*count, 2);
+                assert_eq!(dirs.len(), 2);
+                assert_eq!(dirs[0].path, PathBuf::from("/p1"));
+                assert_eq!(dirs[1].path, PathBuf::from("/p2"));
+            }
+            other => panic!("expected Building, got {other:?}"),
+        }
+    }
+
+    /// `Progress` on `Refreshing` updates the count but discards the
+    /// batch (the cached `dirs` field is the user-visible snapshot
+    /// during SWR — mixing in partial new entries would surface
+    /// duplicates and ghosts during the transition).
+    #[test]
+    fn drain_on_refreshing_with_progress_drops_batch_and_preserves_cache() {
+        let (handle, tx) = index_worker::handle_with_sender_for_test();
+        tx.send(IndexEvent::Progress {
+            count: 5,
+            batch: vec![IndexedDir {
+                path: PathBuf::from("/new"),
+                kind: ProjectKind::Plain,
+            }],
+        })
+        .unwrap();
+        let mut slot = HostIndex {
+            state: IndexState::Refreshing {
+                dirs: vec![IndexedDir {
+                    path: PathBuf::from("/cached"),
+                    kind: ProjectKind::Git,
+                }],
+                handle,
+                count: 0,
+            },
+            save_ctx: ctx(),
+        };
+        assert!(drain_one_host("local", &mut slot).is_none());
+        match &slot.state {
+            IndexState::Refreshing { dirs, count, .. } => {
+                assert_eq!(*count, 5);
+                assert_eq!(dirs.len(), 1, "cache must stay stable until Done");
+                assert_eq!(dirs[0].path, PathBuf::from("/cached"));
+            }
+            other => panic!("expected Refreshing, got {other:?}"),
+        }
+    }
+
+    /// `Done(Ok)` on a `Building` slot transitions to `Ready` with
+    /// the fully-classified dirs from the event (replacing the
+    /// partial accumulator) and surfaces `completed_dirs` so the
+    /// runtime can persist them to disk.
+    #[test]
+    fn drain_on_building_done_ok_transitions_to_ready_and_returns_dirs() {
+        let (handle, tx) = index_worker::handle_with_sender_for_test();
+        tx.send(IndexEvent::Done(Ok(vec![IndexedDir {
+            path: PathBuf::from("/final"),
+            kind: ProjectKind::Git,
+        }])))
+        .unwrap();
+        let mut slot = HostIndex {
+            state: IndexState::Building {
+                handle,
+                count: 0,
+                dirs: vec![IndexedDir {
+                    path: PathBuf::from("/partial"),
+                    kind: ProjectKind::Plain,
+                }],
+            },
+            save_ctx: ctx(),
+        };
+        let (host, next, completed, _) = drain_one_host("local", &mut slot).unwrap();
+        assert_eq!(host, "local");
+        match next {
+            IndexState::Ready { dirs } => {
+                assert_eq!(dirs.len(), 1);
+                assert_eq!(dirs[0].path, PathBuf::from("/final"));
+                assert_eq!(dirs[0].kind, ProjectKind::Git);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        assert!(
+            completed.is_some_and(|d| d[0].path == Path::new("/final")),
+            "completed_dirs must surface the fully-classified list for persistence",
+        );
+    }
+
+    /// `Done(Err)` on a `Refreshing` slot keeps the cached dirs as
+    /// `Ready` (don't blank the wildmenu on a transient walker
+    /// failure) and returns `None` for `completed_dirs` (nothing
+    /// new to persist).
+    #[test]
+    fn drain_on_refreshing_done_err_falls_back_to_cached_ready() {
+        let (handle, tx) = index_worker::handle_with_sender_for_test();
+        tx.send(IndexEvent::Done(Err(IndexError::NoRoots(Vec::new()))))
+            .unwrap();
+        let mut slot = HostIndex {
+            state: IndexState::Refreshing {
+                dirs: vec![IndexedDir {
+                    path: PathBuf::from("/cached"),
+                    kind: ProjectKind::Git,
+                }],
+                handle,
+                count: 0,
+            },
+            save_ctx: ctx(),
+        };
+        let (_, next, completed, _) = drain_one_host("local", &mut slot).unwrap();
+        match next {
+            IndexState::Ready { dirs } => {
+                assert_eq!(dirs.len(), 1);
+                assert_eq!(dirs[0].path, PathBuf::from("/cached"));
+            }
+            other => panic!("expected Ready (fallback to cache), got {other:?}"),
+        }
+        assert!(
+            completed.is_none(),
+            "no fresh dirs to persist on Done(Err) fallback",
+        );
+    }
+
+    /// `Done(Err)` on a `Building` slot (no cache to fall back to)
+    /// transitions to `Failed` so the wildmenu can surface the
+    /// error sentinel instead of pretending nothing went wrong.
+    #[test]
+    fn drain_on_building_done_err_transitions_to_failed() {
+        let (handle, tx) = index_worker::handle_with_sender_for_test();
+        tx.send(IndexEvent::Done(Err(IndexError::NoRoots(Vec::new()))))
+            .unwrap();
+        let mut slot = HostIndex {
+            state: IndexState::Building {
+                handle,
+                count: 0,
+                dirs: Vec::new(),
+            },
+            save_ctx: ctx(),
+        };
+        let (_, next, completed, _) = drain_one_host("local", &mut slot).unwrap();
+        assert!(matches!(next, IndexState::Failed { .. }));
+        assert!(completed.is_none());
     }
 }

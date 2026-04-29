@@ -51,10 +51,23 @@ const PROGRESS_INTERVAL: usize = 1_000;
 /// channel is silent after.
 #[derive(Debug)]
 pub enum IndexEvent {
-    /// Running count of directories discovered so far. Emitted every
-    /// [`PROGRESS_INTERVAL`] entries during the walk. The wildmenu
-    /// renders this as `"indexing… {count} dirs"`.
-    Progress(usize),
+    /// Running count of directories discovered so far AND the new
+    /// batch of dirs since the last progress event. Emitted every
+    /// [`PROGRESS_INTERVAL`] entries during the walk plus a final
+    /// flush at the end of each root. The wildmenu renders the count
+    /// as `"indexing… {count} dirs"`; the manager appends `batch`
+    /// to the in-flight `Building` state's dir list so the user can
+    /// fuzzy-search the partial index while the walk continues.
+    ///
+    /// `batch` entries are classified as [`ProjectKind::Plain`] —
+    /// per-dir Git/marker classification only completes at the end
+    /// of the walk (markers are discovered alongside dirs). The final
+    /// `Done(Ok)` carries the fully-classified version which replaces
+    /// the partial accumulated list.
+    Progress {
+        count: usize,
+        batch: Vec<IndexedDir>,
+    },
     /// Walk finished. `Ok` carries the discovered directory list with
     /// per-entry project classification (possibly partial if cancel
     /// arrived mid-walk). `Err` is reserved for the all-roots-failed
@@ -161,16 +174,29 @@ pub struct HostIndex {
 /// SSH host the user has spawned to) tracks its own state independently.
 #[derive(Debug)]
 pub enum IndexState {
-    /// Index is being built and no prior results are available. The
-    /// runtime drains events and transitions to `Ready` / `Failed` on
-    /// `Done`. The wildmenu shows "indexing… N dirs" while in this
-    /// state.
+    /// Index is being built and no prior cached results are available
+    /// (first run, or the previous run failed). The runtime drains
+    /// events and transitions to `Ready` / `Failed` on `Done`. The
+    /// wildmenu shows "indexing… N dirs" until the user types a
+    /// query, at which point it scores the partial `dirs` list.
+    ///
+    /// `dirs` accumulates from the worker's `Progress` batches as the
+    /// walk runs, so the user can fuzzy-search what has been
+    /// discovered so far instead of waiting for the full walk. Entries
+    /// are classified as [`ProjectKind::Plain`] until the terminating
+    /// `Done(Ok)` arrives with the fully-classified version.
     Building {
         handle: IndexHandle,
         /// Running count from the most recent `Progress` event, or 0
         /// if none has arrived yet. Surfaced to the modal as the
-        /// "indexing… N dirs" counter.
+        /// "indexing… N dirs" counter. Equals `dirs.len()` at the
+        /// moment the event is processed.
         count: usize,
+        /// Partial dir list accumulated from `Progress` batches. The
+        /// fuzzy matcher reads this via [`Self::cached_dirs`] so the
+        /// user can search the in-progress index. Replaced atomically
+        /// with the fully-classified list on `Done(Ok)`.
+        dirs: Vec<IndexedDir>,
     },
     /// Cached results are usable AND a fresh build is in flight. The
     /// modal renders `dirs` immediately (zero-latency open) while the
@@ -196,15 +222,19 @@ pub enum IndexState {
 }
 
 impl IndexState {
-    /// Borrow the cached directory list if any is available. Both
-    /// `Ready` and `Refreshing` carry usable results — the modal's
-    /// fuzzy matcher reads through this rather than discriminating on
-    /// the variant itself.
+    /// Borrow the cached directory list if any is available.
+    /// `Ready` and `Refreshing` carry settled / stale-but-usable
+    /// results; `Building` carries the partial accumulator from the
+    /// in-flight walker. The modal's fuzzy matcher reads through this
+    /// rather than discriminating on the variant itself, so a partial
+    /// index is searchable just like a settled one.
     #[must_use]
     pub fn cached_dirs(&self) -> Option<&[IndexedDir]> {
         match self {
-            Self::Ready { dirs } | Self::Refreshing { dirs, .. } => Some(dirs),
-            Self::Building { .. } | Self::Failed { .. } => None,
+            Self::Ready { dirs } | Self::Refreshing { dirs, .. } | Self::Building { dirs, .. } => {
+                Some(dirs)
+            }
+            Self::Failed { .. } => None,
         }
     }
 
@@ -292,70 +322,28 @@ fn run_index_walk(
 ) {
     let start = Instant::now();
     let marker_set: HashSet<String> = markers.into_iter().collect();
-    let mut dir_paths: Vec<PathBuf> = Vec::new();
-    let mut marker_dirs: HashSet<PathBuf> = HashSet::new();
-    let mut failures: Vec<RootFailure> = Vec::new();
-    let mut succeeded_any = false;
+    let mut state = LocalWalkState::default();
 
     'roots: for root in roots {
         if cancel.load(Relaxed) {
             break;
         }
         if !root.exists() {
-            failures.push(RootFailure {
+            state.failures.push(RootFailure {
                 path: root.clone(),
                 reason: "path does not exist",
             });
             continue;
         }
-        tracing::debug!(root = %root.display(), "fuzzy index: starting walk");
-        // Default `WalkBuilder` already enables `git_ignore`,
-        // `git_global`, `git_exclude`, `parents`, and skips hidden
-        // entries. We rely on those defaults — explicit calls would
-        // just repeat them.
-        let walker = WalkBuilder::new(&root).build();
-
-        let mut root_succeeded = false;
-        for entry in walker {
-            if cancel.load(Relaxed) {
-                break 'roots;
+        match walk_one_local_root(&root, &marker_set, tx, cancel, &mut state) {
+            LocalRootOutcome::Succeeded => state.succeeded_any = true,
+            LocalRootOutcome::FailedWithReason(reason) => {
+                state.failures.push(RootFailure {
+                    path: root.clone(),
+                    reason,
+                });
             }
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::trace!(error = %e, "fuzzy index: walker entry error (skipped)");
-                    continue;
-                }
-            };
-            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
-            if is_dir {
-                dir_paths.push(entry.into_path());
-                root_succeeded = true;
-                if dir_paths.len() >= MAX_INDEX_ENTRIES {
-                    tracing::warn!(
-                        cap = MAX_INDEX_ENTRIES,
-                        "fuzzy index: hit entry cap; truncating",
-                    );
-                    break 'roots;
-                }
-                if dir_paths.len().is_multiple_of(PROGRESS_INTERVAL) {
-                    tx.send(IndexEvent::Progress(dir_paths.len())).ok();
-                }
-            } else if let Some(name) = entry.path().file_name().and_then(|n| n.to_str())
-                && marker_set.contains(name)
-                && let Some(parent) = entry.path().parent()
-            {
-                // The marker file flags its parent dir as a project.
-                marker_dirs.insert(parent.to_path_buf());
-            }
-        }
-        if root_succeeded {
-            succeeded_any = true;
-        } else {
-            failures.push(RootFailure {
-                path: root.clone(),
-                reason: "no readable entries",
-            });
+            LocalRootOutcome::HitCap | LocalRootOutcome::Canceled => break 'roots,
         }
     }
 
@@ -363,11 +351,12 @@ fn run_index_walk(
     // Cancel always produces `Ok` (possibly partial / empty) so the
     // runtime can choose to keep what was built; treating it as an
     // error would force a useless rebuild on every cancel.
-    let result = if was_canceled || succeeded_any {
-        let mut dirs: Vec<IndexedDir> = dir_paths
+    let result = if was_canceled || state.succeeded_any {
+        let mut dirs: Vec<IndexedDir> = state
+            .dir_paths
             .into_iter()
             .map(|path| {
-                let kind = classify_dir(&path, &marker_dirs);
+                let kind = classify_dir(&path, &state.marker_dirs);
                 IndexedDir { path, kind }
             })
             .collect();
@@ -387,9 +376,113 @@ fn run_index_walk(
         );
         Ok(dirs)
     } else {
-        Err(IndexError::NoRoots(failures))
+        Err(IndexError::NoRoots(state.failures))
     };
     tx.send(IndexEvent::Done(result)).ok();
+}
+
+/// Mutable state accumulated across roots in a single local walk.
+/// Bundled so the per-root helper takes one `&mut` rather than five.
+/// Mirrors [`RemoteWalkState`] for the remote walker — the two stay
+/// in lockstep so the only differences between the loops are the
+/// data source (local `WalkBuilder` vs remote `find` lines) and the
+/// classification timing.
+#[derive(Default)]
+struct LocalWalkState {
+    dir_paths: Vec<PathBuf>,
+    marker_dirs: HashSet<PathBuf>,
+    failures: Vec<RootFailure>,
+    succeeded_any: bool,
+    /// Index up to which `dir_paths` has been streamed via a
+    /// `Progress` batch. The slice from here to the current end is
+    /// the new-since-last-batch view.
+    last_batch_end: usize,
+}
+
+/// Per-root completion outcome. `HitCap` and `Canceled` short-circuit
+/// the outer `'roots` loop so we don't keep walking once we've
+/// truncated the index or the user cancelled the build.
+enum LocalRootOutcome {
+    Succeeded,
+    FailedWithReason(&'static str),
+    HitCap,
+    Canceled,
+}
+
+/// Walk one local root: iterate the `WalkBuilder` entries, partition
+/// into directories vs. marker files, accumulate progress batches,
+/// and update `state` in place. Returns the per-root outcome for the
+/// caller's success/failure tally.
+fn walk_one_local_root(
+    root: &Path,
+    marker_set: &HashSet<String>,
+    tx: &Sender<IndexEvent>,
+    cancel: &AtomicBool,
+    state: &mut LocalWalkState,
+) -> LocalRootOutcome {
+    tracing::debug!(root = %root.display(), "fuzzy index: starting walk");
+    // Default `WalkBuilder` already enables `git_ignore`,
+    // `git_global`, `git_exclude`, `parents`, and skips hidden
+    // entries. We rely on those defaults — explicit calls would
+    // just repeat them.
+    let walker = WalkBuilder::new(root).build();
+    let mut root_succeeded = false;
+    for entry in walker {
+        if cancel.load(Relaxed) {
+            return LocalRootOutcome::Canceled;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::trace!(error = %e, "fuzzy index: walker entry error (skipped)");
+                continue;
+            }
+        };
+        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+        if is_dir {
+            state.dir_paths.push(entry.into_path());
+            root_succeeded = true;
+            if state.dir_paths.len() >= MAX_INDEX_ENTRIES {
+                tracing::warn!(
+                    cap = MAX_INDEX_ENTRIES,
+                    "fuzzy index: hit entry cap; truncating",
+                );
+                return LocalRootOutcome::HitCap;
+            }
+            if state.dir_paths.len().is_multiple_of(PROGRESS_INTERVAL) {
+                let batch = batch_as_plain(&state.dir_paths[state.last_batch_end..]);
+                state.last_batch_end = state.dir_paths.len();
+                tx.send(IndexEvent::Progress {
+                    count: state.dir_paths.len(),
+                    batch,
+                })
+                .ok();
+            }
+        } else if let Some(name) = entry.path().file_name().and_then(|n| n.to_str())
+            && marker_set.contains(name)
+            && let Some(parent) = entry.path().parent()
+        {
+            // The marker file flags its parent dir as a project.
+            state.marker_dirs.insert(parent.to_path_buf());
+        }
+    }
+    // Per-root flush so small roots (< PROGRESS_INTERVAL) still
+    // give the user a partial searchable index instead of waiting
+    // for the terminating `Done`.
+    if state.dir_paths.len() > state.last_batch_end {
+        let batch = batch_as_plain(&state.dir_paths[state.last_batch_end..]);
+        state.last_batch_end = state.dir_paths.len();
+        tx.send(IndexEvent::Progress {
+            count: state.dir_paths.len(),
+            batch,
+        })
+        .ok();
+    }
+    if root_succeeded {
+        LocalRootOutcome::Succeeded
+    } else {
+        LocalRootOutcome::FailedWithReason("no readable entries")
+    }
 }
 
 /// Classify a single directory against the discovered marker-dir set
@@ -403,6 +496,25 @@ fn classify_dir(path: &Path, marker_dirs: &HashSet<PathBuf>) -> ProjectKind {
     } else {
         ProjectKind::Plain
     }
+}
+
+/// Wrap a slice of newly-discovered paths as `Plain`-classified
+/// [`IndexedDir`] entries for an in-flight `Progress` batch. Final
+/// per-dir classification (Git / Marker) only completes when the
+/// walk finishes — markers are discovered alongside dirs, so a
+/// directory streamed in the first batch may have its marker file
+/// found in a later batch. Sending `Plain` here keeps the partial
+/// index searchable with the worst-case classification; the
+/// terminating `Done(Ok)` carries the corrected version.
+#[must_use]
+fn batch_as_plain(paths: &[PathBuf]) -> Vec<IndexedDir> {
+    paths
+        .iter()
+        .map(|p| IndexedDir {
+            path: p.clone(),
+            kind: ProjectKind::Plain,
+        })
+        .collect()
 }
 
 /// Tilde-expand each root entry using `$HOME`. Roots starting with `~`
@@ -569,6 +681,11 @@ struct RemoteWalkState {
     marker_dirs: HashSet<PathBuf>,
     failures: Vec<RootFailure>,
     succeeded_any: bool,
+    /// Index up to which `dir_paths` has been streamed via a
+    /// `Progress` batch. Same role as the local walker's local
+    /// counterpart — the slice from here to the current end is the
+    /// new-since-last-batch view.
+    last_batch_end: usize,
 }
 
 /// Per-root completion outcome. `HitCap` short-circuits the outer
@@ -651,7 +768,13 @@ fn walk_one_remote_root(
                     break;
                 }
                 if state.dir_paths.len().is_multiple_of(PROGRESS_INTERVAL) {
-                    tx.send(IndexEvent::Progress(state.dir_paths.len())).ok();
+                    let batch = batch_as_plain(&state.dir_paths[state.last_batch_end..]);
+                    state.last_batch_end = state.dir_paths.len();
+                    tx.send(IndexEvent::Progress {
+                        count: state.dir_paths.len(),
+                        batch,
+                    })
+                    .ok();
                 }
             }
             RemoteFindLine::Skip => {}
@@ -664,6 +787,17 @@ fn walk_one_remote_root(
             status = ?status,
             "remote fuzzy index: find exited non-zero (results so far kept)",
         );
+    }
+    // Per-root flush so small remote roots also produce a partial
+    // searchable index without waiting for the terminating `Done`.
+    if state.dir_paths.len() > state.last_batch_end {
+        let batch = batch_as_plain(&state.dir_paths[state.last_batch_end..]);
+        state.last_batch_end = state.dir_paths.len();
+        tx.send(IndexEvent::Progress {
+            count: state.dir_paths.len(),
+            batch,
+        })
+        .ok();
     }
     if hit_cap {
         RootOutcome::HitCap
@@ -899,13 +1033,22 @@ impl IndexCatalog {
         // host's new state.
         match self.hosts.remove(&host) {
             Some(HostIndex {
-                state: IndexState::Building { handle, count },
+                state:
+                    IndexState::Building {
+                        handle,
+                        count,
+                        dirs,
+                    },
                 save_ctx: prior_ctx,
             }) => {
                 self.hosts.insert(
                     host,
                     HostIndex {
-                        state: IndexState::Building { handle, count },
+                        state: IndexState::Building {
+                            handle,
+                            count,
+                            dirs,
+                        },
                         save_ctx: prior_ctx,
                     },
                 );
@@ -961,6 +1104,7 @@ impl IndexCatalog {
                         state: IndexState::Building {
                             handle: make_handle(),
                             count: 0,
+                            dirs: Vec::new(),
                         },
                         save_ctx,
                     },
@@ -983,6 +1127,15 @@ impl IndexCatalog {
                 state: IndexState::Ready { dirs } | IndexState::Refreshing { dirs, .. },
                 ..
             }) => Some(dirs),
+            // A force-rebuild over a partial Building keeps the
+            // partial accumulator as the visible cache via
+            // `Refreshing` — the user requested a fresh walk, but
+            // dropping the in-progress results would visibly empty
+            // their wildmenu mid-search.
+            Some(HostIndex {
+                state: IndexState::Building { dirs, .. },
+                ..
+            }) if !dirs.is_empty() => Some(dirs),
             _ => None,
         };
         let new_state = match cached {
@@ -994,6 +1147,7 @@ impl IndexCatalog {
             None => IndexState::Building {
                 handle: make_handle(),
                 count: 0,
+                dirs: Vec::new(),
             },
         };
         self.hosts.insert(
@@ -1030,6 +1184,18 @@ pub(crate) fn inert_handle_for_test() -> IndexHandle {
     IndexHandle { cancel, rx }
 }
 
+/// Construct an [`IndexHandle`] paired with its sender so tests can
+/// push synthetic events directly. Used by `index_manager`'s drain
+/// tests to exercise the Building / Refreshing Progress accumulation
+/// paths without spinning up a real walker thread.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn handle_with_sender_for_test() -> (IndexHandle, Sender<IndexEvent>) {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = unbounded::<IndexEvent>();
+    (IndexHandle { cancel, rx }, tx)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1052,7 +1218,7 @@ mod tests {
                 "timed out waiting for IndexEvent::Done",
             );
             match rx.try_recv() {
-                Ok(IndexEvent::Progress(n)) => progress.push(n),
+                Ok(IndexEvent::Progress { count, .. }) => progress.push(count),
                 Ok(IndexEvent::Done(result)) => return (progress, result),
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     std::thread::sleep(Duration::from_millis(5));
@@ -1296,13 +1462,29 @@ mod tests {
     }
 
     #[test]
-    fn cached_dirs_returns_none_for_building_and_failed() {
+    fn cached_dirs_returns_partial_for_building() {
+        // Building with a partial accumulator is still searchable —
+        // the user can fuzzy-match against the in-progress index
+        // instead of waiting for the walk to finish.
         let building = IndexState::Building {
             handle: fresh_handle(),
-            count: 0,
+            count: 2,
+            dirs: vec![
+                IndexedDir {
+                    path: PathBuf::from("/p1"),
+                    kind: ProjectKind::Plain,
+                },
+                IndexedDir {
+                    path: PathBuf::from("/p2"),
+                    kind: ProjectKind::Plain,
+                },
+            ],
         };
-        assert!(building.cached_dirs().is_none());
+        assert_eq!(building.cached_dirs().map(<[_]>::len), Some(2));
+    }
 
+    #[test]
+    fn cached_dirs_returns_none_for_failed() {
         let failed = IndexState::Failed {
             message: "boom".into(),
         };
@@ -1315,6 +1497,7 @@ mod tests {
             IndexState::Building {
                 handle: fresh_handle(),
                 count: 0,
+                dirs: Vec::new(),
             }
             .is_in_flight()
         );
@@ -1425,6 +1608,7 @@ mod tests {
             IndexState::Building {
                 handle: fresh_handle(),
                 count: 7,
+                dirs: Vec::new(),
             },
         );
         let mut called = false;
@@ -1498,6 +1682,7 @@ mod tests {
             IndexState::Building {
                 handle: fresh_handle(),
                 count: 99,
+                dirs: Vec::new(),
             },
         );
         cat.force_rebuild("local".into(), dummy_ctx(), fresh_handle);
@@ -1536,6 +1721,7 @@ mod tests {
             IndexState::Building {
                 handle: fresh_handle(),
                 count: 0,
+                dirs: Vec::new(),
             },
         );
         install(

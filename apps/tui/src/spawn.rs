@@ -611,6 +611,21 @@ impl SpawnMinibuffer {
 
         match key.code {
             KeyCode::Char(c) => {
+                // Auto-enter navigation: typing `/` or `~` from an
+                // empty fuzzy query is a "I want to navigate by path"
+                // gesture. Switch to Precise mode and seed the path
+                // field at root (`/`) or the (local or remote) `$HOME`
+                // (`~`). The user's preferred mode is preserved
+                // (`user_search_mode` is not touched), so the next
+                // modal open returns to Fuzzy.
+                if self.focused == Zone::Path
+                    && self.search_mode == SearchMode::Fuzzy
+                    && self.fuzzy_query.is_empty()
+                    && (c == '/' || c == '~')
+                {
+                    self.enter_navigation_mode_with_seed(c, lister);
+                    return ModalOutcome::None;
+                }
                 if self.focused == Zone::Path {
                     self.path_origin = PathOrigin::UserTyped;
                 }
@@ -628,6 +643,50 @@ impl SpawnMinibuffer {
             }
             _ => ModalOutcome::None,
         }
+    }
+
+    /// Switch from Fuzzy to Precise mode with the path field seeded
+    /// at root (`/`) or the user's home (`~`). Called from
+    /// [`Self::handle`] when the user types `/` or `~` against an
+    /// empty fuzzy query — the gesture is "drop into navigation,
+    /// starting here." The user's `user_search_mode` is intentionally
+    /// NOT updated: this is a one-shot escape into Precise, not a
+    /// preference change.
+    ///
+    /// `~` expands to the local `$HOME` in `PathMode::Local` and to
+    /// the remote `$HOME` (captured during prepare) in
+    /// `PathMode::Remote`. If `$HOME` is unset on the local side,
+    /// the field is seeded with the literal `~/` and the user can
+    /// either edit forward or backspace.
+    fn enter_navigation_mode_with_seed(&mut self, c: char, lister: &mut DirLister<'_>) {
+        self.search_mode = SearchMode::Precise;
+        self.path = match c {
+            '/' => "/".to_string(),
+            '~' => {
+                let home: Option<PathBuf> = match &self.path_mode {
+                    PathMode::Local => std::env::var_os("HOME").map(PathBuf::from),
+                    PathMode::Remote { remote_home, .. } => Some(remote_home.clone()),
+                };
+                match home {
+                    Some(h) => {
+                        let s = h.to_string_lossy();
+                        if s.ends_with('/') {
+                            s.into_owned()
+                        } else {
+                            format!("{s}/")
+                        }
+                    }
+                    None => "~/".to_string(),
+                }
+            }
+            // Caller gates on `c == '/' || c == '~'`.
+            _ => unreachable!(),
+        };
+        self.path_origin = PathOrigin::UserTyped;
+        self.fuzzy_query.clear();
+        self.filtered.clear();
+        self.selected = None;
+        self.refresh(lister);
     }
 
     /// Handle Ctrl-modified keys. Currently supports Ctrl-Backspace
@@ -1224,6 +1283,13 @@ impl SpawnMinibuffer {
     /// Extracted from [`Self::wildmenu_view`] purely to keep that
     /// function under clippy's `too_many_lines` threshold; the only
     /// caller is the fuzzy-empty branch.
+    ///
+    /// Building → always show the live progress sentinel, even if the
+    /// user has typed a query that didn't match the partial index.
+    /// The walker is still discovering dirs; "no matches" would lie
+    /// because the next batch may add the match. Once the walk
+    /// completes (Ready / Refreshing) the "(no matches)" sentinel
+    /// applies normally.
     fn fuzzy_state_view<'a>(
         &self,
         width: usize,
@@ -1313,6 +1379,7 @@ impl SpawnMinibuffer {
                 placeholder_style,
                 cursor_style,
                 false,
+                host_unfocused_value_style(),
             ));
             spans.push(Span::styled(" : ", separator_style));
             let frame = spinner_frame(view.started_at);
@@ -1337,6 +1404,7 @@ impl SpawnMinibuffer {
             placeholder_style,
             cursor_style,
             false,
+            host_unfocused_value_style(),
         ));
         spans.push(Span::styled(" : ", separator_style));
         // Path zone shows whichever input buffer is active for the
@@ -1357,6 +1425,7 @@ impl SpawnMinibuffer {
             placeholder_style,
             cursor_style,
             true,
+            path_unfocused_value_style(),
         ));
 
         // Hint reflects what's actionable in the focused zone. Fuzzy +
@@ -1428,6 +1497,14 @@ impl SpawnMinibuffer {
 /// segment without drowning out the parent directory context. False for
 /// the host zone, which has no analog (a hostname is a single segment).
 ///
+/// `unfocused_value_style` is what gets applied to a non-empty value
+/// when the zone isn't focused. The path zone passes `Style::default()`
+/// (the value just sits there in the terminal's default color); the
+/// host zone passes a cyan style so a committed SSH host stays
+/// visibly "selected" after focus moves to the path zone — without
+/// this, a cyan-when-focused / default-when-not flip made the
+/// unfocused host look identical to the local placeholder.
+///
 /// Lifetime note: `value` and `placeholder` share `'a` so the returned
 /// `Span`s can borrow from both. ratatui is immediate-mode and redraws on
 /// every event/tick, so we deliberately avoid `to_string()` /
@@ -1439,6 +1516,7 @@ fn zone_spans<'a>(
     placeholder_style: Style,
     cursor_style: Style,
     highlight_basename: bool,
+    unfocused_value_style: Style,
 ) -> Vec<Span<'a>> {
     const CURSOR: &str = "█";
     let mut out = Vec::with_capacity(3);
@@ -1473,10 +1551,15 @@ fn zone_spans<'a>(
             let (prefix, tail) = value.split_at(split);
             out.push(Span::styled(prefix, Style::default()));
             if !tail.is_empty() {
-                out.push(Span::styled(tail, value_style(true)));
+                out.push(Span::styled(tail, focused_value_style()));
             }
         } else {
-            out.push(Span::styled(value, value_style(focused)));
+            let style = if focused {
+                focused_value_style()
+            } else {
+                unfocused_value_style
+            };
+            out.push(Span::styled(value, style));
         }
         if focused {
             out.push(Span::styled(CURSOR, cursor_style));
@@ -1485,14 +1568,30 @@ fn zone_spans<'a>(
     out
 }
 
-fn value_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    }
+/// Style applied to the focused zone's value text. The cyan + bold
+/// combo is the modal's "this is what you're typing" cue, used by
+/// both zones (host and path) and by the path-zone basename
+/// highlight.
+fn focused_value_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Default unfocused value style for the path zone — terminal
+/// default color, no modifiers. The host zone uses
+/// [`host_unfocused_value_style`] instead so a committed SSH host
+/// keeps its blue accent after focus moves on.
+fn path_unfocused_value_style() -> Style {
+    Style::default()
+}
+
+/// Unfocused value style for the host zone. Cyan but NOT bold so a
+/// committed SSH host (e.g. `devpod-go`) stays visually distinct
+/// from typed text in the path zone while not competing with the
+/// focused zone's bolded cursor.
+fn host_unfocused_value_style() -> Style {
+    Style::default().fg(Color::Cyan)
 }
 
 fn host_marker_style(focused: bool) -> Style {
@@ -2955,15 +3054,32 @@ mod tests {
     }
 
     #[test]
-    fn value_style_focused_is_cyan_bold() {
-        let s = value_style(true);
+    fn focused_value_style_is_cyan_bold() {
+        let s = focused_value_style();
         assert_eq!(s.fg, Some(Color::Cyan));
         assert!(s.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn value_style_unfocused_is_default() {
-        assert_eq!(value_style(false), Style::default());
+    fn path_unfocused_value_style_is_default() {
+        // Path zone uses the terminal default for unfocused values
+        // — the chrome surrounding it (cyan label, separator) carries
+        // the visual cues; the path text itself just sits there.
+        assert_eq!(path_unfocused_value_style(), Style::default());
+    }
+
+    #[test]
+    fn host_unfocused_value_style_is_cyan_not_bold() {
+        // Host zone keeps a cyan fg even when unfocused so a
+        // committed SSH host (e.g. devpod-go) stays visibly
+        // "selected" after focus moves to the path zone. NOT bold so
+        // the focused zone's bolded text still wins for emphasis.
+        let s = host_unfocused_value_style();
+        assert_eq!(s.fg, Some(Color::Cyan));
+        assert!(
+            !s.add_modifier.contains(Modifier::BOLD),
+            "unfocused host must not be bold (would compete with the focused zone)",
+        );
     }
 
     /// Empty + focused: cursor overlays the FIRST char of the placeholder
@@ -2975,7 +3091,15 @@ mod tests {
     fn zone_spans_empty_focused_overlays_cursor_on_first_placeholder_char() {
         let placeholder_style = Style::default().add_modifier(Modifier::DIM);
         let cursor_style = Style::default().fg(Color::Cyan);
-        let spans = zone_spans(true, "", "local", placeholder_style, cursor_style, false);
+        let spans = zone_spans(
+            true,
+            "",
+            "local",
+            placeholder_style,
+            cursor_style,
+            false,
+            path_unfocused_value_style(),
+        );
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "█");
         // First char of "local" is consumed by the cursor; "ocal" remains.
@@ -2992,7 +3116,15 @@ mod tests {
     /// would still allocate a row cell for it).
     #[test]
     fn zone_spans_empty_focused_with_single_char_placeholder_omits_remainder() {
-        let spans = zone_spans(true, "", "x", Style::default(), Style::default(), false);
+        let spans = zone_spans(
+            true,
+            "",
+            "x",
+            Style::default(),
+            Style::default(),
+            false,
+            path_unfocused_value_style(),
+        );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "█");
     }
@@ -3001,7 +3133,15 @@ mod tests {
     fn zone_spans_empty_unfocused_renders_full_placeholder_no_cursor() {
         let placeholder_style = Style::default().add_modifier(Modifier::DIM);
         let cursor_style = Style::default();
-        let spans = zone_spans(false, "", "local", placeholder_style, cursor_style, false);
+        let spans = zone_spans(
+            false,
+            "",
+            "local",
+            placeholder_style,
+            cursor_style,
+            false,
+            path_unfocused_value_style(),
+        );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "local");
     }
@@ -3017,6 +3157,7 @@ mod tests {
             placeholder_style,
             cursor_style,
             false,
+            path_unfocused_value_style(),
         );
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "alpha");
@@ -3032,9 +3173,35 @@ mod tests {
             Style::default(),
             Style::default(),
             false,
+            path_unfocused_value_style(),
         );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "alpha");
+    }
+
+    /// Host zone, unfocused, with a committed SSH host: the value
+    /// must render in the host-zone unfocused style (cyan, not bold)
+    /// rather than the path-zone default. Without this, the host
+    /// disappears into the terminal's default color the moment focus
+    /// moves to the path zone — the user's reported bug.
+    #[test]
+    fn zone_spans_host_unfocused_with_value_renders_in_cyan() {
+        let spans = zone_spans(
+            false,
+            "devpod-go",
+            "local",
+            Style::default(),
+            Style::default(),
+            false,
+            host_unfocused_value_style(),
+        );
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "devpod-go");
+        assert_eq!(spans[0].style.fg, Some(Color::Cyan));
+        assert!(
+            !spans[0].style.add_modifier.contains(Modifier::BOLD),
+            "unfocused host must not be bold",
+        );
     }
 
     /// Focused path with multiple segments: the parent prefix
@@ -3051,6 +3218,7 @@ mod tests {
             Style::default(),
             Style::default(),
             true,
+            path_unfocused_value_style(),
         );
         // prefix + tail + cursor = 3 spans
         assert_eq!(spans.len(), 3);
@@ -3076,6 +3244,7 @@ mod tests {
             Style::default(),
             Style::default(),
             true,
+            path_unfocused_value_style(),
         );
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "/home/df/");
@@ -3094,6 +3263,7 @@ mod tests {
             Style::default(),
             Style::default(),
             true,
+            path_unfocused_value_style(),
         );
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "repos");
@@ -3113,6 +3283,7 @@ mod tests {
             Style::default(),
             Style::default(),
             true,
+            path_unfocused_value_style(),
         );
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "/home/df/repos");
@@ -3893,6 +4064,116 @@ mod tests {
             "Precise path field must stay clean in Fuzzy mode (got {:?})",
             m.path,
         );
+    }
+
+    /// Typing `/` against an empty fuzzy query is a "drop into
+    /// navigation at root" gesture: switch to Precise and seed `/`
+    /// in the path field. Preserves `user_search_mode` so the next
+    /// modal open returns to Fuzzy.
+    #[test]
+    fn slash_in_fuzzy_with_empty_query_enters_navigation_at_root() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        let outcome = m.handle(&key(KeyCode::Char('/')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.search_mode, SearchMode::Precise);
+        // user_search_mode is the persisted preference — auto-switch
+        // is one-shot, so it must NOT change.
+        assert_eq!(m.user_search_mode, SearchMode::Fuzzy);
+        assert_eq!(m.path, "/");
+        assert!(m.fuzzy_query.is_empty());
+    }
+
+    /// Typing `~` against an empty fuzzy query enters navigation at
+    /// the user's home. The seed expands `$HOME` (with a trailing
+    /// `/` so the wildmenu lists the home dir's children).
+    #[test]
+    fn tilde_in_fuzzy_with_empty_query_enters_navigation_at_home() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        let outcome = m.handle(&key(KeyCode::Char('~')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.search_mode, SearchMode::Precise);
+        assert_eq!(m.user_search_mode, SearchMode::Fuzzy);
+        // The seed should be either `$HOME/` (when HOME is set,
+        // which is the common case in CI / dev) or the literal
+        // `~/` fallback. Either way, it's a directory-style path
+        // ending in `/`. Test environments almost always have HOME
+        // set; if not, the fallback is also acceptable.
+        assert!(
+            m.path.ends_with('/'),
+            "tilde seed must end in '/': {}",
+            m.path,
+        );
+        let expected_home = std::env::var_os("HOME").map_or_else(
+            || "~/".to_string(),
+            |h| format!("{}/", h.to_string_lossy().trim_end_matches('/')),
+        );
+        assert_eq!(m.path, expected_home);
+        assert!(m.fuzzy_query.is_empty());
+    }
+
+    /// `/` typed mid-query should NOT trigger the auto-switch — the
+    /// user already has a fuzzy search in progress and a stray `/`
+    /// shouldn't blow it away. Falls through to the normal Char
+    /// handler (appended to `fuzzy_query`).
+    #[test]
+    fn slash_after_fuzzy_query_stays_in_fuzzy() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.handle(&key(KeyCode::Char('a')), &b(), &mut local());
+        let outcome = m.handle(&key(KeyCode::Char('/')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.search_mode, SearchMode::Fuzzy);
+        assert_eq!(m.fuzzy_query, "a/");
+        assert!(m.path.is_empty());
+    }
+
+    /// In Precise mode, `/` and `~` are normal characters that go
+    /// into the path field as-is. The auto-switch is a Fuzzy-only
+    /// behavior because Precise users are already navigating by path.
+    #[test]
+    fn slash_in_precise_is_a_literal_char() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Precise;
+        m.path.clear();
+        m.handle(&key(KeyCode::Char('/')), &b(), &mut local());
+        assert_eq!(m.search_mode, SearchMode::Precise);
+        assert_eq!(m.path, "/");
+    }
+
+    /// `/` typed in the host zone is a literal char (host names
+    /// don't contain `/`, but the modal shouldn't silently swap
+    /// modes from under the host picker either). The Fuzzy gate
+    /// already guards on `Zone::Path`, but pinning the host case
+    /// makes the contract explicit.
+    #[test]
+    fn slash_in_host_zone_is_a_literal_char_not_an_auto_switch() {
+        let mut m = mb("", "", Zone::Host, &["alpha"]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.handle(&key(KeyCode::Char('/')), &b(), &mut local());
+        assert_eq!(m.host, "/");
+        assert_eq!(m.focused, Zone::Host);
+        assert_eq!(m.search_mode, SearchMode::Fuzzy);
+    }
+
+    /// In `PathMode::Remote`, `~` should expand to the remote
+    /// `$HOME` captured during prepare, not the local `$HOME`. The
+    /// local laptop's home is irrelevant on the remote box.
+    #[test]
+    fn tilde_in_fuzzy_remote_mode_expands_to_remote_home() {
+        let mut m = mb("devpod-go", "", Zone::Path, &["devpod-go"]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.path_mode = PathMode::Remote {
+            remote_home: PathBuf::from("/users/df"),
+            cache: HashMap::new(),
+        };
+        m.handle(&key(KeyCode::Char('~')), &b(), &mut local());
+        assert_eq!(m.search_mode, SearchMode::Precise);
+        assert_eq!(m.path, "/users/df/");
     }
 
     #[test]

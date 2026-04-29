@@ -57,7 +57,7 @@ use crate::bootstrap_worker::{
     AttachEvent, AttachHandle, PrepareEvent, PrepareHandle, PrepareSuccess, start_attach,
     start_prepare,
 };
-use crate::config::{Config, SearchMode, SpawnConfig};
+use crate::config::{Config, SpawnConfig};
 use crate::host_title;
 use crate::index_manager::IndexManager;
 use crate::index_worker::IndexState;
@@ -1605,7 +1605,15 @@ fn event_loop(
     // (request_local_swr / request_remote_swr / force_rebuild_*)
     // and queries `state_for(host)` to drive the modal's render.
     let mut index_mgr = IndexManager::new();
-    if spawn_config.default_mode == SearchMode::Fuzzy {
+    // Always kick off the local index in the background, regardless
+    // of `default_mode`. Indexing is cheap (background thread,
+    // ignore-aware walker) and starting unconditionally means a
+    // mid-session toggle from Precise to Fuzzy lands on a populated
+    // index instead of a cold "indexing…" sentinel. The `Building`
+    // state grows its searchable `dirs` list incrementally so the
+    // first user query can score against the partial index even on
+    // first run.
+    {
         let outcome =
             index_mgr.request_local_swr(&spawn_config.search_roots, &spawn_config.project_markers);
         tracing::debug!(?outcome, "fuzzy index: build started at session start");
@@ -2427,13 +2435,14 @@ fn event_loop(
                         // The manager preserves cached results as
                         // `Refreshing { dirs, .. }` so the modal
                         // opens instantly with stale-but-usable data.
-                        if spawn_config.default_mode == SearchMode::Fuzzy {
-                            let outcome = index_mgr.request_local_swr(
-                                &spawn_config.search_roots,
-                                &spawn_config.project_markers,
-                            );
-                            tracing::debug!(?outcome, "fuzzy index: SWR refresh on modal open");
-                        }
+                        // Run unconditionally (not gated on Fuzzy)
+                        // so a mid-session toggle to Fuzzy still
+                        // benefits from the most-recent walk.
+                        let outcome = index_mgr.request_local_swr(
+                            &spawn_config.search_roots,
+                            &spawn_config.project_markers,
+                        );
+                        tracing::debug!(?outcome, "fuzzy index: SWR refresh on modal open");
                         spawn_ui = Some(SpawnMinibuffer::open(
                             initial_cwd,
                             spawn_config.default_mode,
