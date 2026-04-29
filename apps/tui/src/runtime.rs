@@ -53,6 +53,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use vt100::Parser;
 
+use crate::agent_meta_worker::{AgentMetaWorker, MetaEvent};
 use crate::bootstrap_worker::{
     AttachEvent, AttachHandle, PrepareEvent, PrepareHandle, PrepareSuccess, start_attach,
     start_prepare,
@@ -66,6 +67,7 @@ use crate::log_tail::LogTail;
 use crate::pty_title::TitleCapture;
 use crate::repo_name;
 use crate::spawn::{DirLister, HOST_PLACEHOLDER, ModalOutcome, SpawnMinibuffer};
+use crate::status_bar::{self, SegmentCtx, StatusSegment, render_segments};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const NAV_PANE_WIDTH: u16 = 25;
@@ -139,7 +141,7 @@ impl Drop for TerminalGuard {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum PrefixState {
+pub(crate) enum PrefixState {
     #[default]
     Idle,
     AwaitingCommand,
@@ -704,12 +706,31 @@ struct RuntimeAgent {
     /// no cwd, or remote spawn that defaulted to `$HOME` with an
     /// empty path); the renderer falls back to `label` in that case.
     repo: Option<String>,
+    /// Working directory the agent was spawned in (local agents only).
+    /// Stored separately from [`Self::repo`] because the status-bar
+    /// `BranchSegment` needs the original cwd to compare its basename
+    /// against `repo` (worktree vs. plain checkout) and the
+    /// `agent_meta_worker` needs it to read `.git/HEAD` and resolve
+    /// the JSONL transcript path. `None` for SSH agents (cwd is
+    /// remote — different type, not handled in v1) and for local
+    /// agents spawned without an explicit cwd.
+    cwd: Option<PathBuf>,
     /// Hostname for SSH-backed agents (`Some` for both Ready and
     /// Failed SSH agents, `None` for local). The single source of
     /// truth — the renderer derives the dim/gray prefix from this,
     /// and the failure pane reads it for the "✗ bootstrap of {host}
     /// failed" line.
     host: Option<String>,
+    /// Most-recent Claude model reported by the [`crate::agent_meta_worker`].
+    /// Updates when the user runs `/model` inside the focused agent.
+    /// `None` until the worker's first successful read of the
+    /// session JSONL, and for SSH agents (worker only handles local
+    /// in v1).
+    model: Option<String>,
+    /// Most-recent git branch reported by the [`crate::agent_meta_worker`]
+    /// for the focused agent's cwd. `None` outside a git repo, on
+    /// HEAD-parse failures, and for SSH agents.
+    branch: Option<String>,
     /// Working state observed on the previous frame. The runtime
     /// compares this to `parser.callbacks().is_working()` each tick;
     /// a `true → false` transition while the agent is *not* focused
@@ -798,7 +819,7 @@ enum AgentState {
 }
 
 impl RuntimeAgent {
-    // 8 args after AD-27 added the stable id; the identity, label,
+    // 9 args after the agent_meta_worker landing; identity, label,
     // working dir, host, transport, geometry, and scrollback budget
     // are all distinct concerns that the single call site sets at
     // once. A builder would add code without making any of these
@@ -808,6 +829,7 @@ impl RuntimeAgent {
         id: AgentId,
         label: String,
         repo: Option<String>,
+        cwd: Option<PathBuf>,
         host: Option<String>,
         transport: AgentTransport,
         rows: u16,
@@ -818,7 +840,10 @@ impl RuntimeAgent {
             id,
             label,
             repo,
+            cwd,
             host,
+            model: None,
+            branch: None,
             last_working: false,
             needs_attention: false,
             rows,
@@ -835,10 +860,12 @@ impl RuntimeAgent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn failed(
         id: AgentId,
         label: String,
         repo: Option<String>,
+        cwd: Option<PathBuf>,
         host: String,
         error: codemuxd_bootstrap::Error,
         rows: u16,
@@ -848,7 +875,10 @@ impl RuntimeAgent {
             id,
             label,
             repo,
+            cwd,
             host: Some(host),
+            model: None,
+            branch: None,
             last_working: false,
             needs_attention: false,
             rows,
@@ -1124,12 +1154,14 @@ pub fn run(
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
 
     let chrome = ChromeStyle::from_ui(&config.ui);
+    let segments = status_bar::build_segments(&config.ui.status_bar_segments);
     let ctx = RuntimeContext {
         bindings: &config.bindings,
         chrome: &chrome,
         spawn_config: &config.spawn,
         scrollback_len: config.scrollback_len,
         host_bell_on_finish: config.ui.host_bell_on_finish,
+        segments: &segments,
     };
     event_loop(
         &mut terminal,
@@ -1184,6 +1216,7 @@ fn spawn_local_agent(
         id,
         label,
         repo,
+        cwd.map(Path::to_path_buf),
         None,
         transport,
         rows,
@@ -1549,6 +1582,67 @@ fn resolve_local_scratch_cwd(spawn_config: &SpawnConfig) -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Sync the meta worker's polling target with the currently-focused
+/// agent. Sends `set_target` for a local agent (one with a known cwd)
+/// and `clear_target` for an SSH agent / failed agent / no agent.
+/// Tracks the last-sent id in `last_sent` so we only push to the
+/// worker when focus actually changes — same-agent re-focuses are
+/// no-ops.
+///
+/// This sits at the top of every event-loop tick. Cheap (one
+/// reference compare per frame; clones happen only on the focus-
+/// change path) and keeps the worker control logic in one place
+/// rather than scattered across every `change_focus` call site.
+fn sync_meta_worker_target(
+    worker: &AgentMetaWorker,
+    nav: &NavState,
+    last_sent: &mut Option<AgentId>,
+) {
+    // Yield references rather than clones — we'll only clone on the
+    // SetTarget path that actually moves data into the worker.
+    // Only locally-spawned agents are polled in v1: SSH agents have
+    // a remote cwd that the worker can't read. Detect them by the
+    // absence of `cwd` (set only by `spawn_local_agent`).
+    let focused_local = nav
+        .agents
+        .get(nav.focused)
+        .and_then(|a| a.cwd.as_ref().map(|cwd| (&a.id, cwd)));
+    match (focused_local, last_sent.as_ref()) {
+        (Some((id, _)), Some(prev)) if *id == *prev => {
+            // Same focused agent. Worker still polling it; no clones,
+            // no channel sends.
+        }
+        (Some((id, cwd)), _) => {
+            worker.set_target(id.clone(), cwd.clone());
+            *last_sent = Some(id.clone());
+        }
+        (None, Some(_)) => {
+            worker.clear_target();
+            *last_sent = None;
+        }
+        (None, None) => {}
+    }
+}
+
+/// Apply a batch of `MetaEvent`s drained from the worker. Each event
+/// names an `AgentId`; we resolve it to an index in `agents` before
+/// mutating, so a focus change or reorder mid-poll can never
+/// misroute an update onto the wrong agent.
+fn apply_meta_events(agents: &mut [RuntimeAgent], events: Vec<MetaEvent>) {
+    for ev in events {
+        let target_id = match &ev {
+            MetaEvent::Branch { agent_id, .. } | MetaEvent::Model { agent_id, .. } => agent_id,
+        };
+        let Some(agent) = agents.iter_mut().find(|a| &a.id == target_id) else {
+            continue;
+        };
+        match ev {
+            MetaEvent::Branch { value, .. } => agent.branch = value,
+            MetaEvent::Model { value, .. } => agent.model = value,
+        }
+    }
+}
+
 fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
     for a in agents {
         // Stash the geometry on every agent — even Failed ones — so a
@@ -1859,6 +1953,11 @@ struct RuntimeContext<'a> {
     /// agent's working → idle transition. See `[ui]
     /// host_bell_on_finish` in `Ui` for the user-facing knob.
     host_bell_on_finish: bool,
+    /// Status-bar right-side segments, built from
+    /// `config.ui.status_bar_segments`. Owned by the caller of
+    /// `event_loop`; threaded through to `render_status_bar` so
+    /// segments stay in user-defined order across frames.
+    segments: &'a [Box<dyn StatusSegment>],
 }
 
 fn event_loop(
@@ -1883,6 +1982,7 @@ fn event_loop(
         spawn_config,
         scrollback_len,
         host_bell_on_finish,
+        segments,
     } = *ctx;
     let mut prefix_state = PrefixState::default();
     let mut help_state = HelpState::default();
@@ -1914,6 +2014,12 @@ fn event_loop(
             index_mgr.request_local_swr(&spawn_config.search_roots, &spawn_config.project_markers);
         tracing::debug!(?outcome, "fuzzy index: build started at session start");
     }
+    // Per-focused-agent meta worker: tails the latest Claude session
+    // JSONL for `model` and re-reads `.git/HEAD` for `branch`, then
+    // posts MetaEvents back to the runtime which caches the values
+    // on RuntimeAgent.{model,branch} for the status bar to render.
+    // Single thread, focused-agent only — see [`agent_meta_worker`].
+    let meta_worker = AgentMetaWorker::start();
     let initial_count = agents.len();
     // Bundle the four navigation locals (`agents`, `focused`,
     // `previous_focused`, `popup_state`) into a single owned struct.
@@ -1969,6 +2075,15 @@ fn event_loop(
     // (which the title parser strips out before storage) doesn't
     // produce a per-frame escape stream.
     let mut last_emitted_host_title: Option<String> = None;
+    // Track the agent the meta-worker is currently polling so we only
+    // send a control message when focus actually changes (the worker
+    // dedupes internally too, but a per-frame send floods the channel
+    // and adds noise to the trace logs). `None` represents "worker
+    // has been told to clear" — distinct from "we haven't told it
+    // anything yet" which we model by initialising to `None` on
+    // start and unconditionally pushing the initial focus below.
+    let mut meta_worker_target: Option<AgentId> = None;
+    sync_meta_worker_target(&meta_worker, &nav, &mut meta_worker_target);
 
     loop {
         // Drain in-flight index events for every host (local + each
@@ -1977,6 +2092,13 @@ fn event_loop(
         // thread. The manager owns this whole pipeline; the runtime
         // just yields control once per frame.
         index_mgr.tick();
+        // Apply any model/branch updates the meta worker queued and
+        // make sure it's polling the currently-focused agent. Both
+        // are no-ops when nothing changed (worker idle / focus
+        // stable), so the per-frame cost is a `try_recv` and a
+        // single comparison.
+        apply_meta_events(&mut nav.agents, meta_worker.drain());
+        sync_meta_worker_target(&meta_worker, &nav, &mut meta_worker_target);
         // Refresh the modal's wildmenu from the index for whichever
         // host the modal is currently targeting. The modal
         // short-circuits when not in Fuzzy + Path, so this is cheap
@@ -2049,6 +2171,11 @@ fn event_loop(
                             attach.agent_id.clone(),
                             attach.label.clone(),
                             attach.repo.clone(),
+                            // SSH agents have a remote cwd; `cwd: PathBuf`
+                            // is for local-only operations (git HEAD reads,
+                            // JSONL tailing). Pass None — the meta-worker
+                            // skips SSH agents in v1.
+                            None,
                             Some(attach.host.clone()),
                             transport,
                             attach.rows,
@@ -2062,6 +2189,7 @@ fn event_loop(
                             attach.agent_id.clone(),
                             attach.label.clone(),
                             attach.repo.clone(),
+                            None,
                             attach.host.clone(),
                             e,
                             attach.rows,
@@ -2201,6 +2329,7 @@ fn event_loop(
                     &mut pane_hitbox,
                     selection.as_ref(),
                     modal_index_state,
+                    segments,
                 );
             })
             .wrap_err("draw frame")?;
@@ -2972,6 +3101,7 @@ fn render_frame(
     pane_hitbox: &mut PaneHitbox,
     selection: Option<&Selection>,
     index_state: Option<&IndexState>,
+    segments: &[Box<dyn StatusSegment>],
 ) {
     // Cleared at the top of every frame so a stale frame's rects can
     // never bleed into the next event hit-test if the layout changed
@@ -3029,6 +3159,7 @@ fn render_frame(
                 hitboxes,
                 pane_hitbox,
                 selection,
+                segments,
             );
         }
     }
@@ -3369,6 +3500,7 @@ fn render_popup_style(
     hitboxes: &mut TabHitboxes,
     pane_hitbox: &mut PaneHitbox,
     selection: Option<&Selection>,
+    segments: &[Box<dyn StatusSegment>],
 ) {
     let [pty_area, status_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -3396,6 +3528,7 @@ fn render_popup_style(
         phase,
         chrome,
         hitboxes,
+        segments,
     );
 
     if let PopupState::Open { selection } = popup {
@@ -3403,17 +3536,17 @@ fn render_popup_style(
     }
 }
 
-/// Render the bottom status bar in Popup mode: tab strip on the left
-/// and the prefix hint right-aligned. Splitting into discrete areas
-/// means each section can be styled and clipped independently; the
-/// previous flat-string approach forced uniform style and made it
+/// Render the bottom status bar in Popup mode: tab strip on the left,
+/// status segments on the right (model · repo · branch · prefix-hint
+/// by default — see [`crate::status_bar`]). Splitting into discrete
+/// areas means each section can be styled and clipped independently;
+/// the previous flat-string approach forced uniform style and made it
 /// awkward to highlight the focused tab without rendering a custom
 /// widget.
 ///
-/// The hint at the right swaps based on `prefix_state`: idle shows
-/// the help reminder; `AwaitingCommand` shows a `[NAV]` badge plus a
-/// short reminder of the sticky moves available, so the user has a
-/// visible cue that they're "in nav mode" and what they can do.
+/// The right-side segments stack is built from the user's configured
+/// list and dropped from the LEFT under width pressure, so the
+/// rightmost segment (prefix-hint by default) is always visible.
 #[allow(clippy::too_many_arguments)]
 fn render_status_bar(
     frame: &mut Frame<'_>,
@@ -3425,21 +3558,35 @@ fn render_status_bar(
     phase: AnimationPhase,
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
+    segments: &[Box<dyn StatusSegment>],
 ) {
-    // Compute the hint as both rendered Line (with styling) and a
-    // plain text-width measurement (for the layout split). The two
-    // need to stay in sync — the alternative was to render twice.
-    let (hint_line, hint_width) = build_hint(bindings, prefix_state, chrome);
+    // Build the segments stack first so we know how much space to
+    // reserve on the right. Cap at 3/5 of the area so a long
+    // worktree+branch label can never starve the tab strip on a
+    // moderately-sized terminal. Drop algorithm inside `render_segments`
+    // shrinks the stack from the LEFT until it fits.
+    let max_right = area.width.saturating_mul(3) / 5;
+    let focused_agent = agents.get(focused);
+    let ctx = SegmentCtx {
+        repo: focused_agent.and_then(|a| a.repo.as_deref()),
+        branch: focused_agent.and_then(|a| a.branch.as_deref()),
+        model: focused_agent.and_then(|a| a.model.as_deref()),
+        cwd_basename: focused_agent
+            .and_then(|a| a.cwd.as_deref())
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str()),
+        prefix_state,
+        bindings,
+        secondary: chrome.secondary,
+    };
+    let (segments_line, segments_width) = render_segments(segments, &ctx, max_right);
 
-    // Reserve space for the hint on the right when there's room.
-    // Below a small threshold (just enough for one tab plus the hint),
-    // drop the hint entirely so the user can still see at least one
-    // tab label. Truncation is handled implicitly by ratatui's
-    // Paragraph clipping at the area edge.
-    let (left_area, hint_area) = if area.width > hint_width.saturating_add(8) {
+    // Reserve space for the segments on the right when there's anything
+    // to draw and we have room for at least one tab cell next to it.
+    let (left_area, right_area) = if segments_width > 0 && area.width > segments_width {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(hint_width)])
+            .constraints([Constraint::Min(1), Constraint::Length(segments_width)])
             .split(area);
         (chunks[0], Some(chunks[1]))
     } else {
@@ -3467,7 +3614,7 @@ fn render_status_bar(
         }
         let tab_w = tab.width();
         // Clip against the left_area so a tab that bleeds past the
-        // hint's reserved space (or the screen edge) records its
+        // segments' reserved space (or the screen edge) records its
         // hitbox only over the cells actually drawn. A zero-width
         // result is dropped by `TabHitboxes::record`.
         let avail = area_right.saturating_sub(x);
@@ -3486,50 +3633,9 @@ fn render_status_bar(
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
 
-    if let Some(area) = hint_area {
-        let widget = Paragraph::new(hint_line).alignment(Alignment::Right);
+    if let Some(area) = right_area {
+        let widget = Paragraph::new(segments_line).alignment(Alignment::Right);
         frame.render_widget(widget, area);
-    }
-}
-
-/// Build the right-aligned hint shown in the Popup-mode status bar.
-/// The text changes based on `prefix_state` so the user has a
-/// visible cue when sticky nav mode is active. Returns the styled
-/// `Line` plus the plain-text width — the caller needs both because
-/// ratatui's layout splits need a numeric width while rendering
-/// uses the styled `Line`.
-fn build_hint(
-    bindings: &Bindings,
-    prefix_state: PrefixState,
-    chrome: &ChromeStyle,
-) -> (Line<'static>, u16) {
-    match prefix_state {
-        PrefixState::Idle => {
-            let text = format!("{} {} for help", bindings.prefix, bindings.on_prefix.help);
-            let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
-            let line = Line::styled(text, chrome.secondary);
-            (line, width)
-        }
-        PrefixState::AwaitingCommand => {
-            // [NAV] in yellow + bold to draw the eye; the rest dim
-            // to read as ambient guidance, matching the idle hint
-            // style. Width is the full plain-text length so the
-            // layout reserves enough room for both spans.
-            let badge = "[NAV] ";
-            let body = "h/l prev/next  esc exit";
-            let width =
-                u16::try_from(badge.chars().count() + body.chars().count()).unwrap_or(u16::MAX);
-            let line = Line::from(vec![
-                Span::styled(
-                    badge,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(body, chrome.secondary),
-            ]);
-            (line, width)
-        }
     }
 }
 
@@ -5377,6 +5483,7 @@ mod tests {
             AgentId::new(label),
             label.into(),
             None,
+            None,
             "host".into(),
             err,
             24,
@@ -5393,6 +5500,7 @@ mod tests {
             AgentId::new(label),
             label.into(),
             repo.map(str::to_string),
+            None,
             host.unwrap_or("host").into(),
             err,
             24,
@@ -6124,6 +6232,7 @@ mod tests {
             "a".into(),
             None,
             None,
+            None,
             transport,
             5,
             20,
@@ -6638,27 +6747,39 @@ mod tests {
         assert_eq!(host_span.style, chrome.secondary);
     }
 
-    // build_hint state-driven branch — the user's visible cue that
-    // sticky nav mode is active. The two branches must produce
-    // distinguishable output (different widths) so the layout reserves
-    // appropriate room.
+    // PrefixHintSegment state-driven branch — the user's visible cue
+    // that sticky nav mode is active. The two branches must produce
+    // distinguishable output so the layout reserves appropriate room.
+    // (The detailed PrefixHintSegment behavior is pinned in the
+    // status_bar::segments tests; this is a smoke check here that
+    // the runtime-side hint cue is actually different per state.)
 
     #[test]
-    fn build_hint_idle_and_awaiting_command_produce_different_widths() {
+    fn prefix_hint_segment_idle_and_awaiting_command_render_different_text() {
+        use crate::status_bar::{SegmentCtx, StatusSegment, segments::PrefixHintSegment};
         let bindings = defaults();
-        let (_, idle_width) = build_hint(&bindings, PrefixState::Idle, &ChromeStyle::default());
-        let (_, nav_width) = build_hint(
-            &bindings,
-            PrefixState::AwaitingCommand,
-            &ChromeStyle::default(),
-        );
-        // The NAV-mode hint includes a `[NAV]` badge plus a sticky-mode
-        // reminder, so it's strictly wider than the idle help reminder.
-        // If a future edit makes them equal, the cue gets lost — fail
-        // loudly here so the renderer's affordance stays visible.
-        assert!(nav_width > 0);
-        assert!(idle_width > 0);
-        assert_ne!(idle_width, nav_width);
+        let chrome = ChromeStyle::default();
+        let mk = |state| SegmentCtx {
+            repo: None,
+            branch: None,
+            model: None,
+            cwd_basename: None,
+            prefix_state: state,
+            bindings: &bindings,
+            secondary: chrome.secondary,
+        };
+        let idle = PrefixHintSegment.render(&mk(PrefixState::Idle)).unwrap();
+        let nav = PrefixHintSegment
+            .render(&mk(PrefixState::AwaitingCommand))
+            .unwrap();
+        let idle_text: String = idle.spans.iter().map(|s| s.content.as_ref()).collect();
+        let nav_text: String = nav.spans.iter().map(|s| s.content.as_ref()).collect();
+        // If a future edit makes the two states render identical text,
+        // the cue gets lost — fail loudly here so the renderer's
+        // affordance stays visible.
+        assert_ne!(idle_text, nav_text);
+        assert!(nav_text.contains("[NAV]"));
+        assert!(idle_text.contains("for help"));
     }
 
     #[test]
@@ -6953,6 +7074,7 @@ mod tests {
             "a".into(),
             None,
             None,
+            None,
             transport,
             5,
             20,
@@ -7217,6 +7339,7 @@ mod tests {
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
+                    &[],
                 );
             })
             .unwrap();
@@ -7254,6 +7377,7 @@ mod tests {
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
+                    &[],
                 );
             })
             .unwrap();
@@ -7313,6 +7437,7 @@ mod tests {
                     AnimationPhase::default(),
                     &ChromeStyle::default(),
                     &mut hb,
+                    &[],
                 );
             })
             .unwrap();

@@ -122,6 +122,27 @@ pub struct Ui {
     /// interpret BEL as an audible beep rather than a visual cue
     /// and where the sound is disruptive.
     pub host_bell_on_finish: bool,
+
+    /// Status-bar segments rendered between the tab strip and the
+    /// right edge, in left-to-right order. The rightmost is the
+    /// highest priority: when the terminal can't fit them all,
+    /// segments are dropped from the LEFT first, so the prefix
+    /// hint stays visible even on a 60-cell-wide window.
+    ///
+    /// Built-in IDs:
+    /// - `"model"` — current Claude model on the focused agent
+    /// - `"repo"` — focused agent's repo name
+    /// - `"branch"` — focused agent's git branch (worktree-aware)
+    /// - `"prefix_hint"` — the `super+b for help` / `[NAV] …` hint
+    ///
+    /// Unknown IDs are logged at startup and skipped. An empty list
+    /// disables the right-side block entirely (the tab strip then
+    /// fills the whole status bar).
+    ///
+    /// Default: `["model", "repo", "branch", "prefix_hint"]`. The
+    /// container's `#[serde(default)]` calls `Ui::default()` which
+    /// fills the field — no field-level `default` attribute needed.
+    pub status_bar_segments: Vec<String>,
 }
 
 impl Default for Ui {
@@ -130,6 +151,7 @@ impl Default for Ui {
             subtle: false,
             host_colors: HashMap::new(),
             host_bell_on_finish: true,
+            status_bar_segments: crate::status_bar::default_segment_ids(),
         }
     }
 }
@@ -755,6 +777,45 @@ mod tests {
         // hardcoded default.
         let config: Config = toml::from_str("[ui]\nhost_bell_on_finish = true\n").unwrap();
         assert!(config.ui.host_bell_on_finish);
+    }
+
+    #[test]
+    fn ui_status_bar_segments_default_includes_all_four_built_ins() {
+        // Defaults define the out-of-the-box UX. New users see model,
+        // repo, branch, prefix_hint without writing config.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.ui.status_bar_segments,
+            vec![
+                "model".to_string(),
+                "repo".to_string(),
+                "branch".to_string(),
+                "prefix_hint".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn ui_status_bar_segments_round_trips_user_override() {
+        let toml_text = r#"
+            [ui]
+            status_bar_segments = ["repo", "prefix_hint"]
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.ui.status_bar_segments,
+            vec!["repo".to_string(), "prefix_hint".to_string()],
+            "user list replaces the default (no merge)",
+        );
+    }
+
+    #[test]
+    fn ui_status_bar_segments_empty_list_disables_right_side_block() {
+        // Setting the list to `[]` is the documented way to drop the
+        // right-side block entirely. Pinning this so a future serde
+        // change can't silently swap empty for default.
+        let config: Config = toml::from_str("[ui]\nstatus_bar_segments = []\n").unwrap();
+        assert!(config.ui.status_bar_segments.is_empty());
     }
 
     #[test]

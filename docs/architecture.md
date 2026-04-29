@@ -92,6 +92,25 @@ Consequence: whatever Claude Code can do in a terminal, codemux supports for
 free. Whatever codemux wants to *show beside* Claude Code, it derives from
 out-of-band sources (git for diffs, host probes for liveness).
 
+**Bounded exception (added with the status-bar segment refactor):** the
+`agent_meta_worker` reads `~/.claude/projects/<encoded-cwd>/*.jsonl` to extract
+the **`message.model`** field from the most recent assistant turn, exclusively
+to drive the status bar's `ModelSegment`. The carve-out is intentionally
+narrow:
+
+- One file shape (the per-session transcript JSONL Claude writes).
+- One field (`message.model`).
+- Focused agent only — we never tail more than one transcript at a time.
+- Local agents only in v1 — SSH-backed agents skip this entirely.
+- Read-only, polled at 2 s with no parsing of conversation content,
+  tool calls, or any other JSONL field.
+
+Anything beyond that scope (rendering messages, tracking tool use, parsing
+prompts) requires a new AD update. The above is the only sanctioned reason
+to touch Claude's session output, and it exists because there is no
+out-of-band channel for "current model" today (`/model` mid-session is purely
+in-conversation state).
+
 ### AD-3 — Remote PTY container is `codemuxd`, behind an `AgentTransport` enum
 
 P1 SSH transport. A small Rust daemon (`codemuxd`) holds the remote PTY across
@@ -608,6 +627,62 @@ shape now makes that an additive change (introduce a
 Rejected: a single combined `key_to_bytes` function with modifier
 branching inline (the prior shape). Re-evaluating it would re-stage
 the exact Leaky Abstraction the review fired on, twice.
+
+### AD-29 — Status-bar segments are a closed set of built-ins, selected by config
+
+The bottom status bar's right side renders a stack of context segments
+(model · repo · branch · prefix-hint by default). Users pick which segments
+to show, in what order, via `[ui] status_bar_segments = [...]` in `config.toml`.
+Order is left-to-right; under width pressure, segments are dropped from the
+LEFT first so the rightmost (highest-priority) one stays visible.
+
+The plumbing lives in `apps/tui/src/status_bar/`:
+- `mod.rs` — the `StatusSegment` trait, `SegmentCtx` POD, the right-to-left
+  drop algorithm in `render_segments`, and the `build_segments(&ids)` registry
+  that maps config strings to built-in implementations.
+- `segments.rs` — the four built-in segments. Each is a stateless unit
+  struct that reads its data off `SegmentCtx` and returns `Some(Line)` or
+  `None` (skip silently).
+
+**What this is not.** Not dynamic plugins. Not shell-out segments. Not
+scripting. Built-in IDs only. Adding a new segment is a typed change in
+this codebase: implement `StatusSegment`, add an ID constant, register
+it in `build_segments`'s match arm. The config layer follows automatically.
+
+**Why the closed set.** Same shape as `host_colors` and the fuzzy/precise
+search engine: the user picks from a curated menu rather than authoring
+their own. Three reasons:
+
+1. **No subprocess on the render hot path.** A shell-out segment would
+   invoke `sh -c` per refresh per segment per agent — expensive and a
+   stutter risk.
+2. **Typed contract.** Each segment owns its style decisions in one
+   place. A typo in a built-in ID is a clippy-flagged literal mismatch;
+   a typo in the config logs once at startup and falls back gracefully.
+3. **Bounded surface area.** When debugging "why is this segment empty,"
+   the answer is always one Rust impl in `segments.rs`. Shell-command
+   segments would split the answer between codemux, the user's shell,
+   and the user's PATH.
+
+**Why the drop-from-the-left algorithm.** The user's primary cue (the
+prefix-key hint) lives at the right edge today. Keeping the existing
+visual anchor stable across narrow terminals — and letting newly-added
+segments degrade gracefully on small screens — was the design goal.
+Segments stack up to the left of the hint, and when a 60-cell terminal
+can't fit `model: opus-4-7 │ repo: codemux │ codemux:main │ ctrl+b ? for help`,
+the user still sees `ctrl+b ? for help` and the focused agent's tab,
+not a confused half-hint.
+
+**The model segment is special.** It triggers an AD-1 carve-out (the
+`agent_meta_worker` tails Claude's session JSONL to extract the live
+model). See AD-1's amended prose for the bounded-exception scope.
+
+Rejected: hardcoded inline rendering of the three segments in
+`render_status_bar` (the simplest possible thing). Would require a
+config knob per segment to disable individually, and any new segment
+would mean another inline branch in the renderer. The trait shape lets
+the renderer stay schema-agnostic and pushes per-segment formatting
+into one file per segment.
 
 ## Deferred ideas
 

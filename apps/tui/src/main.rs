@@ -9,8 +9,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod agent_meta_worker;
 mod bootstrap_worker;
 mod config;
+mod git_branch;
 mod host_title;
 mod index_cache;
 mod index_manager;
@@ -22,6 +24,7 @@ mod repo_name;
 mod runtime;
 mod spawn;
 mod ssh_config;
+mod status_bar;
 use runtime::NavStyle;
 
 #[derive(Debug, Parser)]
