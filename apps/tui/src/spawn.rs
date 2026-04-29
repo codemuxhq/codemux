@@ -159,6 +159,21 @@ pub enum ModalOutcome {
     PrepareHost {
         host: String,
     },
+    /// User picked a named project bound to an SSH host (via the
+    /// `host = "<alias>"` field on `[[spawn.projects]]`). The runtime
+    /// kicks off the prepare phase for `host` exactly as it would for
+    /// a plain `PrepareHost`, but stashes `path` on the prepare slot
+    /// so the spawn fires automatically once prepare reports
+    /// `Done(Ok)` — no second user step.
+    ///
+    /// Carried separately from `PrepareHost` (which always returns the
+    /// modal to the user for path entry on success) so the runtime
+    /// can distinguish "the user wants to pick a remote folder" from
+    /// "the user already named the folder via a project alias."
+    PrepareHostThenSpawn {
+        host: String,
+        path: String,
+    },
     /// User pressed Cancel (Esc) or `SwapToHost` (`@`) while the path
     /// zone was locked for bootstrap. The runtime should drop the
     /// in-flight worker and call
@@ -336,6 +351,17 @@ pub struct SpawnMinibuffer {
     /// `nucleo-matcher` against `name` (not the full path) and
     /// boosted above any auto-discovered repository.
     named_projects: Vec<NamedProject>,
+    /// Lookup table from `expand_named_project_path(np.path)` → host
+    /// alias, populated at `open()` from any `named_projects` entry
+    /// whose `host` is `Some` and non-empty. Used at commit time in
+    /// [`Self::confirm`] to upgrade a plain `Spawn` to
+    /// `PrepareHostThenSpawn` when the picked path matches an alias
+    /// bound to a remote host.
+    ///
+    /// Keyed by *expanded* path so the lookup matches what
+    /// `score_fuzzy` emits (the wildmenu shows the expanded path; the
+    /// confirm path resolves the same string back).
+    project_hosts: HashMap<String, String>,
 }
 
 impl SpawnMinibuffer {
@@ -356,6 +382,7 @@ impl SpawnMinibuffer {
     /// user-typed path.
     #[must_use]
     pub fn open(cwd: &Path, default_mode: SearchMode, named_projects: Vec<NamedProject>) -> Self {
+        let project_hosts = build_project_hosts(&named_projects);
         let mut m = Self {
             host: String::new(),
             path: String::new(),
@@ -372,6 +399,7 @@ impl SpawnMinibuffer {
             user_search_mode: default_mode,
             fuzzy_query: String::new(),
             named_projects,
+            project_hosts,
         };
         if default_mode == SearchMode::Precise {
             m.seed_path_with_cwd();
@@ -914,6 +942,20 @@ impl SpawnMinibuffer {
         // empty-path → remote-default mapping that makes SSH spawns
         // work without the user typing a remote path explicitly.
         let path = path.trim().to_string();
+        // Project-host override: if the picked path matches a named
+        // project bound to an SSH alias, route through the bootstrap
+        // state machine instead of emitting a plain `Spawn` (which the
+        // runtime would reject for any non-local host without an
+        // active prepare slot — see the `runtime.rs` "modal state
+        // machine bug" guard). The project alias is the more specific
+        // signal, so it overrides whatever the user typed in the host
+        // zone.
+        if let Some(project_host) = self.project_hosts.get(&path) {
+            return ModalOutcome::PrepareHostThenSpawn {
+                host: project_host.clone(),
+                path,
+            };
+        }
         ModalOutcome::Spawn { host, path }
     }
 
@@ -1689,6 +1731,32 @@ fn expand_named_project_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Build the path → host lookup the spawn modal uses at commit time
+/// to upgrade a plain `Spawn` into `PrepareHostThenSpawn` for projects
+/// bound to an SSH alias. Empty/missing `host` is filtered out (treated
+/// as local). Keys are tilde-expanded so they match the strings
+/// `score_fuzzy` emits into the wildmenu.
+///
+/// On a duplicate path with conflicting hosts the *first* entry wins —
+/// the user's config order is the tiebreaker. We don't bother warning;
+/// duplicate paths in `[[spawn.projects]]` are already a config smell
+/// that the existing dedup in `score_fuzzy` papers over.
+#[must_use]
+fn build_project_hosts(projects: &[NamedProject]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for np in projects {
+        let Some(host) = np.host.as_ref() else {
+            continue;
+        };
+        if host.is_empty() {
+            continue;
+        }
+        map.entry(expand_named_project_path(&np.path))
+            .or_insert_with(|| host.clone());
+    }
+    map
+}
+
 /// Path-zone completions: scan `read_dir(parent)` for entries matching the
 /// trailing component of the typed path. Returns *full* paths (parent +
 /// entry) so the wildmenu shows the user where the candidate actually
@@ -2063,6 +2131,7 @@ mod tests {
             user_search_mode: SearchMode::Precise,
             fuzzy_query: String::new(),
             named_projects: Vec::new(),
+            project_hosts: HashMap::new(),
         };
         m.refresh(&mut local());
         m
@@ -3992,6 +4061,7 @@ mod tests {
             name: "codemux".to_string(),
             // Use absolute path so we don't depend on $HOME in test.
             path: "/explicit/alias/codemux".to_string(),
+            host: None,
         }];
         let result = score_fuzzy("codemux", &dirs, &named);
         assert_eq!(
@@ -4012,6 +4082,7 @@ mod tests {
         let named = vec![NamedProject {
             name: "cm".to_string(),
             path: "/work/codemux".to_string(),
+            host: None,
         }];
         let result = score_fuzzy("cm", &dirs, &named);
         let cm_count = result.iter().filter(|s| s == &"/work/codemux").count();
@@ -4026,6 +4097,7 @@ mod tests {
         let named = vec![NamedProject {
             name: "xy".to_string(),
             path: "/some/where/codemux".to_string(),
+            host: None,
         }];
         let result = score_fuzzy("xy", &dirs, &named);
         assert_eq!(result.len(), 1);
@@ -4036,6 +4108,121 @@ mod tests {
         // looks at `name`.
         let result = score_fuzzy("mux", &dirs, &named);
         assert!(result.is_empty(), "should not match path: {result:?}");
+    }
+
+    // ── Project → host binding ──────────────────────────────────
+    //
+    // `build_project_hosts` is the lookup `confirm` consults at commit
+    // time to upgrade `Spawn` → `PrepareHostThenSpawn`. The unit tests
+    // below cover the construction (only entries with a non-empty
+    // `host` make it in, and tilde-expansion matches the wildmenu's
+    // emitted strings) and the emission path through `confirm` itself.
+
+    #[test]
+    fn build_project_hosts_skips_local_only_entries() {
+        let projects = vec![
+            NamedProject {
+                name: "local-only".to_string(),
+                path: "/local/p".to_string(),
+                host: None,
+            },
+            NamedProject {
+                name: "explicit-empty".to_string(),
+                path: "/local/q".to_string(),
+                host: Some(String::new()),
+            },
+        ];
+        let map = build_project_hosts(&projects);
+        assert!(
+            map.is_empty(),
+            "neither None nor empty-string host should bind: {map:?}",
+        );
+    }
+
+    #[test]
+    fn build_project_hosts_keys_by_expanded_path() {
+        // Use an absolute path so the test doesn't depend on $HOME, but
+        // also cover a `~/...` entry to lock the tilde-expansion in.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let projects = vec![
+            NamedProject {
+                name: "abs".to_string(),
+                path: "/work/code".to_string(),
+                host: Some("devpod-1".to_string()),
+            },
+            NamedProject {
+                name: "tilde".to_string(),
+                path: "~/dotfiles".to_string(),
+                host: Some("devpod-2".to_string()),
+            },
+        ];
+        let map = build_project_hosts(&projects);
+        assert_eq!(map.get("/work/code").map(String::as_str), Some("devpod-1"));
+        if let Some(home) = home {
+            let expanded = home.join("dotfiles").to_string_lossy().into_owned();
+            assert_eq!(map.get(&expanded).map(String::as_str), Some("devpod-2"));
+        }
+    }
+
+    #[test]
+    fn confirm_local_project_emits_plain_spawn() {
+        // A project without `host` keeps today's behavior: confirming
+        // its path emits `Spawn { host: "local", path }`. Simulates
+        // the real flow: project shows in the wildmenu, user picks
+        // it, the resolved path is the project's expanded path.
+        let mut m = SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            SearchMode::Precise,
+            vec![NamedProject {
+                name: "p".to_string(),
+                path: "/tmp/p".to_string(),
+                host: None,
+            }],
+        );
+        m.host.clear();
+        m.path_origin = PathOrigin::UserTyped;
+        m.filtered = vec!["/tmp/p".to_string()];
+        m.selected = Some(0);
+        m.focused = Zone::Path;
+        let outcome = m.confirm(&mut DirLister::Local);
+        assert_eq!(
+            outcome,
+            ModalOutcome::Spawn {
+                host: "local".to_string(),
+                path: "/tmp/p".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn confirm_host_bound_project_emits_prepare_host_then_spawn() {
+        // A project with `host = "devpod-1"` is upgraded to
+        // `PrepareHostThenSpawn`, regardless of what's in the host
+        // zone. The project alias is the more specific signal. The
+        // wildmenu pick is the project's expanded path (just like the
+        // local case above).
+        let mut m = SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            SearchMode::Precise,
+            vec![NamedProject {
+                name: "p".to_string(),
+                path: "/work/p".to_string(),
+                host: Some("devpod-1".to_string()),
+            }],
+        );
+        m.host = "ignored-typed-host".to_string();
+        m.path_origin = PathOrigin::UserTyped;
+        m.filtered = vec!["/work/p".to_string()];
+        m.selected = Some(0);
+        m.focused = Zone::Path;
+        let outcome = m.confirm(&mut DirLister::Local);
+        assert_eq!(
+            outcome,
+            ModalOutcome::PrepareHostThenSpawn {
+                host: "devpod-1".to_string(),
+                path: "/work/p".to_string(),
+            },
+        );
     }
 
     #[test]

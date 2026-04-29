@@ -996,6 +996,14 @@ struct PendingPrepare {
     /// hands a `&fs` / `&runner` pair to the modal per keystroke via
     /// `DirLister`.
     remote_fs: Option<RemoteFs>,
+    /// `Some(path)` when this prepare was triggered by a host-bound
+    /// named project (`ModalOutcome::PrepareHostThenSpawn`). On
+    /// `Done(Ok)` the runtime dismisses the modal and synthesizes
+    /// the SSH spawn against this path instead of unlocking the
+    /// modal for user path entry. `None` for the regular
+    /// `PrepareHost` flow (host typed at the modal, user picks the
+    /// remote path manually after prepare).
+    pending_project_path: Option<String>,
 }
 
 /// In-flight attach worker. The modal usually stays locked watching
@@ -1182,6 +1190,294 @@ fn spawn_local_agent(
         cols,
         scrollback_len,
     ))
+}
+
+/// Build the [`PendingAttach`] for an SSH spawn. Shared by the user-
+/// driven `Spawn { host, path }` path (modal stays open watching the
+/// attach with `modal_owner = true`) and the auto-spawn-after-prepare
+/// path triggered by `PrepareHostThenSpawn` (modal is dismissed before
+/// the call so `modal_owner = false`).
+///
+/// Modal state (lock vs dismiss) is the caller's job — both flows
+/// agree on how the attach is launched, but disagree on what the modal
+/// should look like while it runs.
+///
+/// Mirrors [`spawn_local_agent`] in shape: do the PTY/transport-shaped
+/// work in one place, return a value the caller threads into the
+/// runtime's collections.
+///
+/// `attach_factory` is the function that turns the prepared host plus
+/// attach-shaped args into an [`AttachHandle`]. Production passes
+/// [`start_attach`] directly (function items coerce to `FnOnce`). Tests
+/// pass a closure that returns a scripted handle via
+/// [`AttachHandle::from_events`], avoiding any real worker thread.
+//
+// Nine args (vs clippy's default 7): each is a distinct fact the helper
+// needs and has no natural pairing — bundling `(rows, cols)` or
+// `(tui_pid, spawn_counter)` into a struct would only push the noise
+// to the call site. The added `attach_factory` is the test-injection
+// seam (mirrors the `start_attach` / `start_attach_with_runner` split
+// in `bootstrap_worker.rs`).
+#[allow(clippy::too_many_arguments)]
+fn build_remote_attach<F>(
+    prepared: PreparedHost,
+    host: String,
+    path: &str,
+    tui_pid: u32,
+    spawn_counter: usize,
+    rows: u16,
+    cols: u16,
+    modal_owner: bool,
+    attach_factory: F,
+) -> PendingAttach
+where
+    F: FnOnce(PreparedHost, String, String, Option<PathBuf>, u16, u16) -> AttachHandle,
+{
+    let label = format!("{host}:agent-{spawn_counter}");
+    let runtime_id = AgentId::new(format!("agent-{spawn_counter}"));
+    // Daemon-facing id is namespaced by the TUI's pid so a relaunch
+    // never collides with a still-live remote daemon from a previous
+    // codemux invocation. Without the prefix the bootstrap silently
+    // re-attaches to the old socket (the new daemon's bind fails on
+    // the held pid file, but the surviving socket is what the poll
+    // loop sees). The user-visible label and in-process AgentId stay
+    // short intentionally — the prefix is for the remote filesystem,
+    // not for humans.
+    let daemon_agent_id = daemon_agent_id_for(tui_pid, spawn_counter);
+    // Empty path → None: omit `--cwd` on the remote daemon and let
+    // it inherit the remote shell's login cwd ($HOME). A local path
+    // here would otherwise be sent verbatim to the remote, fail
+    // `cwd.exists()`, and exit the daemon before it ever bound the
+    // socket — the user-visible "EOF before HelloAck" failure mode.
+    let cwd_path = if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    };
+    // Repo name shown in the navigator for this agent. We can't probe
+    // the remote filesystem from here without a second ssh round-trip
+    // (the prepare's `RemoteFs` was already dropped), so we settle
+    // for the basename of whatever the user typed. `None` for empty
+    // paths — the renderer falls back to the static label.
+    let repo = if path.is_empty() {
+        None
+    } else {
+        repo_name::resolve_remote(path)
+    };
+    let handle = attach_factory(
+        prepared,
+        host.clone(),
+        daemon_agent_id,
+        cwd_path,
+        rows,
+        cols,
+    );
+    tracing::info!(%host, label = %label, "started SSH attach worker");
+    PendingAttach {
+        agent_id: runtime_id,
+        label,
+        host,
+        repo,
+        rows,
+        cols,
+        handle,
+        modal_owner,
+    }
+}
+
+/// Bundle of refs/values the [`drain_prepare_events`] state machine
+/// needs from `event_loop`'s locals. Exists only to keep the function
+/// signature within the project's argument-count convention (mirrors
+/// the [`RuntimeContext`] / [`NavState`] pattern: bundle at the
+/// boundary, destructure inside).
+///
+/// `'a` is the borrow lifetime of all the `&mut` refs into
+/// `event_loop`'s locals; `F` is the attach-handle factory closure
+/// (production passes [`start_attach`], tests pass a closure
+/// returning [`crate::bootstrap_worker::AttachHandle::from_events`]).
+struct PrepareDrainCtx<'a, F>
+where
+    F: FnOnce(PreparedHost, String, String, Option<PathBuf>, u16, u16) -> AttachHandle,
+{
+    prepare: &'a mut Option<PendingPrepare>,
+    spawn_ui: &'a mut Option<SpawnMinibuffer>,
+    attaches: &'a mut Vec<PendingAttach>,
+    index_mgr: &'a mut IndexManager,
+    spawn_counter: &'a mut usize,
+    spawn_config: &'a SpawnConfig,
+    pty_geom: (u16, u16),
+    tui_pid: u32,
+    attach_factory: F,
+}
+
+/// Drain one frame's worth of prepare events from the in-flight
+/// bootstrap worker (if any), advancing the modal/attach state machine
+/// accordingly. Returns once the channel is empty for this frame OR
+/// the worker reported `Done(_)` and the resulting transition has
+/// been applied.
+///
+/// Three outcomes encoded in the slot's resting state after the call:
+///
+/// 1. **Still in flight** — `*prepare` is `Some(_)`, the channel had
+///    only `Stage(_)` events (or none). The modal's stage indicator was
+///    updated; nothing else changed. Re-runs next frame.
+///
+/// 2. **Success → user picks remote folder** (`pending_project_path:
+///    None`) — `*prepare` is `Some(_)` with `prepared` and `remote_fs`
+///    populated; the modal is unlocked into `PathMode::Remote`. The
+///    subsequent user-driven `ModalOutcome::Spawn { host, path }`
+///    consumes the slot.
+///
+/// 3. **Success → auto-spawn** (`pending_project_path: Some(path)`,
+///    set by `ModalOutcome::PrepareHostThenSpawn`) — the modal is
+///    dismissed, an attach is built via `build_remote_attach` against
+///    the stashed path, and pushed onto `attaches`. `*prepare` is
+///    `None` — the slot is consumed.
+///
+/// Plus the failure branch: prepare reported `Done(Err)`, modal goes
+/// back to host zone with the structured error visible, `*prepare` is
+/// `None`. Failure path takes precedence over auto-spawn.
+///
+/// `attach_factory` is the function that produces the [`AttachHandle`]
+/// for the auto-spawn flow. Production passes [`start_attach`]
+/// directly; tests pass a closure returning
+/// [`crate::bootstrap_worker::AttachHandle::from_events`] so the call
+/// doesn't spawn a worker thread or touch the network.
+//
+// The args bundle (mutable runtime state + read-only inputs + the
+// attach factory) is heterogeneous enough that there's no natural
+// pairing — the bundle exists for the boundary, not as a domain
+// abstraction. The function body destructures it back into bare
+// locals so the inline reads/writes stay readable.
+fn drain_prepare_events<F>(ctx: PrepareDrainCtx<'_, F>)
+where
+    F: FnOnce(PreparedHost, String, String, Option<PathBuf>, u16, u16) -> AttachHandle,
+{
+    let PrepareDrainCtx {
+        prepare,
+        spawn_ui,
+        attaches,
+        index_mgr,
+        spawn_config,
+        pty_geom,
+        tui_pid,
+        spawn_counter,
+        attach_factory,
+    } = ctx;
+    // Take the slot out for the duration of this drain. Each branch
+    // either re-stashes it (still in flight, or success-without-pending)
+    // or drops it (failure, or auto-spawn success). Owning the slot
+    // here means `*prepare = None` at the end of the function is
+    // implicit — drop semantics — and there's no `&mut prepare` /
+    // `&mut p` borrow conflict to dance around like the previous
+    // inlined version had.
+    let Some(mut slot) = prepare.take() else {
+        return;
+    };
+    let mut completion = None;
+    while let Some(event) = slot.handle.try_recv() {
+        match event {
+            PrepareEvent::Stage(stage) => {
+                if let Some(ui) = spawn_ui.as_mut() {
+                    ui.set_bootstrap_stage(stage);
+                }
+            }
+            PrepareEvent::Done(result) => {
+                completion = Some(result);
+                break;
+            }
+        }
+    }
+    let Some(completion) = completion else {
+        // Channel emptied without a Done — worker still in flight.
+        // Re-stash so the next frame keeps polling.
+        *prepare = Some(slot);
+        return;
+    };
+    match completion {
+        Ok(PrepareSuccess { prepared, fs }) => {
+            // SWR for the SSH host: hydrate from the remote disk
+            // cache if present, then start a fresh walk in the
+            // background. Skip cleanly when `fs` is `None` (the modal
+            // would degrade to literal-path mode anyway). Run in both
+            // pending-path branches — the remote index is useful next
+            // time the modal opens against this host, even when the
+            // current spawn doesn't need the user to pick a path.
+            if let Some(rfs) = fs.as_ref() {
+                let host_roots = spawn_config.ssh_search_roots(&slot.host);
+                let outcome = index_mgr.request_remote_swr(
+                    &slot.host,
+                    rfs.socket_path(),
+                    &prepared.remote_home,
+                    &host_roots,
+                    &spawn_config.project_markers,
+                );
+                tracing::debug!(?outcome, host = %slot.host, "remote fuzzy index: SWR start");
+            }
+            match slot.pending_project_path.take() {
+                None => {
+                    // Regular PrepareHost flow: hand the modal back to
+                    // the user for path entry. The worker opened the
+                    // ssh `ControlMaster` for us (see
+                    // `start_prepare_with_runner`) so the main thread
+                    // doesn't block on a synchronous `RemoteFs::open`
+                    // poll while the spinner is locked. `fs == None`
+                    // means the open failed; the modal degrades to
+                    // literal-path mode (logged in the worker).
+                    if let Some(ui) = spawn_ui.as_mut() {
+                        let runner = RealRunner;
+                        let mut lister = match fs.as_ref() {
+                            Some(rfs) => DirLister::Remote {
+                                fs: rfs,
+                                runner: &runner,
+                            },
+                            None => DirLister::Local,
+                        };
+                        ui.unlock_for_remote_path(
+                            slot.host.clone(),
+                            prepared.remote_home.clone(),
+                            &mut lister,
+                        );
+                    }
+                    slot.remote_fs = fs;
+                    slot.prepared = Some(prepared);
+                    *prepare = Some(slot);
+                }
+                Some(path) => {
+                    // PrepareHostThenSpawn flow: dismiss the modal and
+                    // launch the SSH attach against the stashed path.
+                    // Slot is consumed (not re-stashed) — the prepare
+                    // phase's purpose is fulfilled.
+                    *spawn_counter += 1;
+                    let (rows, cols) = pty_geom;
+                    let attach = build_remote_attach(
+                        prepared,
+                        slot.host,
+                        &path,
+                        tui_pid,
+                        *spawn_counter,
+                        rows,
+                        cols,
+                        /* modal_owner */ false,
+                        attach_factory,
+                    );
+                    *spawn_ui = None;
+                    attaches.push(attach);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(host = %slot.host, "prepare failed: {e}");
+            if let Some(ui) = spawn_ui.as_mut() {
+                // Pass the structured error; the modal formats it via
+                // `user_message()` at render time.
+                ui.unlock_back_to_host(&mut DirLister::Local, Some(e));
+            }
+            // `slot` dropped here — failure path takes precedence
+            // over the auto-spawn `pending_project_path` (which is
+            // also dropped with the slot). Errors always surface.
+        }
+    }
 }
 
 /// Resolve the configured `[spawn].scratch_dir` against the captured
@@ -1693,85 +1989,27 @@ fn event_loop(
         // Drain prepare events first: the modal should reflect the
         // worker's progress on the same frame the events arrive,
         // before any keystroke handling. On `Done` we either unlock
-        // the modal for a remote-folder pick (success) or unlock back
-        // to the host zone with the error visible (failure).
-        if let Some(p) = prepare.as_mut() {
-            let mut completion = None;
-            while let Some(event) = p.handle.try_recv() {
-                match event {
-                    PrepareEvent::Stage(stage) => {
-                        if let Some(ui) = spawn_ui.as_mut() {
-                            ui.set_bootstrap_stage(stage);
-                        }
-                    }
-                    PrepareEvent::Done(result) => {
-                        completion = Some(result);
-                        break;
-                    }
-                }
-            }
-            match completion {
-                Some(Ok(PrepareSuccess { prepared, fs })) => {
-                    // The worker opened the ssh `ControlMaster` for us
-                    // (see `start_prepare_with_runner`) so the main
-                    // thread doesn't block on a synchronous
-                    // `RemoteFs::open` poll while the spinner is
-                    // locked. `fs == None` means the open failed; the
-                    // modal degrades to literal-path mode (logged in
-                    // the worker).
-                    if let Some(ui) = spawn_ui.as_mut() {
-                        // Once unlocked, the modal sits in
-                        // PathMode::Remote and immediately refreshes
-                        // the wildmenu against the remote `$HOME` —
-                        // pass the live ControlMaster (or fall back to
-                        // Local if RemoteFs::open failed in the
-                        // worker) so the first listing is real, not
-                        // empty.
-                        let runner = RealRunner;
-                        let mut lister = match fs.as_ref() {
-                            Some(rfs) => DirLister::Remote {
-                                fs: rfs,
-                                runner: &runner,
-                            },
-                            None => DirLister::Local,
-                        };
-                        ui.unlock_for_remote_path(
-                            p.host.clone(),
-                            prepared.remote_home.clone(),
-                            &mut lister,
-                        );
-                    }
-                    // SWR for the SSH host: hydrate from the remote
-                    // disk cache if present, then start a fresh walk
-                    // in the background. Skip cleanly when `fs` is
-                    // `None` (the modal will be in literal-path mode
-                    // anyway).
-                    if let Some(rfs) = fs.as_ref() {
-                        let host_roots = spawn_config.ssh_search_roots(&p.host);
-                        let outcome = index_mgr.request_remote_swr(
-                            &p.host,
-                            rfs.socket_path(),
-                            &prepared.remote_home,
-                            &host_roots,
-                            &spawn_config.project_markers,
-                        );
-                        tracing::debug!(?outcome, host = %p.host, "remote fuzzy index: SWR start");
-                    }
-                    p.remote_fs = fs;
-                    p.prepared = Some(prepared);
-                }
-                Some(Err(e)) => {
-                    tracing::error!(host = %p.host, "prepare failed: {e}");
-                    if let Some(ui) = spawn_ui.as_mut() {
-                        // Pass the structured error; the modal formats
-                        // via `user_message()` at render time.
-                        ui.unlock_back_to_host(&mut DirLister::Local, Some(e));
-                    }
-                    prepare = None;
-                }
-                None => {}
-            }
-        }
+        // the modal for a remote-folder pick (success), auto-spawn
+        // when a project alias stashed a path, or unlock back to the
+        // host zone with the error visible (failure). Extracted into
+        // a free fn so the SSH state machine can be exercised by unit
+        // tests without driving the full event loop.
+        let pty_geom_for_drain = {
+            let (term_cols, term_rows) =
+                crossterm::terminal::size().wrap_err("read terminal size")?;
+            pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some())
+        };
+        drain_prepare_events(PrepareDrainCtx {
+            prepare: &mut prepare,
+            spawn_ui: &mut spawn_ui,
+            attaches: &mut attaches,
+            index_mgr: &mut index_mgr,
+            spawn_counter: &mut spawn_counter,
+            spawn_config,
+            pty_geom: pty_geom_for_drain,
+            tui_pid,
+            attach_factory: start_attach,
+        });
 
         // Drain attach events. Each pending attach has its own
         // handle; we batch the ready set, apply transitions outside
@@ -2058,6 +2296,25 @@ fn event_loop(
                                 handle: start_prepare(host.clone()),
                                 prepared: None,
                                 remote_fs: None,
+                                pending_project_path: None,
+                            });
+                            ui.lock_for_bootstrap(host, Instant::now());
+                        }
+                        ModalOutcome::PrepareHostThenSpawn { host, path } => {
+                            // Same as PrepareHost (replacing a prior
+                            // slot cancels its worker via Drop), but
+                            // stash `path` so the prepare-Done(Ok)
+                            // branch dismisses the modal and spawns
+                            // automatically instead of unlocking for
+                            // user path entry. Triggered when the
+                            // user picks a `[[spawn.projects]]` entry
+                            // bound to an SSH `host`.
+                            prepare = Some(PendingPrepare {
+                                host: host.clone(),
+                                handle: start_prepare(host.clone()),
+                                prepared: None,
+                                remote_fs: None,
+                                pending_project_path: Some(path),
                             });
                             ui.lock_for_bootstrap(host, Instant::now());
                         }
@@ -2133,75 +2390,22 @@ fn event_loop(
                                     spawn_ui = None;
                                     continue;
                                 };
-                                let label = format!("{host}:agent-{spawn_counter}");
-                                let runtime_id = AgentId::new(format!("agent-{spawn_counter}"));
-                                // Daemon-facing id is namespaced by the
-                                // TUI's pid so a relaunch never
-                                // collides with a still-live remote
-                                // daemon from a previous codemux
-                                // invocation. Without the prefix the
-                                // bootstrap silently re-attaches to the
-                                // old socket (the new daemon's bind
-                                // fails on the held pid file, but the
-                                // surviving socket is what the poll
-                                // loop sees). The user-visible label
-                                // and in-process AgentId stay short
-                                // intentionally — the prefix is for the
-                                // remote filesystem, not for humans.
-                                let daemon_agent_id = daemon_agent_id_for(tui_pid, spawn_counter);
-                                // Empty path → None: omit `--cwd` on
-                                // the remote daemon and let it
-                                // inherit the remote shell's login
-                                // cwd ($HOME). A local path here
-                                // would otherwise be sent verbatim
-                                // to the remote, fail
-                                // `cwd.exists()`, and exit the
-                                // daemon before it ever bound the
-                                // socket — the user-visible "EOF
-                                // before HelloAck" failure mode.
-                                let cwd_path = if path.is_empty() {
-                                    None
-                                } else {
-                                    Some(PathBuf::from(&path))
-                                };
-                                // Repo name shown in the navigator
-                                // for this agent. We can't probe
-                                // the remote filesystem from here
-                                // without a second ssh round-trip
-                                // (the prepare's `RemoteFs` was
-                                // already dropped), so we settle
-                                // for the basename of whatever the
-                                // user typed. `None` for empty
-                                // paths — the renderer falls back
-                                // to the static label.
-                                let repo = if path.is_empty() {
-                                    None
-                                } else {
-                                    repo_name::resolve_remote(&path)
-                                };
-                                let handle = start_attach(
+                                let attach = build_remote_attach(
                                     prepared,
                                     host.clone(),
-                                    daemon_agent_id,
-                                    cwd_path,
+                                    &path,
+                                    tui_pid,
+                                    spawn_counter,
                                     rows,
                                     cols,
+                                    /* modal_owner */ true,
+                                    start_attach,
                                 );
-                                tracing::info!(%host, label = %label, "started SSH attach worker");
                                 // Re-lock the modal so the spinner
                                 // continues through the ~1-2 s
                                 // attach phase.
-                                ui.lock_for_bootstrap(host.clone(), Instant::now());
-                                attaches.push(PendingAttach {
-                                    agent_id: runtime_id,
-                                    label,
-                                    host,
-                                    repo,
-                                    rows,
-                                    cols,
-                                    handle,
-                                    modal_owner: true,
-                                });
+                                ui.lock_for_bootstrap(host, Instant::now());
+                                attaches.push(attach);
                             }
                         }
                         ModalOutcome::SpawnScratch { host } => {
@@ -7978,5 +8182,384 @@ mod tests {
             resolve_remote_scratch_cwd(&cfg, Path::new("/root"), Some(&fs), &runner),
             None,
         );
+    }
+
+    // ── SSH state-machine harness ────────────────────────────────
+    //
+    // These tests exercise the runtime's prepare-event drain (the
+    // extracted `drain_prepare_events` free fn) without driving the
+    // full event loop. Two seams make this work:
+    //
+    //   1. `PrepareHandle::from_events` / `AttachHandle::from_events`
+    //      (in `bootstrap_worker.rs`) — synthetic handles backed by
+    //      pre-loaded crossbeam channels. No worker thread.
+    //   2. `attach_factory` parameter on `build_remote_attach` and
+    //      `drain_prepare_events` — production passes `start_attach`;
+    //      tests pass a closure returning a synthetic AttachHandle.
+    //
+    // Together they let us drive the prepare → success-or-failure →
+    // (auto-spawn | unlock | error) state machine deterministically.
+
+    use codemuxd_bootstrap::{Error as BootstrapError, Stage as BootstrapStage};
+
+    fn fake_attach_factory(
+        _prepared: PreparedHost,
+        _host: String,
+        _agent_id: String,
+        _cwd: Option<PathBuf>,
+        _rows: u16,
+        _cols: u16,
+    ) -> AttachHandle {
+        AttachHandle::from_events(Vec::new())
+    }
+
+    fn prepared_host_for_test() -> PreparedHost {
+        PreparedHost {
+            remote_home: PathBuf::from("/home/u"),
+            binary_was_updated: false,
+        }
+    }
+
+    #[test]
+    fn build_remote_attach_constructs_pending_attach_with_correct_fields() {
+        let prepared = prepared_host_for_test();
+        let attach = build_remote_attach(
+            prepared,
+            "devpod".to_string(),
+            "/work/p",
+            12345,
+            7,
+            24,
+            80,
+            true,
+            fake_attach_factory,
+        );
+        assert_eq!(attach.label, "devpod:agent-7");
+        assert_eq!(attach.agent_id, AgentId::new("agent-7"));
+        assert_eq!(attach.host, "devpod");
+        assert_eq!(attach.repo.as_deref(), Some("p"));
+        assert_eq!(attach.rows, 24);
+        assert_eq!(attach.cols, 80);
+        assert!(attach.modal_owner);
+    }
+
+    #[test]
+    fn build_remote_attach_empty_path_omits_repo() {
+        // An empty `path` is meaningful: it tells the daemon to
+        // inherit `$HOME` as cwd. The navigator falls back to the
+        // static label since there's no repo basename to display.
+        let prepared = prepared_host_for_test();
+        let attach = build_remote_attach(
+            prepared,
+            "devpod".to_string(),
+            "",
+            12345,
+            7,
+            24,
+            80,
+            false,
+            fake_attach_factory,
+        );
+        assert!(
+            attach.repo.is_none(),
+            "empty path must produce repo: None, got {:?}",
+            attach.repo,
+        );
+        assert!(!attach.modal_owner);
+    }
+
+    fn make_pending_prepare(
+        host: &str,
+        events: Vec<PrepareEvent>,
+        pending_project_path: Option<String>,
+    ) -> PendingPrepare {
+        PendingPrepare {
+            host: host.to_string(),
+            handle: PrepareHandle::from_events(events),
+            prepared: None,
+            remote_fs: None,
+            pending_project_path,
+        }
+    }
+
+    fn drain_test_geometry() -> (u16, u16) {
+        (24, 80)
+    }
+
+    #[test]
+    fn drain_prepare_events_with_pending_path_dismisses_modal_and_launches_attach() {
+        // Auto-spawn-after-prepare: prepare reports Done(Ok) and the
+        // slot has a stashed path. Modal is dismissed, attach is
+        // queued. Slot is consumed.
+        let mut prepare = Some(make_pending_prepare(
+            "devpod",
+            vec![PrepareEvent::Done(Ok(PrepareSuccess {
+                prepared: prepared_host_for_test(),
+                fs: None,
+            }))],
+            Some("/work/p".to_string()),
+        ));
+        let mut spawn_ui = Some(SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            crate::config::SearchMode::Precise,
+            Vec::new(),
+        ));
+        let mut attaches: Vec<PendingAttach> = Vec::new();
+        let mut index_mgr = IndexManager::new();
+        let cfg = SpawnConfig::default();
+        let mut spawn_counter: usize = 0;
+
+        drain_prepare_events(PrepareDrainCtx {
+            prepare: &mut prepare,
+            spawn_ui: &mut spawn_ui,
+            attaches: &mut attaches,
+            index_mgr: &mut index_mgr,
+            spawn_counter: &mut spawn_counter,
+            spawn_config: &cfg,
+            pty_geom: drain_test_geometry(),
+            tui_pid: 999,
+            attach_factory: fake_attach_factory,
+        });
+
+        assert!(prepare.is_none(), "auto-spawn consumes the prepare slot");
+        assert!(spawn_ui.is_none(), "auto-spawn dismisses the modal");
+        assert_eq!(attaches.len(), 1, "auto-spawn queues exactly one attach");
+        assert_eq!(attaches[0].host, "devpod");
+        assert_eq!(attaches[0].label, "devpod:agent-1");
+        assert_eq!(attaches[0].repo.as_deref(), Some("p"));
+        assert!(
+            !attaches[0].modal_owner,
+            "auto-spawn flow must not own the modal — it dismissed it",
+        );
+        assert_eq!(spawn_counter, 1, "spawn_counter incremented for the attach");
+    }
+
+    #[test]
+    fn drain_prepare_events_without_pending_path_unlocks_modal() {
+        // Regular PrepareHost flow: prepare succeeds, modal is
+        // unlocked into PathMode::Remote so the user can pick a
+        // remote folder. Slot is re-stashed with `prepared` set so
+        // the subsequent user-driven Spawn arm can consume it.
+        let mut prepare = Some(make_pending_prepare(
+            "devpod",
+            vec![PrepareEvent::Done(Ok(PrepareSuccess {
+                prepared: prepared_host_for_test(),
+                fs: None,
+            }))],
+            None,
+        ));
+        let mut spawn_ui = Some(SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            crate::config::SearchMode::Precise,
+            Vec::new(),
+        ));
+        let mut attaches: Vec<PendingAttach> = Vec::new();
+        let mut index_mgr = IndexManager::new();
+        let cfg = SpawnConfig::default();
+        let mut spawn_counter: usize = 0;
+
+        drain_prepare_events(PrepareDrainCtx {
+            prepare: &mut prepare,
+            spawn_ui: &mut spawn_ui,
+            attaches: &mut attaches,
+            index_mgr: &mut index_mgr,
+            spawn_counter: &mut spawn_counter,
+            spawn_config: &cfg,
+            pty_geom: drain_test_geometry(),
+            tui_pid: 999,
+            attach_factory: fake_attach_factory,
+        });
+
+        assert!(
+            spawn_ui.is_some(),
+            "PrepareHost flow keeps the modal open for path entry",
+        );
+        assert!(
+            attaches.is_empty(),
+            "no attach launched without a stashed path"
+        );
+        let slot = prepare
+            .as_ref()
+            .expect("slot is re-stashed for the subsequent user-driven Spawn");
+        assert!(
+            slot.prepared.is_some(),
+            "prepared host is recorded on the slot",
+        );
+        assert_eq!(
+            spawn_counter, 0,
+            "spawn_counter unchanged in PrepareHost flow"
+        );
+    }
+
+    #[test]
+    fn drain_prepare_events_with_failure_unlocks_back_to_host_zone_even_with_pending_path() {
+        // Failure path takes precedence over auto-spawn: the user
+        // sees the error in the modal even when the slot had a
+        // stashed `pending_project_path`. Slot is dropped.
+        let err = BootstrapError::Bootstrap {
+            stage: BootstrapStage::VersionProbe,
+            source: Box::new(io::Error::other("simulated probe failure")),
+        };
+        let mut prepare = Some(make_pending_prepare(
+            "devpod",
+            vec![PrepareEvent::Done(Err(err))],
+            Some("/work/p".to_string()),
+        ));
+        let mut spawn_ui = Some(SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            crate::config::SearchMode::Precise,
+            Vec::new(),
+        ));
+        let mut attaches: Vec<PendingAttach> = Vec::new();
+        let mut index_mgr = IndexManager::new();
+        let cfg = SpawnConfig::default();
+        let mut spawn_counter: usize = 0;
+
+        drain_prepare_events(PrepareDrainCtx {
+            prepare: &mut prepare,
+            spawn_ui: &mut spawn_ui,
+            attaches: &mut attaches,
+            index_mgr: &mut index_mgr,
+            spawn_counter: &mut spawn_counter,
+            spawn_config: &cfg,
+            pty_geom: drain_test_geometry(),
+            tui_pid: 999,
+            attach_factory: fake_attach_factory,
+        });
+
+        assert!(prepare.is_none(), "failure drops the slot");
+        assert!(
+            spawn_ui.is_some(),
+            "modal stays open so the user sees the error",
+        );
+        assert!(
+            attaches.is_empty(),
+            "no attach launched on failure, even with pending path",
+        );
+        assert_eq!(spawn_counter, 0);
+    }
+
+    #[test]
+    fn drain_prepare_events_with_no_done_event_re_stashes_slot() {
+        // In-flight: handle has a Stage event but no Done. Slot is
+        // re-stashed; modal sees the stage tick.
+        let mut prepare = Some(make_pending_prepare(
+            "devpod",
+            vec![PrepareEvent::Stage(BootstrapStage::VersionProbe)],
+            Some("/work/p".to_string()),
+        ));
+        let mut spawn_ui = Some(SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            crate::config::SearchMode::Precise,
+            Vec::new(),
+        ));
+        let mut attaches: Vec<PendingAttach> = Vec::new();
+        let mut index_mgr = IndexManager::new();
+        let cfg = SpawnConfig::default();
+        let mut spawn_counter: usize = 0;
+
+        drain_prepare_events(PrepareDrainCtx {
+            prepare: &mut prepare,
+            spawn_ui: &mut spawn_ui,
+            attaches: &mut attaches,
+            index_mgr: &mut index_mgr,
+            spawn_counter: &mut spawn_counter,
+            spawn_config: &cfg,
+            pty_geom: drain_test_geometry(),
+            tui_pid: 999,
+            attach_factory: fake_attach_factory,
+        });
+
+        assert!(prepare.is_some(), "in-flight slot is re-stashed");
+        assert!(spawn_ui.is_some(), "modal stays open while in-flight");
+        assert!(
+            attaches.is_empty(),
+            "no attach yet — prepare hasn't completed"
+        );
+        let slot = prepare.as_ref().expect("slot re-stashed");
+        assert_eq!(
+            slot.pending_project_path.as_deref(),
+            Some("/work/p"),
+            "pending path preserved across in-flight drains",
+        );
+    }
+
+    #[test]
+    fn drain_prepare_events_no_slot_is_a_noop() {
+        // The drain must tolerate being called with no pending
+        // prepare — the event_loop calls it every frame regardless.
+        let mut prepare: Option<PendingPrepare> = None;
+        let mut spawn_ui: Option<SpawnMinibuffer> = None;
+        let mut attaches: Vec<PendingAttach> = Vec::new();
+        let mut index_mgr = IndexManager::new();
+        let cfg = SpawnConfig::default();
+        let mut spawn_counter: usize = 0;
+
+        drain_prepare_events(PrepareDrainCtx {
+            prepare: &mut prepare,
+            spawn_ui: &mut spawn_ui,
+            attaches: &mut attaches,
+            index_mgr: &mut index_mgr,
+            spawn_counter: &mut spawn_counter,
+            spawn_config: &cfg,
+            pty_geom: drain_test_geometry(),
+            tui_pid: 999,
+            attach_factory: fake_attach_factory,
+        });
+
+        assert!(prepare.is_none());
+        assert!(spawn_ui.is_none());
+        assert!(attaches.is_empty());
+        assert_eq!(spawn_counter, 0);
+    }
+
+    #[test]
+    fn drain_prepare_events_with_remote_fs_kicks_off_swr_index() {
+        // PrepareSuccess with `fs: Some(_)` exercises the SWR-on-success
+        // branch: the remote fuzzy index for this host gets a hydrate
+        // request even if the user is going to dismiss the modal
+        // without browsing. Pre-warms the next session.
+        let fs = RemoteFs::for_test("devpod".into(), PathBuf::from("/tmp/sock"));
+        let mut prepare = Some(make_pending_prepare(
+            "devpod",
+            vec![PrepareEvent::Done(Ok(PrepareSuccess {
+                prepared: prepared_host_for_test(),
+                fs: Some(fs),
+            }))],
+            None,
+        ));
+        let mut spawn_ui = Some(SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            crate::config::SearchMode::Precise,
+            Vec::new(),
+        ));
+        let mut attaches: Vec<PendingAttach> = Vec::new();
+        let mut index_mgr = IndexManager::new();
+        let cfg = SpawnConfig::default();
+        let mut spawn_counter: usize = 0;
+
+        drain_prepare_events(PrepareDrainCtx {
+            prepare: &mut prepare,
+            spawn_ui: &mut spawn_ui,
+            attaches: &mut attaches,
+            index_mgr: &mut index_mgr,
+            spawn_counter: &mut spawn_counter,
+            spawn_config: &cfg,
+            pty_geom: drain_test_geometry(),
+            tui_pid: 999,
+            attach_factory: fake_attach_factory,
+        });
+
+        // Slot is re-stashed, modal unlocked into the remote-path zone
+        // with a live RemoteFs lister (not the literal-path fallback).
+        let slot = prepare
+            .as_ref()
+            .expect("slot re-stashed for user-driven Spawn");
+        assert!(
+            slot.remote_fs.is_some(),
+            "RemoteFs handed off to the slot for the modal's per-keystroke listing",
+        );
+        assert!(slot.prepared.is_some());
+        assert!(spawn_ui.is_some());
     }
 }

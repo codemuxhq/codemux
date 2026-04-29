@@ -141,6 +141,23 @@ impl PrepareHandle {
     pub fn cancel(&self) {
         self.cancel.store(true, Relaxed);
     }
+
+    /// Build a handle pre-loaded with a scripted event sequence — no
+    /// worker thread, no real bootstrap. The runtime's drain loop sees
+    /// the events in order via [`Self::try_recv`] just as it would for
+    /// a real worker. Used by the runtime's prepare-event-drain tests.
+    ///
+    /// Mirrors [`AttachHandle::from_events`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_events(events: Vec<PrepareEvent>) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded();
+        for ev in events {
+            let _ = tx.send(ev);
+        }
+        Self { cancel, rx }
+    }
 }
 
 impl Drop for PrepareHandle {
@@ -170,6 +187,23 @@ impl AttachHandle {
     /// Signal the worker to stop at the next subprocess boundary.
     pub fn cancel(&self) {
         self.cancel.store(true, Relaxed);
+    }
+
+    /// Build a handle pre-loaded with a scripted event sequence — no
+    /// worker thread, no real attach. Tests rarely need this directly
+    /// (the runtime's attach-drain tests are out of scope for the
+    /// current state-machine harness), but it's added alongside
+    /// [`PrepareHandle::from_events`] for symmetry — drain logic on
+    /// either handle should be testable the same way.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_events(events: Vec<AttachEvent>) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded();
+        for ev in events {
+            let _ = tx.send(ev);
+        }
+        Self { cancel, rx }
     }
 }
 

@@ -373,10 +373,39 @@ impl Default for SpawnConfig {
 
 /// User-curated alias for a project path. Matched by `name` in the
 /// fuzzy modal; spawn target is `path` (tilde-expanded at use site).
+///
+/// `host` binds the project to an SSH alias from `~/.ssh/config`. When
+/// set, picking the project from the spawn modal kicks off the bootstrap
+/// for that host and auto-spawns at `path` once the prepare phase
+/// completes — no second user step. Missing/`None` means local. An
+/// explicit empty string `host = ""` is normalised to `None` at the
+/// I/O boundary (see [`deserialize_optional_non_empty_string`]) so
+/// downstream code never has to think about an "empty alias" sentinel.
+/// The alias is *not* validated at config-load time: `~/.ssh/config`
+/// is read lazily by the spawn modal, so a bad alias surfaces as a
+/// normal bootstrap failure when the user picks the project rather
+/// than as a startup error.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct NamedProject {
     pub name: String,
     pub path: String,
+    #[serde(default, deserialize_with = "deserialize_optional_non_empty_string")]
+    pub host: Option<String>,
+}
+
+/// Serde adapter that maps `Some("")` → `None` for fields where the
+/// empty string is semantically equivalent to "unset". Used by
+/// [`NamedProject::host`] so the user can clear the alias by emptying
+/// the value (`host = ""`) without us carrying an `Option<String>`
+/// whose `Some` variant might still be empty.
+fn deserialize_optional_non_empty_string<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    Ok(opt.filter(|s| !s.is_empty()))
 }
 
 /// Which path-zone search engine the spawn modal uses.
@@ -969,7 +998,46 @@ mod tests {
             config.spawn.projects[0].path,
             "~/Workbench/repositories/codemux",
         );
+        assert!(
+            config.spawn.projects[0].host.is_none(),
+            "missing `host` deserializes to None (local)",
+        );
         assert_eq!(config.spawn.projects[1].name, "dotfiles");
+        assert!(config.spawn.projects[1].host.is_none());
+    }
+
+    #[test]
+    fn spawn_named_project_host_round_trips() {
+        let toml_text = r#"
+            [[spawn.projects]]
+            name = "devpod-work"
+            path = "~/work"
+            host = "devpod-1"
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(config.spawn.projects.len(), 1);
+        assert_eq!(
+            config.spawn.projects[0].host.as_deref(),
+            Some("devpod-1"),
+            "explicit `host` is preserved as the SSH alias",
+        );
+    }
+
+    #[test]
+    fn spawn_named_project_empty_host_normalises_to_none() {
+        // `host = ""` is the user's way to clear the field. The
+        // custom deserializer maps it to `None` at the I/O boundary
+        // so downstream code only ever sees `Some(non_empty)` or
+        // `None` — no "empty alias" sentinel leaking into the
+        // spawn-modal lookup.
+        let toml_text = r#"
+            [[spawn.projects]]
+            name = "p"
+            path = "/tmp/p"
+            host = ""
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert!(config.spawn.projects[0].host.is_none());
     }
 
     #[test]
