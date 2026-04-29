@@ -1154,7 +1154,7 @@ pub fn run(
     let mut terminal = Terminal::new(backend).wrap_err("construct ratatui terminal")?;
 
     let chrome = ChromeStyle::from_ui(&config.ui);
-    let segments = status_bar::build_segments(&config.ui.status_bar_segments);
+    let segments = status_bar::build_segments(&config.ui.status_bar_segments, &config.ui.segments);
     let ctx = RuntimeContext {
         bindings: &config.bindings,
         chrome: &chrome,

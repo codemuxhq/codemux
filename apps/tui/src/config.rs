@@ -131,10 +131,12 @@ pub struct Ui {
     ///
     /// Built-in IDs:
     /// - `"model"` — current Claude model on the focused agent
-    /// - `"worktree"` — basename of the focused agent's working dir
-    ///   (the worktree directory name, or repo basename for a plain
-    ///   checkout)
-    /// - `"branch"` — focused agent's git branch
+    /// - `"worktree"` — basename of the focused agent's working dir,
+    ///   shown only when the worktree directory differs from the repo
+    ///   name (i.e. you're not in the main checkout)
+    /// - `"branch"` — focused agent's git branch, shown only when the
+    ///   branch is not in [`Self::segments`]'s
+    ///   [`BranchSegmentConfig::default_branches`]
     /// - `"prefix_hint"` — the `super+b for help` / `[NAV] …` hint
     /// - `"repo"` — focused agent's repo name (opt-in; not in the
     ///   default set since `worktree` covers the same use case)
@@ -147,6 +149,20 @@ pub struct Ui {
     /// container's `#[serde(default)]` calls `Ui::default()` which
     /// fills the field — no field-level `default` attribute needed.
     pub status_bar_segments: Vec<String>,
+
+    /// Per-segment policy knobs. Each built-in that needs configuration
+    /// owns its own field here, namespaced under `[ui.segments.<id>]`
+    /// in the user's TOML. This matches the Common Closure Principle:
+    /// changing a segment's behavior shouldn't require touching the
+    /// global `[ui]` schema.
+    ///
+    /// Example:
+    ///
+    /// ```toml
+    /// [ui.segments.branch]
+    /// default_branches = ["main", "develop"]
+    /// ```
+    pub segments: SegmentConfig,
 }
 
 impl Default for Ui {
@@ -156,6 +172,49 @@ impl Default for Ui {
             host_colors: HashMap::new(),
             host_bell_on_finish: true,
             status_bar_segments: crate::status_bar::default_segment_ids(),
+            segments: SegmentConfig::default(),
+        }
+    }
+}
+
+/// Container for per-segment configuration. Lives under `[ui.segments]`
+/// in the user's TOML. Each built-in segment that has a configurable
+/// policy gets its own field here so the segment owns its config and
+/// the global `Ui` doesn't accumulate one-off knobs per segment.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SegmentConfig {
+    /// Configuration for the `branch` built-in segment. See
+    /// [`BranchSegmentConfig`].
+    pub branch: BranchSegmentConfig,
+}
+
+/// Configuration for the status-bar `branch` segment.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct BranchSegmentConfig {
+    /// Branches treated as "uninteresting" by the `branch` segment.
+    /// When the focused agent's current branch matches one of these,
+    /// the segment renders nothing — the assumption being that you
+    /// only need to *see* the branch when it's worth seeing.
+    ///
+    /// Default: `["main", "master"]`. Override per project by listing
+    /// whatever your team treats as the trunk:
+    ///
+    /// ```toml
+    /// [ui.segments.branch]
+    /// default_branches = ["main", "develop", "trunk"]
+    /// ```
+    ///
+    /// Set to `[]` to always show the branch segment (every branch
+    /// is "interesting").
+    pub default_branches: Vec<String>,
+}
+
+impl Default for BranchSegmentConfig {
+    fn default() -> Self {
+        Self {
+            default_branches: vec!["main".to_string(), "master".to_string()],
         }
     }
 }
@@ -821,6 +880,59 @@ mod tests {
         // change can't silently swap empty for default.
         let config: Config = toml::from_str("[ui]\nstatus_bar_segments = []\n").unwrap();
         assert!(config.ui.status_bar_segments.is_empty());
+    }
+
+    #[test]
+    fn ui_default_branches_defaults_to_main_and_master() {
+        // The branch segment hides itself for these. Cover the most
+        // common conventions so a fresh install hides the segment on
+        // either main or master without writing config.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(
+            config.ui.segments.branch.default_branches,
+            vec!["main".to_string(), "master".to_string()],
+        );
+    }
+
+    #[test]
+    fn ui_default_branches_round_trips_user_override() {
+        // Knob lives under [ui.segments.branch] now (not [ui]) so the
+        // segment that owns the policy also owns the config namespace.
+        let toml_text = r#"
+            [ui.segments.branch]
+            default_branches = ["main", "develop", "trunk"]
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        assert_eq!(
+            config.ui.segments.branch.default_branches,
+            vec![
+                "main".to_string(),
+                "develop".to_string(),
+                "trunk".to_string(),
+            ],
+            "user list replaces the default (no merge)",
+        );
+    }
+
+    #[test]
+    fn ui_default_branches_empty_list_means_show_every_branch() {
+        // The documented opt-out: empty list = no branches treated
+        // as default = branch segment always renders.
+        let config: Config =
+            toml::from_str("[ui.segments.branch]\ndefault_branches = []\n").unwrap();
+        assert!(config.ui.segments.branch.default_branches.is_empty());
+    }
+
+    #[test]
+    fn ui_segments_section_is_optional_and_defaults_apply() {
+        // A user with no [ui.segments] table at all still gets the
+        // sensible defaults via the container's #[serde(default)].
+        let config: Config = toml::from_str("[ui]\nsubtle = true\n").unwrap();
+        assert!(config.ui.subtle);
+        assert_eq!(
+            config.ui.segments.branch.default_branches,
+            vec!["main".to_string(), "master".to_string()],
+        );
     }
 
     #[test]

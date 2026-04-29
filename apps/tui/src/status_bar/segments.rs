@@ -11,6 +11,25 @@
 //! into a single line by extracting the spans, which would drop the
 //! line-level style and render the text in the terminal default
 //! color. Style on the span survives the extraction.
+//!
+//! ## Visibility is the segment's call
+//!
+//! Segments returning `None` from `render` is the universal "skip
+//! me this frame" mechanism — that's what makes the segment list
+//! pluggable (`Box<dyn StatusSegment>`) without a separate
+//! `should_render` method. Built-ins use this to hide themselves
+//! when their value is the project default:
+//!
+//! - [`WorktreeSegment`] hides when the cwd basename matches the
+//!   repo name (you're in the main checkout, no worktree to
+//!   announce).
+//! - [`BranchSegment`] hides when the branch is in its instance
+//!   `default_branches` (you're on the trunk).
+//!
+//! New segments inherit the same option: any custom logic for "should
+//! I render right now?" goes in `render` and returns `None` to opt
+//! out. The renderer collapses the slot cleanly — no separator drawn,
+//! no width consumed.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -83,10 +102,12 @@ impl StatusSegment for RepoSegment {
 // ─── WorktreeSegment ──────────────────────────────────────────────
 
 /// Renders the basename of the focused agent's working directory as
-/// `wt:<name>`. For a regular checkout this is the repo name; for a
-/// git worktree (e.g. `~/Workbench/worktrees/feature-x`) it's the
-/// worktree directory's name. Combined with `BranchSegment` this
-/// gives the user a complete "where am I" view at a glance.
+/// `wt:<name>` — but **only when it differs from the repo name**. In
+/// a regular checkout the cwd basename equals the repo basename and
+/// the segment renders nothing (no use restating the repo). In a git
+/// worktree (e.g. `~/Workbench/worktrees/feature-x`) the cwd
+/// basename is the worktree directory's name, which is the value
+/// worth surfacing.
 pub(crate) struct WorktreeSegment;
 
 impl StatusSegment for WorktreeSegment {
@@ -96,16 +117,42 @@ impl StatusSegment for WorktreeSegment {
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
         let cwd = ctx.cwd_basename?;
+        // In the main checkout, cwd basename matches the repo name —
+        // the worktree label would just restate the repo. Skip.
+        if ctx.repo == Some(cwd) {
+            return None;
+        }
         Some(Line::from(Span::styled(format!("wt:{cwd}"), ctx.secondary)))
     }
 }
 
 // ─── BranchSegment ────────────────────────────────────────────────
 
-/// Renders the focused agent's git branch as `branch:<name>`. Data
-/// is supplied by [`crate::agent_meta_worker`] which reads
+/// Renders the focused agent's git branch as `branch:<name>` — but
+/// **only when the branch is not in [`Self::default_branches`]**
+/// (typically `main` / `master`). The whole point of the segment is
+/// to flag "you're not on the trunk;" once you're back on it, the
+/// label would be ambient noise.
+///
+/// The hide-list is held on the segment instance (rather than passed
+/// per-frame via [`SegmentCtx`]) so segment policy travels with the
+/// segment. Setting up another built-in with its own config follows
+/// the same shape: add a field, take it in `new`, store it.
+///
+/// Data is supplied by [`crate::agent_meta_worker`] which reads
 /// `<cwd>/.git/HEAD`. `None` outside a git repo.
-pub(crate) struct BranchSegment;
+pub(crate) struct BranchSegment {
+    default_branches: Vec<String>,
+}
+
+impl BranchSegment {
+    /// Construct with the user-configured list of branches treated as
+    /// "default" (typically `main` / `master`). The segment hides
+    /// itself when the focused agent's branch matches one of these.
+    pub(crate) fn new(default_branches: Vec<String>) -> Self {
+        Self { default_branches }
+    }
+}
 
 impl StatusSegment for BranchSegment {
     fn id(&self) -> &'static str {
@@ -114,6 +161,9 @@ impl StatusSegment for BranchSegment {
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
         let branch = ctx.branch?;
+        if self.default_branches.iter().any(|b| b == branch) {
+            return None;
+        }
         Some(Line::from(Span::styled(
             format!("branch:{branch}"),
             ctx.secondary,
@@ -187,6 +237,21 @@ mod tests {
             model,
             cwd_basename,
             prefix_state,
+            bindings,
+            secondary: Style::default(),
+        }
+    }
+
+    /// Test ctx for [`BranchSegment`]'s "branch is set" path. The
+    /// "is this branch a default" decision now lives on the segment
+    /// instance, not in the ctx.
+    fn ctx_with_branch<'a>(bindings: &'a Bindings, branch: Option<&'a str>) -> SegmentCtx<'a> {
+        SegmentCtx {
+            repo: None,
+            branch,
+            model: None,
+            cwd_basename: None,
+            prefix_state: PrefixState::Idle,
             bindings,
             secondary: Style::default(),
         }
@@ -298,8 +363,9 @@ mod tests {
     // ─── WorktreeSegment ───────────────────────────────────────────
 
     #[test]
-    fn worktree_segment_renders_cwd_basename() {
-        // Plain checkout: cwd basename is the repo basename.
+    fn worktree_segment_hides_in_main_checkout() {
+        // Plain checkout: cwd basename matches the repo name. The
+        // segment hides itself rather than restate the repo.
         let bindings = Bindings::default();
         let ctx = ctx_with(
             &bindings,
@@ -309,12 +375,11 @@ mod tests {
             Some("codemux"),
             PrefixState::Idle,
         );
-        let line = WorktreeSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), "wt:codemux");
+        assert!(WorktreeSegment.render(&ctx).is_none());
     }
 
     #[test]
-    fn worktree_segment_renders_worktree_directory_name() {
+    fn worktree_segment_renders_when_cwd_differs_from_repo() {
         // Worktree: cwd basename differs from repo. Segment shows
         // the worktree name so the user knows which checkout they're
         // in.
@@ -332,6 +397,25 @@ mod tests {
     }
 
     #[test]
+    fn worktree_segment_renders_when_repo_is_unknown() {
+        // We have a cwd basename but the repo couldn't be resolved
+        // (rare — agent spawned outside any repo). With nothing to
+        // compare against, render the cwd basename so the user at
+        // least sees where they are.
+        let bindings = Bindings::default();
+        let ctx = ctx_with(
+            &bindings,
+            None,
+            None,
+            None,
+            Some("scratch"),
+            PrefixState::Idle,
+        );
+        let line = WorktreeSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "wt:scratch");
+    }
+
+    #[test]
     fn worktree_segment_returns_none_when_cwd_basename_unknown() {
         // SSH agent or a path with no resolvable basename.
         let bindings = Bindings::default();
@@ -342,33 +426,42 @@ mod tests {
     // ─── BranchSegment ─────────────────────────────────────────────
 
     #[test]
-    fn branch_segment_renders_branch_with_prefix() {
+    fn branch_segment_renders_when_branch_is_not_default() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(&bindings, None, Some("main"), None, None, PrefixState::Idle);
-        let line = BranchSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), "branch:main");
+        let segment = BranchSegment::new(vec!["main".into(), "master".into()]);
+        let ctx = ctx_with_branch(&bindings, Some("feat/x"));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "branch:feat/x");
     }
 
     #[test]
-    fn branch_segment_renders_slash_branches_verbatim() {
+    fn branch_segment_hides_when_branch_is_in_default_list() {
+        // Trunk: branch matches the configured default. Hide.
         let bindings = Bindings::default();
-        let ctx = ctx_with(
-            &bindings,
-            None,
-            Some("feat/x"),
-            None,
-            None,
-            PrefixState::Idle,
-        );
-        let line = BranchSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), "branch:feat/x");
+        let segment = BranchSegment::new(vec!["main".into(), "master".into()]);
+        let ctx = ctx_with_branch(&bindings, Some("main"));
+        assert!(segment.render(&ctx).is_none());
+        let ctx = ctx_with_branch(&bindings, Some("master"));
+        assert!(segment.render(&ctx).is_none());
+    }
+
+    #[test]
+    fn branch_segment_renders_main_when_default_list_is_empty() {
+        // Documented opt-out: empty default_branches means every
+        // branch is "interesting." Even `main` renders.
+        let bindings = Bindings::default();
+        let segment = BranchSegment::new(vec![]);
+        let ctx = ctx_with_branch(&bindings, Some("main"));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "branch:main");
     }
 
     #[test]
     fn branch_segment_returns_none_when_no_branch() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
-        assert!(BranchSegment.render(&ctx).is_none());
+        let segment = BranchSegment::new(vec!["main".into()]);
+        let ctx = ctx_with_branch(&bindings, None);
+        assert!(segment.render(&ctx).is_none());
     }
 
     // ─── PrefixHintSegment ─────────────────────────────────────────

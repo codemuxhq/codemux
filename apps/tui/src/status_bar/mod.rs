@@ -130,17 +130,23 @@ pub(crate) trait StatusSegment {
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>>;
 }
 
-/// Construct the live segment list from a config-supplied ID list.
+/// Construct the live segment list from a config-supplied ID list,
+/// passing each built-in its slice of [`crate::config::SegmentConfig`].
 /// Unknown IDs are logged at startup (loud) and skipped — better than
 /// failing the whole load over a typo.
 #[must_use]
-pub(crate) fn build_segments(ids: &[String]) -> Vec<Box<dyn StatusSegment>> {
+pub(crate) fn build_segments(
+    ids: &[String],
+    cfg: &crate::config::SegmentConfig,
+) -> Vec<Box<dyn StatusSegment>> {
     ids.iter()
         .filter_map(|id| match id.as_str() {
             SEGMENT_MODEL => Some(Box::new(segments::ModelSegment) as Box<dyn StatusSegment>),
             SEGMENT_REPO => Some(Box::new(segments::RepoSegment) as Box<dyn StatusSegment>),
             SEGMENT_WORKTREE => Some(Box::new(segments::WorktreeSegment) as Box<dyn StatusSegment>),
-            SEGMENT_BRANCH => Some(Box::new(segments::BranchSegment) as Box<dyn StatusSegment>),
+            SEGMENT_BRANCH => Some(Box::new(segments::BranchSegment::new(
+                cfg.branch.default_branches.clone(),
+            )) as Box<dyn StatusSegment>),
             SEGMENT_PREFIX_HINT => {
                 Some(Box::new(segments::PrefixHintSegment) as Box<dyn StatusSegment>)
             }
@@ -447,7 +453,7 @@ mod tests {
         // returned list contains the recognised ones in the requested
         // order and skips the unknown.
         let ids = vec!["model".to_string(), "bogus".to_string(), "repo".to_string()];
-        let built = build_segments(&ids);
+        let built = build_segments(&ids, &crate::config::SegmentConfig::default());
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].id(), SEGMENT_MODEL);
         assert_eq!(built[1].id(), SEGMENT_REPO);
@@ -455,13 +461,16 @@ mod tests {
 
     #[test]
     fn build_segments_handles_empty_list() {
-        let built = build_segments(&[]);
+        let built = build_segments(&[], &crate::config::SegmentConfig::default());
         assert!(built.is_empty());
     }
 
     #[test]
     fn build_segments_default_set_is_model_worktree_branch_hint() {
-        let built = build_segments(&default_segment_ids());
+        let built = build_segments(
+            &default_segment_ids(),
+            &crate::config::SegmentConfig::default(),
+        );
         let ids: Vec<&str> = built.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids,
@@ -479,7 +488,7 @@ mod tests {
         // Repo isn't in defaults but stays available as a built-in
         // — users can put it back via [ui] status_bar_segments.
         let ids = vec!["repo".to_string()];
-        let built = build_segments(&ids);
+        let built = build_segments(&ids, &crate::config::SegmentConfig::default());
         assert_eq!(built.len(), 1);
         assert_eq!(built[0].id(), SEGMENT_REPO);
     }
