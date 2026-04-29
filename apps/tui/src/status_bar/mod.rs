@@ -2,8 +2,8 @@
 //!
 //! The bottom status bar is split into two zones: the agent tab strip
 //! on the left, and a stack of context segments on the right
-//! (model · repo · branch · prefix-hint by default). This module owns
-//! the right-side stack — the trait, the four built-ins, and the
+//! (model · worktree · branch · prefix-hint by default). This module owns
+//! the right-side stack — the trait, the built-ins, and the
 //! drop-from-the-left algorithm that handles narrow terminals.
 //!
 //! ## Plugin shape
@@ -48,17 +48,24 @@ pub(crate) mod segments;
 /// truth would silently drift.
 pub(crate) const SEGMENT_MODEL: &str = "model";
 pub(crate) const SEGMENT_REPO: &str = "repo";
+pub(crate) const SEGMENT_WORKTREE: &str = "worktree";
 pub(crate) const SEGMENT_BRANCH: &str = "branch";
 pub(crate) const SEGMENT_PREFIX_HINT: &str = "prefix_hint";
 
 /// Default segment list when the user hasn't set `status_bar_segments`
 /// in their config. Order is left-to-right; the rightmost is the
 /// highest priority and is the last to be dropped under width pressure.
+///
+/// `repo` is intentionally absent from the defaults — `worktree`
+/// covers the same "where am I" use case and is more useful when the
+/// user is inside a git worktree (whose directory name typically
+/// differs from the repo name). Users who want the old `repo` label
+/// can opt in via `[ui] status_bar_segments`.
 #[must_use]
 pub(crate) fn default_segment_ids() -> Vec<String> {
     vec![
         SEGMENT_MODEL.into(),
-        SEGMENT_REPO.into(),
+        SEGMENT_WORKTREE.into(),
         SEGMENT_BRANCH.into(),
         SEGMENT_PREFIX_HINT.into(),
     ]
@@ -84,10 +91,10 @@ pub(crate) struct SegmentCtx<'a> {
     /// `~/.claude/projects/<encoded-cwd>/*.jsonl`. `None` until the
     /// worker's first successful read and for SSH agents.
     pub model: Option<&'a str>,
-    /// Basename of the focused agent's cwd, used by [`segments::BranchSegment`]
-    /// to distinguish a worktree directory from a regular checkout
-    /// (when the cwd basename differs from the repo name, the segment
-    /// renders both: `worktree-foo:feat/bar` instead of just `:bar`).
+    /// Basename of the focused agent's cwd, rendered by
+    /// [`segments::WorktreeSegment`] as `wt:<basename>`. For a regular
+    /// checkout this is the repo basename; for a git worktree it's the
+    /// worktree directory's name. `None` for SSH agents.
     pub cwd_basename: Option<&'a str>,
     /// Idle vs in-prefix-mode. Drives [`segments::PrefixHintSegment`]'s
     /// label/badge swap.
@@ -132,6 +139,7 @@ pub(crate) fn build_segments(ids: &[String]) -> Vec<Box<dyn StatusSegment>> {
         .filter_map(|id| match id.as_str() {
             SEGMENT_MODEL => Some(Box::new(segments::ModelSegment) as Box<dyn StatusSegment>),
             SEGMENT_REPO => Some(Box::new(segments::RepoSegment) as Box<dyn StatusSegment>),
+            SEGMENT_WORKTREE => Some(Box::new(segments::WorktreeSegment) as Box<dyn StatusSegment>),
             SEGMENT_BRANCH => Some(Box::new(segments::BranchSegment) as Box<dyn StatusSegment>),
             SEGMENT_PREFIX_HINT => {
                 Some(Box::new(segments::PrefixHintSegment) as Box<dyn StatusSegment>)
@@ -140,7 +148,7 @@ pub(crate) fn build_segments(ids: &[String]) -> Vec<Box<dyn StatusSegment>> {
                 tracing::warn!(
                     segment = %other,
                     "unknown status_bar_segments id; skipping. \
-                     Known ids: model, repo, branch, prefix_hint",
+                     Known ids: model, repo, worktree, branch, prefix_hint",
                 );
                 None
             }
@@ -452,18 +460,28 @@ mod tests {
     }
 
     #[test]
-    fn build_segments_recognises_all_four_built_ins() {
+    fn build_segments_default_set_is_model_worktree_branch_hint() {
         let built = build_segments(&default_segment_ids());
         let ids: Vec<&str> = built.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids,
             vec![
                 SEGMENT_MODEL,
-                SEGMENT_REPO,
+                SEGMENT_WORKTREE,
                 SEGMENT_BRANCH,
                 SEGMENT_PREFIX_HINT
             ],
         );
+    }
+
+    #[test]
+    fn build_segments_recognises_repo_when_user_opts_in() {
+        // Repo isn't in defaults but stays available as a built-in
+        // — users can put it back via [ui] status_bar_segments.
+        let ids = vec!["repo".to_string()];
+        let built = build_segments(&ids);
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].id(), SEGMENT_REPO);
     }
 
     #[test]

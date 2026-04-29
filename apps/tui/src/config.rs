@@ -131,15 +131,19 @@ pub struct Ui {
     ///
     /// Built-in IDs:
     /// - `"model"` — current Claude model on the focused agent
-    /// - `"repo"` — focused agent's repo name
-    /// - `"branch"` — focused agent's git branch (worktree-aware)
+    /// - `"worktree"` — basename of the focused agent's working dir
+    ///   (the worktree directory name, or repo basename for a plain
+    ///   checkout)
+    /// - `"branch"` — focused agent's git branch
     /// - `"prefix_hint"` — the `super+b for help` / `[NAV] …` hint
+    /// - `"repo"` — focused agent's repo name (opt-in; not in the
+    ///   default set since `worktree` covers the same use case)
     ///
     /// Unknown IDs are logged at startup and skipped. An empty list
     /// disables the right-side block entirely (the tab strip then
     /// fills the whole status bar).
     ///
-    /// Default: `["model", "repo", "branch", "prefix_hint"]`. The
+    /// Default: `["model", "worktree", "branch", "prefix_hint"]`. The
     /// container's `#[serde(default)]` calls `Ui::default()` which
     /// fills the field — no field-level `default` attribute needed.
     pub status_bar_segments: Vec<String>,
@@ -782,13 +786,14 @@ mod tests {
     #[test]
     fn ui_status_bar_segments_default_includes_all_four_built_ins() {
         // Defaults define the out-of-the-box UX. New users see model,
-        // repo, branch, prefix_hint without writing config.
+        // worktree, branch, prefix_hint without writing config. Repo
+        // is intentionally omitted (worktree covers the same need).
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(
             config.ui.status_bar_segments,
             vec![
                 "model".to_string(),
-                "repo".to_string(),
+                "worktree".to_string(),
                 "branch".to_string(),
                 "prefix_hint".to_string(),
             ],

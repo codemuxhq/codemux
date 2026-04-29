@@ -4,6 +4,13 @@
 //! Adding a new segment: implement [`StatusSegment`], add a unique ID
 //! constant in `mod.rs`, register it in `build_segments`, and document
 //! it in the `Ui::status_bar_segments` doc comment.
+//!
+//! Each segment returns a `Line` whose **spans** carry the style
+//! directly. We do not use `Line::styled(...)` — that style lives on
+//! the line wrapper, and `render_segments` flattens per-segment lines
+//! into a single line by extracting the spans, which would drop the
+//! line-level style and render the text in the terminal default
+//! color. Style on the span survives the extraction.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,7 +39,10 @@ impl StatusSegment for ModelSegment {
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
         let model = ctx.model?;
         let short = shorten_model_name(model);
-        Some(Line::styled(format!("model: {short}"), ctx.secondary))
+        Some(Line::from(Span::styled(
+            format!("model:{short}"),
+            ctx.secondary,
+        )))
     }
 }
 
@@ -50,7 +60,10 @@ fn shorten_model_name(raw: &str) -> &str {
 
 /// Renders the focused agent's repo name (git root basename or cwd
 /// basename). Sourced directly from [`SegmentCtx::repo`], which
-/// mirrors `RuntimeAgent.repo`.
+/// mirrors `RuntimeAgent.repo`. Not in the default segment list as
+/// of v1 — `WorktreeSegment` covers the same use case more directly
+/// — but kept available for users who want to opt in via
+/// `[ui] status_bar_segments`.
 pub(crate) struct RepoSegment;
 
 impl StatusSegment for RepoSegment {
@@ -60,23 +73,38 @@ impl StatusSegment for RepoSegment {
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
         let repo = ctx.repo?;
-        Some(Line::styled(format!("repo: {repo}"), ctx.secondary))
+        Some(Line::from(Span::styled(
+            format!("repo:{repo}"),
+            ctx.secondary,
+        )))
+    }
+}
+
+// ─── WorktreeSegment ──────────────────────────────────────────────
+
+/// Renders the basename of the focused agent's working directory as
+/// `wt:<name>`. For a regular checkout this is the repo name; for a
+/// git worktree (e.g. `~/Workbench/worktrees/feature-x`) it's the
+/// worktree directory's name. Combined with `BranchSegment` this
+/// gives the user a complete "where am I" view at a glance.
+pub(crate) struct WorktreeSegment;
+
+impl StatusSegment for WorktreeSegment {
+    fn id(&self) -> &'static str {
+        super::SEGMENT_WORKTREE
+    }
+
+    fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
+        let cwd = ctx.cwd_basename?;
+        Some(Line::from(Span::styled(format!("wt:{cwd}"), ctx.secondary)))
     }
 }
 
 // ─── BranchSegment ────────────────────────────────────────────────
 
-/// Renders the focused agent's git branch, prefixed with the worktree
-/// directory's basename **only when it differs from the repo name**.
-/// This is the worktree-vs-checkout distinction:
-///
-/// - Plain checkout (cwd basename == repo): renders `:main`
-/// - Worktree (cwd is `.../worktrees/feature-x`): renders
-///   `feature-x:feat/x`
-///
-/// The leading `:` in the plain-checkout case is intentional — it
-/// reads as "branch on this repo" without restating the repo name
-/// (which `RepoSegment` already shows immediately to the left).
+/// Renders the focused agent's git branch as `branch:<name>`. Data
+/// is supplied by [`crate::agent_meta_worker`] which reads
+/// `<cwd>/.git/HEAD`. `None` outside a git repo.
 pub(crate) struct BranchSegment;
 
 impl StatusSegment for BranchSegment {
@@ -86,11 +114,10 @@ impl StatusSegment for BranchSegment {
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
         let branch = ctx.branch?;
-        let label = match (ctx.cwd_basename, ctx.repo) {
-            (Some(cwd), Some(repo)) if cwd != repo => format!("{cwd}:{branch}"),
-            _ => format!(":{branch}"),
-        };
-        Some(Line::styled(label, ctx.secondary))
+        Some(Line::from(Span::styled(
+            format!("branch:{branch}"),
+            ctx.secondary,
+        )))
     }
 }
 
@@ -119,7 +146,7 @@ impl StatusSegment for PrefixHintSegment {
                     "{} {} for help",
                     ctx.bindings.prefix, ctx.bindings.on_prefix.help,
                 );
-                Some(Line::styled(text, ctx.secondary))
+                Some(Line::from(Span::styled(text, ctx.secondary)))
             }
             PrefixState::AwaitingCommand => {
                 // Yellow + bold on the badge, dim chrome on the body.
@@ -169,6 +196,13 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    fn line_style(line: &Line<'_>) -> Style {
+        // Segments must put the style on the span (not the line wrapper)
+        // so it survives the span-extraction flatten in render_segments.
+        // Each segment renders one styled span; assert against that.
+        line.spans.first().map(|s| s.style).unwrap_or_default()
+    }
+
     // ─── ModelSegment ──────────────────────────────────────────────
 
     #[test]
@@ -183,7 +217,7 @@ mod tests {
             PrefixState::Idle,
         );
         let line = ModelSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), "model: opus-4-7");
+        assert_eq!(line_text(&line), "model:opus-4-7");
     }
 
     #[test]
@@ -200,16 +234,39 @@ mod tests {
             PrefixState::Idle,
         );
         let line = ModelSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), "model: internal/llama-7b");
+        assert_eq!(line_text(&line), "model:internal/llama-7b");
     }
 
     #[test]
     fn model_segment_returns_none_when_model_is_unknown() {
         // Worker hasn't reported yet, or focused agent is SSH-backed.
-        // Segment must be skipped (not rendered as `model: ?`).
+        // Segment must be skipped (not rendered as `model:?`).
         let bindings = Bindings::default();
         let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
         assert!(ModelSegment.render(&ctx).is_none());
+    }
+
+    #[test]
+    fn model_segment_styles_the_span_so_color_survives_flattening() {
+        // The reason this test exists: `Line::styled(text, style)` puts
+        // the style on the line wrapper, not the span. When
+        // render_segments extracts spans into a unified line, that
+        // line-level style is dropped and the text renders in the
+        // terminal's default color. Pinning that the style lives on
+        // the span guards against that regression.
+        let bindings = Bindings::default();
+        let secondary = Style::default().fg(Color::Indexed(247));
+        let ctx = SegmentCtx {
+            repo: None,
+            branch: None,
+            model: Some("claude-opus-4-7"),
+            cwd_basename: None,
+            prefix_state: PrefixState::Idle,
+            bindings: &bindings,
+            secondary,
+        };
+        let line = ModelSegment.render(&ctx).unwrap();
+        assert_eq!(line_style(&line), secondary);
     }
 
     // ─── RepoSegment ───────────────────────────────────────────────
@@ -226,7 +283,7 @@ mod tests {
             PrefixState::Idle,
         );
         let line = RepoSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), "repo: codemux");
+        assert_eq!(line_text(&line), "repo:codemux");
     }
 
     #[test]
@@ -236,74 +293,79 @@ mod tests {
         assert!(RepoSegment.render(&ctx).is_none());
     }
 
-    // ─── BranchSegment ─────────────────────────────────────────────
+    // ─── WorktreeSegment ───────────────────────────────────────────
 
     #[test]
-    fn branch_segment_renders_just_branch_when_cwd_basename_equals_repo() {
-        // Plain checkout: cwd basename matches the git root basename,
-        // so we render `:main` (no need to repeat the repo name —
-        // RepoSegment is right next door on screen).
+    fn worktree_segment_renders_cwd_basename() {
+        // Plain checkout: cwd basename is the repo basename.
         let bindings = Bindings::default();
         let ctx = ctx_with(
             &bindings,
             Some("codemux"),
-            Some("main"),
+            None,
             None,
             Some("codemux"),
             PrefixState::Idle,
         );
-        let line = BranchSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), ":main");
+        let line = WorktreeSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "wt:codemux");
     }
 
     #[test]
-    fn branch_segment_prefixes_worktree_name_when_cwd_differs_from_repo() {
-        // Worktree: `cd ~/Workbench/worktrees/feature-x && claude`.
-        // cwd basename is `feature-x`, repo basename is `codemux`,
-        // branch is `feat/x`. Segment renders `feature-x:feat/x` so
-        // the user can see at a glance which worktree they're in.
+    fn worktree_segment_renders_worktree_directory_name() {
+        // Worktree: cwd basename differs from repo. Segment shows
+        // the worktree name so the user knows which checkout they're
+        // in.
         let bindings = Bindings::default();
         let ctx = ctx_with(
             &bindings,
             Some("codemux"),
-            Some("feat/x"),
+            None,
             None,
             Some("feature-x"),
             PrefixState::Idle,
         );
-        let line = BranchSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), "feature-x:feat/x");
+        let line = WorktreeSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "wt:feature-x");
     }
 
     #[test]
-    fn branch_segment_falls_back_to_just_branch_when_cwd_basename_is_unknown() {
-        // Defensive: if the worker ever reports a branch but the
-        // cwd basename couldn't be derived (shouldn't happen — they're
-        // resolved together — but we don't crash if it does).
+    fn worktree_segment_returns_none_when_cwd_basename_unknown() {
+        // SSH agent or a path with no resolvable basename.
+        let bindings = Bindings::default();
+        let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
+        assert!(WorktreeSegment.render(&ctx).is_none());
+    }
+
+    // ─── BranchSegment ─────────────────────────────────────────────
+
+    #[test]
+    fn branch_segment_renders_branch_with_prefix() {
+        let bindings = Bindings::default();
+        let ctx = ctx_with(&bindings, None, Some("main"), None, None, PrefixState::Idle);
+        let line = BranchSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "branch:main");
+    }
+
+    #[test]
+    fn branch_segment_renders_slash_branches_verbatim() {
         let bindings = Bindings::default();
         let ctx = ctx_with(
             &bindings,
-            Some("codemux"),
-            Some("main"),
+            None,
+            Some("feat/x"),
             None,
             None,
             PrefixState::Idle,
         );
         let line = BranchSegment.render(&ctx).unwrap();
-        assert_eq!(line_text(&line), ":main");
+        assert_eq!(line_text(&line), "branch:feat/x");
     }
 
     #[test]
     fn branch_segment_returns_none_when_no_branch() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(
-            &bindings,
-            Some("codemux"),
-            None,
-            None,
-            None,
-            PrefixState::Idle,
-        );
+        let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
         assert!(BranchSegment.render(&ctx).is_none());
     }
 
@@ -314,9 +376,6 @@ mod tests {
         let bindings = Bindings::default();
         let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
         let line = PrefixHintSegment.render(&ctx).unwrap();
-        // Default prefix is `ctrl+b`, default help binding is `?`.
-        // Just check the suffix; the exact prefix glyph depends on
-        // the default binding which other tests pin separately.
         assert!(
             line_text(&line).ends_with("for help"),
             "got {:?}",
@@ -337,6 +396,26 @@ mod tests {
         );
         let line = PrefixHintSegment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "[NAV] h/l prev/next  esc exit");
+    }
+
+    #[test]
+    fn prefix_hint_segment_styles_idle_text_via_span() {
+        // Same regression test as ModelSegment's: idle hint must put
+        // its style on the span so the gray color survives the
+        // render_segments flatten.
+        let bindings = Bindings::default();
+        let secondary = Style::default().fg(Color::Indexed(247));
+        let ctx = SegmentCtx {
+            repo: None,
+            branch: None,
+            model: None,
+            cwd_basename: None,
+            prefix_state: PrefixState::Idle,
+            bindings: &bindings,
+            secondary,
+        };
+        let line = PrefixHintSegment.render(&ctx).unwrap();
+        assert_eq!(line_style(&line), secondary);
     }
 
     #[test]
