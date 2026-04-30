@@ -868,6 +868,25 @@ enum AgentState {
     },
 }
 
+impl AgentState {
+    /// Live or last-frozen vt100 screen for this agent. `Some` for
+    /// `Ready` (live PTY) and `Crashed` (frozen at moment of death so
+    /// the user can still scroll back through what claude was doing
+    /// pre-crash); `None` for `Failed` because no parser was ever
+    /// constructed. Centralised here so call sites that need a screen
+    /// (selection commit, hover lookup, post-draw OSC 8 painter) don't
+    /// each repeat the same `Ready | Crashed => Some(...), Failed =>
+    /// None` match against the variant shape.
+    fn screen(&self) -> Option<&vt100::Screen> {
+        match self {
+            AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
+                Some(parser.screen())
+            }
+            AgentState::Failed { .. } => None,
+        }
+    }
+}
+
 impl RuntimeAgent {
     // 9 args after the agent_meta_worker landing; identity, label,
     // working dir, host, transport, geometry, and scrollback budget
@@ -944,12 +963,7 @@ impl RuntimeAgent {
     /// transport is gone — the user can still page back through what
     /// claude was doing pre-crash.
     fn scrollback_offset(&self) -> usize {
-        match &self.state {
-            AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
-                parser.screen().scrollback()
-            }
-            AgentState::Failed { .. } => 0,
-        }
+        self.state.screen().map_or(0, vt100::Screen::scrollback)
     }
 
     /// Adjust the scrollback offset by `delta` (positive scrolls back
@@ -1953,15 +1967,11 @@ fn commit_selection(sel: &Selection, agents: &[RuntimeAgent]) {
     let Some(agent) = agents.iter().find(|a| a.id == sel.agent) else {
         return;
     };
-    let parser = match &agent.state {
-        AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => parser,
-        AgentState::Failed { .. } => return,
+    let Some(screen) = agent.state.screen() else {
+        return;
     };
     let (start, end) = normalized_range(sel.anchor, sel.head);
-    let text =
-        parser
-            .screen()
-            .contents_between(start.row, start.col, end.row, end.col.saturating_add(1));
+    let text = screen.contents_between(start.row, start.col, end.row, end.col.saturating_add(1));
     if text.is_empty() {
         return;
     }
@@ -1991,11 +2001,7 @@ fn compute_hover(
 ) -> Option<HoverUrl> {
     let (agent_id, cell) = pane_hitbox.cell_at(column, row)?;
     let agent = agents.iter().find(|a| a.id == agent_id)?;
-    let parser = match &agent.state {
-        AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => parser,
-        AgentState::Failed { .. } => return None,
-    };
-    let span = crate::url_scan::find_url_at(parser.screen(), cell.row, cell.col)?;
+    let span = crate::url_scan::find_url_at(agent.state.screen()?, cell.row, cell.col)?;
     Some(HoverUrl {
         agent: agent_id,
         row: cell.row,
@@ -2010,8 +2016,13 @@ fn compute_hover(
 /// concern about hardcoded `Command::new("open")` inside the runtime
 /// crate. Production wires [`OsUrlOpener`]; tests can swap in a mock
 /// that records the URLs without spawning a browser.
+///
+/// Returns `io::Result<()>` rather than swallowing internally so the
+/// caller decides whether to log or surface the failure — the runtime
+/// loop logs via `tracing::debug!` and continues; a future test could
+/// assert on the error.
 trait UrlOpener {
-    fn open(&self, url: &str);
+    fn open(&self, url: &str) -> io::Result<()>;
 }
 
 /// Production [`UrlOpener`]: spawns the host OS's URL handler.
@@ -2027,33 +2038,27 @@ trait UrlOpener {
 struct OsUrlOpener;
 
 impl UrlOpener for OsUrlOpener {
-    fn open(&self, url: &str) {
+    fn open(&self, url: &str) -> io::Result<()> {
         use std::process::{Command, Stdio};
-        let result = if cfg!(target_os = "macos") {
-            Command::new("open")
-                .arg(url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+        let mut command = if cfg!(target_os = "macos") {
+            let mut c = Command::new("open");
+            c.arg(url);
+            c
         } else if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(["/C", "start", "", url])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+            let mut c = Command::new("cmd");
+            c.args(["/C", "start", "", url]);
+            c
         } else {
-            Command::new("xdg-open")
-                .arg(url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+            let mut c = Command::new("xdg-open");
+            c.arg(url);
+            c
         };
-        if let Err(err) = result {
-            tracing::debug!(?err, url, "OsUrlOpener: spawn failed");
-        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_child| ())
     }
 }
 
@@ -2069,49 +2074,75 @@ impl UrlOpener for OsUrlOpener {
 /// Super/Cmd, so the only path to native Cmd-click is to step out of
 /// capture entirely while the modifier is held.
 ///
-/// `mode_active` is the static "did we ever turn capture on" flag (a
-/// mirror of `TerminalGuard::mouse_captured`); without it, terminals
-/// that refused our initial `EnableMouseCapture` could still see us
-/// emit a no-op `DisableMouseCapture` on yield. Toggle is idempotent
-/// in both directions so a repeated press (no release in between, e.g.
-/// from sticky keys) doesn't over-emit escape sequences.
+/// Tracks whether codemux has temporarily yielded mouse capture to the
+/// host terminal so the user can use the host's native URL-hover and
+/// click-to-open UX. The yield happens on bare-modifier press (Cmd by
+/// default on macOS, Ctrl elsewhere — configurable via
+/// [`MouseUrlModifier`]); reclaim happens on release or focus loss.
+///
+/// Why this is needed at all: any DEC mouse capture mode silences
+/// Ghostty's URL hover detector (verified empirically — see the test
+/// trail in commit history). The SGR mouse encoding cannot deliver
+/// Super/Cmd, so the only path to native Cmd-click is to step out of
+/// capture entirely while the modifier is held.
+///
+/// Modeled as an enum (not a `{ active: bool, yielded: bool }` struct)
+/// so the invalid combination `active=false && yielded=true` cannot be
+/// represented at all — terminals that refused our initial
+/// `EnableMouseCapture` stay in [`Self::Disabled`] forever and the
+/// yield/reclaim methods are pure no-ops on that variant. Idempotent in
+/// both directions: repeated presses without an intervening release
+/// (e.g. sticky keys) don't over-emit escape sequences.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MouseCaptureState {
-    mode_active: bool,
-    yielded: bool,
+enum MouseCaptureState {
+    /// Initial `EnableMouseCapture` failed or was never attempted.
+    /// Yield/reclaim are no-ops; the host terminal already owns mouse
+    /// events.
+    Disabled,
+    /// Capture is active — codemux is receiving mouse events via the
+    /// SGR mouse encoding and the host terminal's native URL handler
+    /// is silenced.
+    Captured,
+    /// Capture was temporarily released (the user is holding the URL
+    /// modifier). Mouse events go to the host terminal so its native
+    /// URL UX can run; reclaimed on modifier release or focus loss.
+    Yielded,
 }
 
 impl MouseCaptureState {
     fn new(mode_active: bool) -> Self {
-        Self {
-            mode_active,
-            yielded: false,
+        if mode_active {
+            Self::Captured
+        } else {
+            Self::Disabled
         }
     }
 
     /// Step out of mouse capture so the host terminal can run its
-    /// native URL hover/click handler. No-op when capture was never
-    /// successfully enabled, when we're already yielded, or when the
-    /// `DisableMouseCapture` write fails (in which case we leave the
-    /// state machine intact for the next try).
+    /// native URL hover/click handler. No-op on `Disabled` (capture
+    /// was never enabled) and `Yielded` (already stepped out). Failure
+    /// to write `DisableMouseCapture` leaves us in `Captured` so the
+    /// next press can retry.
     fn yield_to_host(&mut self) {
-        if !self.mode_active || self.yielded {
+        if !matches!(self, Self::Captured) {
             return;
         }
         if execute!(io::stdout(), DisableMouseCapture).is_ok() {
-            self.yielded = true;
+            *self = Self::Yielded;
         }
     }
 
     /// Re-enable mouse capture after the user releases the URL
     /// modifier (or after focus loss while held). Same idempotency
-    /// posture as [`Self::yield_to_host`].
+    /// posture as [`Self::yield_to_host`] — `Disabled` and `Captured`
+    /// are no-ops; failure leaves us in `Yielded` so the next reclaim
+    /// attempt retries.
     fn reclaim(&mut self) {
-        if !self.mode_active || !self.yielded {
+        if !matches!(self, Self::Yielded) {
             return;
         }
         if execute!(io::stdout(), EnableMouseCapture).is_ok() {
-            self.yielded = false;
+            *self = Self::Captured;
         }
     }
 }
@@ -2565,7 +2596,10 @@ fn event_loop(
         if let Some(h) = hover.as_ref()
             && nav.agents.get(nav.focused).is_none_or(|a| a.id != h.agent)
         {
-            let _ = update_hover(&mut io::stdout(), &mut hover, None);
+            let transition = update_hover(&mut hover, None);
+            if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
+                tracing::debug!(?err, "hover cursor update failed");
+            }
         }
         // Push the focused agent's title out to the surrounding
         // terminal so Ghostty / iTerm2 / Kitty can label its codemux
@@ -2636,20 +2670,13 @@ fn event_loop(
             && hover.is_none()
             && let Some(rect) = pane_hitbox.rect()
             && let Some(agent) = nav.agents.get(nav.focused)
+            && let Some(screen) = agent.state.screen()
         {
-            let screen_opt = match &agent.state {
-                AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
-                    Some(parser.screen())
-                }
-                AgentState::Failed { .. } => None,
-            };
-            if let Some(screen) = screen_opt {
-                let mut stdout = io::stdout().lock();
-                if let Err(err) = paint_hyperlinks_post_draw(&mut stdout, rect, screen) {
-                    tracing::debug!(?err, "OSC 8 hyperlink paint failed");
-                } else if let Err(err) = stdout.flush() {
-                    tracing::debug!(?err, "OSC 8 hyperlink flush failed");
-                }
+            let mut stdout = io::stdout().lock();
+            if let Err(err) = paint_hyperlinks_post_draw(&mut stdout, rect, screen) {
+                tracing::debug!(?err, "OSC 8 hyperlink paint failed");
+            } else if let Err(err) = stdout.flush() {
+                tracing::debug!(?err, "OSC 8 hyperlink flush failed");
             }
         }
 
@@ -2691,7 +2718,10 @@ fn event_loop(
             // the catch-all arm at the bottom.
             Event::FocusLost => {
                 mouse_capture_state.reclaim();
-                let _ = update_hover(&mut io::stdout(), &mut hover, None);
+                let transition = update_hover(&mut hover, None);
+                if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
+                    tracing::debug!(?err, "hover cursor update failed");
+                }
             }
             // Press OR Repeat: a held character key sends Repeat events
             // under KKP `REPORT_EVENT_TYPES`. Treat them the same as
@@ -3204,7 +3234,10 @@ fn event_loop(
                 selection = None;
                 // Same reflow concern for the hover URL: the row /
                 // column the URL was on may now hold different content.
-                let _ = update_hover(&mut io::stdout(), &mut hover, None);
+                let transition = update_hover(&mut hover, None);
+                if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
+                    tracing::debug!(?err, "hover cursor update failed");
+                }
             }
             Event::Mouse(MouseEvent {
                 kind,
@@ -3242,11 +3275,17 @@ fn event_loop(
                         let ctrl_held = modifiers.contains(KeyModifiers::CONTROL);
                         if ctrl_held && matches!(other, MouseEventKind::Moved) {
                             let new = compute_hover(&pane_hitbox, &nav.agents, column, row);
-                            let _ = update_hover(&mut io::stdout(), &mut hover, new);
+                            let transition = update_hover(&mut hover, new);
+                            if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
+                                tracing::debug!(?err, "hover cursor update failed");
+                            }
                             continue;
                         }
                         if !ctrl_held && hover.is_some() {
-                            let _ = update_hover(&mut io::stdout(), &mut hover, None);
+                            let transition = update_hover(&mut hover, None);
+                            if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
+                                tracing::debug!(?err, "hover cursor update failed");
+                            }
                         }
                         // Ctrl+Click on a URL cell hands the URL to the
                         // OS opener and consumes the event so the
@@ -3259,8 +3298,13 @@ fn event_loop(
                             && let Some(span) =
                                 compute_hover(&pane_hitbox, &nav.agents, column, row)
                         {
-                            url_opener.open(&span.url);
-                            let _ = update_hover(&mut io::stdout(), &mut hover, Some(span));
+                            if let Err(err) = url_opener.open(&span.url) {
+                                tracing::debug!(?err, url = %span.url, "URL opener failed");
+                            }
+                            let transition = update_hover(&mut hover, Some(span));
+                            if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
+                                tracing::debug!(?err, "hover cursor update failed");
+                            }
                             continue;
                         }
                         // Pane-relative selection takes priority over
@@ -3789,33 +3833,65 @@ fn emit_color<W: io::Write>(out: &mut W, color: vt100::Color, foreground: bool) 
 /// Ghostty's docs and the iTerm2 escape catalog list. Terminals that
 /// don't recognise OSC 22 strip the unknown sequence silently.
 ///
-/// Wrapped in [`update_hover`] so the emit only fires on the boolean
-/// transition `hover.is_some()` ↔ `hover.is_none()` — repeat moves
-/// across cells of the same URL don't re-emit.
+/// Caller pairs this with [`update_hover`] / [`apply_hover_cursor`] so
+/// the emit only fires on the boolean transition
+/// `hover.is_some()` ↔ `hover.is_none()` — repeat moves across cells
+/// of the same URL don't re-emit.
 fn emit_mouse_cursor_shape<W: io::Write>(out: &mut W, pointer: bool) -> io::Result<()> {
     let shape = if pointer { "pointer" } else { "default" };
     write!(out, "\x1b]22;{shape}\x1b\\")
 }
 
-/// Update the in-app hover state and, when the boolean activeness
-/// transitions, emit OSC 22 to flip the host mouse pointer between
-/// hand and arrow. Centralises the "every hover mutation must keep
-/// the cursor shape in sync" invariant — without this, every call
-/// site that touches `hover` would have to remember to also write
-/// the OSC sequence and the next contributor adding a new mutation
-/// site would forget. Errors are surfaced so callers can decide
-/// whether to log; the runtime loop currently swallows them.
-fn update_hover<W: io::Write>(
-    out: &mut W,
-    hover: &mut Option<HoverUrl>,
-    new: Option<HoverUrl>,
-) -> io::Result<()> {
+/// What changed when [`update_hover`] swapped the hover state.
+/// `Activated` and `Deactivated` mark the boolean transitions where
+/// the host mouse pointer needs to flip; `Unchanged` covers both
+/// `Some → Some` (different cell or different URL — pointer stays a
+/// hand) and `None → None` (no-op moves outside any URL — pointer
+/// stays an arrow).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HoverTransition {
+    Unchanged,
+    Activated,
+    Deactivated,
+}
+
+/// Pure state mutator: swap `hover` for `new` and report whether the
+/// boolean activeness transitioned. Pure because the I/O side effect
+/// (flipping the host mouse pointer via OSC 22) lives in
+/// [`apply_hover_cursor`] — separated so the controller decides when
+/// to emit, and the state mutation can be tested without a writer
+/// fixture. Centralises the "every hover mutation must keep the
+/// cursor shape in sync" invariant: every call site goes
+/// `update_hover → apply_hover_cursor`, and a future contributor
+/// adding a new mutation site has the pattern visible at every
+/// existing one to copy.
+fn update_hover(hover: &mut Option<HoverUrl>, new: Option<HoverUrl>) -> HoverTransition {
     let was_active = hover.is_some();
     let now_active = new.is_some();
     *hover = new;
-    if was_active != now_active {
-        emit_mouse_cursor_shape(out, now_active)?;
-        out.flush()?;
+    match (was_active, now_active) {
+        (false, true) => HoverTransition::Activated,
+        (true, false) => HoverTransition::Deactivated,
+        _ => HoverTransition::Unchanged,
+    }
+}
+
+/// I/O effect for a [`HoverTransition`]: emit OSC 22 to switch the
+/// host mouse pointer to a hand on `Activated`, back to arrow on
+/// `Deactivated`, no-op on `Unchanged`. Flushes on emit so the
+/// pointer change shows up before the next event-poll iteration —
+/// otherwise the user would see the old cursor for one frame.
+fn apply_hover_cursor<W: io::Write>(out: &mut W, transition: HoverTransition) -> io::Result<()> {
+    match transition {
+        HoverTransition::Activated => {
+            emit_mouse_cursor_shape(out, true)?;
+            out.flush()?;
+        }
+        HoverTransition::Deactivated => {
+            emit_mouse_cursor_shape(out, false)?;
+            out.flush()?;
+        }
+        HoverTransition::Unchanged => {}
     }
     Ok(())
 }
@@ -9031,64 +9107,67 @@ mod tests {
     }
 
     #[test]
-    fn update_hover_emits_osc_22_pointer_only_on_none_to_some_transition() {
+    fn update_hover_returns_activated_on_none_to_some() {
         let mut hover: Option<HoverUrl> = None;
-        let mut out = Vec::new();
         let new = HoverUrl {
             agent: AgentId::new("a"),
             row: 0,
             cols: 0..5,
             url: "https://x".into(),
         };
-        update_hover(&mut out, &mut hover, Some(new.clone())).unwrap();
-        let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b]22;pointer\x1b\\");
+        let transition = update_hover(&mut hover, Some(new.clone()));
+        assert_eq!(transition, HoverTransition::Activated);
+        assert_eq!(hover, Some(new));
     }
 
     #[test]
-    fn update_hover_emits_osc_22_default_only_on_some_to_none_transition() {
+    fn update_hover_returns_deactivated_on_some_to_none() {
         let mut hover: Option<HoverUrl> = Some(HoverUrl {
             agent: AgentId::new("a"),
             row: 0,
             cols: 0..5,
             url: "https://x".into(),
         });
-        let mut out = Vec::new();
-        update_hover(&mut out, &mut hover, None).unwrap();
-        let s = String::from_utf8(out).unwrap();
-        assert_eq!(s, "\x1b]22;default\x1b\\");
+        let transition = update_hover(&mut hover, None);
+        assert_eq!(transition, HoverTransition::Deactivated);
+        assert_eq!(hover, None);
     }
 
     #[test]
-    fn update_hover_does_not_re_emit_when_active_state_unchanged() {
-        // Some → Some (different cell of the same URL, or a different URL):
-        // the pointer was already a hand, no need to re-tell the host.
-        let initial = HoverUrl {
+    fn update_hover_returns_unchanged_when_active_state_unchanged() {
+        // Some → Some (different cell or different URL): pointer was
+        // already a hand, no transition.
+        let mut hover: Option<HoverUrl> = Some(HoverUrl {
             agent: AgentId::new("a"),
             row: 0,
             cols: 0..5,
             url: "https://x".into(),
-        };
-        let mut hover: Option<HoverUrl> = Some(initial);
+        });
         let next = HoverUrl {
             agent: AgentId::new("a"),
             row: 0,
             cols: 6..11,
             url: "https://y".into(),
         };
-        let mut out = Vec::new();
-        update_hover(&mut out, &mut hover, Some(next)).unwrap();
-        assert!(
-            out.is_empty(),
-            "Some→Some must be a no-op for OSC 22, got {out:?}",
+        assert_eq!(
+            update_hover(&mut hover, Some(next.clone())),
+            HoverTransition::Unchanged,
         );
+        assert_eq!(hover, Some(next));
 
-        // None → None: also a no-op (mouse moved over non-URL cell while
-        // already off-URL).
+        // None → None: also no transition.
         let mut hover: Option<HoverUrl> = None;
+        assert_eq!(update_hover(&mut hover, None), HoverTransition::Unchanged,);
+    }
+
+    #[test]
+    fn apply_hover_cursor_emits_pointer_on_activated_default_on_deactivated_nothing_on_unchanged() {
         let mut out = Vec::new();
-        update_hover(&mut out, &mut hover, None).unwrap();
-        assert!(out.is_empty(), "None→None must be a no-op, got {out:?}");
+        apply_hover_cursor(&mut out, HoverTransition::Activated).unwrap();
+        apply_hover_cursor(&mut out, HoverTransition::Deactivated).unwrap();
+        apply_hover_cursor(&mut out, HoverTransition::Unchanged).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b]22;pointer\x1b\\\x1b]22;default\x1b\\");
     }
 
     fn ready_agent_with(id: &str, cols: u16, body: &[u8]) -> RuntimeAgent {
@@ -9177,16 +9256,17 @@ mod tests {
             calls: RefCell<Vec<String>>,
         }
         impl UrlOpener for Recorder {
-            fn open(&self, url: &str) {
+            fn open(&self, url: &str) -> io::Result<()> {
                 self.calls.borrow_mut().push(url.to_string());
+                Ok(())
             }
         }
         let r = Recorder {
             calls: RefCell::new(Vec::new()),
         };
         let opener: &dyn UrlOpener = &r;
-        opener.open("https://example.com");
-        opener.open("https://second.example");
+        opener.open("https://example.com").unwrap();
+        opener.open("https://second.example").unwrap();
         assert_eq!(
             r.calls.borrow().as_slice(),
             &["https://example.com", "https://second.example"],
@@ -9232,20 +9312,25 @@ mod tests {
         }
     }
 
-    /// `MouseCaptureState` short-circuits when capture was never enabled
-    /// in the first place — yielding then would emit a `?1006l` for a
-    /// terminal that never opted into `?1006h`, which is at best wasted
-    /// bytes and at worst a state-machine confusion. Same shape going
-    /// the other way: reclaim is a no-op if we never yielded. The
-    /// state assertions below don't write to stdout because we don't
-    /// drive the IO when `mode_active = false`.
+    /// `MouseCaptureState::Disabled` short-circuits both `yield_to_host`
+    /// and `reclaim` — yielding from a state that never had capture
+    /// would emit a `?1006l` for a terminal that never opted into
+    /// `?1006h`, which is at best wasted bytes and at worst a
+    /// state-machine confusion in some terminal emulators. The state
+    /// assertions below don't write to stdout because the methods
+    /// short-circuit before the `execute!` call.
     #[test]
     fn mouse_capture_state_no_op_when_capture_inactive() {
         let mut s = MouseCaptureState::new(false);
+        assert_eq!(s, MouseCaptureState::Disabled);
         s.yield_to_host();
-        assert!(!s.yielded, "yield must do nothing without active capture");
+        assert_eq!(s, MouseCaptureState::Disabled, "yield must not transition");
         s.reclaim();
-        assert!(!s.yielded, "reclaim must do nothing without active capture");
+        assert_eq!(
+            s,
+            MouseCaptureState::Disabled,
+            "reclaim must not transition",
+        );
     }
 
     /// The PID prefix is the whole point of `daemon_agent_id_for` — it
