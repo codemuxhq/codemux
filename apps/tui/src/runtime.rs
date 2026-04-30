@@ -589,6 +589,30 @@ struct Selection {
     head: CellPos,
 }
 
+/// A URL the user is hovering over with Ctrl held. Stored pane-relative
+/// (same as [`Selection`]) and bound to a stable [`AgentId`] so a tab
+/// switch or reap clears it without lookup ambiguity. The renderer
+/// underlines `cols` on `row`; the click handler reads `url` to dispatch
+/// the OS opener. Single-row only — see [`crate::url_scan`] for why.
+#[derive(Clone, Eq, PartialEq, Debug)]
+struct HoverUrl {
+    agent: AgentId,
+    row: u16,
+    cols: std::ops::Range<u16>,
+    url: String,
+}
+
+/// Pane-overlay state passed to the render layer: read-only references
+/// to the user's drag-to-select selection and Ctrl-hover URL highlight.
+/// Bundled to keep render-fn signatures from gaining a parameter every
+/// time a new overlay lands — flagged in architecture review as
+/// viscosity / tramp data when threaded as separate args.
+#[derive(Clone, Copy, Default)]
+struct PaneOverlay<'a> {
+    selection: Option<&'a Selection>,
+    hover: Option<&'a HoverUrl>,
+}
+
 /// Returns `(start, end)` ordered top-left-first regardless of which
 /// direction the user dragged. `vt100::Screen::contents_between`
 /// requires the start cell to be earlier in reading order than the
@@ -1896,7 +1920,93 @@ fn commit_selection(sel: &Selection, agents: &[RuntimeAgent]) {
     }
 }
 
-/// Emit an OSC 52 sequence carrying the selection payload. The host
+/// Translate a screen-cell mouse coordinate into a [`HoverUrl`] when
+/// the cell sits over a URL in the focused agent's pane. Used by both
+/// the Ctrl-hover highlight (drives [`paint_hover_url_if_active`]) and
+/// the Ctrl-click open dispatch (the URL string is what's handed to
+/// `open` / `xdg-open`).
+///
+/// Returns `None` when:
+/// - the click landed outside the recorded pane rect,
+/// - the focused agent isn't `Ready` (no live parser to scan),
+/// - or the cell isn't inside any URL on its row.
+///
+/// Single-row scope matches `find_url_at` — multi-row URLs are a
+/// follow-up; in practice Claude doesn't wrap them.
+fn compute_hover(
+    pane_hitbox: &PaneHitbox,
+    agents: &[RuntimeAgent],
+    column: u16,
+    row: u16,
+) -> Option<HoverUrl> {
+    let (agent_id, cell) = pane_hitbox.cell_at(column, row)?;
+    let agent = agents.iter().find(|a| a.id == agent_id)?;
+    let parser = match &agent.state {
+        AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => parser,
+        AgentState::Failed { .. } => return None,
+    };
+    let span = crate::url_scan::find_url_at(parser.screen(), cell.row, cell.col)?;
+    Some(HoverUrl {
+        agent: agent_id,
+        row: cell.row,
+        cols: span.cols,
+        url: span.url,
+    })
+}
+
+/// Abstraction over the OS-level "open this URL" call. The event loop
+/// holds a `&dyn UrlOpener` rather than calling the platform-specific
+/// command directly — surfaced in arch review as a Dependency Inversion
+/// concern about hardcoded `Command::new("open")` inside the runtime
+/// crate. Production wires [`OsUrlOpener`]; tests can swap in a mock
+/// that records the URLs without spawning a browser.
+trait UrlOpener {
+    fn open(&self, url: &str);
+}
+
+/// Production [`UrlOpener`]: spawns the host OS's URL handler.
+///
+/// macOS: `open <url>`. Other Unix: `xdg-open <url>`. Windows: `cmd /C
+/// start "" <url>` (the empty quoted string is `start`'s "no window
+/// title" sentinel; without it the URL would be parsed as the title).
+///
+/// Best-effort: spawn-only, no wait, no output capture. The URL is
+/// passed as a single argv entry — never through a shell — so a
+/// quote/space/`;` in the URL can't escape into the user's environment.
+/// Same threat model as iTerm2's Cmd+Click.
+struct OsUrlOpener;
+
+impl UrlOpener for OsUrlOpener {
+    fn open(&self, url: &str) {
+        use std::process::{Command, Stdio};
+        let result = if cfg!(target_os = "macos") {
+            Command::new("open")
+                .arg(url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        } else if cfg!(target_os = "windows") {
+            Command::new("cmd")
+                .args(["/C", "start", "", url])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        } else {
+            Command::new("xdg-open")
+                .arg(url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        if let Err(err) = result {
+            tracing::debug!(?err, url, "OsUrlOpener: spawn failed");
+        }
+    }
+}
+
 /// terminal (iTerm2 / Ghostty / Kitty / `WezTerm` / Alacritty / tmux
 /// passthrough) decodes the base64 and writes to the system clipboard.
 ///
@@ -2056,6 +2166,15 @@ fn event_loop(
     // — the lookup at commit time will return `None` and we just clear
     // without writing to the clipboard. See AD-25's selection follow-up.
     let mut selection: Option<Selection> = None;
+    // URL the user is currently hovering with Ctrl held. Drives the
+    // underline overlay (in the renderer) and Ctrl+Click open dispatch
+    // (in the mouse handler). Cleared on resize, focused-agent change,
+    // and any motion event that arrives without Ctrl held.
+    let mut hover: Option<HoverUrl> = None;
+    // Production URL opener: spawns `open` / `xdg-open` / `cmd start`.
+    // Held behind the [`UrlOpener`] trait so a future test can swap in
+    // a recording mock without spawning a real browser.
+    let url_opener: &dyn UrlOpener = &OsUrlOpener;
     let mut spawn_counter: usize = initial_count;
     // PID of this codemux invocation, used to namespace SSH daemon
     // agent_ids so a relaunch can never collide with a still-running
@@ -2288,6 +2407,14 @@ fn event_loop(
         {
             selection = None;
         }
+        // Same staleness guard for the Ctrl-hover URL highlight: if the
+        // focused agent went away (reap, popup pick, dismiss), the cell
+        // coordinates point at an agent that no longer renders here.
+        if let Some(h) = hover.as_ref()
+            && nav.agents.get(nav.focused).is_none_or(|a| a.id != h.agent)
+        {
+            hover = None;
+        }
         // Push the focused agent's title out to the surrounding
         // terminal so Ghostty / iTerm2 / Kitty can label its codemux
         // tab with what's actually on screen. Debounced against the
@@ -2332,7 +2459,10 @@ fn event_loop(
                     chrome,
                     &mut tab_hitboxes,
                     &mut pane_hitbox,
-                    selection.as_ref(),
+                    PaneOverlay {
+                        selection: selection.as_ref(),
+                        hover: hover.as_ref(),
+                    },
                     modal_index_state,
                     segments,
                 );
@@ -2848,9 +2978,15 @@ fn event_loop(
                 // the cheapest correct answer; the user re-drags if
                 // they still want the same text.
                 selection = None;
+                // Same reflow concern for the hover URL: the row /
+                // column the URL was on may now hold different content.
+                hover = None;
             }
             Event::Mouse(MouseEvent {
-                kind, column, row, ..
+                kind,
+                column,
+                row,
+                modifiers,
             }) if no_overlay_active(spawn_ui.as_ref(), nav.popup_state, help_state) => {
                 // Wheel events are unconditional — anywhere in the
                 // window is treated as "scroll the nav.focused agent." In
@@ -2873,6 +3009,35 @@ fn event_loop(
                         }
                     }
                     other => {
+                        // Ctrl+hover: maintain a URL highlight under the
+                        // cursor. Recompute on every Moved event because
+                        // we can't see Ctrl-release-without-motion (no
+                        // keyup in SGR mouse mode); when the user does
+                        // move without Ctrl held, this branch falls
+                        // through to the `clear_hover` path below.
+                        let ctrl_held = modifiers.contains(KeyModifiers::CONTROL);
+                        if ctrl_held && matches!(other, MouseEventKind::Moved) {
+                            hover = compute_hover(&pane_hitbox, &nav.agents, column, row);
+                            continue;
+                        }
+                        if !ctrl_held && hover.is_some() {
+                            hover = None;
+                        }
+                        // Ctrl+Click on a URL cell hands the URL to the
+                        // OS opener and consumes the event so the
+                        // selection-arm path below doesn't also fire.
+                        // Off-URL Ctrl+Click falls through — the user
+                        // probably wants the selection they were going
+                        // to start.
+                        if ctrl_held
+                            && matches!(other, MouseEventKind::Down(MouseButton::Left))
+                            && let Some(span) =
+                                compute_hover(&pane_hitbox, &nav.agents, column, row)
+                        {
+                            url_opener.open(&span.url);
+                            hover = Some(span);
+                            continue;
+                        }
                         // Pane-relative selection takes priority over
                         // tab dispatch: a Down inside the live PTY
                         // surface arms / extends / commits a drag-to-
@@ -3104,7 +3269,7 @@ fn render_frame(
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
     pane_hitbox: &mut PaneHitbox,
-    selection: Option<&Selection>,
+    overlay: PaneOverlay<'_>,
     index_state: Option<&IndexState>,
     segments: &[Box<dyn StatusSegment>],
 ) {
@@ -3146,7 +3311,7 @@ fn render_frame(
                 chrome,
                 hitboxes,
                 pane_hitbox,
-                selection,
+                overlay,
             );
         }
         NavStyle::Popup => {
@@ -3163,7 +3328,7 @@ fn render_frame(
                 chrome,
                 hitboxes,
                 pane_hitbox,
-                selection,
+                overlay,
                 segments,
             );
         }
@@ -3220,14 +3385,15 @@ fn render_agent_pane(
     agent: &RuntimeAgent,
     dismiss_label: &str,
     pane_hitbox: &mut PaneHitbox,
-    selection: Option<&Selection>,
+    overlay: PaneOverlay<'_>,
 ) {
     match &agent.state {
         AgentState::Ready { parser, .. } => {
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
             pane_hitbox.record(area, agent.id.clone());
-            paint_selection_if_active(frame, area, &agent.id, selection);
+            paint_selection_if_active(frame, area, &agent.id, overlay.selection);
+            paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
             if offset > 0 {
                 render_scroll_indicator(frame, area, offset);
@@ -3241,7 +3407,8 @@ fn render_agent_pane(
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
             pane_hitbox.record(area, agent.id.clone());
-            paint_selection_if_active(frame, area, &agent.id, selection);
+            paint_selection_if_active(frame, area, &agent.id, overlay.selection);
+            paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
             if offset > 0 {
                 render_scroll_indicator(frame, area, offset);
@@ -3292,7 +3459,38 @@ fn paint_selection_if_active(
     }
 }
 
-/// One-row banner pinned to the top of a Crashed agent's pane. Same
+/// If `hover` belongs to the agent currently being painted, underline
+/// the URL's column range on its row and tint it cyan. Same overlay
+/// trick as [`paint_selection_if_active`]: additive on the cell's
+/// existing modifier set so styling under the URL passes through.
+///
+/// Out-of-bounds cells are dropped silently — `Buffer::cell_mut`
+/// returns `None` and the inner branch becomes a no-op. This protects
+/// against a stale-frame race where the pane shrank between the hover
+/// being recorded and the next render.
+fn paint_hover_url_if_active(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    agent_id: &AgentId,
+    hover: Option<&HoverUrl>,
+) {
+    let Some(h) = hover else {
+        return;
+    };
+    if &h.agent != agent_id {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let y = area.y.saturating_add(h.row);
+    for col in h.cols.clone() {
+        let x = area.x.saturating_add(col);
+        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+            cell.modifier.insert(Modifier::UNDERLINED);
+            cell.fg = Color::Cyan;
+        }
+    }
+}
+
 /// overlay technique as [`render_scroll_indicator`] (`Clear` + a
 /// styled `Paragraph`) so the underlying last-frame doesn't bleed
 /// through. Color and copy depend on the exit code:
@@ -3430,7 +3628,7 @@ fn render_left_pane(
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
     pane_hitbox: &mut PaneHitbox,
-    selection: Option<&Selection>,
+    overlay: PaneOverlay<'_>,
 ) {
     let [nav_area, pty_area] = Layout::default()
         .direction(Direction::Horizontal)
@@ -3479,14 +3677,7 @@ fn render_left_pane(
     }
 
     if let Some(agent) = agents.get(focused) {
-        render_agent_pane(
-            frame,
-            pty_area,
-            agent,
-            dismiss_label,
-            pane_hitbox,
-            selection,
-        );
+        render_agent_pane(frame, pty_area, agent, dismiss_label, pane_hitbox, overlay);
     }
 }
 
@@ -3504,7 +3695,7 @@ fn render_popup_style(
     chrome: &ChromeStyle,
     hitboxes: &mut TabHitboxes,
     pane_hitbox: &mut PaneHitbox,
-    selection: Option<&Selection>,
+    overlay: PaneOverlay<'_>,
     segments: &[Box<dyn StatusSegment>],
 ) {
     let [pty_area, status_area] = Layout::default()
@@ -3513,14 +3704,7 @@ fn render_popup_style(
         .areas(area);
 
     if let Some(agent) = agents.get(focused) {
-        render_agent_pane(
-            frame,
-            pty_area,
-            agent,
-            dismiss_label,
-            pane_hitbox,
-            selection,
-        );
+        render_agent_pane(frame, pty_area, agent, dismiss_label, pane_hitbox, overlay);
     }
 
     render_status_bar(
@@ -7479,7 +7663,7 @@ mod tests {
                     &ChromeStyle::default(),
                     &mut hb,
                     &mut PaneHitbox::default(),
-                    None,
+                    PaneOverlay::default(),
                 );
             })
             .unwrap();
@@ -7516,7 +7700,7 @@ mod tests {
                     &ChromeStyle::default(),
                     &mut hb,
                     &mut PaneHitbox::default(),
-                    None,
+                    PaneOverlay::default(),
                 );
             })
             .unwrap();
@@ -7559,7 +7743,7 @@ mod tests {
                     &ChromeStyle::default(),
                     &mut hb,
                     &mut PaneHitbox::default(),
-                    None,
+                    PaneOverlay::default(),
                 );
             })
             .unwrap();
@@ -7609,7 +7793,7 @@ mod tests {
                     &agent,
                     "d",
                     &mut PaneHitbox::default(),
-                    None,
+                    PaneOverlay::default(),
                 );
             })
             .unwrap();
@@ -7643,7 +7827,7 @@ mod tests {
                     &agent,
                     "d",
                     &mut PaneHitbox::default(),
-                    None,
+                    PaneOverlay::default(),
                 );
             })
             .unwrap();
@@ -7680,7 +7864,7 @@ mod tests {
                     &agent,
                     "d",
                     &mut PaneHitbox::default(),
-                    None,
+                    PaneOverlay::default(),
                 );
             })
             .unwrap();
@@ -7720,7 +7904,7 @@ mod tests {
                     &agent,
                     "ctrl+x",
                     &mut PaneHitbox::default(),
-                    None,
+                    PaneOverlay::default(),
                 );
             })
             .unwrap();
@@ -8178,6 +8362,180 @@ mod tests {
                 "no cell should be flipped when agent id does not match",
             );
         }
+    }
+
+    #[test]
+    fn paint_hover_url_if_active_underlines_url_range_and_tints_cyan() {
+        // Mirrors paint_selection_if_active_flips_reversed_modifier_on_selected_cells.
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        };
+        let agent_id = AgentId::new("a");
+        let hover = HoverUrl {
+            agent: agent_id.clone(),
+            row: 1,
+            cols: 2..6,
+            url: "https://x".to_string(),
+        };
+        terminal
+            .draw(|frame| {
+                paint_hover_url_if_active(frame, area, &agent_id, Some(&hover));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        for x in 0..10u16 {
+            let cell = &buf[(x, 1)];
+            let in_url = (2..6).contains(&x);
+            assert_eq!(
+                cell.modifier.contains(Modifier::UNDERLINED),
+                in_url,
+                "underline at x={x} expected_in_url={in_url}",
+            );
+            if in_url {
+                assert_eq!(cell.fg, Color::Cyan, "cyan fg at x={x}");
+            }
+        }
+        for x in 0..10u16 {
+            assert!(!buf[(x, 0)].modifier.contains(Modifier::UNDERLINED));
+            assert!(!buf[(x, 2)].modifier.contains(Modifier::UNDERLINED));
+        }
+    }
+
+    #[test]
+    fn paint_hover_url_if_active_skips_when_agent_id_does_not_match() {
+        let backend = TestBackend::new(10, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 3,
+        };
+        let hover = HoverUrl {
+            agent: AgentId::new("a"),
+            row: 0,
+            cols: 0..10,
+            url: "https://x".to_string(),
+        };
+        terminal
+            .draw(|frame| {
+                paint_hover_url_if_active(frame, area, &AgentId::new("b"), Some(&hover));
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        for x in 0..10u16 {
+            assert!(
+                !buf[(x, 0)].modifier.contains(Modifier::UNDERLINED),
+                "no cell should be underlined when agent id does not match",
+            );
+        }
+    }
+
+    fn ready_agent_with(id: &str, cols: u16, body: &[u8]) -> RuntimeAgent {
+        let transport =
+            AgentTransport::for_test(format!("{id}-test"), 5, cols).expect("for_test transport");
+        let mut agent = RuntimeAgent::ready(
+            AgentId::new(id),
+            id.into(),
+            None,
+            None,
+            None,
+            transport,
+            5,
+            cols,
+            100,
+        );
+        if let AgentState::Ready { parser, .. } = &mut agent.state {
+            parser.process(body);
+        }
+        agent
+    }
+
+    #[test]
+    fn compute_hover_returns_url_under_pane_cell() {
+        let agents = vec![ready_agent_with("h", 40, b"see https://example.com here")];
+        let mut hitbox = PaneHitbox::default();
+        hitbox.record(
+            Rect {
+                x: 10,
+                y: 5,
+                width: 40,
+                height: 5,
+            },
+            AgentId::new("h"),
+        );
+        let span =
+            compute_hover(&hitbox, &agents, 14, 5).expect("col 14 maps to pane col 4 (the 'h')");
+        assert_eq!(span.url, "https://example.com");
+        assert_eq!(span.agent, AgentId::new("h"));
+        assert_eq!(span.row, 0);
+        assert_eq!(span.cols, 4..23);
+    }
+
+    #[test]
+    fn compute_hover_returns_none_when_screen_cell_outside_pane() {
+        let agents = vec![ready_agent_with("h", 40, b"https://example.com")];
+        let mut hitbox = PaneHitbox::default();
+        hitbox.record(
+            Rect {
+                x: 10,
+                y: 5,
+                width: 40,
+                height: 5,
+            },
+            AgentId::new("h"),
+        );
+        // (0, 0) is well outside the pane (x=10..50, y=5..10).
+        assert!(compute_hover(&hitbox, &agents, 0, 0).is_none());
+    }
+
+    #[test]
+    fn compute_hover_returns_none_when_no_url_under_cell() {
+        let agents = vec![ready_agent_with("h", 40, b"plain text, no url here")];
+        let mut hitbox = PaneHitbox::default();
+        hitbox.record(
+            Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 5,
+            },
+            AgentId::new("h"),
+        );
+        assert!(compute_hover(&hitbox, &agents, 5, 0).is_none());
+    }
+
+    /// Locks in the [`UrlOpener`] seam: the trait must be implementable
+    /// outside the production [`OsUrlOpener`] so future event-loop
+    /// tests can record URLs without spawning a browser. If this stops
+    /// compiling because the trait gained a method or sealed itself,
+    /// that's a regression in the abstraction.
+    #[test]
+    fn url_opener_trait_supports_recording_mock_implementations() {
+        use std::cell::RefCell;
+        struct Recorder {
+            calls: RefCell<Vec<String>>,
+        }
+        impl UrlOpener for Recorder {
+            fn open(&self, url: &str) {
+                self.calls.borrow_mut().push(url.to_string());
+            }
+        }
+        let r = Recorder {
+            calls: RefCell::new(Vec::new()),
+        };
+        let opener: &dyn UrlOpener = &r;
+        opener.open("https://example.com");
+        opener.open("https://second.example");
+        assert_eq!(
+            r.calls.borrow().as_slice(),
+            &["https://example.com", "https://second.example"],
+        );
     }
 
     /// The PID prefix is the whole point of `daemon_agent_id_for` — it

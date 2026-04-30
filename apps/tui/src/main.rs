@@ -25,6 +25,7 @@ mod runtime;
 mod spawn;
 mod ssh_config;
 mod status_bar;
+mod url_scan;
 use runtime::NavStyle;
 
 #[derive(Debug, Parser)]
