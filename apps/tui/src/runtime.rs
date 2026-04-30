@@ -1172,6 +1172,14 @@ pub fn run(
     if needs_modifier_events {
         keyboard_flags |= KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
         keyboard_flags |= KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+        // Also push REPORT_ALTERNATE_KEYS so the terminal includes the
+        // shifted form alongside the base form for keys like Shift+1.
+        // Without this flag, REPORT_ALL_KEYS_AS_ESCAPE_CODES makes
+        // crossterm receive `KeyCode::Char('1') + SHIFT` and our wire
+        // encoder writes "1" to the PTY instead of "!" — Shift-typed
+        // symbols get the wrong character. With this flag, crossterm
+        // resolves to `KeyCode::Char('!')` directly.
+        keyboard_flags |= KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
     }
     let enhanced_keyboard = !keyboard_flags.is_empty()
         && execute!(io::stdout(), PushKeyboardEnhancementFlags(keyboard_flags)).is_ok();
@@ -2616,6 +2624,7 @@ fn event_loop(
                 if let KeyCode::Modifier(mk) = key.code
                     && matches_url_modifier(mk, mouse_url_modifier)
                 {
+                    tracing::debug!(?mk, kind = ?key.kind, "url-modifier event");
                     match key.kind {
                         KeyEventKind::Press => mouse_capture_state.yield_to_host(),
                         KeyEventKind::Release => mouse_capture_state.reclaim(),
@@ -2637,7 +2646,12 @@ fn event_loop(
                 mouse_capture_state.reclaim();
                 hover = None;
             }
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+            // Press OR Repeat: a held character key sends Repeat events
+            // under KKP `REPORT_EVENT_TYPES`. Treat them the same as
+            // Press for forwarding so the user can hold a key to repeat
+            // it (e.g. holding Backspace to delete-line). Release events
+            // for non-modifier keys are swallowed by the catch-all.
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 // Help screen takes the highest priority: any key closes it
                 // (including the prefix key, which is friendly when the user
                 // opened help by accident).
