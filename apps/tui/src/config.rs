@@ -55,6 +55,17 @@ pub struct Config {
     /// Knobs for the spawn modal — search engine choice and the roots
     /// the fuzzy directory indexer walks.
     pub spawn: SpawnConfig,
+    /// Modifier the user holds to enable host-terminal URL handling
+    /// (Ghostty / iTerm2 / Kitty cursor change + Cmd-click open). When
+    /// the user holds this key, codemux temporarily yields mouse capture
+    /// to the host so its URL hover detector can run; on release we
+    /// reclaim. Independent of the in-app Ctrl+click handler, which
+    /// always works as a fallback whenever mouse capture is active and
+    /// the click arrives with `KeyModifiers::CONTROL` set.
+    ///
+    /// Default: `cmd` on macOS (Ghostty/iTerm2 use Cmd for URLs there),
+    /// `ctrl` elsewhere.
+    pub mouse_url_modifier: MouseUrlModifier,
 }
 
 impl Default for Config {
@@ -64,6 +75,51 @@ impl Default for Config {
             scrollback_len: default_scrollback_len(),
             ui: Ui::default(),
             spawn: SpawnConfig::default(),
+            mouse_url_modifier: MouseUrlModifier::default(),
+        }
+    }
+}
+
+/// Modifier key the user holds to make codemux yield mouse capture so
+/// the host terminal can run its native URL hover-and-open UX.
+///
+/// Why this exists: any DEC mouse capture mode (`?1000h`, `?1002h`,
+/// `?1003h`) silences Ghostty's URL hover detector. We can't deliver
+/// Cmd over the SGR mouse encoding (only shift/alt/ctrl bits exist),
+/// so the only path to native Cmd-click is to temporarily release
+/// capture on the user's modifier press, then reclaim on release. The
+/// Kitty Keyboard Protocol delivers bare-modifier press/release events
+/// when `REPORT_ALL_KEYS_AS_ESCAPE_CODES` + `REPORT_EVENT_TYPES` are
+/// pushed.
+///
+/// `None` disables the yield behavior entirely (in-app Ctrl+click is
+/// the only path).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseUrlModifier {
+    /// Never yield. Only the in-app Ctrl+click handler fires.
+    None,
+    /// Yield while the user holds Cmd (macOS) / Win / Super.
+    /// Aliases: `super`, `win`, `command`.
+    #[serde(alias = "super", alias = "win", alias = "command")]
+    Cmd,
+    /// Yield while the user holds Control. Alias: `control`.
+    #[serde(alias = "control")]
+    Ctrl,
+    /// Yield while the user holds Alt / Option / Meta.
+    /// Aliases: `option`, `meta`.
+    #[serde(alias = "option", alias = "meta")]
+    Alt,
+    /// Yield while the user holds Shift.
+    Shift,
+}
+
+impl Default for MouseUrlModifier {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Cmd
+        } else {
+            Self::Ctrl
         }
     }
 }
@@ -1406,5 +1462,58 @@ mod tests {
             config.spawn.remote_scratch_dir(Path::new("/root")),
             Some(PathBuf::from("/root/.codemux/scratch")),
         );
+    }
+
+    /// Default `mouse_url_modifier` follows the host platform's URL
+    /// convention: Cmd on macOS (Ghostty/iTerm2 use Cmd for URLs),
+    /// Ctrl elsewhere. Locking the default down so a future
+    /// platform-default refactor can't silently flip it.
+    #[test]
+    fn mouse_url_modifier_default_is_platform_aware() {
+        let expected = if cfg!(target_os = "macos") {
+            MouseUrlModifier::Cmd
+        } else {
+            MouseUrlModifier::Ctrl
+        };
+        assert_eq!(MouseUrlModifier::default(), expected);
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.mouse_url_modifier, expected);
+    }
+
+    /// The user-facing config accepts every spelling each modifier
+    /// goes by in the wild. If a future serde rename drops one of
+    /// these aliases, every config file using that spelling silently
+    /// stops parsing — this test catches the regression.
+    #[test]
+    fn mouse_url_modifier_parses_all_documented_spellings() {
+        for spelling in ["cmd", "super", "win", "command"] {
+            let cfg: Config =
+                toml::from_str(&format!("mouse_url_modifier = \"{spelling}\"")).unwrap();
+            assert_eq!(
+                cfg.mouse_url_modifier,
+                MouseUrlModifier::Cmd,
+                "{spelling} should map to Cmd",
+            );
+        }
+        for spelling in ["ctrl", "control"] {
+            let cfg: Config =
+                toml::from_str(&format!("mouse_url_modifier = \"{spelling}\"")).unwrap();
+            assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::Ctrl);
+        }
+        for spelling in ["alt", "option", "meta"] {
+            let cfg: Config =
+                toml::from_str(&format!("mouse_url_modifier = \"{spelling}\"")).unwrap();
+            assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::Alt);
+        }
+        let cfg: Config = toml::from_str("mouse_url_modifier = \"shift\"").unwrap();
+        assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::Shift);
+        let cfg: Config = toml::from_str("mouse_url_modifier = \"none\"").unwrap();
+        assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::None);
+    }
+
+    #[test]
+    fn mouse_url_modifier_rejects_unknown_value() {
+        let res: Result<Config, _> = toml::from_str("mouse_url_modifier = \"bogus\"");
+        assert!(res.is_err(), "unknown modifier should fail to parse");
     }
 }

@@ -35,9 +35,10 @@ use codemuxd_bootstrap::{PreparedHost, RealRunner, RemoteFs};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-    MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -58,7 +59,7 @@ use crate::bootstrap_worker::{
     AttachEvent, AttachHandle, PrepareEvent, PrepareHandle, PrepareSuccess, start_attach,
     start_prepare,
 };
-use crate::config::{Config, SpawnConfig};
+use crate::config::{Config, MouseUrlModifier, SpawnConfig};
 use crate::host_title;
 use crate::index_manager::IndexManager;
 use crate::index_worker::IndexState;
@@ -90,7 +91,7 @@ const SCROLL_INDICATOR_WIDTH: u16 = 24;
 // Each bool tracks an independent terminal capability we may have
 // failed to enable (so we can skip the matching disable on drop).
 // Modeling them as a state machine or pair of two-variant enums
-// would just be ceremony — they're four orthogonal flags.
+// would just be ceremony — they're orthogonal flags.
 #[allow(clippy::struct_excessive_bools)]
 struct TerminalGuard {
     enhanced_keyboard: bool,
@@ -102,6 +103,10 @@ struct TerminalGuard {
     /// flag only exists so a future "skip on bad terminal" branch
     /// has somewhere to live.
     host_title_pushed: bool,
+    /// Whether we asked the terminal to deliver focus-change events.
+    /// Used so the URL-modifier yield logic can reclaim mouse capture
+    /// if the user alt-tabs away while still holding the modifier.
+    focus_changes: bool,
 }
 
 impl Drop for TerminalGuard {
@@ -111,13 +116,15 @@ impl Drop for TerminalGuard {
         // a degraded state, and surfacing an error would clobber whatever the
         // panic backtrace was about to say.
         //
-        // Drop order is the reverse of acquisition: bracketed paste, mouse
-        // capture, then keyboard enhancement, then leave-alt-screen +
-        // raw-mode. Each is an independent escape sequence (`?2004l`,
-        // `?1006l`, `<u`); mirroring acquisition order is the safe
-        // discipline — and skipping the matching disable when the matching
-        // enable failed avoids generating spurious sequences the terminal
-        // never opted into.
+        // Drop order is the reverse of acquisition: focus changes, bracketed
+        // paste, mouse capture, then keyboard enhancement, then leave-alt-
+        // screen + raw-mode. Each is an independent escape sequence; mirroring
+        // acquisition order is the safe discipline — and skipping the matching
+        // disable when the matching enable failed avoids generating spurious
+        // sequences the terminal never opted into.
+        if self.focus_changes {
+            let _ = execute!(io::stdout(), DisableFocusChange);
+        }
         if self.bracketed_paste {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
@@ -1147,22 +1154,39 @@ pub fn run(
         tracing::warn!("EnableBracketedPaste failed; multi-line pastes may submit early");
     }
 
-    // Auto-detect: enable the Kitty Keyboard Protocol only when the user has
-    // bound something to a SUPER (Cmd / Win) chord. Without this, terminals
-    // that support the protocol (Ghostty, Kitty, WezTerm, recent Alacritty,
-    // Foot) cannot deliver Cmd events to the application. Terminals that do
-    // not understand the negotiation simply ignore it; the help screen
-    // remains the escape hatch ("if my chord does not register, the
-    // terminal is the limit, not codemux").
-    let enhanced_keyboard = config.bindings.uses_super_modifier()
-        && execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        )
-        .is_ok();
-    if enhanced_keyboard {
-        tracing::debug!("Kitty Keyboard Protocol enabled (binding uses SUPER)");
+    // Auto-detect: enable the Kitty Keyboard Protocol when the user has
+    // bound something to a SUPER (Cmd / Win) chord OR when the URL-modifier
+    // yield feature is active (the latter needs bare-modifier press/release
+    // events, which are off by default and require the
+    // `REPORT_ALL_KEYS_AS_ESCAPE_CODES` + `REPORT_EVENT_TYPES` sub-modes).
+    // Without this, terminals that support the protocol (Ghostty, Kitty,
+    // WezTerm, recent Alacritty, Foot) cannot deliver Cmd events at all,
+    // and the modifier-yield logic never sees the press/release pair.
+    // Terminals that do not understand the negotiation simply ignore it.
+    let needs_super_keys = config.bindings.uses_super_modifier();
+    let needs_modifier_events = !matches!(config.mouse_url_modifier, MouseUrlModifier::None);
+    let mut keyboard_flags = KeyboardEnhancementFlags::empty();
+    if needs_super_keys || needs_modifier_events {
+        keyboard_flags |= KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
     }
+    if needs_modifier_events {
+        keyboard_flags |= KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
+        keyboard_flags |= KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+    }
+    let enhanced_keyboard = !keyboard_flags.is_empty()
+        && execute!(io::stdout(), PushKeyboardEnhancementFlags(keyboard_flags)).is_ok();
+    if enhanced_keyboard {
+        tracing::debug!(
+            ?keyboard_flags,
+            "Kitty Keyboard Protocol enabled (super-bindings or url-modifier)",
+        );
+    }
+
+    // Focus-change events let us reclaim mouse capture if the user alt-tabs
+    // away while still holding the URL modifier. Only useful when the yield
+    // feature is on; for a `None` modifier we never yield so we never need
+    // to reclaim on focus loss.
+    let focus_changes = needs_modifier_events && execute!(io::stdout(), EnableFocusChange).is_ok();
 
     // Save the user's pre-codemux terminal title onto the emulator's
     // internal stack so the matching pop in `TerminalGuard::drop`
@@ -1176,6 +1200,7 @@ pub fn run(
         mouse_captured,
         bracketed_paste,
         host_title_pushed,
+        focus_changes,
     };
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -1189,6 +1214,8 @@ pub fn run(
         spawn_config: &config.spawn,
         scrollback_len: config.scrollback_len,
         host_bell_on_finish: config.ui.host_bell_on_finish,
+        mouse_captured,
+        mouse_url_modifier: config.mouse_url_modifier,
         segments: &segments,
     };
     event_loop(
@@ -2007,6 +2034,94 @@ impl UrlOpener for OsUrlOpener {
     }
 }
 
+/// Tracks whether codemux has temporarily yielded mouse capture to the
+/// host terminal so the user can use the host's native URL-hover and
+/// click-to-open UX. The yield happens on bare-modifier press (Cmd by
+/// default on macOS, Ctrl elsewhere — configurable via
+/// [`MouseUrlModifier`]); reclaim happens on release or focus loss.
+///
+/// Why this is needed at all: any DEC mouse capture mode silences
+/// Ghostty's URL hover detector (verified empirically — see the test
+/// trail in commit history). The SGR mouse encoding cannot deliver
+/// Super/Cmd, so the only path to native Cmd-click is to step out of
+/// capture entirely while the modifier is held.
+///
+/// `mode_active` is the static "did we ever turn capture on" flag (a
+/// mirror of `TerminalGuard::mouse_captured`); without it, terminals
+/// that refused our initial `EnableMouseCapture` could still see us
+/// emit a no-op `DisableMouseCapture` on yield. Toggle is idempotent
+/// in both directions so a repeated press (no release in between, e.g.
+/// from sticky keys) doesn't over-emit escape sequences.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MouseCaptureState {
+    mode_active: bool,
+    yielded: bool,
+}
+
+impl MouseCaptureState {
+    fn new(mode_active: bool) -> Self {
+        Self {
+            mode_active,
+            yielded: false,
+        }
+    }
+
+    /// Step out of mouse capture so the host terminal can run its
+    /// native URL hover/click handler. No-op when capture was never
+    /// successfully enabled, when we're already yielded, or when the
+    /// `DisableMouseCapture` write fails (in which case we leave the
+    /// state machine intact for the next try).
+    fn yield_to_host(&mut self) {
+        if !self.mode_active || self.yielded {
+            return;
+        }
+        if execute!(io::stdout(), DisableMouseCapture).is_ok() {
+            self.yielded = true;
+        }
+    }
+
+    /// Re-enable mouse capture after the user releases the URL
+    /// modifier (or after focus loss while held). Same idempotency
+    /// posture as [`Self::yield_to_host`].
+    fn reclaim(&mut self) {
+        if !self.mode_active || !self.yielded {
+            return;
+        }
+        if execute!(io::stdout(), EnableMouseCapture).is_ok() {
+            self.yielded = false;
+        }
+    }
+}
+
+/// True when `mk` is the modifier key the user has chosen to drive the
+/// URL-yield. Both left- and right-side variants count, so the user can
+/// hold either physical key. `Cmd` matches Super (macOS Command) and
+/// Meta (some X11 keymaps map the Meta key to the Command key);
+/// platforms differ enough here that being permissive is safer than
+/// strict.
+fn matches_url_modifier(mk: ModifierKeyCode, url_mod: MouseUrlModifier) -> bool {
+    match url_mod {
+        MouseUrlModifier::None => false,
+        MouseUrlModifier::Cmd => matches!(
+            mk,
+            ModifierKeyCode::LeftSuper
+                | ModifierKeyCode::RightSuper
+                | ModifierKeyCode::LeftMeta
+                | ModifierKeyCode::RightMeta
+        ),
+        MouseUrlModifier::Ctrl => matches!(
+            mk,
+            ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl
+        ),
+        MouseUrlModifier::Alt => {
+            matches!(mk, ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt)
+        }
+        MouseUrlModifier::Shift => {
+            matches!(mk, ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
+        }
+    }
+}
+
 /// terminal (iTerm2 / Ghostty / Kitty / `WezTerm` / Alacritty / tmux
 /// passthrough) decodes the base64 and writes to the system clipboard.
 ///
@@ -2067,6 +2182,13 @@ struct RuntimeContext<'a> {
     /// agent's working → idle transition. See `[ui]
     /// host_bell_on_finish` in `Ui` for the user-facing knob.
     host_bell_on_finish: bool,
+    /// True iff the initial `EnableMouseCapture` succeeded. The yield/
+    /// reclaim state machine uses this so it doesn't try to disable
+    /// capture that was never enabled.
+    mouse_captured: bool,
+    /// Modifier key the user holds to make codemux yield mouse capture
+    /// for the host's native URL hover/click UX. See [`MouseUrlModifier`].
+    mouse_url_modifier: MouseUrlModifier,
     /// Status-bar right-side segments, built from
     /// `config.ui.status_bar_segments`. Owned by the caller of
     /// `event_loop`; threaded through to `render_status_bar` so
@@ -2096,6 +2218,8 @@ fn event_loop(
         spawn_config,
         scrollback_len,
         host_bell_on_finish,
+        mouse_captured,
+        mouse_url_modifier,
         segments,
     } = *ctx;
     let mut prefix_state = PrefixState::default();
@@ -2171,6 +2295,11 @@ fn event_loop(
     // (in the mouse handler). Cleared on resize, focused-agent change,
     // and any motion event that arrives without Ctrl held.
     let mut hover: Option<HoverUrl> = None;
+    // Tracks whether mouse capture has been temporarily yielded to the
+    // host terminal so the user's URL modifier can drive Ghostty's
+    // (or iTerm2's, Kitty's, ...) native URL hover/click handler. See
+    // the type doc for why this exists at all.
+    let mut mouse_capture_state = MouseCaptureState::new(mouse_captured);
     // Production URL opener: spawns `open` / `xdg-open` / `cmd start`.
     // Held behind the [`UrlOpener`] trait so a future test can swap in
     // a recording mock without spawning a real browser.
@@ -2474,6 +2603,40 @@ fn event_loop(
         }
 
         match event::read().wrap_err("read input")? {
+            // Bare-modifier press/release (e.g. Cmd alone) drives the
+            // URL-yield state machine: while held, codemux releases mouse
+            // capture so the host terminal can run its native URL UX. The
+            // KKP `REPORT_ALL_KEYS_AS_ESCAPE_CODES` + `REPORT_EVENT_TYPES`
+            // flags push these events; without those flags this arm never
+            // fires (terminals that don't support KKP also fall through
+            // here and the in-app Ctrl+click handler stays the path).
+            // Always swallowed — Claude has no use for bare modifier
+            // events and forwarding them would just leak escape bytes.
+            Event::Key(key) if matches!(key.code, KeyCode::Modifier(_)) => {
+                if let KeyCode::Modifier(mk) = key.code
+                    && matches_url_modifier(mk, mouse_url_modifier)
+                {
+                    match key.kind {
+                        KeyEventKind::Press => mouse_capture_state.yield_to_host(),
+                        KeyEventKind::Release => mouse_capture_state.reclaim(),
+                        KeyEventKind::Repeat => {}
+                    }
+                }
+            }
+            // User alt-tabbed away: if we yielded mouse capture for a
+            // modifier hold, reclaim now. Without this, a focus-loss
+            // mid-hold would leave codemux in the yielded state until
+            // some unrelated event coincidentally sees the modifier
+            // released — the user would notice that wheel/tabs stopped
+            // responding for the duration. `Event::FocusGained` needs
+            // no explicit handler: capture is already in whatever
+            // state we left it (yielded if the user alt-tabbed back
+            // while still holding, else captured) and falls through
+            // the catch-all arm at the bottom.
+            Event::FocusLost => {
+                mouse_capture_state.reclaim();
+                hover = None;
+            }
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 // Help screen takes the highest priority: any key closes it
                 // (including the prefix key, which is friendly when the user
@@ -8667,6 +8830,61 @@ mod tests {
             r.calls.borrow().as_slice(),
             &["https://example.com", "https://second.example"],
         );
+    }
+
+    /// `matches_url_modifier` is the gate between a bare-modifier KKP
+    /// event and the yield state machine. Locking the matrix down so a
+    /// future refactor that adds a new `MouseUrlModifier` variant
+    /// can't silently miss a left-vs-right physical-key case.
+    #[test]
+    fn matches_url_modifier_covers_both_sides_for_each_variant() {
+        use ModifierKeyCode::*;
+        // Cmd: Super + Meta, both sides; everything else rejected.
+        for mk in [LeftSuper, RightSuper, LeftMeta, RightMeta] {
+            assert!(matches_url_modifier(mk, MouseUrlModifier::Cmd), "{mk:?}");
+        }
+        for mk in [
+            LeftControl,
+            RightControl,
+            LeftAlt,
+            RightAlt,
+            LeftShift,
+            RightShift,
+        ] {
+            assert!(!matches_url_modifier(mk, MouseUrlModifier::Cmd), "{mk:?}");
+        }
+        // Ctrl
+        assert!(matches_url_modifier(LeftControl, MouseUrlModifier::Ctrl));
+        assert!(matches_url_modifier(RightControl, MouseUrlModifier::Ctrl));
+        assert!(!matches_url_modifier(LeftSuper, MouseUrlModifier::Ctrl));
+        // Alt
+        assert!(matches_url_modifier(LeftAlt, MouseUrlModifier::Alt));
+        assert!(matches_url_modifier(RightAlt, MouseUrlModifier::Alt));
+        assert!(!matches_url_modifier(LeftShift, MouseUrlModifier::Alt));
+        // Shift
+        assert!(matches_url_modifier(LeftShift, MouseUrlModifier::Shift));
+        assert!(matches_url_modifier(RightShift, MouseUrlModifier::Shift));
+        assert!(!matches_url_modifier(LeftAlt, MouseUrlModifier::Shift));
+        // None: rejects everything.
+        for mk in [LeftSuper, LeftControl, LeftAlt, LeftShift, LeftMeta] {
+            assert!(!matches_url_modifier(mk, MouseUrlModifier::None), "{mk:?}");
+        }
+    }
+
+    /// `MouseCaptureState` short-circuits when capture was never enabled
+    /// in the first place — yielding then would emit a `?1006l` for a
+    /// terminal that never opted into `?1006h`, which is at best wasted
+    /// bytes and at worst a state-machine confusion. Same shape going
+    /// the other way: reclaim is a no-op if we never yielded. The
+    /// state assertions below don't write to stdout because we don't
+    /// drive the IO when `mode_active = false`.
+    #[test]
+    fn mouse_capture_state_no_op_when_capture_inactive() {
+        let mut s = MouseCaptureState::new(false);
+        s.yield_to_host();
+        assert!(!s.yielded, "yield must do nothing without active capture");
+        s.reclaim();
+        assert!(!s.yielded, "reclaim must do nothing without active capture");
     }
 
     /// The PID prefix is the whole point of `daemon_agent_id_for` — it
