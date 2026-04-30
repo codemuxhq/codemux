@@ -31,20 +31,47 @@ pub(crate) struct UrlSpan {
     pub cols: Range<u16>,
 }
 
+/// Same as [`UrlSpan`] but with the row index attached. Returned by
+/// [`find_urls_in_screen`] so the renderer can walk every visible URL
+/// in the pane in one call instead of scanning row-by-row itself.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub(crate) struct UrlSpanAt {
+    pub url: String,
+    pub row: u16,
+    pub cols: Range<u16>,
+}
+
 /// Returns the URL whose column span covers `target_col` on `target_row`,
 /// or `None` if the cell isn't inside any URL.
-///
-/// Cheap: one row scan, early-returns the first match. No allocations
-/// on the no-URL path beyond a per-row text buffer that's reused
-/// across calls if the caller cares. Caller currently invokes per
-/// mouse event, which is fine — typical row width is < 200 cells.
 pub(crate) fn find_url_at(screen: &Screen, target_row: u16, target_col: u16) -> Option<UrlSpan> {
     let (rows, cols) = screen.size();
     if target_row >= rows || target_col >= cols {
         return None;
     }
     let row_text = collect_row(screen, target_row, cols);
-    scan_for_url_at(&row_text, target_col)
+    scan_row_urls(&row_text)
+        .into_iter()
+        .find(|span| span.cols.contains(&target_col))
+}
+
+/// Find every URL across every visible row of `screen`. Used by the
+/// OSC 8 hyperlink injector — see [`crate::runtime::paint_hyperlinks`].
+/// Skips the trailing rows that contain no schemes via cheap byte
+/// scanning, so cost on idle frames stays bounded.
+pub(crate) fn find_urls_in_screen(screen: &Screen) -> Vec<UrlSpanAt> {
+    let (rows, cols) = screen.size();
+    let mut out = Vec::new();
+    for row in 0..rows {
+        let row_text = collect_row(screen, row, cols);
+        for span in scan_row_urls(&row_text) {
+            out.push(UrlSpanAt {
+                url: span.url,
+                row,
+                cols: span.cols,
+            });
+        }
+    }
+    out
 }
 
 /// One byte in the assembled row text and the cell column it came
@@ -100,40 +127,39 @@ fn collect_row(screen: &Screen, row: u16, cols: u16) -> RowText {
     }
 }
 
-/// Find the first URL on `row` whose column range covers `target_col`,
-/// or `None` if no URL spans that cell. Walks the schemes once and
-/// returns as soon as it finds a hit, so the no-URL path is cheap and
-/// a row with several URLs only pays for the ones up to the target.
-fn scan_for_url_at(row: &RowText, target_col: u16) -> Option<UrlSpan> {
+/// Find every URL on `row` and return them in left-to-right order.
+/// Each [`UrlSpan`] carries the URL string and its half-open column
+/// range. Trailing prose punctuation that's almost never part of a
+/// URL is trimmed (matches the linkify behaviour every modern
+/// terminal uses).
+fn scan_row_urls(row: &RowText) -> Vec<UrlSpan> {
+    let mut out = Vec::new();
     let bytes = row.text.as_bytes();
     let mut search_from = 0_usize;
     while let Some((scheme_start, scheme_len)) = next_scheme(bytes, search_from) {
-        let url_start = scheme_start;
         let url_end = walk_url_end(bytes, scheme_start + scheme_len);
-        let trimmed_end = trim_trailing_punct(bytes, url_start, url_end);
-        if trimmed_end > url_start + scheme_len {
-            let col_start = row.col_of_byte[url_start];
+        let trimmed_end = trim_trailing_punct(bytes, scheme_start, url_end);
+        if trimmed_end > scheme_start + scheme_len {
+            let col_start = row.col_of_byte[scheme_start];
             let col_end = row
                 .col_of_byte
                 .get(trimmed_end)
                 .copied()
                 .unwrap_or(row.end_col);
-            if (col_start..col_end).contains(&target_col) {
-                // SAFETY: `url_start` and `trimmed_end` are byte
-                // indices that came from scanning ASCII scheme prefixes
-                // and ASCII terminator characters, so they always land
-                // on UTF-8 character boundaries even when the row
-                // contains multi-byte text. String-byte slicing here
-                // can't panic for the inputs collect_row produces.
-                return Some(UrlSpan {
-                    url: row.text[url_start..trimmed_end].to_string(),
-                    cols: col_start..col_end,
-                });
-            }
+            // SAFETY: `scheme_start` and `trimmed_end` are byte indices
+            // that came from scanning ASCII scheme prefixes and ASCII
+            // terminator characters, so they always land on UTF-8
+            // character boundaries even when the row contains multi-
+            // byte text. String-byte slicing here can't panic for the
+            // inputs collect_row produces.
+            out.push(UrlSpan {
+                url: row.text[scheme_start..trimmed_end].to_string(),
+                cols: col_start..col_end,
+            });
         }
         search_from = url_end.max(scheme_start + 1);
     }
-    None
+    out
 }
 
 /// Find the next scheme prefix (`https://`, `http://`, …) at or after
@@ -274,5 +300,37 @@ mod tests {
         let p = parser_with("<https://example.com>");
         let span = find(&p, 0, 1).expect("on 'h'");
         assert_eq!(span.url, "https://example.com");
+    }
+
+    #[test]
+    fn find_urls_in_screen_returns_every_url_across_rows() {
+        let mut p = Parser::new(3, 40, 0);
+        p.process(b"top https://a.example.com line\r\n");
+        p.process(b"middle no-url here\r\n");
+        p.process(b"bottom http://b.example.org end");
+        let spans = find_urls_in_screen(p.screen());
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].url, "https://a.example.com");
+        assert_eq!(spans[0].row, 0);
+        assert_eq!(spans[1].url, "http://b.example.org");
+        assert_eq!(spans[1].row, 2);
+    }
+
+    #[test]
+    fn find_urls_in_screen_returns_multiple_urls_on_one_row() {
+        let mut p = Parser::new(1, 60, 0);
+        p.process(b"see http://a.b and https://c.d for more");
+        let spans = find_urls_in_screen(p.screen());
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].url, "http://a.b");
+        assert_eq!(spans[1].url, "https://c.d");
+        assert!(spans[0].cols.end <= spans[1].cols.start);
+    }
+
+    #[test]
+    fn find_urls_in_screen_returns_empty_when_no_urls() {
+        let mut p = Parser::new(2, 20, 0);
+        p.process(b"plain text\r\nno urls here");
+        assert!(find_urls_in_screen(p.screen()).is_empty());
     }
 }

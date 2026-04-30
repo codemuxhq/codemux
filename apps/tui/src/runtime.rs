@@ -3392,6 +3392,7 @@ fn render_agent_pane(
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
             pane_hitbox.record(area, agent.id.clone());
+            paint_hyperlinks(frame, area, parser.screen());
             paint_selection_if_active(frame, area, &agent.id, overlay.selection);
             paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
@@ -3407,6 +3408,7 @@ fn render_agent_pane(
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
             pane_hitbox.record(area, agent.id.clone());
+            paint_hyperlinks(frame, area, parser.screen());
             paint_selection_if_active(frame, area, &agent.id, overlay.selection);
             paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
@@ -3424,7 +3426,55 @@ fn render_agent_pane(
     }
 }
 
-/// If `selection` belongs to the agent currently being painted, flip
+/// Wrap every URL in the visible PTY screen with OSC 8 hyperlink
+/// escape sequences so the host terminal (Ghostty / iTerm2 / Kitty /
+/// `WezTerm`) can render its native URL-hover indicator and open the
+/// link via Cmd-click (macOS) or Ctrl-click (Linux/Win) — whichever
+/// modifier the host terminal is configured for.
+///
+/// The trick: the `tui-term`/`vt100` pipeline drops OSC 8 from
+/// Claude's output (vt100 0.16 ignores `osc_dispatch`). We can't
+/// resurrect Claude's hyperlink intent, but we can scan the rendered
+/// cells for plain-text URLs and wrap them ourselves before the bytes
+/// reach the host terminal. We do that by mutating the first URL
+/// cell's `symbol` to *prepend* `\x1b]8;;<url>\x1b\\` and the last
+/// URL cell's `symbol` to *append* `\x1b]8;;\x1b\\`. The host
+/// terminal parses the OSC 8 inline and remembers each cell's
+/// hyperlink target; non-supporting terminals strip the unknown OSC
+/// silently.
+///
+/// The crossterm backend writes `Print(cell.symbol())` verbatim and
+/// advances `last_pos` by one column per cell, so embedding multi-
+/// byte escape sequences in a symbol doesn't desync the cell layout
+/// — the bytes are control sequences from the terminal's perspective.
+///
+/// Out-of-bounds cells (clipped by a renderer that drew over part of
+/// the area, or coordinates that drifted out during a resize race)
+/// are dropped silently.
+fn paint_hyperlinks(frame: &mut Frame<'_>, area: Rect, screen: &vt100::Screen) {
+    let spans = crate::url_scan::find_urls_in_screen(screen);
+    if spans.is_empty() {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for span in spans {
+        if span.cols.start >= span.cols.end {
+            continue;
+        }
+        let y = area.y.saturating_add(span.row);
+        let first_x = area.x.saturating_add(span.cols.start);
+        let last_x = area.x.saturating_add(span.cols.end.saturating_sub(1));
+        if let Some(cell) = buf.cell_mut(Position::new(first_x, y)) {
+            let original = cell.symbol().to_string();
+            cell.set_symbol(&format!("\x1b]8;;{}\x1b\\{original}", span.url));
+        }
+        if let Some(cell) = buf.cell_mut(Position::new(last_x, y)) {
+            let original = cell.symbol().to_string();
+            cell.set_symbol(&format!("{original}\x1b]8;;\x1b\\"));
+        }
+    }
+}
+
 /// the `REVERSED` modifier on every cell in the normalized selection
 /// rectangle. Additive on the cell's existing modifier set so bold /
 /// italic / underline / colors pass through unchanged.
@@ -8433,6 +8483,87 @@ mod tests {
                 !buf[(x, 0)].modifier.contains(Modifier::UNDERLINED),
                 "no cell should be underlined when agent id does not match",
             );
+        }
+    }
+
+    /// `paint_hyperlinks` should prepend OSC 8 setup to the first
+    /// URL cell's symbol and append the OSC 8 reset to the last URL
+    /// cell's symbol. The host terminal parses the inline escape
+    /// sequence and tags the run as a hyperlink. Cells outside the
+    /// URL range stay untouched.
+    #[test]
+    fn paint_hyperlinks_wraps_url_cells_with_osc_8_setup_and_reset() {
+        // 3-row screen so we exercise multi-row scanning. URL goes on row 1.
+        let mut parser = vt100::Parser::new(3, 40, 0);
+        parser.process(b"plain row\r\nsee https://example.com here\r\nbottom");
+
+        let backend = TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 3,
+        };
+        terminal
+            .draw(|frame| {
+                // First render via PseudoTerminal so cells have the URL text,
+                // then layer the OSC 8 wrapper on top.
+                let widget = PseudoTerminal::new(parser.screen());
+                frame.render_widget(widget, area);
+                paint_hyperlinks(frame, area, parser.screen());
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let first = buf[(4u16, 1u16)].symbol(); // 'h' of "https"
+        let last = buf[(22u16, 1u16)].symbol(); // 'm' of "...com"
+        assert!(
+            first.starts_with("\x1b]8;;https://example.com\x1b\\"),
+            "first cell should carry OSC 8 setup, got {first:?}",
+        );
+        assert!(first.ends_with('h'), "first cell still renders 'h'");
+        assert!(
+            last.ends_with("\x1b]8;;\x1b\\"),
+            "last cell should carry OSC 8 reset, got {last:?}",
+        );
+        // A cell well outside the URL range must not contain any escape bytes.
+        let outside = buf[(0u16, 0u16)].symbol();
+        assert!(
+            !outside.contains('\x1b'),
+            "non-URL cell should be untouched, got {outside:?}",
+        );
+    }
+
+    #[test]
+    fn paint_hyperlinks_is_a_no_op_when_no_urls_present() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"plain text\r\nno url here");
+
+        let backend = TestBackend::new(20, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 2,
+        };
+        terminal
+            .draw(|frame| {
+                let widget = PseudoTerminal::new(parser.screen());
+                frame.render_widget(widget, area);
+                paint_hyperlinks(frame, area, parser.screen());
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        for y in 0..2u16 {
+            for x in 0..20u16 {
+                assert!(
+                    !buf[(x, y)].symbol().contains('\x1b'),
+                    "no escape sequence should leak when no URLs found ({x},{y})",
+                );
+            }
         }
     }
 
