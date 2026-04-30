@@ -710,10 +710,10 @@ struct RuntimeAgent {
     /// Stored separately from [`Self::repo`] because the status-bar
     /// `BranchSegment` needs the original cwd to compare its basename
     /// against `repo` (worktree vs. plain checkout) and the
-    /// `agent_meta_worker` needs it to read `.git/HEAD` and resolve
-    /// the JSONL transcript path. `None` for SSH agents (cwd is
-    /// remote — different type, not handled in v1) and for local
-    /// agents spawned without an explicit cwd.
+    /// `agent_meta_worker` needs it to read `.git/HEAD` for the
+    /// branch lookup. `None` for SSH agents (cwd is remote —
+    /// different type, not handled in v1) and for local agents
+    /// spawned without an explicit cwd.
     cwd: Option<PathBuf>,
     /// Hostname for SSH-backed agents (`Some` for both Ready and
     /// Failed SSH agents, `None` for local). The single source of
@@ -721,12 +721,16 @@ struct RuntimeAgent {
     /// and the failure pane reads it for the "✗ bootstrap of {host}
     /// failed" line.
     host: Option<String>,
-    /// Most-recent Claude model reported by the [`crate::agent_meta_worker`].
-    /// Updates when the user runs `/model` inside the focused agent.
-    /// `None` until the worker's first successful read of the
-    /// session JSONL, and for SSH agents (worker only handles local
-    /// in v1).
-    model: Option<String>,
+    /// Most-recent model alias + reasoning effort reported by the
+    /// [`crate::agent_meta_worker`]. Updates when the user runs
+    /// `/model` inside any agent (the source is the global
+    /// `~/.claude/settings.json`, not a per-session transcript).
+    /// `None` until the worker's first successful read of that file,
+    /// and for SSH agents (worker only handles local in v1). Held as
+    /// a single struct rather than two flat fields so the segment
+    /// can never render a torn pair (a fresh model with a stale
+    /// effort, or vice versa).
+    model_effort: Option<crate::agent_meta_worker::ModelEffort>,
     /// Most-recent git branch reported by the [`crate::agent_meta_worker`]
     /// for the focused agent's cwd. `None` outside a git repo, on
     /// HEAD-parse failures, and for SSH agents.
@@ -842,7 +846,7 @@ impl RuntimeAgent {
             repo,
             cwd,
             host,
-            model: None,
+            model_effort: None,
             branch: None,
             last_working: false,
             needs_attention: false,
@@ -877,7 +881,7 @@ impl RuntimeAgent {
             repo,
             cwd,
             host: Some(host),
-            model: None,
+            model_effort: None,
             branch: None,
             last_working: false,
             needs_attention: false,
@@ -1638,7 +1642,7 @@ fn apply_meta_events(agents: &mut [RuntimeAgent], events: Vec<MetaEvent>) {
         };
         match ev {
             MetaEvent::Branch { value, .. } => agent.branch = value,
-            MetaEvent::Model { value, .. } => agent.model = value,
+            MetaEvent::Model { value, .. } => agent.model_effort = value,
         }
     }
 }
@@ -2014,11 +2018,12 @@ fn event_loop(
             index_mgr.request_local_swr(&spawn_config.search_roots, &spawn_config.project_markers);
         tracing::debug!(?outcome, "fuzzy index: build started at session start");
     }
-    // Per-focused-agent meta worker: tails the latest Claude session
-    // JSONL for `model` and re-reads `.git/HEAD` for `branch`, then
-    // posts MetaEvents back to the runtime which caches the values
-    // on RuntimeAgent.{model,branch} for the status bar to render.
-    // Single thread, focused-agent only — see [`agent_meta_worker`].
+    // Per-focused-agent meta worker: reads `~/.claude/settings.json`
+    // for `model`+`effortLevel` and re-reads `<cwd>/.git/HEAD` for
+    // `branch`, then posts MetaEvents back to the runtime which
+    // caches the values on RuntimeAgent.{model,effort,branch} for
+    // the status bar to render. Single thread, focused-agent only —
+    // see [`agent_meta_worker`].
     let meta_worker = AgentMetaWorker::start();
     let initial_count = agents.len();
     // Bundle the four navigation locals (`agents`, `focused`,
@@ -2172,8 +2177,8 @@ fn event_loop(
                             attach.label.clone(),
                             attach.repo.clone(),
                             // SSH agents have a remote cwd; `cwd: PathBuf`
-                            // is for local-only operations (git HEAD reads,
-                            // JSONL tailing). Pass None — the meta-worker
+                            // is for local-only operations (git HEAD
+                            // reads). Pass None — the meta-worker
                             // skips SSH agents in v1.
                             None,
                             Some(attach.host.clone()),
@@ -3570,7 +3575,7 @@ fn render_status_bar(
     let ctx = SegmentCtx {
         repo: focused_agent.and_then(|a| a.repo.as_deref()),
         branch: focused_agent.and_then(|a| a.branch.as_deref()),
-        model: focused_agent.and_then(|a| a.model.as_deref()),
+        model_effort: focused_agent.and_then(|a| a.model_effort.as_ref()),
         cwd_basename: focused_agent
             .and_then(|a| a.cwd.as_deref())
             .and_then(|p| p.file_name())
@@ -6762,7 +6767,7 @@ mod tests {
         let mk = |state| SegmentCtx {
             repo: None,
             branch: None,
-            model: None,
+            model_effort: None,
             cwd_basename: None,
             prefix_state: state,
             bindings: &bindings,
@@ -8686,5 +8691,89 @@ mod tests {
         );
         assert!(slot.prepared.is_some());
         assert!(spawn_ui.is_some());
+    }
+
+    // ---- apply_meta_events ----
+
+    #[test]
+    fn apply_meta_events_routes_branch_to_matching_agent() {
+        // Branch event addressed to agent "a" lands on "a", not "b".
+        let mut a = ready_test_agent(100);
+        a.id = AgentId::new("a");
+        let mut b = ready_test_agent(100);
+        b.id = AgentId::new("b");
+        let mut agents = vec![a, b];
+        apply_meta_events(
+            &mut agents,
+            vec![MetaEvent::Branch {
+                agent_id: AgentId::new("a"),
+                value: Some("feature/x".into()),
+            }],
+        );
+        assert_eq!(agents[0].branch.as_deref(), Some("feature/x"));
+        assert!(agents[1].branch.is_none());
+    }
+
+    #[test]
+    fn apply_meta_events_writes_model_and_effort_together() {
+        // Some(ModelEffort) populates both fields on the agent.
+        // Pairing them in one event is the contract that keeps the
+        // segment from rendering a stale model with a fresh effort.
+        let mut agent = ready_test_agent(100);
+        agent.id = AgentId::new("a");
+        let mut agents = vec![agent];
+        apply_meta_events(
+            &mut agents,
+            vec![MetaEvent::Model {
+                agent_id: AgentId::new("a"),
+                value: Some(crate::agent_meta_worker::ModelEffort {
+                    model: "opus[1m]".into(),
+                    effort: Some("xhigh".into()),
+                }),
+            }],
+        );
+        let me = agents[0].model_effort.as_ref().unwrap();
+        assert_eq!(me.model, "opus[1m]");
+        assert_eq!(me.effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn apply_meta_events_clears_model_and_effort_on_none() {
+        // None means settings.json couldn't be read this poll. Both
+        // fields must clear together so the segment hides cleanly
+        // rather than displaying a stale pair.
+        let mut agent = ready_test_agent(100);
+        agent.id = AgentId::new("a");
+        agent.model_effort = Some(crate::agent_meta_worker::ModelEffort {
+            model: "opus[1m]".into(),
+            effort: Some("xhigh".into()),
+        });
+        let mut agents = vec![agent];
+        apply_meta_events(
+            &mut agents,
+            vec![MetaEvent::Model {
+                agent_id: AgentId::new("a"),
+                value: None,
+            }],
+        );
+        assert!(agents[0].model_effort.is_none());
+    }
+
+    #[test]
+    fn apply_meta_events_drops_events_for_unknown_agents() {
+        // A focus change or reorder mid-poll can leave events
+        // addressed to agents that no longer exist in the slice.
+        // The function must drop them silently rather than panic.
+        let mut agent = ready_test_agent(100);
+        agent.id = AgentId::new("a");
+        let mut agents = vec![agent];
+        apply_meta_events(
+            &mut agents,
+            vec![MetaEvent::Branch {
+                agent_id: AgentId::new("ghost"),
+                value: Some("ghost-branch".into()),
+            }],
+        );
+        assert!(agents[0].branch.is_none());
     }
 }

@@ -1,15 +1,15 @@
-//! Background worker that surfaces "what model is the focused agent
-//! running, and what git branch is its cwd on" to the status bar.
+//! Background worker that surfaces "what model + effort is the focused
+//! agent running, and what git branch is its cwd on" to the status bar.
 //!
 //! ## Why a background worker
 //!
 //! Both lookups touch the filesystem — the branch lookup reads
-//! `<cwd>/.git/HEAD` (cheap, but still I/O), and the model lookup tails
-//! `~/.claude/projects/<encoded-cwd>/*.jsonl` (potentially many MB).
-//! Doing either inline on the render hot path would risk a stutter. We
-//! poll on a 2 s cadence — slow enough to be invisible to top, fast
-//! enough that a `/model` change in claude is reflected before the
-//! user has time to be confused about it.
+//! `<cwd>/.git/HEAD` (cheap, but still I/O), and the model lookup
+//! reads `~/.claude/settings.json` (small JSON config). Doing either
+//! inline on the render hot path would risk a stutter. We poll on a
+//! 2 s cadence — slow enough to be invisible to top, fast enough that
+//! a `/model` change in claude is reflected before the user has time
+//! to be confused about it.
 //!
 //! ## Single coordinator, focused-agent only
 //!
@@ -17,21 +17,26 @@
 //! [`crate::index_manager`] pattern. The runtime calls
 //! [`AgentMetaWorker::set_target`] when focus changes; the worker
 //! tracks the latest target and polls just that one. SSH agents are
-//! not handled in v1 (the worker silently ignores them); see the
-//! plan file for the deferral rationale.
+//! not handled in v1 (the worker silently ignores them): the branch
+//! lookup needs a local cwd, and the model/effort lookup reads the
+//! *local* user's settings, which may not match the remote claude
+//! instance's state.
 //!
 //! ## AD-1 carve-out
 //!
-//! Reading `~/.claude/projects/<encoded-cwd>/*.jsonl` is the single
-//! sanctioned exception to AD-1's "never semantically parse Claude
-//! Code" rule. We only read one specific file shape (the per-session
-//! transcript JSONL), only extract one specific field
-//! (`message.model` from the most recent assistant turn), only for
-//! the focused agent, and only for local agents in v1. See AD-1's
+//! Reading `~/.claude/settings.json` is the single sanctioned
+//! exception to AD-1's "never semantically parse Claude Code" rule.
+//! We only read one specific file (the user's global claude config),
+//! only extract two fields (`model`, `effortLevel`), only for the
+//! focused local agent. The previous approach tailed the per-session
+//! JSONL transcript for the model; that was dropped because the
+//! "newest jsonl by mtime" heuristic was fragile when multiple
+//! sessions shared a project directory (the wrong session's transcript
+//! could win the mtime race, masking `/model` changes in the active
+//! agent). settings.json is a single-writer file that updates
+//! immediately on `/model`, so the bug class disappears. See AD-1's
 //! amended prose in `docs/architecture.md`.
 
-use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,9 +55,9 @@ use crate::git_branch;
 const POLL_INTERVAL: Duration = Duration::from_millis(2_000);
 
 /// Pluggable IO surface for the worker. Production uses [`RealProbe`]
-/// which calls into [`git_branch`] and the JSONL tailer; tests use a
-/// scripted impl so the worker thread can be exercised without
-/// touching the real filesystem and without sleeping.
+/// which calls into [`git_branch`] and reads `~/.claude/settings.json`;
+/// tests use a scripted impl so the worker thread can be exercised
+/// without touching the real filesystem and without sleeping.
 ///
 /// `Send + Sync + 'static` because the worker thread captures it
 /// behind `Box<dyn MetaProbe>` and reads through it concurrently with
@@ -61,10 +66,30 @@ pub trait MetaProbe: Send + Sync + 'static {
     /// Read the git branch for `cwd`. `None` outside a git repo or on
     /// an unreadable HEAD.
     fn read_branch(&self, cwd: &Path) -> Option<String>;
-    /// Read the most-recent assistant model for `cwd`'s Claude session
-    /// transcript. `None` when no transcript exists yet, no assistant
-    /// turn yet, or any IO failure.
-    fn read_model(&self, cwd: &Path) -> Option<String>;
+    /// Read the user's currently-active claude model (alias) and
+    /// reasoning effort level from `~/.claude/settings.json`. Returns
+    /// `None` when the file can't be read or has no `model` field.
+    /// The effort level is a separate `Option` because it may be
+    /// absent from the file (older claude versions, default value
+    /// not yet customised).
+    fn read_model_effort(&self) -> Option<ModelEffort>;
+}
+
+/// Pair returned by [`MetaProbe::read_model_effort`]. The model alias
+/// is required (no point reporting "we read the file but no model");
+/// effort is optional (older settings.json files may not have it, and
+/// claude only writes the field when it's been customised).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ModelEffort {
+    /// Raw alias as it appears in `~/.claude/settings.json`'s `model`
+    /// field — `"opus[1m]"`, `"sonnet"`, `"claude-opus-4-7[1m]"`, etc.
+    /// The status-bar segment shortens this for display; the worker
+    /// passes it through verbatim.
+    pub model: String,
+    /// Reasoning effort level from `effortLevel` — `"low"`, `"medium"`,
+    /// `"high"`, `"xhigh"`. `None` when the field is absent. The
+    /// segment hides the effort badge for the default value.
+    pub effort: Option<String>,
 }
 
 /// Production [`MetaProbe`]: forwards to the real filesystem readers.
@@ -77,8 +102,8 @@ impl MetaProbe for RealProbe {
         git_branch::resolve_local(cwd)
     }
 
-    fn read_model(&self, cwd: &Path) -> Option<String> {
-        current_model_for_cwd(cwd)
+    fn read_model_effort(&self) -> Option<ModelEffort> {
+        current_model_and_effort()
     }
 }
 
@@ -94,12 +119,15 @@ pub enum MetaEvent {
         agent_id: AgentId,
         value: Option<String>,
     },
-    /// New model reading. `value = None` means "no JSONL found yet"
-    /// (claude hasn't started writing the session file) or "no
-    /// assistant turn yet."
+    /// New model + effort reading. `value = None` means
+    /// `~/.claude/settings.json` couldn't be read (no HOME, file
+    /// missing, malformed) or has no `model` field. Carries both
+    /// fields together because they live in the same file and read
+    /// atomically — splitting them into two events would risk a frame
+    /// where the user briefly sees a model with the wrong effort.
     Model {
         agent_id: AgentId,
-        value: Option<String>,
+        value: Option<ModelEffort>,
     },
 }
 
@@ -211,7 +239,7 @@ fn worker_loop(
 ) {
     let mut target: Option<(AgentId, PathBuf)> = None;
     let mut last_branch: Option<String> = None;
-    let mut last_model: Option<String> = None;
+    let mut last_model_effort: Option<ModelEffort> = None;
 
     while !cancel.load(Ordering::Relaxed) {
         let has_target = target.is_some();
@@ -231,14 +259,16 @@ fn worker_loop(
                     return;
                 }
             }
-            // Model lookup: find newest jsonl, scan tail-first.
-            let model = probe.read_model(cwd);
-            if model != last_model {
-                last_model.clone_from(&model);
+            // Model + effort lookup: read the global claude
+            // settings.json, paired together so the segment never
+            // shows model-without-effort or vice versa for one frame.
+            let model_effort = probe.read_model_effort();
+            if model_effort != last_model_effort {
+                last_model_effort.clone_from(&model_effort);
                 if events_tx
                     .send(MetaEvent::Model {
                         agent_id: agent_id.clone(),
-                        value: model,
+                        value: model_effort,
                     })
                     .is_err()
                 {
@@ -255,7 +285,7 @@ fn worker_loop(
             // or the next poll cycle, whichever comes first.
             match control_rx.recv_timeout(poll_interval) {
                 Ok(msg) => {
-                    apply_control(msg, &mut target, &mut last_branch, &mut last_model);
+                    apply_control(msg, &mut target, &mut last_branch, &mut last_model_effort);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -264,7 +294,7 @@ fn worker_loop(
             // Idle: block until the runtime hands us a target.
             match control_rx.recv() {
                 Ok(msg) => {
-                    apply_control(msg, &mut target, &mut last_branch, &mut last_model);
+                    apply_control(msg, &mut target, &mut last_branch, &mut last_model_effort);
                 }
                 Err(_) => return,
             }
@@ -279,7 +309,7 @@ fn apply_control(
     msg: Control,
     target: &mut Option<(AgentId, PathBuf)>,
     last_branch: &mut Option<String>,
-    last_model: &mut Option<String>,
+    last_model_effort: &mut Option<ModelEffort>,
 ) {
     match msg {
         Control::SetTarget { agent_id, cwd } => {
@@ -289,135 +319,64 @@ fn apply_control(
                 // fresh poll instead of inheriting the previous
                 // agent's last reading.
                 *last_branch = None;
-                *last_model = None;
+                *last_model_effort = None;
             }
             *target = Some((agent_id, cwd));
         }
         Control::ClearTarget => {
             *target = None;
             *last_branch = None;
-            *last_model = None;
+            *last_model_effort = None;
         }
     }
 }
 
-/// Resolve the most-recent Claude `model` for `cwd` by:
+/// Read the user's currently-active claude model and effort level
+/// from `~/.claude/settings.json`.
 ///
-/// 1. Encoding `cwd` into the directory name Claude uses for its
-///    project transcripts (every `/` and `.` becomes `-`, leading
-///    `-` preserved).
-/// 2. Locating the most-recently-modified `.jsonl` file in
-///    `~/.claude/projects/<encoded>/`.
-/// 3. Scanning that file from the end, stopping at the first
-///    `{"type":"assistant","message":{"model":"...",...}}` line.
+/// Returns `None` for any failure (no `$HOME`, settings.json missing,
+/// malformed JSON, no `model` field). The model field is required to
+/// return `Some` — without it there's nothing to display, and pairing
+/// an effort with no model would render a stray bracket on the bar.
 ///
-/// Returns `None` for any failure (no `$HOME`, no projects dir, no
-/// jsonl, no assistant line yet, malformed file). Caller treats
-/// `None` as "no model to display."
+/// The `model` field is the alias the user picked from `/model`
+/// (e.g. `"opus[1m]"`, `"sonnet"`). The status-bar segment shortens
+/// it for display; we pass it through verbatim.
+///
+/// Why settings.json instead of the per-session JSONL transcript:
+/// the previous tailing approach picked the newest `.jsonl` by mtime
+/// in the project directory, which raced when multiple sessions
+/// shared a project dir (host vs. test instance vs. subagent
+/// transcripts) — a `/model` switch in one agent could appear to do
+/// nothing because the worker was scanning a different session's
+/// transcript. settings.json is a single-writer global file that
+/// updates immediately on `/model`. See AD-1 in `docs/architecture.md`.
 #[must_use]
-pub fn current_model_for_cwd(cwd: &Path) -> Option<String> {
+pub fn current_model_and_effort() -> Option<ModelEffort> {
     let home = std::env::var_os("HOME")?;
-    let encoded = encode_cwd(cwd)?;
-    let project_dir = PathBuf::from(home)
-        .join(".claude")
-        .join("projects")
-        .join(encoded);
-    let newest = newest_jsonl_in(&project_dir)?;
-    latest_model_in_file(&newest)
+    let path = PathBuf::from(home).join(".claude").join("settings.json");
+    read_model_effort_from(&path)
 }
 
-/// Encode an absolute path into Claude's project-dir naming. Every
-/// `/` and `.` in the path becomes `-`. Verified against the live
-/// filesystem layout (see the plan file for the verification command).
-///
-/// Returns `None` for non-UTF-8 paths (none of the rest of codemux
-/// handles them either; this is a unix-only TUI).
+/// Parse `path` as claude's settings.json and pull out `model` +
+/// `effortLevel`. Split out from [`current_model_and_effort`] so a
+/// test can drive it against a tempfile without monkey-patching
+/// `$HOME`.
 #[must_use]
-pub fn encode_cwd(cwd: &Path) -> Option<String> {
-    let s = cwd.to_str()?;
-    Some(
-        s.chars()
-            .map(|c| if c == '/' || c == '.' { '-' } else { c })
-            .collect(),
-    )
-}
-
-/// Find the most-recently-modified `.jsonl` file in `dir`. Returns
-/// `None` if the directory doesn't exist, can't be read, or contains
-/// no `.jsonl` files.
-fn newest_jsonl_in(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension() != Some(OsStr::new("jsonl")) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else { continue };
-        let Ok(mtime) = meta.modified() else { continue };
-        match &best {
-            Some((current_mtime, _)) if mtime <= *current_mtime => {}
-            _ => best = Some((mtime, path)),
-        }
-    }
-    best.map(|(_, p)| p)
-}
-
-/// Scan `path` linearly for the most recent line that describes an
-/// assistant turn with a `model` field. Returns the raw model
-/// identifier (e.g. `"claude-opus-4-7"`).
-///
-/// Implementation: read forward, remember the last assistant line
-/// seen. For the JSONL files claude writes (~hundreds of KB to a few
-/// MB), this is fast enough — we'd only need a true reverse scan if
-/// the files grew into the tens of MB. Polled every 2 s; even a 5 MB
-/// file scans in single-digit ms on any modern disk.
-#[must_use]
-pub fn latest_model_in_file(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    let mut latest: Option<String> = None;
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(model) = extract_assistant_model(&line) {
-            latest = Some(model);
-        }
-    }
-    latest
-}
-
-/// Given a single JSONL line, return the `model` field iff this line
-/// is an assistant turn (`type == "assistant"`) and `message.model`
-/// is a string. `None` for any other shape (user turn, system event,
-/// malformed JSON, etc.).
-///
-/// Implementation: a partial `serde_json` deserialise targeting only
-/// the two fields we care about. Uses `Cow<'a, str>` so a value
-/// without escapes borrows from the input (zero-alloc fast path)
-/// while a value with `\"` escapes lands in an owned `String`. The
-/// hand-rolled `find()` parser this replaced was flagged in code
-/// review for being brittle around escapes — typed parsing is
-/// shorter, correct, and not measurably slower at the per-poll
-/// volumes Claude writes (a few thousand lines).
-fn extract_assistant_model(line: &str) -> Option<String> {
-    use std::borrow::Cow;
-
+pub fn read_model_effort_from(path: &Path) -> Option<ModelEffort> {
     #[derive(serde::Deserialize)]
-    struct Partial<'a> {
-        #[serde(rename = "type", borrow)]
-        type_: Option<Cow<'a, str>>,
-        #[serde(borrow)]
-        message: Option<MessagePartial<'a>>,
+    struct Partial {
+        model: Option<String>,
+        #[serde(rename = "effortLevel")]
+        effort_level: Option<String>,
     }
-    #[derive(serde::Deserialize)]
-    struct MessagePartial<'a> {
-        #[serde(borrow)]
-        model: Option<Cow<'a, str>>,
-    }
-    let parsed: Partial<'_> = serde_json::from_str(line).ok()?;
-    if parsed.type_?.as_ref() != "assistant" {
-        return None;
-    }
-    parsed.message?.model.map(std::borrow::Cow::into_owned)
+    let bytes = std::fs::read(path).ok()?;
+    let parsed: Partial = serde_json::from_slice(&bytes).ok()?;
+    let model = parsed.model?;
+    Some(ModelEffort {
+        model,
+        effort: parsed.effort_level,
+    })
 }
 
 #[cfg(test)]
@@ -425,154 +384,77 @@ fn extract_assistant_model(line: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+    use std::time::Instant;
     use tempfile::TempDir;
 
-    // ─── encode_cwd ────────────────────────────────────────────────
+    // ─── read_model_effort_from ────────────────────────────────────
 
-    #[test]
-    fn encode_cwd_replaces_slashes_with_dashes() {
-        // Verified against the live filesystem:
-        // /Users/x/Workbench/repositories/codemux
-        //   → -Users-x-Workbench-repositories-codemux
-        let encoded = encode_cwd(Path::new("/Users/x/Workbench/repositories/codemux")).unwrap();
-        assert_eq!(encoded, "-Users-x-Workbench-repositories-codemux");
+    /// Helper to write a settings.json into a tempdir and return the
+    /// path. Tests use this instead of monkey-patching `$HOME` so the
+    /// real `current_model_and_effort()` path can stay simple and we
+    /// still exercise the full read+parse path.
+    fn write_settings(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("settings.json");
+        fs::write(&path, body).unwrap();
+        path
     }
 
     #[test]
-    fn encode_cwd_replaces_dots_with_dashes() {
-        // Hidden directories like `.dotfiles` produce a double-dash
-        // in the encoded name. /Users/x/.dotfiles → -Users-x--dotfiles
-        let encoded = encode_cwd(Path::new("/Users/x/.dotfiles")).unwrap();
-        assert_eq!(encoded, "-Users-x--dotfiles");
-    }
-
-    #[test]
-    fn encode_cwd_handles_root() {
-        assert_eq!(encode_cwd(Path::new("/")).unwrap(), "-");
-    }
-
-    // ─── extract_assistant_model ───────────────────────────────────
-
-    #[test]
-    fn extract_returns_model_for_assistant_line() {
-        let line =
-            r#"{"type":"assistant","message":{"model":"claude-opus-4-7","role":"assistant"}}"#;
-        assert_eq!(
-            extract_assistant_model(line),
-            Some("claude-opus-4-7".into())
+    fn read_model_effort_returns_both_fields_when_present() {
+        // The shape we read is the production claude code settings.json
+        // file shape (verified live): a top-level `model` alias plus
+        // an `effortLevel`. Other fields exist (env vars, hooks, etc.)
+        // and must be ignored without failing the parse.
+        let tmp = TempDir::new().unwrap();
+        let path = write_settings(
+            tmp.path(),
+            r#"{"model":"opus[1m]","effortLevel":"xhigh","unrelated":42}"#,
         );
+        let got = read_model_effort_from(&path).unwrap();
+        assert_eq!(got.model, "opus[1m]");
+        assert_eq!(got.effort.as_deref(), Some("xhigh"));
     }
 
     #[test]
-    fn extract_returns_none_for_user_line() {
-        let line = r#"{"type":"user","message":{"role":"user","content":"hi"}}"#;
-        assert_eq!(extract_assistant_model(line), None);
-    }
-
-    #[test]
-    fn extract_returns_none_for_system_line_without_model() {
-        let line = r#"{"type":"system","subtype":"init"}"#;
-        assert_eq!(extract_assistant_model(line), None);
-    }
-
-    #[test]
-    fn extract_returns_none_for_malformed_line() {
-        // Half a line — stream got truncated. Don't crash, don't lie.
-        let line = r#"{"type":"assistant","message":{"mod"#;
-        assert_eq!(extract_assistant_model(line), None);
-    }
-
-    #[test]
-    fn extract_returns_none_for_empty_line() {
-        assert_eq!(extract_assistant_model(""), None);
-    }
-
-    // ─── latest_model_in_file ──────────────────────────────────────
-
-    #[test]
-    fn latest_model_returns_most_recent_assistant_model() {
+    fn read_model_effort_returns_some_with_no_effort_when_field_absent() {
+        // Older claude versions wrote settings.json without
+        // `effortLevel`; the segment treats missing-effort the same
+        // as default-effort (no badge shown). Here we pin that the
+        // parse path doesn't fail just because the optional field is
+        // missing.
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                r#"{"type":"user","message":{"role":"user"}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"model":"claude-sonnet-4-6"}}"#,
-                "\n",
-                r#"{"type":"user","message":{"role":"user"}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"model":"claude-opus-4-7"}}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        // The user mid-session ran `/model` and switched to opus —
-        // the worker must report the latest, not the first.
-        assert_eq!(latest_model_in_file(&path), Some("claude-opus-4-7".into()),);
+        let path = write_settings(tmp.path(), r#"{"model":"sonnet"}"#);
+        let got = read_model_effort_from(&path).unwrap();
+        assert_eq!(got.model, "sonnet");
+        assert!(got.effort.is_none());
     }
 
     #[test]
-    fn latest_model_returns_none_for_empty_file() {
+    fn read_model_effort_returns_none_when_model_field_missing() {
+        // Without a model alias there's nothing to display. Returning
+        // None (vs Some with empty model) means the segment slot
+        // collapses cleanly instead of rendering a stray bracket.
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("empty.jsonl");
-        fs::write(&path, "").unwrap();
-        assert_eq!(latest_model_in_file(&path), None);
+        let path = write_settings(tmp.path(), r#"{"effortLevel":"high"}"#);
+        assert!(read_model_effort_from(&path).is_none());
     }
 
     #[test]
-    fn latest_model_returns_none_for_missing_file() {
+    fn read_model_effort_returns_none_for_missing_file() {
         let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("does-not-exist.jsonl");
-        assert_eq!(latest_model_in_file(&missing), None);
+        let missing = tmp.path().join("does-not-exist.json");
+        assert!(read_model_effort_from(&missing).is_none());
     }
 
     #[test]
-    fn latest_model_returns_none_when_no_assistant_lines_yet() {
+    fn read_model_effort_returns_none_for_malformed_json() {
+        // Half-written file mid-flush from claude code's writer.
+        // `read_model_effort_from` must swallow the error and return
+        // None — the next poll will see the completed file.
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("user-only.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                r#"{"type":"user","message":{"role":"user"}}"#,
-                "\n",
-                r#"{"type":"system","subtype":"init"}"#,
-                "\n",
-            ),
-        )
-        .unwrap();
-        assert_eq!(latest_model_in_file(&path), None);
-    }
-
-    // ─── newest_jsonl_in ───────────────────────────────────────────
-
-    #[test]
-    fn newest_jsonl_in_returns_none_for_missing_directory() {
-        let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("nope");
-        assert_eq!(newest_jsonl_in(&missing), None);
-    }
-
-    #[test]
-    fn newest_jsonl_in_returns_none_when_no_jsonl_files_present() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("README.md"), "").unwrap();
-        assert_eq!(newest_jsonl_in(tmp.path()), None);
-    }
-
-    #[test]
-    fn newest_jsonl_in_picks_most_recent_by_mtime() {
-        // Two jsonl files written in order; the second one is newer
-        // by writing it after the first. Sleep a tick between writes
-        // to make sure even a 1-second-resolution FS sees a difference.
-        let tmp = TempDir::new().unwrap();
-        let older = tmp.path().join("a.jsonl");
-        let newer = tmp.path().join("b.jsonl");
-        fs::write(&older, "x").unwrap();
-        thread::sleep(Duration::from_millis(1_100));
-        fs::write(&newer, "y").unwrap();
-        let picked = newest_jsonl_in(tmp.path()).unwrap();
-        assert_eq!(picked, newer);
+        let path = write_settings(tmp.path(), r#"{"model":"opus[1m]","#);
+        assert!(read_model_effort_from(&path).is_none());
     }
 
     // ─── apply_control ─────────────────────────────────────────────
@@ -581,7 +463,7 @@ mod tests {
     fn apply_control_set_target_when_idle_caches_nothing_yet() {
         let mut target: Option<(AgentId, PathBuf)> = None;
         let mut last_branch: Option<String> = None;
-        let mut last_model: Option<String> = None;
+        let mut last_model_effort: Option<ModelEffort> = None;
         apply_control(
             Control::SetTarget {
                 agent_id: AgentId::new("a"),
@@ -589,11 +471,11 @@ mod tests {
             },
             &mut target,
             &mut last_branch,
-            &mut last_model,
+            &mut last_model_effort,
         );
         assert_eq!(target, Some((AgentId::new("a"), PathBuf::from("/tmp/a"))),);
         assert!(last_branch.is_none());
-        assert!(last_model.is_none());
+        assert!(last_model_effort.is_none());
     }
 
     #[test]
@@ -601,11 +483,18 @@ mod tests {
         // Switching focus must drop the previous agent's cached
         // values so the new agent's first poll posts a fresh
         // event — otherwise the user sees the previous agent's
-        // model/branch flash for ~2s after switching.
+        // model/branch flash for ~2s after switching. With model+
+        // effort now coming from a global file the per-agent flush
+        // is technically redundant for the model side (everyone
+        // reads the same value), but keeping it symmetric with the
+        // branch side avoids a special case in the cache logic.
         let mut target: Option<(AgentId, PathBuf)> =
             Some((AgentId::new("a"), PathBuf::from("/tmp/a")));
         let mut last_branch = Some("main".to_string());
-        let mut last_model = Some("claude-opus-4-7".to_string());
+        let mut last_model_effort = Some(ModelEffort {
+            model: "opus[1m]".into(),
+            effort: Some("xhigh".into()),
+        });
         apply_control(
             Control::SetTarget {
                 agent_id: AgentId::new("b"),
@@ -613,11 +502,14 @@ mod tests {
             },
             &mut target,
             &mut last_branch,
-            &mut last_model,
+            &mut last_model_effort,
         );
         assert_eq!(target.as_ref().unwrap().0, AgentId::new("b"));
         assert!(last_branch.is_none(), "cache must flush on agent change");
-        assert!(last_model.is_none(), "cache must flush on agent change");
+        assert!(
+            last_model_effort.is_none(),
+            "cache must flush on agent change"
+        );
     }
 
     #[test]
@@ -629,7 +521,10 @@ mod tests {
         let mut target: Option<(AgentId, PathBuf)> =
             Some((AgentId::new("a"), PathBuf::from("/tmp/a")));
         let mut last_branch = Some("main".to_string());
-        let mut last_model = Some("claude-opus-4-7".to_string());
+        let mut last_model_effort = Some(ModelEffort {
+            model: "opus[1m]".into(),
+            effort: None,
+        });
         apply_control(
             Control::SetTarget {
                 agent_id: AgentId::new("a"),
@@ -637,10 +532,13 @@ mod tests {
             },
             &mut target,
             &mut last_branch,
-            &mut last_model,
+            &mut last_model_effort,
         );
         assert_eq!(last_branch.as_deref(), Some("main"));
-        assert_eq!(last_model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(
+            last_model_effort.as_ref().map(|m| m.model.as_str()),
+            Some("opus[1m]")
+        );
     }
 
     #[test]
@@ -648,51 +546,49 @@ mod tests {
         let mut target: Option<(AgentId, PathBuf)> =
             Some((AgentId::new("a"), PathBuf::from("/tmp/a")));
         let mut last_branch = Some("main".to_string());
-        let mut last_model = Some("claude-opus-4-7".to_string());
+        let mut last_model_effort = Some(ModelEffort {
+            model: "opus[1m]".into(),
+            effort: Some("xhigh".into()),
+        });
         apply_control(
             Control::ClearTarget,
             &mut target,
             &mut last_branch,
-            &mut last_model,
+            &mut last_model_effort,
         );
         assert!(target.is_none());
         assert!(last_branch.is_none());
-        assert!(last_model.is_none());
+        assert!(last_model_effort.is_none());
     }
 
     // ─── worker integration tests ──────────────────────────────────
     //
-    // Drive the real worker thread with a scripted [`MetaProbe`] and a
-    // 50 ms poll interval so we can observe end-to-end behavior
+    // Drive the real worker thread with a scripted [`MetaProbe`] and
+    // a 50 ms poll interval so we can observe end-to-end behavior
     // (set_target → poll → emit → drain) without sleeping for the
-    // production 2 s cadence and without touching the real
-    // filesystem. The probe records every call so we can also assert
-    // that focus changes drive the expected re-poll pattern.
-
-    use std::sync::Mutex;
-    use std::time::Instant;
+    // production 2 s cadence and without touching the real filesystem.
 
     /// `MetaProbe` whose return values for each `read_branch` /
-    /// `read_model` call are scripted in advance. Records every call
-    /// (path arg) so a test can assert the worker queried the right
-    /// agent. When the script runs out, the **last** scripted value
-    /// repeats forever — that mirrors a stable filesystem state and
-    /// keeps the "no-change → no-emit" tests deterministic across
-    /// extra polls a slow CI box might race in.
+    /// `read_model_effort` call are scripted in advance. Records
+    /// every call (path arg, count) so a test can assert the worker
+    /// queried the right agent. When the script runs out, the **last**
+    /// scripted value repeats forever — that mirrors a stable file
+    /// state and keeps the "no-change → no-emit" tests deterministic
+    /// across extra polls a slow CI box might race in.
     struct ScriptedProbe {
         branch_script: Mutex<Vec<Option<String>>>,
-        model_script: Mutex<Vec<Option<String>>>,
+        model_script: Mutex<Vec<Option<ModelEffort>>>,
         branch_calls: Mutex<Vec<PathBuf>>,
-        model_calls: Mutex<Vec<PathBuf>>,
+        model_calls: Mutex<u64>,
     }
 
     impl ScriptedProbe {
-        fn new(branches: Vec<Option<String>>, models: Vec<Option<String>>) -> Self {
+        fn new(branches: Vec<Option<String>>, models: Vec<Option<ModelEffort>>) -> Self {
             Self {
                 branch_script: Mutex::new(branches.into_iter().rev().collect()),
                 model_script: Mutex::new(models.into_iter().rev().collect()),
                 branch_calls: Mutex::new(Vec::new()),
-                model_calls: Mutex::new(Vec::new()),
+                model_calls: Mutex::new(0),
             }
         }
     }
@@ -700,7 +596,7 @@ mod tests {
     /// Pop the next scripted value, leaving the last one in place so
     /// further calls keep returning it. `None`-valued scripts behave
     /// the same as a real probe that consistently can't read the file.
-    fn pop_or_repeat(script: &Mutex<Vec<Option<String>>>) -> Option<String> {
+    fn pop_or_repeat<T: Clone>(script: &Mutex<Vec<Option<T>>>) -> Option<T> {
         let mut s = script.lock().unwrap();
         if s.len() > 1 {
             s.pop().unwrap_or(None)
@@ -715,13 +611,13 @@ mod tests {
             pop_or_repeat(&self.branch_script)
         }
 
-        fn read_model(&self, cwd: &Path) -> Option<String> {
-            self.model_calls.lock().unwrap().push(cwd.to_path_buf());
+        fn read_model_effort(&self) -> Option<ModelEffort> {
+            *self.model_calls.lock().unwrap() += 1;
             pop_or_repeat(&self.model_script)
         }
     }
 
-    /// Wait up to `deadline` for the worker to emit `expected_count`
+    /// Wait up to a deadline for the worker to emit `expected_count`
     /// events, then drain and return them. The worker polls every
     /// 50 ms; the upper bound here is deliberately generous (2 s) so
     /// a slow CI box doesn't flake.
@@ -742,7 +638,10 @@ mod tests {
     fn worker_emits_branch_and_model_after_first_poll() {
         let probe = Box::new(ScriptedProbe::new(
             vec![Some("main".to_string())],
-            vec![Some("claude-opus-4-7".to_string())],
+            vec![Some(ModelEffort {
+                model: "opus[1m]".into(),
+                effort: Some("xhigh".into()),
+            })],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
         worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
@@ -758,7 +657,10 @@ mod tests {
         assert!(
             events.contains(&MetaEvent::Model {
                 agent_id: AgentId::new("a"),
-                value: Some("claude-opus-4-7".into()),
+                value: Some(ModelEffort {
+                    model: "opus[1m]".into(),
+                    effort: Some("xhigh".into()),
+                }),
             }),
             "expected Model event in {events:?}",
         );
@@ -766,20 +668,21 @@ mod tests {
 
     #[test]
     fn worker_does_not_re_emit_when_value_unchanged() {
-        // Probe returns the same branch + model every call. The worker
-        // must emit ONCE per value across many polls — re-emitting
-        // would flood the runtime with redundant change notifications.
+        // Probe returns the same branch + model+effort every call.
+        // The worker must emit ONCE per value across many polls —
+        // re-emitting would flood the runtime with redundant change
+        // notifications.
+        let me = ModelEffort {
+            model: "opus[1m]".into(),
+            effort: Some("xhigh".into()),
+        };
         let probe = Box::new(ScriptedProbe::new(
             vec![
                 Some("main".to_string()),
                 Some("main".to_string()),
                 Some("main".to_string()),
             ],
-            vec![
-                Some("claude-opus-4-7".to_string()),
-                Some("claude-opus-4-7".to_string()),
-                Some("claude-opus-4-7".to_string()),
-            ],
+            vec![Some(me.clone()), Some(me.clone()), Some(me.clone())],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
         worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
@@ -803,32 +706,51 @@ mod tests {
     }
 
     #[test]
-    fn worker_emits_update_when_branch_changes_mid_session() {
-        // Simulates a `git checkout`: poll 1 sees `main`, poll 2 sees
-        // `feature`. The worker must emit a second Branch event with
-        // the new value.
+    fn worker_emits_update_when_model_or_effort_changes_mid_session() {
+        // Simulates `/model` mid-session: poll 1 sees `opus[1m]`+xhigh,
+        // poll 2 sees `sonnet` with no effort. Both transitions
+        // (model alias change AND effort drop) must produce a fresh
+        // event so the segment renders the new pair.
         let probe = Box::new(ScriptedProbe::new(
-            vec![Some("main".to_string()), Some("feature".to_string())],
             vec![None, None],
+            vec![
+                Some(ModelEffort {
+                    model: "opus[1m]".into(),
+                    effort: Some("xhigh".into()),
+                }),
+                Some(ModelEffort {
+                    model: "sonnet".into(),
+                    effort: None,
+                }),
+            ],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
         worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
 
-        // Wait for both Branch events.
+        // Wait for both Model events.
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut branches: Vec<Option<String>> = Vec::new();
-        while Instant::now() < deadline && branches.len() < 2 {
+        let mut models: Vec<Option<ModelEffort>> = Vec::new();
+        while Instant::now() < deadline && models.len() < 2 {
             for ev in worker.drain() {
-                if let MetaEvent::Branch { value, .. } = ev {
-                    branches.push(value);
+                if let MetaEvent::Model { value, .. } = ev {
+                    models.push(value);
                 }
             }
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
-            branches,
-            vec![Some("main".into()), Some("feature".into())],
-            "expected sequential Branch updates",
+            models,
+            vec![
+                Some(ModelEffort {
+                    model: "opus[1m]".into(),
+                    effort: Some("xhigh".into()),
+                }),
+                Some(ModelEffort {
+                    model: "sonnet".into(),
+                    effort: None,
+                }),
+            ],
+            "expected sequential Model updates",
         );
     }
 
@@ -839,7 +761,10 @@ mod tests {
         // wait should be empty.
         let probe = Box::new(ScriptedProbe::new(
             vec![Some("main".to_string())],
-            vec![Some("claude-opus-4-7".to_string())],
+            vec![Some(ModelEffort {
+                model: "opus[1m]".into(),
+                effort: None,
+            })],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
         worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
@@ -925,6 +850,8 @@ mod tests {
         );
     }
 
+    // ─── RealProbe ─────────────────────────────────────────────────
+
     #[test]
     fn real_probe_delegates_to_git_branch_resolver() {
         // Spot-check that RealProbe is wired to git_branch::resolve_local —
@@ -944,18 +871,14 @@ mod tests {
     }
 
     #[test]
-    fn real_probe_read_model_returns_none_for_path_with_no_transcript() {
-        // RealProbe.read_model goes through current_model_for_cwd, which
-        // hits HOME-resolution and the projects-dir lookup. For a path
-        // that has no encoded directory under ~/.claude/projects/, the
-        // result is None — verifies the probe doesn't panic.
+    fn real_probe_read_model_effort_does_not_panic() {
+        // The shim just delegates to current_model_and_effort, which
+        // is in turn covered by read_model_effort_from tests against
+        // tempfiles. We can't override $HOME from a parallel test
+        // without a global lock, so the smoke check here just pins
+        // that the production wiring runs end-to-end.
         let probe = RealProbe;
-        assert_eq!(
-            probe.read_model(Path::new(
-                "/this/path/has/no/claude/transcript/anywhere/xyzzy"
-            )),
-            None,
-        );
+        let _ = probe.read_model_effort();
     }
 
     #[test]
@@ -968,44 +891,5 @@ mod tests {
         // A drain immediately after construction should be empty.
         assert!(worker.drain().is_empty());
         drop(worker);
-    }
-
-    #[test]
-    fn extract_returns_none_when_value_lacks_closing_quote() {
-        // Truncated line — invalid JSON. The typed deserialiser
-        // returns Err, the helper returns None. Pinning so a future
-        // refactor can't silently start succeeding on partial frames.
-        let line = r#"{"type":"assistant","model":"unterminated"#;
-        assert_eq!(extract_assistant_model(line), None);
-    }
-
-    #[test]
-    fn extract_returns_decoded_string_with_json_escape_sequences() {
-        // Legal JSON with an escaped `"` inside the model value. The
-        // typed serde_json parser must decode the escape correctly —
-        // the previous hand-rolled string scanner stripped escapes
-        // from the result, which was wrong (and a brittleness flagged
-        // by the Rust style guide).
-        let line = r#"{"type":"assistant","message":{"model":"weird\"name"}}"#;
-        assert_eq!(extract_assistant_model(line), Some("weird\"name".into()));
-    }
-
-    #[test]
-    fn extract_returns_none_for_completely_invalid_json() {
-        // Garbage that doesn't even open a JSON object. serde returns
-        // Err on the first character, helper returns None.
-        let line = "\"type\":\"assistant\"\"model\":\"";
-        assert_eq!(extract_assistant_model(line), None);
-    }
-
-    #[test]
-    fn encode_cwd_returns_none_for_non_utf8_path() {
-        // Non-UTF8 path. On Unix this is constructible via OsStr's
-        // byte representation; the `to_str()?` early return guards
-        // against passing garbage downstream.
-        use std::os::unix::ffi::OsStrExt;
-        let bad: &OsStr = OsStr::from_bytes(&[0x80, 0xff, 0xfe]);
-        let path = Path::new(bad);
-        assert_eq!(encode_cwd(path), None);
     }
 }

@@ -92,24 +92,44 @@ Consequence: whatever Claude Code can do in a terminal, codemux supports for
 free. Whatever codemux wants to *show beside* Claude Code, it derives from
 out-of-band sources (git for diffs, host probes for liveness).
 
-**Bounded exception (added with the status-bar segment refactor):** the
-`agent_meta_worker` reads `~/.claude/projects/<encoded-cwd>/*.jsonl` to extract
-the **`message.model`** field from the most recent assistant turn, exclusively
-to drive the status bar's `ModelSegment`. The carve-out is intentionally
-narrow:
+**Bounded exception (added with the status-bar segment refactor; revised
+when the status-bar combined model with effort):** the
+`agent_meta_worker` reads `~/.claude/settings.json` to extract the
+**`model`** alias and the **`effortLevel`** field, exclusively to drive
+the status bar's `ModelSegment`. The carve-out is intentionally narrow:
 
-- One file shape (the per-session transcript JSONL Claude writes).
-- One field (`message.model`).
-- Focused agent only — we never tail more than one transcript at a time.
-- Local agents only in v1 — SSH-backed agents skip this entirely.
-- Read-only, polled at 2 s with no parsing of conversation content,
-  tool calls, or any other JSONL field.
+- One file (`~/.claude/settings.json`).
+- Two fields (`model`, `effortLevel`).
+- Focused agent only — we never read more than once per poll cycle.
+- Local agents only in v1 — SSH-backed agents skip this entirely (the
+  worker still needs the focused agent's local cwd for the branch
+  read, and the local user's claude settings don't necessarily
+  reflect the remote claude session's state).
+- Read-only, polled at 2 s with no parsing of any other field in
+  the file.
 
-Anything beyond that scope (rendering messages, tracking tool use, parsing
-prompts) requires a new AD update. The above is the only sanctioned reason
-to touch Claude's session output, and it exists because there is no
-out-of-band channel for "current model" today (`/model` mid-session is purely
-in-conversation state).
+The previous incarnation of this carve-out tailed the per-session
+JSONL transcript (`~/.claude/projects/<encoded-cwd>/*.jsonl`) for the
+most recent assistant turn's `message.model` field. That approach
+worked for the single-session case but was fragile when multiple
+claude sessions shared a project directory (host TUI vs. test
+codemux instance vs. subagent transcripts): the "newest jsonl by
+mtime" heuristic would pick whichever session was most recently
+written to, masking `/model` switches in the active agent and
+occasionally returning `None` when the chosen file had no assistant
+line yet. settings.json is a single-writer global file that updates
+immediately on `/model`, so the bug class disappears. The tradeoff
+is that model+effort are now global rather than per-agent — but
+`/model` itself updates a global file, so the per-agent illusion in
+claude was never really there.
+
+Anything beyond that scope (rendering messages, tracking tool use,
+parsing prompts, tailing the JSONL transcripts) requires a new AD
+update. The above is the only sanctioned reason to touch Claude's
+on-disk state, and it exists because there is no out-of-band channel
+for "current model + effort" today (`/model` mid-session updates
+in-conversation state plus the global settings.json, but there's no
+event hook).
 
 ### AD-3 — Remote PTY container is `codemuxd`, behind an `AgentTransport` enum
 
@@ -674,8 +694,9 @@ the user still sees `ctrl+b ? for help` and the focused agent's tab,
 not a confused half-hint.
 
 **The model segment is special.** It triggers an AD-1 carve-out (the
-`agent_meta_worker` tails Claude's session JSONL to extract the live
-model). See AD-1's amended prose for the bounded-exception scope.
+`agent_meta_worker` reads `~/.claude/settings.json` to extract the
+user's currently-selected model alias and effort level). See AD-1's
+amended prose for the bounded-exception scope.
 
 Rejected: hardcoded inline rendering of the three segments in
 `render_status_bar` (the simplest possible thing). Would require a

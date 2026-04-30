@@ -28,12 +28,12 @@
 //!
 //! ## AD-1 carve-out
 //!
-//! [`segments::ModelSegment`] reads the focused agent's most recent
-//! Claude session JSONL to surface the live model. This is the single
-//! sanctioned exception to AD-1's "never semantically parse Claude
-//! Code" rule — bounded to one specific file shape, one specific
-//! field, focused local agent only. See AD-1's amended prose in
-//! `docs/architecture.md`.
+//! [`segments::ModelSegment`] reads `~/.claude/settings.json` to
+//! surface the user's currently-selected model alias and reasoning
+//! effort level. This is the single sanctioned exception to AD-1's
+//! "never semantically parse Claude Code" rule — bounded to one
+//! specific file, two specific fields, focused local agent only.
+//! See AD-1's amended prose in `docs/architecture.md`.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -86,11 +86,13 @@ pub(crate) struct SegmentCtx<'a> {
     /// successful read, on non-git directories, and for SSH agents
     /// (worker only handles local in v1).
     pub branch: Option<&'a str>,
-    /// Current Claude model for the focused local agent. Updated by
-    /// [`crate::agent_meta_worker`] from
-    /// `~/.claude/projects/<encoded-cwd>/*.jsonl`. `None` until the
-    /// worker's first successful read and for SSH agents.
-    pub model: Option<&'a str>,
+    /// Current model alias + reasoning effort for the focused local
+    /// agent. Read from `~/.claude/settings.json` by
+    /// [`crate::agent_meta_worker`]. Held as a single struct so the
+    /// segment never sees a torn pair (alias updated, effort stale).
+    /// `None` until the worker's first successful read and for SSH
+    /// agents.
+    pub model_effort: Option<&'a crate::agent_meta_worker::ModelEffort>,
     /// Basename of the focused agent's cwd, rendered by
     /// [`segments::WorktreeSegment`] as `wt:<basename>`. For a regular
     /// checkout this is the repo basename; for a git worktree it's the
@@ -295,7 +297,7 @@ mod tests {
         SegmentCtx {
             repo: None,
             branch: None,
-            model: None,
+            model_effort: None,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings,

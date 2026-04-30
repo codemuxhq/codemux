@@ -39,15 +39,21 @@ use crate::runtime::PrefixState;
 
 // ─── ModelSegment ─────────────────────────────────────────────────
 
-/// Renders the focused agent's currently-selected Claude model. Data
-/// is supplied by [`crate::agent_meta_worker`] which tails
-/// `~/.claude/projects/<encoded-cwd>/*.jsonl` for the most recent
-/// `model` field on an assistant turn — the only architecturally-
-/// sanctioned exception to AD-1, see `docs/architecture.md`.
+/// Renders the user's currently-selected Claude model paired with the
+/// reasoning effort level. Both fields are read by
+/// [`crate::agent_meta_worker`] from `~/.claude/settings.json` —
+/// the only architecturally-sanctioned place to peek at claude
+/// state, see AD-1's amended prose in `docs/architecture.md`.
 ///
-/// The raw model identifier is run through [`shorten_model_name`]
-/// for display: `claude-opus-4-7` → `opus-4-7`. Pass-through for
-/// anything we don't recognise (better to show the raw id than guess).
+/// Display:
+///
+/// - `model:opus-4-7` when effort is default (or absent)
+/// - `model:opus-4-7 [xhigh]` when effort is non-default
+///
+/// The model alias is run through [`shorten_model_name`] for display:
+/// `claude-opus-4-7` → `opus-4-7`, `opus[1m]` → `opus`. Pass-through
+/// for anything we don't recognise (better to show the raw alias than
+/// guess).
 pub(crate) struct ModelSegment;
 
 impl StatusSegment for ModelSegment {
@@ -56,23 +62,92 @@ impl StatusSegment for ModelSegment {
     }
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
-        let model = ctx.model?;
-        let short = shorten_model_name(model);
-        Some(Line::from(Span::styled(
-            format!("model:{short}"),
-            ctx.secondary,
-        )))
+        let me = ctx.model_effort?;
+        let short = shorten_model_name(&me.model);
+        // Effort badge is suppressed when the level is "default" or
+        // "medium" (claude's default). Otherwise we render a
+        // bracketed badge so the user knows they're on a non-default
+        // setting at a glance — this mirrors `BranchSegment` hiding
+        // when on the trunk.
+        let badge = me.effort.as_deref().and_then(format_effort_badge);
+        let text = match badge {
+            Some(b) => format!("model:{short} [{b}]"),
+            None => format!("model:{short}"),
+        };
+        Some(Line::from(Span::styled(text, ctx.secondary)))
     }
 }
 
-/// Strip the `claude-` prefix that every Anthropic model ID carries.
-/// Anything else (custom names, non-Anthropic models reached through
-/// a proxy) passes through unchanged. Returns a borrowed slice — the
-/// caller folds it into a `format!` so there's no need to allocate
-/// here.
+/// Strip the `claude-` prefix and the trailing `[<digits><a-z>]`
+/// context-window suffix that claude code's aliases carry. So:
+///
+/// - `claude-opus-4-7`     → `opus-4-7`
+/// - `claude-opus-4-7[1m]` → `opus-4-7`
+/// - `opus[1m]`            → `opus`
+/// - `sonnet`              → `sonnet`
+///
+/// The bracketed suffix is the user's chosen context-window option
+/// (`1m` for 1M tokens, etc.) and is surfaced separately in the
+/// `/model` picker UI; it doesn't add information once you know
+/// which model you picked. Anything else (custom names, non-Anthropic
+/// models reached through a proxy) passes through unchanged.
 #[must_use]
 fn shorten_model_name(raw: &str) -> &str {
-    raw.strip_prefix("claude-").unwrap_or(raw)
+    let no_prefix = raw.strip_prefix("claude-").unwrap_or(raw);
+    strip_bracketed_suffix(no_prefix)
+}
+
+/// Return the input with a trailing `[<digits><a-z>+]` suffix removed
+/// (`opus[1m]` → `opus`). Returns the input unchanged when there's
+/// no such suffix, when the bracket payload doesn't look like a
+/// context-window code, or when stripping would leave an empty
+/// string. Pulled out of [`shorten_model_name`] so the predicate
+/// is testable in isolation and re-usable for any future suffix
+/// claude introduces (`[200k]`, `[2m]`, etc.).
+#[must_use]
+fn strip_bracketed_suffix(s: &str) -> &str {
+    let Some(rest) = s.strip_suffix(']') else {
+        return s;
+    };
+    let Some((base, suffix)) = rest.rsplit_once('[') else {
+        return s;
+    };
+    if base.is_empty() {
+        return s;
+    }
+    // Single pass: split the suffix at the first non-digit. The
+    // prefix part must be non-empty (saw a digit), the trailing
+    // part must be non-empty and all-lowercase-or-digit (saw the
+    // unit code). Rejects `opus[]`, `opus[ABC]`, and friends —
+    // we'd rather pass them through and surface the weirdness
+    // than silently swallow it.
+    let split_idx = suffix
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(suffix.len());
+    let (digits, letters) = suffix.split_at(split_idx);
+    let saw_digit = !digits.is_empty();
+    let saw_alpha = !letters.is_empty()
+        && letters
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if saw_digit && saw_alpha { base } else { s }
+}
+
+/// Decide whether to render an effort badge, and what its text
+/// should be (without brackets — those are added by `ModelSegment`
+/// during composition). Returns `None` when the effort is default;
+/// `Some(borrowed_text)` otherwise. The default set is intentionally
+/// narrow — `"medium"` is claude's documented default and `"default"`
+/// is the legacy spelling — anything else is shown verbatim so a
+/// future `"max"` or `"thinking"` flag surfaces immediately. The
+/// borrowed return avoids a per-frame allocation in the hot render
+/// path; bracketing is folded into the segment's single `format!`.
+#[must_use]
+fn format_effort_badge(effort: &str) -> Option<&str> {
+    match effort {
+        "" | "medium" | "default" => None,
+        other => Some(other),
+    }
 }
 
 // ─── RepoSegment ──────────────────────────────────────────────────
@@ -221,24 +296,48 @@ impl StatusSegment for PrefixHintSegment {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::agent_meta_worker::ModelEffort;
     use crate::keymap::Bindings;
 
     fn ctx_with<'a>(
         bindings: &'a Bindings,
         repo: Option<&'a str>,
         branch: Option<&'a str>,
-        model: Option<&'a str>,
         cwd_basename: Option<&'a str>,
         prefix_state: PrefixState,
     ) -> SegmentCtx<'a> {
         SegmentCtx {
             repo,
             branch,
-            model,
+            model_effort: None,
             cwd_basename,
             prefix_state,
             bindings,
             secondary: Style::default(),
+        }
+    }
+
+    /// Variant of [`ctx_with`] that carries a [`ModelEffort`] —
+    /// used by the `ModelSegment` tests. The caller owns the
+    /// `ModelEffort` so the borrow lives the length of the test.
+    fn ctx_with_me<'a>(bindings: &'a Bindings, me: Option<&'a ModelEffort>) -> SegmentCtx<'a> {
+        SegmentCtx {
+            repo: None,
+            branch: None,
+            model_effort: me,
+            cwd_basename: None,
+            prefix_state: PrefixState::Idle,
+            bindings,
+            secondary: Style::default(),
+        }
+    }
+
+    /// Build a `ModelEffort` from string literals — single-line
+    /// constructor for the tests below.
+    fn me(model: &str, effort: Option<&str>) -> ModelEffort {
+        ModelEffort {
+            model: model.into(),
+            effort: effort.map(str::to_string),
         }
     }
 
@@ -249,7 +348,7 @@ mod tests {
         SegmentCtx {
             repo: None,
             branch,
-            model: None,
+            model_effort: None,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings,
@@ -275,14 +374,8 @@ mod tests {
     #[test]
     fn model_segment_shortens_anthropic_model_ids() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(
-            &bindings,
-            None,
-            None,
-            Some("claude-opus-4-7"),
-            None,
-            PrefixState::Idle,
-        );
+        let model = me("claude-opus-4-7", None);
+        let ctx = ctx_with_me(&bindings, Some(&model));
         let line = ModelSegment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "model:opus-4-7");
     }
@@ -292,14 +385,8 @@ mod tests {
         // Custom models reached through a proxy may not start with
         // `claude-`. Better to show the raw id than mangle it.
         let bindings = Bindings::default();
-        let ctx = ctx_with(
-            &bindings,
-            None,
-            None,
-            Some("internal/llama-7b"),
-            None,
-            PrefixState::Idle,
-        );
+        let model = me("internal/llama-7b", None);
+        let ctx = ctx_with_me(&bindings, Some(&model));
         let line = ModelSegment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "model:internal/llama-7b");
     }
@@ -309,8 +396,126 @@ mod tests {
         // Worker hasn't reported yet, or focused agent is SSH-backed.
         // Segment must be skipped (not rendered as `model:?`).
         let bindings = Bindings::default();
-        let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
+        let ctx = ctx_with_me(&bindings, None);
         assert!(ModelSegment.render(&ctx).is_none());
+    }
+
+    #[test]
+    fn model_segment_strips_bracketed_context_window_suffix() {
+        // Aliases like `opus[1m]` carry a trailing `[1m]` context-
+        // window flag that's redundant once the user has picked the
+        // model. Pin that the segment shortens to `opus` (not `opus[1m]`).
+        let bindings = Bindings::default();
+        let model = me("opus[1m]", None);
+        let ctx = ctx_with_me(&bindings, Some(&model));
+        let line = ModelSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "model:opus");
+    }
+
+    #[test]
+    fn model_segment_strips_both_prefix_and_suffix_when_present() {
+        // `claude-opus-4-7[1m]` — both the `claude-` prefix and the
+        // `[1m]` suffix come off, leaving `opus-4-7`.
+        let bindings = Bindings::default();
+        let model = me("claude-opus-4-7[1m]", None);
+        let ctx = ctx_with_me(&bindings, Some(&model));
+        let line = ModelSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "model:opus-4-7");
+    }
+
+    #[test]
+    fn model_segment_appends_bracketed_effort_badge_when_non_default() {
+        // The whole point of this rewrite: model + effort together,
+        // bracketed-suffix style. `opus-4-7 [xhigh]` per the user's
+        // chosen UX.
+        let bindings = Bindings::default();
+        let model = me("claude-opus-4-7", Some("xhigh"));
+        let ctx = ctx_with_me(&bindings, Some(&model));
+        let line = ModelSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "model:opus-4-7 [xhigh]");
+    }
+
+    #[test]
+    fn model_segment_hides_effort_badge_when_medium_default() {
+        // `medium` is claude's documented default — surfacing it
+        // would just be noise on the status bar. Hide it the same
+        // way `BranchSegment` hides the trunk branch.
+        let bindings = Bindings::default();
+        let model = me("opus[1m]", Some("medium"));
+        let ctx = ctx_with_me(&bindings, Some(&model));
+        let line = ModelSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "model:opus");
+    }
+
+    #[test]
+    fn model_segment_hides_effort_badge_when_legacy_default_spelling() {
+        // The legacy spelling `"default"` shows up in older
+        // settings.json files; hide it the same as `"medium"`.
+        let bindings = Bindings::default();
+        let model = me("opus[1m]", Some("default"));
+        let ctx = ctx_with_me(&bindings, Some(&model));
+        let line = ModelSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "model:opus");
+    }
+
+    #[test]
+    fn model_segment_hides_effort_badge_when_field_empty_or_absent() {
+        // Older settings.json files may not have the field at all
+        // (None) or carry an empty string. Both must hide the
+        // badge — the segment shouldn't render `model:opus []`.
+        let bindings = Bindings::default();
+        let absent_me = me("opus[1m]", None);
+        let empty_me = me("opus[1m]", Some(""));
+        let absent = ctx_with_me(&bindings, Some(&absent_me));
+        let empty = ctx_with_me(&bindings, Some(&empty_me));
+        assert_eq!(
+            line_text(&ModelSegment.render(&absent).unwrap()),
+            "model:opus"
+        );
+        assert_eq!(
+            line_text(&ModelSegment.render(&empty).unwrap()),
+            "model:opus"
+        );
+    }
+
+    #[test]
+    fn model_segment_passes_unknown_effort_through_verbatim() {
+        // A future claude flag like `"max"` or `"thinking"` should
+        // surface immediately as `[max]` rather than being silently
+        // hidden by an over-aggressive default-detection list.
+        let bindings = Bindings::default();
+        let model = me("opus[1m]", Some("max"));
+        let ctx = ctx_with_me(&bindings, Some(&model));
+        let line = ModelSegment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "model:opus [max]");
+    }
+
+    #[test]
+    fn shorten_model_name_passes_through_garbage_bracketed_suffix() {
+        assert_eq!(shorten_model_name("opus[]"), "opus[]");
+        assert_eq!(shorten_model_name("opus[ABC]"), "opus[ABC]");
+        assert_eq!(shorten_model_name("opus[2m]"), "opus");
+        assert_eq!(shorten_model_name("opus[200k]"), "opus");
+    }
+
+    #[test]
+    fn shorten_model_name_passes_through_when_no_open_bracket() {
+        // Input ends with `]` but contains no `[`. The rsplit_once
+        // returns None and the function passes through. Pinning the
+        // edge case so a future "trim trailing `]`" shortcut doesn't
+        // silently mangle exotic aliases.
+        assert_eq!(shorten_model_name("foo]"), "foo]");
+        assert_eq!(shorten_model_name("opus-4-7]"), "opus-4-7]");
+    }
+
+    #[test]
+    fn shorten_model_name_passes_through_when_base_is_empty() {
+        // The whole alias is `[<payload>]` with nothing before the
+        // bracket. Stripping would leave an empty string — the
+        // function passes through instead so the rendered segment
+        // still has something visible (`model:[1m]`).
+        assert_eq!(shorten_model_name("[1m]"), "[1m]");
+        assert_eq!(shorten_model_name("[200k]"), "[200k]");
     }
 
     #[test]
@@ -323,10 +528,11 @@ mod tests {
         // the span guards against that regression.
         let bindings = Bindings::default();
         let secondary = Style::default().fg(Color::Indexed(247));
+        let model = me("claude-opus-4-7", None);
         let ctx = SegmentCtx {
             repo: None,
             branch: None,
-            model: Some("claude-opus-4-7"),
+            model_effort: Some(&model),
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings: &bindings,
@@ -341,14 +547,7 @@ mod tests {
     #[test]
     fn repo_segment_renders_repo_name() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(
-            &bindings,
-            Some("codemux"),
-            None,
-            None,
-            None,
-            PrefixState::Idle,
-        );
+        let ctx = ctx_with(&bindings, Some("codemux"), None, None, PrefixState::Idle);
         let line = RepoSegment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "repo:codemux");
     }
@@ -356,7 +555,7 @@ mod tests {
     #[test]
     fn repo_segment_returns_none_when_no_repo() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
+        let ctx = ctx_with(&bindings, None, None, None, PrefixState::Idle);
         assert!(RepoSegment.render(&ctx).is_none());
     }
 
@@ -370,7 +569,6 @@ mod tests {
         let ctx = ctx_with(
             &bindings,
             Some("codemux"),
-            None,
             None,
             Some("codemux"),
             PrefixState::Idle,
@@ -388,7 +586,6 @@ mod tests {
             &bindings,
             Some("codemux"),
             None,
-            None,
             Some("feature-x"),
             PrefixState::Idle,
         );
@@ -403,14 +600,7 @@ mod tests {
         // compare against, render the cwd basename so the user at
         // least sees where they are.
         let bindings = Bindings::default();
-        let ctx = ctx_with(
-            &bindings,
-            None,
-            None,
-            None,
-            Some("scratch"),
-            PrefixState::Idle,
-        );
+        let ctx = ctx_with(&bindings, None, None, Some("scratch"), PrefixState::Idle);
         let line = WorktreeSegment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "wt:scratch");
     }
@@ -419,7 +609,7 @@ mod tests {
     fn worktree_segment_returns_none_when_cwd_basename_unknown() {
         // SSH agent or a path with no resolvable basename.
         let bindings = Bindings::default();
-        let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
+        let ctx = ctx_with(&bindings, None, None, None, PrefixState::Idle);
         assert!(WorktreeSegment.render(&ctx).is_none());
     }
 
@@ -469,7 +659,7 @@ mod tests {
     #[test]
     fn prefix_hint_segment_renders_help_label_when_idle() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(&bindings, None, None, None, None, PrefixState::Idle);
+        let ctx = ctx_with(&bindings, None, None, None, PrefixState::Idle);
         let line = PrefixHintSegment.render(&ctx).unwrap();
         assert!(
             line_text(&line).ends_with("for help"),
@@ -481,14 +671,7 @@ mod tests {
     #[test]
     fn prefix_hint_segment_renders_nav_badge_when_awaiting_command() {
         let bindings = Bindings::default();
-        let ctx = ctx_with(
-            &bindings,
-            None,
-            None,
-            None,
-            None,
-            PrefixState::AwaitingCommand,
-        );
+        let ctx = ctx_with(&bindings, None, None, None, PrefixState::AwaitingCommand);
         let line = PrefixHintSegment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "[NAV] h/l prev/next  esc exit");
     }
@@ -503,7 +686,7 @@ mod tests {
         let ctx = SegmentCtx {
             repo: None,
             branch: None,
-            model: None,
+            model_effort: None,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings: &bindings,
@@ -519,7 +702,7 @@ mod tests {
         // it stay rightmost (highest priority) by default.
         let bindings = Bindings::default();
         for state in [PrefixState::Idle, PrefixState::AwaitingCommand] {
-            let ctx = ctx_with(&bindings, None, None, None, None, state);
+            let ctx = ctx_with(&bindings, None, None, None, state);
             assert!(PrefixHintSegment.render(&ctx).is_some());
         }
     }
