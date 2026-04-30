@@ -55,9 +55,10 @@ pub(crate) fn find_url_at(screen: &Screen, target_row: u16, target_col: u16) -> 
 }
 
 /// Find every URL across every visible row of `screen`. Used by the
-/// OSC 8 hyperlink injector — see [`crate::runtime::paint_hyperlinks`].
-/// Skips the trailing rows that contain no schemes via cheap byte
-/// scanning, so cost on idle frames stays bounded.
+/// post-draw OSC 8 hyperlink injector — see
+/// [`crate::runtime::paint_hyperlinks_post_draw`]. Skips the trailing
+/// rows that contain no schemes via cheap byte scanning, so cost on
+/// idle frames stays bounded.
 pub(crate) fn find_urls_in_screen(screen: &Screen) -> Vec<UrlSpanAt> {
     let (rows, cols) = screen.size();
     let mut out = Vec::new();

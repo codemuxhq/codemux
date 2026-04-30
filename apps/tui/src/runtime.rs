@@ -25,6 +25,7 @@
 //! after the modal closes.
 
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -131,6 +132,12 @@ impl Drop for TerminalGuard {
         if self.mouse_captured {
             let _ = execute!(io::stdout(), DisableMouseCapture);
         }
+        // Reset the host mouse pointer in case we left it as a hand
+        // (in-app Ctrl+hover sets OSC 22 `pointer`; if the user kills
+        // codemux mid-hover the host inherits whatever shape we last
+        // sent). OSC 22 `default` is a no-op on terminals that don't
+        // implement the sequence.
+        let _ = io::stdout().write_all(b"\x1b]22;default\x1b\\");
         if self.enhanced_keyboard {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
@@ -531,6 +538,14 @@ impl PaneHitbox {
         }
         self.rect = Some(rect);
         self.agent_id = Some(agent_id);
+    }
+
+    /// Read-only accessor for the post-draw OSC 8 hyperlink painter.
+    /// Returns `None` when the focused agent's pane wasn't recorded
+    /// this frame (e.g. all agents are in `Failed` state, or layout
+    /// has zero area for the pane).
+    fn rect(&self) -> Option<Rect> {
+        self.rect
     }
 
     /// Translate a screen-cell click into a pane-relative cell, or
@@ -2550,7 +2565,7 @@ fn event_loop(
         if let Some(h) = hover.as_ref()
             && nav.agents.get(nav.focused).is_none_or(|a| a.id != h.agent)
         {
-            hover = None;
+            let _ = update_hover(&mut io::stdout(), &mut hover, None);
         }
         // Push the focused agent's title out to the surrounding
         // terminal so Ghostty / iTerm2 / Kitty can label its codemux
@@ -2606,6 +2621,38 @@ fn event_loop(
             })
             .wrap_err("draw frame")?;
 
+        // OSC 8 hyperlink wrap, post-draw — see `paint_hyperlinks_post_draw`'s
+        // doc comment for why this can't live inside the closure. Gated on:
+        // - no overlay active (spawn modal / help / popup repaint the agent
+        //   pane area in the ratatui buffer; re-emitting URL chars from
+        //   the agent's PTY screen would overwrite the modal text).
+        // - no in-app `hover` active. The Ctrl+hover overlay paints cyan +
+        //   underline directly into the ratatui buffer; re-emitting from
+        //   vt100 would clobber that styling because the post-draw walk
+        //   reads colors from the PTY screen, not from ratatui's buffer.
+        //   When `hover` clears, the next frame re-tags all URL cells so
+        //   the host terminal's hyperlink state stays current.
+        if no_overlay_active(spawn_ui.as_ref(), nav.popup_state, help_state)
+            && hover.is_none()
+            && let Some(rect) = pane_hitbox.rect()
+            && let Some(agent) = nav.agents.get(nav.focused)
+        {
+            let screen_opt = match &agent.state {
+                AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
+                    Some(parser.screen())
+                }
+                AgentState::Failed { .. } => None,
+            };
+            if let Some(screen) = screen_opt {
+                let mut stdout = io::stdout().lock();
+                if let Err(err) = paint_hyperlinks_post_draw(&mut stdout, rect, screen) {
+                    tracing::debug!(?err, "OSC 8 hyperlink paint failed");
+                } else if let Err(err) = stdout.flush() {
+                    tracing::debug!(?err, "OSC 8 hyperlink flush failed");
+                }
+            }
+        }
+
         if !event::poll(FRAME_POLL).wrap_err("poll for input")? {
             continue;
         }
@@ -2644,7 +2691,7 @@ fn event_loop(
             // the catch-all arm at the bottom.
             Event::FocusLost => {
                 mouse_capture_state.reclaim();
-                hover = None;
+                let _ = update_hover(&mut io::stdout(), &mut hover, None);
             }
             // Press OR Repeat: a held character key sends Repeat events
             // under KKP `REPORT_EVENT_TYPES`. Treat them the same as
@@ -3157,7 +3204,7 @@ fn event_loop(
                 selection = None;
                 // Same reflow concern for the hover URL: the row /
                 // column the URL was on may now hold different content.
-                hover = None;
+                let _ = update_hover(&mut io::stdout(), &mut hover, None);
             }
             Event::Mouse(MouseEvent {
                 kind,
@@ -3194,11 +3241,12 @@ fn event_loop(
                         // through to the `clear_hover` path below.
                         let ctrl_held = modifiers.contains(KeyModifiers::CONTROL);
                         if ctrl_held && matches!(other, MouseEventKind::Moved) {
-                            hover = compute_hover(&pane_hitbox, &nav.agents, column, row);
+                            let new = compute_hover(&pane_hitbox, &nav.agents, column, row);
+                            let _ = update_hover(&mut io::stdout(), &mut hover, new);
                             continue;
                         }
                         if !ctrl_held && hover.is_some() {
-                            hover = None;
+                            let _ = update_hover(&mut io::stdout(), &mut hover, None);
                         }
                         // Ctrl+Click on a URL cell hands the URL to the
                         // OS opener and consumes the event so the
@@ -3212,7 +3260,7 @@ fn event_loop(
                                 compute_hover(&pane_hitbox, &nav.agents, column, row)
                         {
                             url_opener.open(&span.url);
-                            hover = Some(span);
+                            let _ = update_hover(&mut io::stdout(), &mut hover, Some(span));
                             continue;
                         }
                         // Pane-relative selection takes priority over
@@ -3569,7 +3617,6 @@ fn render_agent_pane(
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
             pane_hitbox.record(area, agent.id.clone());
-            paint_hyperlinks(frame, area, parser.screen());
             paint_selection_if_active(frame, area, &agent.id, overlay.selection);
             paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
@@ -3585,7 +3632,6 @@ fn render_agent_pane(
             let widget = PseudoTerminal::new(parser.screen());
             frame.render_widget(widget, area);
             pane_hitbox.record(area, agent.id.clone());
-            paint_hyperlinks(frame, area, parser.screen());
             paint_selection_if_active(frame, area, &agent.id, overlay.selection);
             paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
@@ -3609,47 +3655,169 @@ fn render_agent_pane(
 /// link via Cmd-click (macOS) or Ctrl-click (Linux/Win) — whichever
 /// modifier the host terminal is configured for.
 ///
-/// The trick: the `tui-term`/`vt100` pipeline drops OSC 8 from
-/// Claude's output (vt100 0.16 ignores `osc_dispatch`). We can't
-/// resurrect Claude's hyperlink intent, but we can scan the rendered
-/// cells for plain-text URLs and wrap them ourselves before the bytes
-/// reach the host terminal. We do that by mutating the first URL
-/// cell's `symbol` to *prepend* `\x1b]8;;<url>\x1b\\` and the last
-/// URL cell's `symbol` to *append* `\x1b]8;;\x1b\\`. The host
-/// terminal parses the OSC 8 inline and remembers each cell's
-/// hyperlink target; non-supporting terminals strip the unknown OSC
-/// silently.
+/// Why post-draw and not inside `terminal.draw`: the natural-looking
+/// alternative is to mutate the first/last URL cell symbols to embed
+/// the OSC 8 setup/reset escape bytes, but that breaks ratatui's diff
+/// algorithm. `unicode_width::Width` on a 27-byte symbol returns 27,
+/// `Buffer::diff` then thinks the cell is a 27-cell-wide grapheme and
+/// suppresses the immediately-following cell from the update list —
+/// which leaves whatever was previously at that column on screen as
+/// stale content, so `https://example.com` reads back as something like
+/// `hetps://example.coms`. Symptoms verified with a focused repro.
 ///
-/// The crossterm backend writes `Print(cell.symbol())` verbatim and
-/// advances `last_pos` by one column per cell, so embedding multi-
-/// byte escape sequences in a symbol doesn't desync the cell layout
-/// — the bytes are control sequences from the terminal's perspective.
+/// Instead: after `terminal.draw` finishes flushing the diff, we walk
+/// each visible URL on the focused pane's PTY screen and write OSC 8
+/// directly to stdout — `MoveTo(first_x, y)`, OSC 8 setup, then a
+/// per-cell SGR + `Print(contents)` walk so each cell receives the
+/// hyperlink attribute (OSC 8 attaches to glyphs printed while the
+/// attribute is active; a bare `MoveTo` doesn't tag intervening
+/// cells), then OSC 8 reset. The whole batch is bracketed with DECSC
+/// (`\x1b7`) and DECRC (`\x1b8`) so cursor position *and* SGR state
+/// are restored to whatever ratatui left at end-of-draw — the next
+/// frame's diff is unaffected.
 ///
-/// Out-of-bounds cells (clipped by a renderer that drew over part of
-/// the area, or coordinates that drifted out during a resize race)
-/// are dropped silently.
-fn paint_hyperlinks(frame: &mut Frame<'_>, area: Rect, screen: &vt100::Screen) {
-    let spans = crate::url_scan::find_urls_in_screen(screen);
-    if spans.is_empty() {
-        return;
+/// Re-printing the URL chars with their original SGR is a visual
+/// no-op (same glyph, same colors) — only the hidden hyperlink
+/// attribute changes. Terminals that don't support OSC 8 strip the
+/// unknown sequences and the redundant cell prints look identical to
+/// what was already on screen.
+///
+/// Cells past the screen edge are skipped via `screen.cell()` returning
+/// `None`. Wide-char continuation cells inside a URL (rare; URL chars
+/// are ASCII) are skipped to keep cursor advancement in sync with the
+/// glyph stream — the wide cell's primary already printed two columns
+/// in one print.
+fn paint_hyperlinks_post_draw<W: io::Write>(
+    out: &mut W,
+    area: Rect,
+    screen: &vt100::Screen,
+) -> io::Result<()> {
+    let urls = crate::url_scan::find_urls_in_screen(screen);
+    if urls.is_empty() {
+        return Ok(());
     }
-    let buf = frame.buffer_mut();
-    for span in spans {
-        if span.cols.start >= span.cols.end {
+    // DECSC saves cursor position + character set + SGR; the matching
+    // DECRC at the bottom restores them so ratatui's cursor tracking
+    // and the next frame's per-cell SGR emit don't see our intermediate
+    // state. CSI s / CSI u (the more portable cursor save/restore that
+    // crossterm uses) only saves position, not SGR, which would force
+    // an extra explicit reset.
+    out.write_all(b"\x1b7")?;
+    for url in urls {
+        if url.cols.start >= url.cols.end {
             continue;
         }
-        let y = area.y.saturating_add(span.row);
-        let first_x = area.x.saturating_add(span.cols.start);
-        let last_x = area.x.saturating_add(span.cols.end.saturating_sub(1));
-        if let Some(cell) = buf.cell_mut(Position::new(first_x, y)) {
-            let original = cell.symbol().to_string();
-            cell.set_symbol(&format!("\x1b]8;;{}\x1b\\{original}", span.url));
+        let y = area.y.saturating_add(url.row);
+        let first_x = area.x.saturating_add(url.cols.start);
+        // CUP (cursor position) is 1-based for both row and column.
+        write!(
+            out,
+            "\x1b[{};{}H\x1b]8;;{}\x1b\\",
+            u32::from(y).saturating_add(1),
+            u32::from(first_x).saturating_add(1),
+            url.url,
+        )?;
+        for col in url.cols.clone() {
+            let Some(cell) = screen.cell(url.row, col) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            emit_cell_sgr(out, cell)?;
+            let contents = cell.contents();
+            if contents.is_empty() {
+                out.write_all(b" ")?;
+            } else {
+                out.write_all(contents.as_bytes())?;
+            }
         }
-        if let Some(cell) = buf.cell_mut(Position::new(last_x, y)) {
-            let original = cell.symbol().to_string();
-            cell.set_symbol(&format!("{original}\x1b]8;;\x1b\\"));
-        }
+        // Empty OSC 8 closes the hyperlink so any subsequent text on
+        // the same row (or in the next cell ratatui re-emits) isn't
+        // tagged with this URL.
+        out.write_all(b"\x1b]8;;\x1b\\")?;
     }
+    out.write_all(b"\x1b8")?;
+    Ok(())
+}
+
+/// Emit SGR escape bytes for a vt100 cell: full reset first (so the
+/// previous cell's attributes don't leak), then bold / italic /
+/// underline / inverse if set, then fg + bg colors. We deliberately
+/// omit `dim`: most terminals render it by darkening fg, which fights
+/// the host terminal's URL-hover tint.
+fn emit_cell_sgr<W: io::Write>(out: &mut W, cell: &vt100::Cell) -> io::Result<()> {
+    out.write_all(b"\x1b[0m")?;
+    if cell.bold() {
+        out.write_all(b"\x1b[1m")?;
+    }
+    if cell.italic() {
+        out.write_all(b"\x1b[3m")?;
+    }
+    if cell.underline() {
+        out.write_all(b"\x1b[4m")?;
+    }
+    if cell.inverse() {
+        out.write_all(b"\x1b[7m")?;
+    }
+    emit_color(out, cell.fgcolor(), true)?;
+    emit_color(out, cell.bgcolor(), false)?;
+    Ok(())
+}
+
+/// Emit one SGR color escape — `Default` → `[39m`/`[49m`, indexed →
+/// 256-color form, true-color → 24-bit form. `foreground` switches
+/// between the fg (38/39) and bg (48/49) parameter prefixes.
+fn emit_color<W: io::Write>(out: &mut W, color: vt100::Color, foreground: bool) -> io::Result<()> {
+    let (prefix, default) = if foreground { (38, 39) } else { (48, 49) };
+    match color {
+        vt100::Color::Default => write!(out, "\x1b[{default}m"),
+        vt100::Color::Idx(n) => write!(out, "\x1b[{prefix};5;{n}m"),
+        vt100::Color::Rgb(r, g, b) => write!(out, "\x1b[{prefix};2;{r};{g};{b}m"),
+    }
+}
+
+/// Set the host terminal's *mouse pointer* shape via OSC 22, mirroring
+/// the native hover affordance the host gives Cmd-hover-on-OSC-8 cells:
+/// switch to a hand pointer over a Ctrl-hovered URL, switch back to the
+/// arrow when the user moves off (or releases Ctrl).
+///
+/// Names follow the CSS cursor convention that modern terminals
+/// (Ghostty / iTerm2 / Kitty / `WezTerm`) accept — `pointer` for hand,
+/// `default` for arrow. Older xterm-style X11 cursor-font names (e.g.
+/// `hand1`, `left_ptr`) would also work but the CSS form is what
+/// Ghostty's docs and the iTerm2 escape catalog list. Terminals that
+/// don't recognise OSC 22 strip the unknown sequence silently.
+///
+/// Wrapped in [`update_hover`] so the emit only fires on the boolean
+/// transition `hover.is_some()` ↔ `hover.is_none()` — repeat moves
+/// across cells of the same URL don't re-emit.
+fn emit_mouse_cursor_shape<W: io::Write>(out: &mut W, pointer: bool) -> io::Result<()> {
+    let shape = if pointer { "pointer" } else { "default" };
+    write!(out, "\x1b]22;{shape}\x1b\\")
+}
+
+/// Update the in-app hover state and, when the boolean activeness
+/// transitions, emit OSC 22 to flip the host mouse pointer between
+/// hand and arrow. Centralises the "every hover mutation must keep
+/// the cursor shape in sync" invariant — without this, every call
+/// site that touches `hover` would have to remember to also write
+/// the OSC sequence and the next contributor adding a new mutation
+/// site would forget. Errors are surfaced so callers can decide
+/// whether to log; the runtime loop currently swallows them.
+fn update_hover<W: io::Write>(
+    out: &mut W,
+    hover: &mut Option<HoverUrl>,
+    new: Option<HoverUrl>,
+) -> io::Result<()> {
+    let was_active = hover.is_some();
+    let now_active = new.is_some();
+    *hover = new;
+    if was_active != now_active {
+        emit_mouse_cursor_shape(out, now_active)?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 /// the `REVERSED` modifier on every cell in the normalized selection
@@ -8663,85 +8831,264 @@ mod tests {
         }
     }
 
-    /// `paint_hyperlinks` should prepend OSC 8 setup to the first
-    /// URL cell's symbol and append the OSC 8 reset to the last URL
-    /// cell's symbol. The host terminal parses the inline escape
-    /// sequence and tags the run as a hyperlink. Cells outside the
-    /// URL range stay untouched.
+    /// `paint_hyperlinks_post_draw` should bracket its writes with
+    /// DECSC/DECRC and emit, for each URL, an OSC 8 setup followed by
+    /// per-cell SGR plus cell contents and a closing OSC 8 reset.
+    /// Verified at the byte level rather than via a fake terminal: the
+    /// post-draw approach deliberately bypasses ratatui's diff/emit
+    /// pipeline, so `TestBackend` has nothing to observe.
     #[test]
-    fn paint_hyperlinks_wraps_url_cells_with_osc_8_setup_and_reset() {
-        // 3-row screen so we exercise multi-row scanning. URL goes on row 1.
+    fn paint_hyperlinks_post_draw_emits_osc_8_wrap_around_cell_walk() {
         let mut parser = vt100::Parser::new(3, 40, 0);
         parser.process(b"plain row\r\nsee https://example.com here\r\nbottom");
 
-        let backend = TestBackend::new(40, 3);
-        let mut terminal = Terminal::new(backend).unwrap();
         let area = Rect {
             x: 0,
             y: 0,
             width: 40,
             height: 3,
         };
-        terminal
-            .draw(|frame| {
-                // First render via PseudoTerminal so cells have the URL text,
-                // then layer the OSC 8 wrapper on top.
-                let widget = PseudoTerminal::new(parser.screen());
-                frame.render_widget(widget, area);
-                paint_hyperlinks(frame, area, parser.screen());
-            })
-            .unwrap();
+        let mut out = Vec::new();
+        paint_hyperlinks_post_draw(&mut out, area, parser.screen()).unwrap();
+        let s = String::from_utf8(out).expect("ASCII-only output");
 
-        let buf = terminal.backend().buffer();
-        let first = buf[(4u16, 1u16)].symbol(); // 'h' of "https"
-        let last = buf[(22u16, 1u16)].symbol(); // 'm' of "...com"
+        assert!(s.starts_with("\x1b7"), "leads with DECSC, got {s:?}");
+        assert!(s.ends_with("\x1b8"), "trails with DECRC, got {s:?}");
+        // CUP positions cursor 1-based at row 2 (URL is on screen row 1),
+        // col 5 ('h' is at pane-relative col 4).
         assert!(
-            first.starts_with("\x1b]8;;https://example.com\x1b\\"),
-            "first cell should carry OSC 8 setup, got {first:?}",
+            s.contains("\x1b[2;5H"),
+            "CUP for first URL cell missing, got {s:?}",
         );
-        assert!(first.ends_with('h'), "first cell still renders 'h'");
         assert!(
-            last.ends_with("\x1b]8;;\x1b\\"),
-            "last cell should carry OSC 8 reset, got {last:?}",
+            s.contains("\x1b]8;;https://example.com\x1b\\"),
+            "OSC 8 setup with URL missing, got {s:?}",
         );
-        // A cell well outside the URL range must not contain any escape bytes.
-        let outside = buf[(0u16, 0u16)].symbol();
+        // Each URL char gets re-printed under the active hyperlink so
+        // every cell receives the OSC 8 attribute.
+        for ch in "https://example.com".chars() {
+            assert!(
+                s.contains(ch),
+                "URL char {ch:?} missing from re-print, got {s:?}",
+            );
+        }
         assert!(
-            !outside.contains('\x1b'),
-            "non-URL cell should be untouched, got {outside:?}",
+            s.contains("\x1b]8;;\x1b\\"),
+            "OSC 8 reset missing, got {s:?}",
         );
     }
 
     #[test]
-    fn paint_hyperlinks_is_a_no_op_when_no_urls_present() {
+    fn paint_hyperlinks_post_draw_translates_pane_offset_into_terminal_cup() {
+        let mut parser = vt100::Parser::new(1, 40, 0);
+        parser.process(b"https://example.com");
+        // Pane offset by 10 cols, 5 rows in the terminal — CUP must
+        // reflect the absolute position, not the pane-local one.
+        let area = Rect {
+            x: 10,
+            y: 5,
+            width: 40,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        paint_hyperlinks_post_draw(&mut out, area, parser.screen()).unwrap();
+        let s = String::from_utf8(out).expect("ASCII-only output");
+        // 1-based CUP, so screen row 0 + pane row 5 → "6", and pane-local
+        // col 0 + pane offset 10 → "11".
+        assert!(
+            s.contains("\x1b[6;11H"),
+            "CUP must translate pane offset into absolute coords, got {s:?}",
+        );
+    }
+
+    #[test]
+    fn paint_hyperlinks_post_draw_is_a_no_op_when_no_urls_present() {
         let mut parser = vt100::Parser::new(2, 20, 0);
         parser.process(b"plain text\r\nno url here");
-
-        let backend = TestBackend::new(20, 2);
-        let mut terminal = Terminal::new(backend).unwrap();
         let area = Rect {
             x: 0,
             y: 0,
             width: 20,
             height: 2,
         };
-        terminal
-            .draw(|frame| {
-                let widget = PseudoTerminal::new(parser.screen());
-                frame.render_widget(widget, area);
-                paint_hyperlinks(frame, area, parser.screen());
-            })
-            .unwrap();
+        let mut out = Vec::new();
+        paint_hyperlinks_post_draw(&mut out, area, parser.screen()).unwrap();
+        assert!(
+            out.is_empty(),
+            "no bytes should be written when there are no URLs, got {out:?}",
+        );
+    }
 
-        let buf = terminal.backend().buffer();
-        for y in 0..2u16 {
-            for x in 0..20u16 {
-                assert!(
-                    !buf[(x, y)].symbol().contains('\x1b'),
-                    "no escape sequence should leak when no URLs found ({x},{y})",
-                );
+    /// The bug this whole post-draw approach exists to fix: with the
+    /// previous `paint_hyperlinks` (cell-symbol baking) the rendered URL
+    /// came out as `hetps://example.coms` because ratatui's diff treated
+    /// the OSC-8-bearing cell as a 27-cell-wide grapheme and suppressed
+    /// the immediately-following cell from the update list, leaving
+    /// stale content visible. The post-draw painter has no diff, so the
+    /// emitted byte stream contains every URL char in order.
+    #[test]
+    fn paint_hyperlinks_post_draw_does_not_drop_chars_adjacent_to_url_boundaries() {
+        let mut parser = vt100::Parser::new(1, 40, 0);
+        parser.process(b"see https://example.com here");
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 1,
+        };
+        let mut out = Vec::new();
+        paint_hyperlinks_post_draw(&mut out, area, parser.screen()).unwrap();
+        let s = String::from_utf8(out).expect("ASCII-only output");
+
+        // The URL must appear, in order, inside the OSC 8 wrap. Per-cell
+        // SGR escapes are interleaved between the URL chars (one full
+        // reset + fg/bg per cell), so we strip CSI sequences before
+        // looking for the URL substring rather than asserting it appears
+        // verbatim. The setup/reset OSC 8 markers anchor the search
+        // window to the URL region.
+        let setup = "\x1b]8;;https://example.com\x1b\\";
+        let reset = "\x1b]8;;\x1b\\";
+        let setup_at = s.find(setup).expect("OSC 8 setup present");
+        let reset_at = s[setup_at..]
+            .find(reset)
+            .expect("OSC 8 reset present after setup");
+        let between = &s[setup_at + setup.len()..setup_at + reset_at];
+        let stripped = strip_csi_sequences(between);
+        assert_eq!(
+            stripped, "https://example.com",
+            "URL must be re-printed contiguously between OSC 8 setup and reset",
+        );
+    }
+
+    /// Test helper: drop all `\x1b[…<final>` CSI escape sequences from a
+    /// string so we can compare the visible glyph stream against the
+    /// expected URL text without per-cell SGR noise getting in the way.
+    /// CSI is `ESC [`, parameter bytes `0x30-0x3F`, intermediate bytes
+    /// `0x20-0x2F`, terminated by a final byte `0x40-0x7E`.
+    fn strip_csi_sequences(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let bytes = input.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && (0x30..=0x3F).contains(&bytes[i]) {
+                    i += 1;
+                }
+                while i < bytes.len() && (0x20..=0x2F).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // skip the final byte
+                }
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
             }
         }
+        out
+    }
+
+    #[test]
+    fn emit_cell_sgr_resets_then_emits_attrs_and_colors_for_a_styled_cell() {
+        // Bold + underline, red fg on yellow bg, then "X". After the
+        // process, the cell at col 0 should report all those attrs.
+        let mut parser = vt100::Parser::new(1, 5, 0);
+        parser.process(b"\x1b[1;4;31;43mX\x1b[0m");
+        let cell = parser.screen().cell(0, 0).expect("cell exists");
+
+        let mut out = Vec::new();
+        emit_cell_sgr(&mut out, cell).unwrap();
+        let s = String::from_utf8(out).expect("ASCII-only");
+        assert!(s.starts_with("\x1b[0m"), "leads with full reset, got {s:?}");
+        assert!(s.contains("\x1b[1m"), "bold missing, got {s:?}");
+        assert!(s.contains("\x1b[4m"), "underline missing, got {s:?}");
+        // vt100 normalizes the standard 16 colors to indexed-256 entries,
+        // so "red" and "yellow" surface as Idx(1) / Idx(3) and we emit
+        // them via the 256-color SGR form.
+        assert!(s.contains("\x1b[38;5;1m"), "red fg missing, got {s:?}");
+        assert!(s.contains("\x1b[48;5;3m"), "yellow bg missing, got {s:?}");
+    }
+
+    #[test]
+    fn emit_color_emits_default_indexed_and_rgb_forms() {
+        let mut out = Vec::new();
+        emit_color(&mut out, vt100::Color::Default, true).unwrap();
+        emit_color(&mut out, vt100::Color::Default, false).unwrap();
+        emit_color(&mut out, vt100::Color::Idx(42), true).unwrap();
+        emit_color(&mut out, vt100::Color::Rgb(10, 20, 30), false).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b[39m\x1b[49m\x1b[38;5;42m\x1b[48;2;10;20;30m");
+    }
+
+    #[test]
+    fn emit_mouse_cursor_shape_writes_osc_22_with_pointer_or_default() {
+        let mut out = Vec::new();
+        emit_mouse_cursor_shape(&mut out, true).unwrap();
+        emit_mouse_cursor_shape(&mut out, false).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b]22;pointer\x1b\\\x1b]22;default\x1b\\");
+    }
+
+    #[test]
+    fn update_hover_emits_osc_22_pointer_only_on_none_to_some_transition() {
+        let mut hover: Option<HoverUrl> = None;
+        let mut out = Vec::new();
+        let new = HoverUrl {
+            agent: AgentId::new("a"),
+            row: 0,
+            cols: 0..5,
+            url: "https://x".into(),
+        };
+        update_hover(&mut out, &mut hover, Some(new.clone())).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b]22;pointer\x1b\\");
+    }
+
+    #[test]
+    fn update_hover_emits_osc_22_default_only_on_some_to_none_transition() {
+        let mut hover: Option<HoverUrl> = Some(HoverUrl {
+            agent: AgentId::new("a"),
+            row: 0,
+            cols: 0..5,
+            url: "https://x".into(),
+        });
+        let mut out = Vec::new();
+        update_hover(&mut out, &mut hover, None).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b]22;default\x1b\\");
+    }
+
+    #[test]
+    fn update_hover_does_not_re_emit_when_active_state_unchanged() {
+        // Some → Some (different cell of the same URL, or a different URL):
+        // the pointer was already a hand, no need to re-tell the host.
+        let initial = HoverUrl {
+            agent: AgentId::new("a"),
+            row: 0,
+            cols: 0..5,
+            url: "https://x".into(),
+        };
+        let mut hover: Option<HoverUrl> = Some(initial);
+        let next = HoverUrl {
+            agent: AgentId::new("a"),
+            row: 0,
+            cols: 6..11,
+            url: "https://y".into(),
+        };
+        let mut out = Vec::new();
+        update_hover(&mut out, &mut hover, Some(next)).unwrap();
+        assert!(
+            out.is_empty(),
+            "Some→Some must be a no-op for OSC 22, got {out:?}",
+        );
+
+        // None → None: also a no-op (mouse moved over non-URL cell while
+        // already off-URL).
+        let mut hover: Option<HoverUrl> = None;
+        let mut out = Vec::new();
+        update_hover(&mut out, &mut hover, None).unwrap();
+        assert!(out.is_empty(), "None→None must be a no-op, got {out:?}");
     }
 
     fn ready_agent_with(id: &str, cols: u16, body: &[u8]) -> RuntimeAgent {
