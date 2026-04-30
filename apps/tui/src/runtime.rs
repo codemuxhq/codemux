@@ -24,6 +24,7 @@
 //! `Failed` agent so the bootstrap error has a render surface even
 //! after the modal closes.
 
+use std::collections::HashMap;
 use std::io;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,7 @@ use crate::bootstrap_worker::{
     start_prepare,
 };
 use crate::config::{Config, MouseUrlModifier, SpawnConfig};
+use crate::fuzzy_worker::FuzzyWorker;
 use crate::host_title;
 use crate::index_manager::IndexManager;
 use crate::index_worker::IndexState;
@@ -1289,6 +1291,75 @@ fn daemon_agent_id_for(tui_pid: u32, spawn_counter: usize) -> String {
     format!("agent-{tui_pid}-{spawn_counter}")
 }
 
+/// One frame of fuzzy-worker bookkeeping for the spawn modal:
+/// drain any results the worker has produced and apply them to the
+/// modal, then dispatch fresh `SetIndex` / `Query` messages when the
+/// per-host index generation or the modal's query string have moved
+/// on since the last dispatch. Cheap when the modal is closed
+/// (drain-and-drop) or not in fuzzy mode (no dispatch).
+///
+/// Memoization tables are passed by `&mut` so the helper can be
+/// called from both the per-tick spot at the top of the loop AND the
+/// post-keystroke spot inside the event arm without losing state
+/// between calls. Both call sites need the same drain-then-dispatch
+/// ordering — see the doc on [`crate::fuzzy_worker`] for the race
+/// the ordering exists to handle.
+fn tick_fuzzy_dispatch(
+    spawn_ui: Option<&mut SpawnMinibuffer>,
+    fuzzy_worker: &FuzzyWorker,
+    index_mgr: &IndexManager,
+    last_pushed_index_gen: &mut HashMap<String, u64>,
+    last_pushed_query: &mut HashMap<String, String>,
+) {
+    // Drain first regardless — even if the modal is closed, results
+    // from a just-cancelled query may still be in flight; drop them
+    // so the channel doesn't grow unbounded.
+    let drained = fuzzy_worker.drain();
+    let Some(ui) = spawn_ui else {
+        return;
+    };
+    for r in drained {
+        ui.set_fuzzy_results(r);
+    }
+    // Active-host gate + empty-query short-circuit: the modal returns
+    // `None` outside Fuzzy + Path mode and for empty queries. Both
+    // cases mean "no fuzzy work to dispatch."
+    let Some(req) = ui.fuzzy_dispatch_request() else {
+        return;
+    };
+    let host = req.host.to_string();
+    let query = req.query.to_string();
+    // SetIndex memoization: only push when the per-host generation
+    // counter (bumped by `IndexCatalog` mutations and the in-place
+    // `dirs.extend` in `IndexManager::drain_one_host`) differs from
+    // the last-pushed value. This is the line that turns ~50 ms-per-
+    // frame `score_fuzzy` calls into "once per index transition."
+    let current_gen = index_mgr.state_generation_for(&host);
+    let pushed_gen = last_pushed_index_gen.get(&host).copied();
+    if current_gen != pushed_gen
+        && let Some(dirs) = index_mgr.state_for(&host).and_then(IndexState::cached_dirs)
+    {
+        let named = ui.named_projects().to_vec();
+        fuzzy_worker.set_index(host.clone(), dirs.to_vec(), named);
+        if let Some(g) = current_gen {
+            last_pushed_index_gen.insert(host.clone(), g);
+        }
+        // Force the Query branch below to re-dispatch so the
+        // worker scores the *current* query against the *new*
+        // index in the same drain batch — without this, a query
+        // that landed before the index was ready would never
+        // produce a result.
+        last_pushed_query.remove(&host);
+    }
+    // Query memoization: dispatch on every distinct value, not on
+    // every frame. Combined with the SetIndex memoization above, an
+    // idle modal with a static query produces zero worker traffic.
+    if last_pushed_query.get(&host).map(String::as_str) != Some(query.as_str()) {
+        fuzzy_worker.query(host.clone(), query.clone());
+        last_pushed_query.insert(host, query);
+    }
+}
+
 /// Construct a [`RuntimeAgent`] backed by a local PTY. The transport
 /// owns the PTY shape (master + child + reader thread); the runtime
 /// keeps the renderable [`Parser`] alongside, since rendering is the
@@ -2313,6 +2384,17 @@ fn event_loop(
     // the status bar to render. Single thread, focused-agent only —
     // see [`agent_meta_worker`].
     let meta_worker = AgentMetaWorker::start();
+    // Background fuzzy scoring for the spawn modal. Declared after
+    // `meta_worker` so reverse-declaration drop order tears it down
+    // first — neither worker depends on the other, but keeping a
+    // consistent shutdown order makes the trace logs predictable.
+    // The runtime memoizes via `last_pushed_index_gen` /
+    // `last_pushed_query` so the worker only sees one dispatch per
+    // distinct (host, gen) and (host, query) — typing fast collapses
+    // to the latest state inside the worker's drain loop.
+    let fuzzy_worker = FuzzyWorker::start();
+    let mut last_pushed_index_gen: HashMap<String, u64> = HashMap::new();
+    let mut last_pushed_query: HashMap<String, String> = HashMap::new();
     let initial_count = agents.len();
     // Bundle the four navigation locals (`agents`, `focused`,
     // `previous_focused`, `popup_state`) into a single owned struct.
@@ -2406,14 +2488,17 @@ fn event_loop(
         // single comparison.
         apply_meta_events(&mut nav.agents, meta_worker.drain());
         sync_meta_worker_target(&meta_worker, &nav, &mut meta_worker_target);
-        // Refresh the modal's wildmenu from the index for whichever
-        // host the modal is currently targeting. The modal
-        // short-circuits when not in Fuzzy + Path, so this is cheap
-        // on every other frame.
-        if let Some(ui) = spawn_ui.as_mut() {
-            let key = ui.active_host_key().to_string();
-            ui.notify_index_state(index_mgr.state_for(&key));
-        }
+        // Drain background fuzzy results into the modal and dispatch
+        // any new SetIndex / Query messages — see `tick_fuzzy_dispatch`
+        // for the memoization and ordering rules. Cheap when the
+        // modal is closed or not in fuzzy mode.
+        tick_fuzzy_dispatch(
+            spawn_ui.as_mut(),
+            &fuzzy_worker,
+            &index_mgr,
+            &mut last_pushed_index_gen,
+            &mut last_pushed_query,
+        );
 
         // Drain prepare events first: the modal should reflect the
         // worker's progress on the same frame the events arrive,
@@ -3042,15 +3127,19 @@ fn event_loop(
                             }
                         }
                     }
-                    // Refresh the fuzzy wildmenu against the current
-                    // index state so a keystroke updates `filtered` on
-                    // the same frame instead of waiting for the next
-                    // loop iteration's drain. Cheap when not in fuzzy
-                    // mode (the modal short-circuits inside).
-                    if let Some(ui) = spawn_ui.as_mut() {
-                        let key = ui.active_host_key().to_string();
-                        ui.notify_index_state(index_mgr.state_for(&key));
-                    }
+                    // Re-tick fuzzy dispatch so the just-typed
+                    // keystroke immediately enqueues a worker
+                    // request instead of waiting for the next loop
+                    // iteration. The worker scoring runs off-thread
+                    // and the result lands a frame or two later;
+                    // typing itself is no longer blocked on it.
+                    tick_fuzzy_dispatch(
+                        spawn_ui.as_mut(),
+                        &fuzzy_worker,
+                        &index_mgr,
+                        &mut last_pushed_index_gen,
+                        &mut last_pushed_query,
+                    );
                     continue;
                 }
 
@@ -9794,6 +9883,121 @@ mod tests {
         assert!(spawn_ui.is_none());
         assert!(attaches.is_empty());
         assert_eq!(spawn_counter, 0);
+    }
+
+    #[test]
+    fn tick_fuzzy_dispatch_records_pushed_index_and_query_for_active_modal() {
+        // The runtime memoizes both the per-host index generation
+        // and the modal's query string after dispatching to the
+        // fuzzy worker. This is the line that turns per-frame
+        // score_fuzzy work into "once per index transition" — the
+        // table entries are the observable proof the dispatch fired.
+        let fuzzy_worker = FuzzyWorker::start();
+        let mut spawn_ui = Some(SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            crate::config::SearchMode::Fuzzy,
+            Vec::new(),
+        ));
+        if let Some(ui) = spawn_ui.as_mut() {
+            ui.set_fuzzy_query_for_test("code");
+        }
+        let mut index_mgr = IndexManager::new();
+        index_mgr.hydrate_for_test(
+            HOST_PLACEHOLDER.into(),
+            crate::index_worker::IndexSaveCtx::Local { roots: Vec::new() },
+            vec![crate::index_worker::IndexedDir {
+                path: PathBuf::from("/code"),
+                kind: crate::index_worker::ProjectKind::Plain,
+            }],
+        );
+        let mut last_pushed_index_gen: HashMap<String, u64> = HashMap::new();
+        let mut last_pushed_query: HashMap<String, String> = HashMap::new();
+
+        tick_fuzzy_dispatch(
+            spawn_ui.as_mut(),
+            &fuzzy_worker,
+            &index_mgr,
+            &mut last_pushed_index_gen,
+            &mut last_pushed_query,
+        );
+
+        assert_eq!(
+            last_pushed_index_gen.get(HOST_PLACEHOLDER).copied(),
+            index_mgr.state_generation_for(HOST_PLACEHOLDER),
+            "SetIndex memoization must record the dispatched generation",
+        );
+        assert_eq!(
+            last_pushed_query.get(HOST_PLACEHOLDER).map(String::as_str),
+            Some("code"),
+            "Query memoization must record the dispatched query",
+        );
+
+        // Second call with no state change must not re-dispatch (the
+        // memoization table values stay identical).
+        let gen_before = last_pushed_index_gen.clone();
+        let query_before = last_pushed_query.clone();
+        tick_fuzzy_dispatch(
+            spawn_ui.as_mut(),
+            &fuzzy_worker,
+            &index_mgr,
+            &mut last_pushed_index_gen,
+            &mut last_pushed_query,
+        );
+        assert_eq!(last_pushed_index_gen, gen_before);
+        assert_eq!(last_pushed_query, query_before);
+    }
+
+    #[test]
+    fn tick_fuzzy_dispatch_skips_when_modal_closed() {
+        // Modal closed: no dispatch, no memoization. Drained results
+        // (none here) are dropped silently.
+        let fuzzy_worker = FuzzyWorker::start();
+        let index_mgr = IndexManager::new();
+        let mut last_pushed_index_gen: HashMap<String, u64> = HashMap::new();
+        let mut last_pushed_query: HashMap<String, String> = HashMap::new();
+
+        tick_fuzzy_dispatch(
+            None,
+            &fuzzy_worker,
+            &index_mgr,
+            &mut last_pushed_index_gen,
+            &mut last_pushed_query,
+        );
+
+        assert!(last_pushed_index_gen.is_empty());
+        assert!(last_pushed_query.is_empty());
+    }
+
+    #[test]
+    fn tick_fuzzy_dispatch_skips_when_query_empty() {
+        // Empty query short-circuits inside the modal's
+        // `fuzzy_dispatch_request` — the runtime must not push a
+        // SetIndex or Query for it.
+        let fuzzy_worker = FuzzyWorker::start();
+        let mut spawn_ui = Some(SpawnMinibuffer::open(
+            Path::new("/tmp"),
+            crate::config::SearchMode::Fuzzy,
+            Vec::new(),
+        ));
+        let mut index_mgr = IndexManager::new();
+        index_mgr.hydrate_for_test(
+            HOST_PLACEHOLDER.into(),
+            crate::index_worker::IndexSaveCtx::Local { roots: Vec::new() },
+            Vec::new(),
+        );
+        let mut last_pushed_index_gen: HashMap<String, u64> = HashMap::new();
+        let mut last_pushed_query: HashMap<String, String> = HashMap::new();
+
+        tick_fuzzy_dispatch(
+            spawn_ui.as_mut(),
+            &fuzzy_worker,
+            &index_mgr,
+            &mut last_pushed_index_gen,
+            &mut last_pushed_query,
+        );
+
+        assert!(last_pushed_index_gen.is_empty());
+        assert!(last_pushed_query.is_empty());
     }
 
     #[test]

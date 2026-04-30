@@ -192,12 +192,36 @@ impl IndexManager {
     }
 
     /// Borrow the [`IndexState`] for `host`, if any. Used by the
-    /// modal's `notify_index_state` and the wildmenu render path.
-    /// Returns `None` for a host that has never been touched in
-    /// this session and has no disk cache.
+    /// wildmenu render path and the fuzzy worker dispatcher in
+    /// `runtime.rs`. Returns `None` for a host that has never been
+    /// touched in this session and has no disk cache.
     #[must_use]
     pub fn state_for(&self, host: &str) -> Option<&IndexState> {
         self.catalog.state_for(host)
+    }
+
+    /// Per-host monotonic version stamp. Bumped whenever the underlying
+    /// `IndexState` (and therefore `cached_dirs()`) could have changed.
+    /// The fuzzy worker dispatcher in `runtime.rs` memoizes on this
+    /// value so a fresh `SetIndex` only fires when the snapshot has
+    /// actually moved on.
+    #[must_use]
+    pub fn state_generation_for(&self, host: &str) -> Option<u64> {
+        self.catalog.generation_for(host)
+    }
+
+    /// Test-only seam: install a `Ready` snapshot for `host` without
+    /// going through the disk-cache hydration path. Used by runtime
+    /// integration tests that need a known-state catalog without
+    /// staging a real cache file on disk.
+    #[cfg(test)]
+    pub(crate) fn hydrate_for_test(
+        &mut self,
+        host: String,
+        save_ctx: IndexSaveCtx,
+        dirs: Vec<IndexedDir>,
+    ) {
+        self.catalog.hydrate(host, save_ctx, dirs);
     }
 }
 
@@ -225,6 +249,14 @@ fn drain_one_host(
         Ok(Vec<IndexedDir>),
         Err(String),
     }
+    // Tracks whether a Building Progress event extended `dirs` in place.
+    // The terminal Building/Refreshing → Ready/Failed transition runs
+    // through `IndexCatalog::set_state` which bumps the generation on
+    // its own; this flag covers the *partial* progress case so the
+    // fuzzy worker dispatcher sees a fresh stamp as the index grows.
+    // Refreshing Progress only mutates `count` (the batch is dropped to
+    // keep the stale cache stable), so no bump there.
+    let mut partial_dirs_extended = false;
     let term: Option<Term> = match &mut slot.state {
         IndexState::Building {
             handle,
@@ -241,6 +273,9 @@ fn drain_one_host(
                         // Classification stays Plain; the final
                         // `Done(Ok)` swaps the entire dirs vec for
                         // the fully-classified version.
+                        if !batch.is_empty() {
+                            partial_dirs_extended = true;
+                        }
                         dirs.extend(batch);
                     }
                     IndexEvent::Done(Ok(d)) => {
@@ -279,6 +314,9 @@ fn drain_one_host(
         }
         _ => None,
     };
+    if partial_dirs_extended {
+        slot.generation += 1;
+    }
     let term = term?;
     // Stale dirs from the prior `Refreshing` carrier. `take` empties
     // the vec in place so the next state owns a fresh allocation;
@@ -365,6 +403,7 @@ mod tests {
                     .collect(),
             },
             save_ctx: ctx(),
+            generation: 0,
         }
     }
 
@@ -417,6 +456,7 @@ mod tests {
                 count: 0,
             },
             save_ctx: ctx(),
+            generation: 0,
         };
         assert!(drain_one_host("local", &mut slot).is_none());
         match &slot.state {
@@ -455,6 +495,7 @@ mod tests {
                 dirs: Vec::new(),
             },
             save_ctx: ctx(),
+            generation: 0,
         };
         assert!(drain_one_host("local", &mut slot).is_none());
         match &slot.state {
@@ -466,6 +507,10 @@ mod tests {
             }
             other => panic!("expected Building, got {other:?}"),
         }
+        // Generation must bump because dirs grew — the fuzzy worker
+        // dispatcher uses this to detect partial-index changes
+        // mid-walk and re-snapshot.
+        assert_eq!(slot.generation, 1);
     }
 
     /// `Progress` on `Refreshing` updates the count but discards the
@@ -493,6 +538,7 @@ mod tests {
                 count: 0,
             },
             save_ctx: ctx(),
+            generation: 0,
         };
         assert!(drain_one_host("local", &mut slot).is_none());
         match &slot.state {
@@ -503,6 +549,11 @@ mod tests {
             }
             other => panic!("expected Refreshing, got {other:?}"),
         }
+        // Refreshing Progress drops the batch — `cached_dirs()` is
+        // unchanged — so the generation must NOT bump. Otherwise the
+        // fuzzy worker dispatcher would re-snapshot the same data on
+        // every progress tick and burn CPU on the dirs clone.
+        assert_eq!(slot.generation, 0);
     }
 
     /// `Done(Ok)` on a `Building` slot transitions to `Ready` with
@@ -527,6 +578,7 @@ mod tests {
                 }],
             },
             save_ctx: ctx(),
+            generation: 0,
         };
         let (host, next, completed, _) = drain_one_host("local", &mut slot).unwrap();
         assert_eq!(host, "local");
@@ -563,6 +615,7 @@ mod tests {
                 count: 0,
             },
             save_ctx: ctx(),
+            generation: 0,
         };
         let (_, next, completed, _) = drain_one_host("local", &mut slot).unwrap();
         match next {
@@ -593,6 +646,7 @@ mod tests {
                 dirs: Vec::new(),
             },
             save_ctx: ctx(),
+            generation: 0,
         };
         let (_, next, completed, _) = drain_one_host("local", &mut slot).unwrap();
         assert!(matches!(next, IndexState::Failed { .. }));

@@ -86,6 +86,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::config::{NamedProject, SearchMode};
+use crate::fuzzy_worker::FuzzyResult;
 use crate::index_worker::{IndexState, IndexedDir, ProjectKind};
 use crate::keymap::{ModalAction, ModalBindings};
 use crate::ssh_config::load_ssh_hosts;
@@ -184,7 +185,8 @@ pub enum ModalOutcome {
     /// mode. The runtime should cancel any in-flight index build and
     /// start a fresh one from the configured search roots. No-op for
     /// the modal beyond emitting this — the wildmenu reverts to the
-    /// "indexing…" sentinel via the normal `notify_index_state` path.
+    /// "indexing…" sentinel via the wildmenu render path once
+    /// `cached_dirs()` returns empty for the rebuilding host.
     RefreshIndex,
 }
 
@@ -255,6 +257,17 @@ pub struct BootstrapView {
     /// When the lock started. Drives the spinner phase via
     /// [`spinner_frame`].
     pub started_at: Instant,
+}
+
+/// What [`SpawnMinibuffer::fuzzy_dispatch_request`] hands back to the
+/// runtime: a borrowed `(host, query)` pair the runtime turns into a
+/// [`crate::fuzzy_worker::FuzzyControl::Query`] dispatch. Named struct
+/// (vs a tuple) so the call site can't accidentally swap the two
+/// `&str` fields.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FuzzyDispatchRequest<'a> {
+    pub host: &'a str,
+    pub query: &'a str,
 }
 
 /// Which zone of the structured prompt is currently accepting input.
@@ -342,9 +355,9 @@ pub struct SpawnMinibuffer {
     /// Input buffer for fuzzy mode. Kept separate from `path` so
     /// toggling Fuzzy ↔ Precise preserves both engines' inputs (the
     /// path field stays as the user left it; the query field stays as
-    /// the user left it). The runtime feeds this into `nucleo-matcher`
-    /// via [`Self::refresh_fuzzy`] each time the runtime drains an
-    /// index event or an input keystroke arrives.
+    /// the user left it). The runtime ships this to `nucleo-matcher`
+    /// via the [`crate::fuzzy_worker`] background thread on every
+    /// distinct value (see [`Self::fuzzy_dispatch_request`]).
     fuzzy_query: String,
     /// User-curated named projects from `[[spawn.projects]]`. Stashed
     /// at `open()` because they don't change mid-session. Scored by
@@ -362,6 +375,15 @@ pub struct SpawnMinibuffer {
     /// `score_fuzzy` emits (the wildmenu shows the expanded path; the
     /// confirm path resolves the same string back).
     project_hosts: HashMap<String, String>,
+    /// `true` when `filtered` may not reflect the current
+    /// `fuzzy_query` because a fresh fuzzy search has been kicked off
+    /// (background worker in `crate::fuzzy_worker`) but its result
+    /// hasn't landed yet. Set on every keystroke that mutates
+    /// `fuzzy_query`; cleared by [`Self::set_fuzzy_results`] when a
+    /// matching result arrives. Drives the dim modifier in the
+    /// wildmenu so the user can see results are "in flight" without
+    /// the menu blanking. No effect outside Fuzzy + Path mode.
+    filtered_stale: bool,
 }
 
 impl SpawnMinibuffer {
@@ -400,6 +422,7 @@ impl SpawnMinibuffer {
             fuzzy_query: String::new(),
             named_projects,
             project_hosts,
+            filtered_stale: false,
         };
         if default_mode == SearchMode::Precise {
             m.seed_path_with_cwd();
@@ -408,8 +431,9 @@ impl SpawnMinibuffer {
         // (filtered to directories only — files are not valid spawn
         // targets). In Fuzzy mode `refresh` short-circuits via the
         // path-zone fuzzy guard at the top; the wildmenu shows the
-        // index-state sentinel until the runtime calls
-        // `notify_index_state` with the first batch of results.
+        // index-state sentinel until the runtime drains the first
+        // [`crate::fuzzy_worker::FuzzyResult`] and the modal applies
+        // it via [`Self::set_fuzzy_results`].
         // Modal opens in `PathMode::Local` so the lister doesn't
         // matter; the local branch in `refresh` calls into the
         // synchronous `read_dir` path.
@@ -1048,12 +1072,15 @@ impl SpawnMinibuffer {
     }
 
     fn refresh(&mut self, lister: &mut DirLister<'_>) {
-        // Fuzzy mode owns its own wildmenu lifecycle: results are
-        // populated by `refresh_fuzzy` (driven by the runtime's index
-        // drain), not by the per-keystroke read_dir below. Bail out
-        // here so a Char/Backspace in fuzzy mode doesn't clobber the
-        // matcher's results with an empty Vec.
+        // Fuzzy mode owns its own wildmenu lifecycle: results come
+        // from the background [`crate::fuzzy_worker`] (kicked off by
+        // the runtime when it sees `fuzzy_dispatch_request` change),
+        // not the per-keystroke `read_dir` below. Hand off to
+        // `mark_fuzzy_stale` so the empty-query branch clears
+        // synchronously and non-empty queries are marked stale until
+        // the worker's matching result lands.
         if self.search_mode == SearchMode::Fuzzy && self.focused == Zone::Path {
+            self.mark_fuzzy_stale();
             return;
         }
         self.filtered = match self.focused {
@@ -1105,23 +1132,14 @@ impl SpawnMinibuffer {
             self.seed_path_with_cwd();
         }
         // Reset wildmenu state — different engine, different candidates.
-        // Precise mode is repopulated by `refresh`; Fuzzy mode waits
-        // for the runtime's `notify_index_state` callback.
+        // Precise mode is repopulated by `refresh`; Fuzzy mode marks
+        // the wildmenu stale and waits for the worker dispatch on the
+        // next runtime tick.
         self.filtered.clear();
         self.selected = None;
+        self.filtered_stale = false;
         self.refresh(lister);
         tracing::trace!(mode = ?next, "spawn modal: search mode toggled");
-    }
-
-    /// Runtime entry point. Called once per frame after the index
-    /// drain so the modal can repopulate its fuzzy wildmenu when a new
-    /// `IndexEvent::Done` lands or when the user just typed into the
-    /// query buffer. No-op outside Fuzzy + Path mode.
-    pub fn notify_index_state(&mut self, index: Option<&IndexState>) {
-        if self.search_mode != SearchMode::Fuzzy || self.focused != Zone::Path {
-            return;
-        }
-        self.refresh_fuzzy(index);
     }
 
     /// Catalog key the runtime should use when looking up the index
@@ -1138,32 +1156,100 @@ impl SpawnMinibuffer {
         }
     }
 
-    /// Score the current `fuzzy_query` against the index and populate
-    /// `filtered` with the top results. Called by `notify_index_state`;
-    /// public so tests can drive it without a runtime drain loop.
-    pub fn refresh_fuzzy(&mut self, index: Option<&IndexState>) {
-        // Empty query: clear the wildmenu so Enter doesn't commit a
-        // stale highlighted candidate from a previous query.
+    /// Reset the fuzzy wildmenu after the user changed the query.
+    /// Empty query → clear synchronously (no worker round-trip
+    /// makes sense). Non-empty → mark `filtered` stale so the
+    /// renderer dims it and the runtime knows to dispatch a fresh
+    /// scoring request to [`crate::fuzzy_worker`].
+    ///
+    /// Public so tests can drive the empty-query / stale paths
+    /// without standing up a worker. No-op outside Fuzzy + Path mode.
+    pub fn mark_fuzzy_stale(&mut self) {
+        if self.search_mode != SearchMode::Fuzzy || self.focused != Zone::Path {
+            return;
+        }
+        // Empty query: clear synchronously so the wildmenu doesn't
+        // hold ranked hits from a previous query (and so Enter doesn't
+        // commit a stale highlighted candidate). No worker dispatch
+        // needed — the runtime short-circuits before sending.
         if self.fuzzy_query.is_empty() {
             self.filtered.clear();
             self.selected = None;
+            self.filtered_stale = false;
             return;
         }
-        // Both `Ready` and `Refreshing` carry usable cached results
-        // — the SWR refresh just keeps a worker walking in the
-        // background. Reading via `cached_dirs` keeps this branch
-        // exhaustive over the four-variant enum without enumerating
-        // both arms inline.
-        let Some(dirs) = index.and_then(IndexState::cached_dirs) else {
-            // Index not ready (Building / Failed / None). Leave
-            // `filtered` empty so `wildmenu_view` falls into the
-            // index-state sentinel branch.
-            self.filtered.clear();
-            self.selected = None;
+        // Non-empty: the previously rendered hits stay visible (the
+        // wildmenu will dim them via `filtered_stale`) until the
+        // worker's matching result lands and `set_fuzzy_results`
+        // replaces them.
+        self.filtered_stale = true;
+    }
+
+    /// Apply a [`FuzzyResult`] to the modal's wildmenu. Drops results
+    /// whose `(host, query)` tag doesn't match the modal's current
+    /// `(active_host_key, fuzzy_query)` — the natural race when the
+    /// user types fast: an in-flight `c` result lands after the
+    /// modal has already moved on to `co`. On match, replaces
+    /// `filtered`, clears the stale flag, and resets `selected` to
+    /// the first hit (or `None` for empty hits so Enter doesn't
+    /// commit a non-candidate).
+    pub fn set_fuzzy_results(&mut self, result: FuzzyResult) {
+        if result.host != self.active_host_key() {
+            tracing::trace!(
+                got = ?result.host,
+                want = ?self.active_host_key(),
+                "fuzzy result: host mismatch, dropping"
+            );
             return;
-        };
-        self.filtered = score_fuzzy(&self.fuzzy_query, dirs, &self.named_projects);
+        }
+        if result.query != self.fuzzy_query {
+            tracing::trace!(
+                got = ?result.query,
+                want = ?self.fuzzy_query,
+                "fuzzy result: query superseded, dropping"
+            );
+            return;
+        }
+        self.filtered = result.hits;
         self.selected = (!self.filtered.is_empty()).then_some(0);
+        self.filtered_stale = false;
+    }
+
+    /// What the runtime needs to dispatch to [`crate::fuzzy_worker`].
+    /// Returns `Some(FuzzyDispatchRequest)` when the modal is in
+    /// Fuzzy + Path mode AND the query is non-empty. The runtime
+    /// memoizes on the returned `query` (last-pushed-per-host map)
+    /// so the worker only sees one dispatch per distinct query string.
+    #[must_use]
+    pub fn fuzzy_dispatch_request(&self) -> Option<FuzzyDispatchRequest<'_>> {
+        if self.search_mode != SearchMode::Fuzzy || self.focused != Zone::Path {
+            return None;
+        }
+        if self.fuzzy_query.is_empty() {
+            return None;
+        }
+        Some(FuzzyDispatchRequest {
+            host: self.active_host_key(),
+            query: self.fuzzy_query.as_str(),
+        })
+    }
+
+    /// Borrow the user's named-project list. The fuzzy worker scores
+    /// against this alongside the indexed dirs, and the runtime
+    /// hands it through inside [`crate::fuzzy_worker::FuzzyControl::SetIndex`].
+    /// Set at [`Self::open`] and never mutated mid-modal.
+    #[must_use]
+    pub fn named_projects(&self) -> &[NamedProject] {
+        &self.named_projects
+    }
+
+    /// Test-only seam: set the fuzzy query string without driving a
+    /// real keystroke through `handle`. The runtime's
+    /// [`crate::runtime::tick_fuzzy_dispatch`] tests use this to
+    /// arrange a known modal state before exercising the dispatch.
+    #[cfg(test)]
+    pub(crate) fn set_fuzzy_query_for_test(&mut self, query: &str) {
+        self.fuzzy_query = query.to_string();
     }
 
     /// Render the minibuffer at the bottom of `area`. The widget
@@ -1289,6 +1375,13 @@ impl SpawnMinibuffer {
         let usable = WILDMENU_ROWS as usize - 1; // top border eats one row
         let zone = self.focused;
         let fuzzy = self.search_mode == SearchMode::Fuzzy;
+        // While the fuzzy worker is computing fresh hits for a
+        // just-changed query, the previous query's hits stay visible
+        // but dimmed so the user has a visual cue that results are
+        // in flight. The selected row keeps its highlight (cyan bg)
+        // so arrow/Enter stays unambiguous. Only relevant in Fuzzy
+        // + Path mode — `filtered_stale` is never set otherwise.
+        let stale = fuzzy && zone == Zone::Path && self.filtered_stale;
         let lines: Vec<Line> = self
             .filtered
             .iter()
@@ -1297,7 +1390,7 @@ impl SpawnMinibuffer {
             .map(|(i, c)| {
                 let is_selected = Some(i) == self.selected;
                 let marker = if is_selected { " ▸ " } else { "   " };
-                let style = if is_selected {
+                let mut line_style = if is_selected {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
@@ -1305,6 +1398,9 @@ impl SpawnMinibuffer {
                 } else {
                     Style::default()
                 };
+                if stale && !is_selected {
+                    line_style = line_style.add_modifier(Modifier::DIM);
+                }
                 // In fuzzy mode the full path *is* the signal — basename
                 // alone strips the directory context that the user is
                 // searching for. Precise / Host modes keep the existing
@@ -1315,7 +1411,7 @@ impl SpawnMinibuffer {
                     wildmenu_display_text(zone, c)
                 };
                 let display = clip_middle(&display_str, width.saturating_sub(3));
-                Line::styled(format!("{marker}{display}"), style)
+                Line::styled(format!("{marker}{display}"), line_style)
             })
             .collect();
         Paragraph::new(lines).block(block)
@@ -1662,7 +1758,7 @@ fn host_marker_style(focused: bool) -> Style {
 /// in the indexed search roots, the named entry wins (the indexed dup
 /// is filtered out by path equality).
 #[must_use]
-fn score_fuzzy(query: &str, dirs: &[IndexedDir], named: &[NamedProject]) -> Vec<String> {
+pub(crate) fn score_fuzzy(query: &str, dirs: &[IndexedDir], named: &[NamedProject]) -> Vec<String> {
     use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
     use nucleo_matcher::{Config, Matcher, Utf32Str};
 
@@ -2132,6 +2228,7 @@ mod tests {
             fuzzy_query: String::new(),
             named_projects: Vec::new(),
             project_hosts: HashMap::new(),
+            filtered_stale: false,
         };
         m.refresh(&mut local());
         m
@@ -3772,38 +3869,6 @@ mod tests {
         );
     }
 
-    /// Build a `Ready` `IndexState` from a slice of plain path strings.
-    /// Tests that need typed kinds construct `IndexedDir` literals
-    /// directly.
-    fn ready_index_plain(paths: &[&str]) -> IndexState {
-        IndexState::Ready {
-            dirs: paths
-                .iter()
-                .map(|p| IndexedDir {
-                    path: PathBuf::from(p),
-                    kind: ProjectKind::Plain,
-                })
-                .collect(),
-        }
-    }
-
-    /// Build a `Refreshing` index state with the given paths as the
-    /// stale-but-usable cache. The handle is inert (no live worker)
-    /// so the test owns the lifecycle entirely.
-    fn refreshing_index_plain(paths: &[&str]) -> IndexState {
-        IndexState::Refreshing {
-            dirs: paths
-                .iter()
-                .map(|p| IndexedDir {
-                    path: PathBuf::from(p),
-                    kind: ProjectKind::Plain,
-                })
-                .collect(),
-            handle: crate::index_worker::inert_handle_for_test(),
-            count: 0,
-        }
-    }
-
     #[test]
     fn open_fuzzy_starts_with_empty_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -3932,52 +3997,136 @@ mod tests {
     }
 
     #[test]
-    fn refresh_fuzzy_with_ready_index_populates_filtered_with_full_paths() {
+    fn mark_fuzzy_stale_with_non_empty_query_sets_the_flag() {
+        // After the move to async fuzzy scoring (`crate::fuzzy_worker`),
+        // `mark_fuzzy_stale` no longer scores synchronously — it just
+        // tags the wildmenu as stale so the runtime knows to dispatch
+        // a worker request and the renderer dims the previous results.
+        // The actual hits arrive later via `set_fuzzy_results`.
         let mut m = mb("", "", Zone::Path, &[]);
         m.search_mode = SearchMode::Fuzzy;
         m.fuzzy_query = "code".to_string();
-        let idx = ready_index_plain(&[
-            "/home/df/Workbench/repositories/codemux",
-            "/home/df/Library/something",
-            "/home/df/code-utils",
-        ]);
-        m.refresh_fuzzy(Some(&idx));
-        assert!(!m.filtered.is_empty(), "should have matches for 'code'");
-        assert!(
-            m.filtered
-                .iter()
-                .any(|p| p == "/home/df/Workbench/repositories/codemux"),
-            "codemux should be in matches: {:?}",
-            m.filtered,
-        );
-        assert_eq!(m.selected, Some(0));
-        // Full paths, not basenames.
-        assert!(m.filtered.iter().all(|p| p.contains('/')));
+        // `mb()` populated `filtered` via the Precise-mode refresh of
+        // the test runner's cwd; clear it so this assertion checks
+        // *only* whether `mark_fuzzy_stale` itself touched the field.
+        m.filtered.clear();
+        m.mark_fuzzy_stale();
+        assert!(m.filtered_stale, "non-empty query must mark stale");
+        // mark_fuzzy_stale must NOT touch `filtered` itself — that's
+        // the worker's job. (If `filtered` had had stale hits from
+        // the previous query, they'd be preserved here for the
+        // dimmed overlay.)
+        assert!(m.filtered.is_empty());
     }
 
     #[test]
-    fn refresh_fuzzy_empty_query_clears_wildmenu() {
+    fn mark_fuzzy_stale_empty_query_clears_wildmenu() {
         let mut m = mb("", "", Zone::Path, &[]);
         m.search_mode = SearchMode::Fuzzy;
         m.fuzzy_query.clear();
         m.filtered = vec!["stale".to_string()];
         m.selected = Some(0);
-        let idx = ready_index_plain(&["/anything"]);
-        m.refresh_fuzzy(Some(&idx));
+        m.filtered_stale = true;
+        m.mark_fuzzy_stale();
+        // Empty query is a synchronous clear so Enter doesn't commit
+        // a leftover-highlighted candidate. Stale flag also clears
+        // because there's nothing in flight to wait for.
         assert!(m.filtered.is_empty());
         assert_eq!(m.selected, None);
+        assert!(!m.filtered_stale);
     }
 
     #[test]
-    fn refresh_fuzzy_with_building_index_leaves_filtered_empty() {
+    fn set_fuzzy_results_with_matching_tag_replaces_filtered() {
         let mut m = mb("", "", Zone::Path, &[]);
         m.search_mode = SearchMode::Fuzzy;
         m.fuzzy_query = "code".to_string();
-        // None simulates the index not started yet. Both `None` and
-        // the `Building` variant should keep `filtered` empty so the
-        // wildmenu shows the indexer-state sentinel.
-        m.refresh_fuzzy(None);
+        m.filtered_stale = true;
+        let result = FuzzyResult {
+            host: HOST_PLACEHOLDER.to_string(),
+            query: "code".to_string(),
+            hits: vec![
+                "/home/df/Workbench/repositories/codemux".to_string(),
+                "/home/df/code-utils".to_string(),
+            ],
+        };
+        m.set_fuzzy_results(result);
+        assert_eq!(m.filtered.len(), 2);
+        assert_eq!(m.selected, Some(0));
+        assert!(!m.filtered_stale, "matched result must clear stale flag");
+    }
+
+    #[test]
+    fn set_fuzzy_results_with_superseded_query_is_dropped() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        m.filtered.clear();
+        m.filtered_stale = true;
+        // Result tagged with the prior query — the user has since
+        // typed a superseding character. The modal must reject it so
+        // the wildmenu doesn't briefly show "co"-shaped hits while
+        // the user is staring at "code".
+        let result = FuzzyResult {
+            host: HOST_PLACEHOLDER.to_string(),
+            query: "co".to_string(),
+            hits: vec!["/anything".to_string()],
+        };
+        m.set_fuzzy_results(result);
         assert!(m.filtered.is_empty());
+        assert!(m.filtered_stale, "stale flag must remain set");
+    }
+
+    #[test]
+    fn set_fuzzy_results_with_wrong_host_is_dropped() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        m.filtered.clear();
+        // Result for a host other than the modal's `active_host_key()`
+        // — happens when the user committed a host change before the
+        // worker finished scoring the previous host's query.
+        let result = FuzzyResult {
+            host: "devpod-web".to_string(),
+            query: "code".to_string(),
+            hits: vec!["/srv/something".to_string()],
+        };
+        m.set_fuzzy_results(result);
+        assert!(m.filtered.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_dispatch_request_returns_none_outside_fuzzy_path() {
+        // Outside Fuzzy + Path mode, the runtime must not dispatch a
+        // worker request — there's no fuzzy scoring to do.
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Precise;
+        m.fuzzy_query = "code".to_string();
+        assert!(m.fuzzy_dispatch_request().is_none());
+        m.search_mode = SearchMode::Fuzzy;
+        m.focused = Zone::Host;
+        assert!(m.fuzzy_dispatch_request().is_none());
+    }
+
+    #[test]
+    fn fuzzy_dispatch_request_returns_none_for_empty_query() {
+        // Empty query short-circuits in `mark_fuzzy_stale` (synchronous
+        // clear); the dispatch helper must agree so the runtime
+        // doesn't wake the worker for a no-op.
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query.clear();
+        assert!(m.fuzzy_dispatch_request().is_none());
+    }
+
+    #[test]
+    fn fuzzy_dispatch_request_returns_host_and_query() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        let req = m.fuzzy_dispatch_request().unwrap();
+        assert_eq!(req.host, HOST_PLACEHOLDER);
+        assert_eq!(req.query, "code");
     }
 
     #[test]
@@ -4364,34 +4513,41 @@ mod tests {
     }
 
     #[test]
-    fn notify_index_state_is_no_op_outside_fuzzy_path() {
-        // In Host zone, even if mode is Fuzzy, notify should not touch
-        // filtered (which holds host candidates from `refresh`).
+    fn mark_fuzzy_stale_is_no_op_outside_fuzzy_path() {
+        // In Host zone, even if mode is Fuzzy, mark_fuzzy_stale must
+        // not touch `filtered` (which holds host candidates from
+        // `refresh`) or set the stale flag (no fuzzy work pending).
         let mut m = mb("dev", "", Zone::Host, &["devpod-web"]);
         m.search_mode = SearchMode::Fuzzy;
         let before = m.filtered.clone();
-        let idx = ready_index_plain(&["/some/where"]);
-        m.notify_index_state(Some(&idx));
+        m.mark_fuzzy_stale();
         assert_eq!(m.filtered, before, "host wildmenu must not be clobbered");
+        assert!(!m.filtered_stale);
     }
 
     #[test]
-    fn refresh_fuzzy_reads_from_refreshing_dirs() {
-        // The whole point of SWR: while the background rebuild is in
-        // flight, the modal must keep serving results from the cached
-        // `dirs` carried by the `Refreshing` variant. Without the
-        // `cached_dirs` extension, the matcher would see "no usable
-        // index" and the wildmenu would go blank between rebuilds.
+    fn set_fuzzy_results_works_with_refreshing_index_dirs() {
+        // SWR (Refreshing) doesn't change anything from the modal's
+        // perspective — the worker scores against whatever dirs are
+        // cached, and the modal accepts the result by `(host, query)`
+        // tag. This test validates the full round-trip: the worker
+        // produced hits from a Refreshing-style snapshot (synthesised
+        // here as a `FuzzyResult`) and the modal applies them.
         let mut m = mb("", "", Zone::Path, &[]);
         m.search_mode = SearchMode::Fuzzy;
         m.fuzzy_query = "code".to_string();
-        let idx = refreshing_index_plain(&["/home/df/code-utils", "/home/df/Workbench/codemux"]);
-        m.refresh_fuzzy(Some(&idx));
-        assert!(
-            !m.filtered.is_empty(),
-            "Refreshing dirs must be queryable: {:?}",
-            m.filtered,
-        );
+        m.filtered_stale = true;
+        let result = FuzzyResult {
+            host: HOST_PLACEHOLDER.to_string(),
+            query: "code".to_string(),
+            hits: vec![
+                "/home/df/code-utils".to_string(),
+                "/home/df/Workbench/codemux".to_string(),
+            ],
+        };
+        m.set_fuzzy_results(result);
+        assert_eq!(m.filtered.len(), 2);
+        assert!(!m.filtered_stale);
     }
 
     // ── active_host_key ──────────────────────────────────────────

@@ -167,6 +167,15 @@ pub enum IndexSaveCtx {
 pub struct HostIndex {
     pub state: IndexState,
     pub save_ctx: IndexSaveCtx,
+    /// Monotonic version stamp for the index state.
+    // Bumped whenever `state` changes so memoizing readers (notably the
+    // fuzzy worker dispatcher in `runtime.rs`) can detect when
+    // `cached_dirs()` may have moved on. Mutators inside this module
+    // own the bump rule; `crate::index_manager::drain_one_host` writes
+    // the field directly via `slot.generation += 1` for partial-progress
+    // updates that bypass `IndexCatalog`. Always starts at 0; u64
+    // wraparound is impossible in any realistic session.
+    pub generation: u64,
 }
 
 /// Lifecycle of the session-long fuzzy directory index. The runtime
@@ -971,11 +980,32 @@ impl IndexCatalog {
     }
 
     /// Convenience: borrow only the [`IndexState`] for `host`. The
-    /// modal's `notify_index_state` and the wildmenu render path
-    /// don't need the save context, just the state.
+    /// wildmenu render path and the fuzzy worker dispatcher in
+    /// `runtime.rs` read through this; neither needs the bundled
+    /// `save_ctx`.
     #[must_use]
     pub fn state_for(&self, host: &str) -> Option<&IndexState> {
         self.hosts.get(host).map(|h| &h.state)
+    }
+
+    /// Borrow the per-host generation counter. Used by the fuzzy
+    /// worker dispatcher in `runtime.rs` to memoize `SetIndex`
+    /// dispatches: re-push only when the value differs from the
+    /// previously-pushed snapshot. `None` for hosts that have never
+    /// been touched in this session.
+    #[must_use]
+    pub fn generation_for(&self, host: &str) -> Option<u64> {
+        self.hosts.get(host).map(|h| h.generation)
+    }
+
+    /// Compute the generation value to assign on the next state
+    /// installation for `host`. Returns `1` for a fresh host (nothing
+    /// installed yet) and `prior + 1` when an existing slot is being
+    /// replaced. Used by the three mutator paths that re-insert a
+    /// `HostIndex` (`hydrate`, `start_refresh`, `force_rebuild`) so
+    /// the base-1 initialisation rule lives in one place.
+    fn next_generation_for(&self, host: &str) -> u64 {
+        self.hosts.get(host).map_or(1, |h| h.generation + 1)
     }
 
     /// Iterate the in-flight (`Building` / `Refreshing`) entries
@@ -990,10 +1020,12 @@ impl IndexCatalog {
     /// Replace the state for `host` while preserving its existing
     /// `save_ctx`. Used by the runtime when a `Done` event arrives
     /// (the drain code computes the next state and calls this).
-    /// Returns the prior `HostIndex` if any, mostly for debug logging.
+    /// Bumps the per-host generation so memoizing readers (notably
+    /// the fuzzy worker dispatcher) re-snapshot the new dirs.
     pub fn set_state(&mut self, host: &str, state: IndexState) {
         if let Some(slot) = self.hosts.get_mut(host) {
             slot.state = state;
+            slot.generation += 1;
         }
     }
 
@@ -1001,12 +1033,17 @@ impl IndexCatalog {
     /// runtime calls this at startup (local) or right after the SSH
     /// prepare succeeds (remote). `save_ctx` is set atomically with
     /// the state so the next `Done(Ok)` knows where to persist.
+    /// Re-hydrating an existing host preserves generation
+    /// monotonicity (prior `+ 1`) so a memoizing reader sees a fresh
+    /// stamp.
     pub fn hydrate(&mut self, host: String, save_ctx: IndexSaveCtx, dirs: Vec<IndexedDir>) {
+        let next_gen = self.next_generation_for(&host);
         self.hosts.insert(
             host,
             HostIndex {
                 state: IndexState::Ready { dirs },
                 save_ctx,
+                generation: next_gen,
             },
         );
     }
@@ -1030,7 +1067,12 @@ impl IndexCatalog {
         // Re-using the same exhaustive `remove` + classify pattern
         // as before; the bundled save_ctx threads through every
         // arm so a refresh always pairs the right ctx with the
-        // host's new state.
+        // host's new state. `prior_gen` is captured up front so the
+        // re-insertion can preserve monotonicity (Skipped paths
+        // pass it through unchanged; Started paths use
+        // `next_generation_for` for the +1 bump).
+        let prior_gen = self.hosts.get(&host).map_or(0, |h| h.generation);
+        let next_gen = self.next_generation_for(&host);
         match self.hosts.remove(&host) {
             Some(HostIndex {
                 state:
@@ -1040,6 +1082,7 @@ impl IndexCatalog {
                         dirs,
                     },
                 save_ctx: prior_ctx,
+                ..
             }) => {
                 self.hosts.insert(
                     host,
@@ -1050,6 +1093,7 @@ impl IndexCatalog {
                             dirs,
                         },
                         save_ctx: prior_ctx,
+                        generation: prior_gen,
                     },
                 );
                 RefreshOutcome::Skipped
@@ -1062,6 +1106,7 @@ impl IndexCatalog {
                         count,
                     },
                 save_ctx: prior_ctx,
+                ..
             }) => {
                 self.hosts.insert(
                     host,
@@ -1072,6 +1117,7 @@ impl IndexCatalog {
                             count,
                         },
                         save_ctx: prior_ctx,
+                        generation: prior_gen,
                     },
                 );
                 RefreshOutcome::Skipped
@@ -1089,6 +1135,7 @@ impl IndexCatalog {
                             count: 0,
                         },
                         save_ctx,
+                        generation: next_gen,
                     },
                 );
                 RefreshOutcome::Started
@@ -1107,6 +1154,7 @@ impl IndexCatalog {
                             dirs: Vec::new(),
                         },
                         save_ctx,
+                        generation: next_gen,
                     },
                 );
                 RefreshOutcome::Started
@@ -1122,6 +1170,7 @@ impl IndexCatalog {
     where
         F: FnOnce() -> IndexHandle,
     {
+        let next_gen = self.next_generation_for(&host);
         let cached = match self.hosts.remove(&host) {
             Some(HostIndex {
                 state: IndexState::Ready { dirs } | IndexState::Refreshing { dirs, .. },
@@ -1155,6 +1204,7 @@ impl IndexCatalog {
             HostIndex {
                 state: new_state,
                 save_ctx,
+                generation: next_gen,
             },
         );
     }
@@ -1734,6 +1784,91 @@ mod tests {
         let names: Vec<String> = cat.iter_in_flight_mut().map(|(h, _)| h.clone()).collect();
         assert_eq!(names.len(), 1);
         assert_eq!(names[0], "host-a");
+    }
+
+    // ── per-host generation counter ──────────────────────────────
+    //
+    // Memoization for the fuzzy worker dispatcher in `runtime.rs`
+    // hinges on this counter being monotonic across every mutation
+    // path that could change `cached_dirs()`. The tests cover each
+    // mutator in isolation and confirm an unknown host returns
+    // `None` (so the dispatcher's `HashMap::get` short-circuit
+    // works).
+
+    #[test]
+    fn generation_for_unknown_host_is_none() {
+        let cat = IndexCatalog::new();
+        assert!(cat.generation_for("local").is_none());
+    }
+
+    #[test]
+    fn hydrate_starts_generation_at_one() {
+        let mut cat = IndexCatalog::new();
+        cat.hydrate("local".into(), dummy_ctx(), Vec::new());
+        assert_eq!(cat.generation_for("local"), Some(1));
+    }
+
+    #[test]
+    fn rehydrate_preserves_monotonic_generation() {
+        let mut cat = IndexCatalog::new();
+        cat.hydrate("local".into(), dummy_ctx(), Vec::new());
+        cat.hydrate("local".into(), dummy_ctx(), Vec::new());
+        assert_eq!(cat.generation_for("local"), Some(2));
+    }
+
+    #[test]
+    fn set_state_bumps_generation() {
+        let mut cat = IndexCatalog::new();
+        cat.hydrate("local".into(), dummy_ctx(), Vec::new());
+        let before = cat.generation_for("local").unwrap();
+        cat.set_state("local", ready_state(&["/x"]));
+        assert_eq!(cat.generation_for("local"), Some(before + 1));
+    }
+
+    #[test]
+    fn set_state_on_unknown_host_is_no_op() {
+        let mut cat = IndexCatalog::new();
+        cat.set_state("ghost", ready_state(&["/x"]));
+        assert!(cat.generation_for("ghost").is_none());
+    }
+
+    #[test]
+    fn force_rebuild_bumps_generation() {
+        let mut cat = IndexCatalog::new();
+        cat.hydrate("local".into(), dummy_ctx(), Vec::new());
+        let before = cat.generation_for("local").unwrap();
+        cat.force_rebuild("local".into(), dummy_ctx(), fresh_handle);
+        assert_eq!(cat.generation_for("local"), Some(before + 1));
+    }
+
+    #[test]
+    fn start_refresh_bumps_generation_when_started() {
+        let mut cat = IndexCatalog::new();
+        // Hydrate to Ready so start_refresh transitions to Refreshing
+        // (the Started arm).
+        cat.hydrate("local".into(), dummy_ctx(), Vec::new());
+        let before = cat.generation_for("local").unwrap();
+        let outcome = cat.start_refresh("local".into(), dummy_ctx(), fresh_handle);
+        assert_eq!(outcome, RefreshOutcome::Started);
+        assert_eq!(cat.generation_for("local"), Some(before + 1));
+    }
+
+    #[test]
+    fn start_refresh_skipped_path_preserves_generation() {
+        let mut cat = IndexCatalog::new();
+        install(
+            &mut cat,
+            "local",
+            IndexState::Building {
+                handle: fresh_handle(),
+                count: 0,
+                dirs: Vec::new(),
+            },
+        );
+        let before = cat.generation_for("local").unwrap();
+        let outcome = cat.start_refresh("local".into(), dummy_ctx(), fresh_handle);
+        assert_eq!(outcome, RefreshOutcome::Skipped);
+        assert_eq!(cat.generation_for("local"), Some(before));
     }
 
     // ── expand_remote_roots ──────────────────────────────────────

@@ -12,6 +12,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod agent_meta_worker;
 mod bootstrap_worker;
 mod config;
+mod fuzzy_worker;
 mod git_branch;
 mod host_title;
 mod index_cache;
