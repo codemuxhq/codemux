@@ -151,6 +151,25 @@ impl Drop for TerminalGuard {
         if self.host_title_pushed {
             let _ = host_title::pop_title(&mut io::stdout());
         }
+        // Drain any input bytes still buffered in stdin before raw-mode
+        // is disabled. Under KKP `REPORT_EVENT_TYPES` (enabled when the
+        // URL-modifier feature is active) the terminal emits a
+        // key-release event for the quit chord — typically `q` after
+        // `<prefix> q` — as a kitty escape sequence such as
+        // `\x1b[113;1:3u`. Codemux exits on the *press*, so the release
+        // bytes are still sitting in stdin when raw mode is turned
+        // off. The shell that launched codemux then reads them as raw
+        // input: zsh's emacs bindings see the leading `\x1b` as Meta
+        // and the user lands at an Alt-X "execute: " prompt with no
+        // way out short of `Ctrl-G`. Reading and discarding all
+        // pending events here closes the gap. Done after `Pop`-ing
+        // KKP so the terminal has stopped generating new release
+        // events by the time we drain.
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            if event::read().is_err() {
+                break;
+            }
+        }
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
