@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn display_matches_inner_string() {
-        assert_eq!(HostId::new("devpod-uber-1").to_string(), "devpod-uber-1");
+        assert_eq!(HostId::new("devpod-work-1").to_string(), "devpod-work-1");
     }
 
     #[test]

@@ -886,8 +886,8 @@ fn local_socket_path(dir: &Path, agent_id: &str) -> Result<PathBuf, Error> {
 /// `ControlPath=none` and `ControlMaster=no` are **also load-bearing**:
 /// if the user's `~/.ssh/config` sets `ControlMaster auto` for this
 /// host (extremely common — it's the standard recipe for connection
-/// multiplexing, used by every `~/.ssh/config` template at Uber and
-/// most public dotfile setups), our `ssh -N -L` will be routed
+/// multiplexing, found in most org-wide `~/.ssh/config` templates and
+/// public dotfile setups), our `ssh -N -L` will be routed
 /// through the existing master via mux. The slave then sends a
 /// `forward` request to the master and exits with status 0, but the
 /// local socket file is *never bound* (mux's handling of unix-socket

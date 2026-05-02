@@ -18,7 +18,7 @@
 //!   tab completion. Wildmenu shows full paths.
 //! - **host** — autocompletes against `~/.ssh/config` `Host` entries
 //!   (wildcards skipped). `Include` directives are followed recursively
-//!   with glob and `~/` expansion, so layouts like Uber's
+//!   with glob and `~/` expansion, so modular layouts like
 //!   `Include config.d/*` work out of the box. Empty host → spawns locally.
 //!
 //! Zone navigation:

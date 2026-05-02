@@ -2,7 +2,7 @@
 
 ## Shape of the work
 
-A typical working day: 3–4 Claude Code agents alive in parallel. Some local on my laptop. Some on a server or a devpod — often more than one devpod on the same host (e.g., two concurrent workspaces on `devpod-uber`). Each agent is its own independent session, doing its own task. I move between them.
+A typical working day: 3–4 Claude Code agents alive in parallel. Some local on my laptop. Some on a server or a devpod — often more than one devpod on the same host (e.g., two concurrent workspaces on `devpod-work`). Each agent is its own independent session, doing its own task. I move between them.
 
 The pain is in the parallelization. Agents finish at unpredictable times. I want to know quickly, review what they did, push back if something's off, and move on. Current tools make me alt-tab between terminals to check status and hunt for the right session.
 
@@ -12,20 +12,20 @@ codemux exists to remove that friction. The four scenarios below are the concret
 
 I have four agents going:
 
-- `uber-feed` on `devpod-uber-1` — a bugfix
-- `uber-carousel` on `devpod-uber-2` — a feature
+- `work-feed` on `devpod-work-1` — a bugfix
+- `work-carousel` on `devpod-work-2` — a feature
 - `agents-window` on my laptop — a personal side project
 - `knowledge-curate` on my laptop — an ops task
 
-I scan the navigator. For each agent I see: status (running / idle / needs-input / done), pwd (which repo), host. I pick one and focus it in a single keystroke. No mental bookkeeping of "which tmux window was `uber-feed` again."
+I scan the navigator. For each agent I see: status (running / idle / needs-input / done), pwd (which repo), host. I pick one and focus it in a single keystroke. No mental bookkeeping of "which tmux window was `work-feed` again."
 
 ## Scenario 2 — "Is it done yet?"
 
-`uber-feed` was running `go test` under Claude's orchestration. I moved to `uber-carousel` to give it instructions. Three minutes later `uber-feed` finishes.
+`work-feed` was running `go test` under Claude's orchestration. I moved to `work-carousel` to give it instructions. Three minutes later `work-feed` finishes.
 
-Without codemux: I periodically alt-tab to my `devpod-uber-1` terminal to check. Wasteful, breaks flow.
+Without codemux: I periodically alt-tab to my `devpod-work-1` terminal to check. Wasteful, breaks flow.
 
-With codemux: the navigator's status dot for `uber-feed` flips from running to idle (or to needs-input if Claude is asking a permission question). Eventually (P2), an OS notification fires. I see it, jump to that agent with one keystroke, read what happened, respond.
+With codemux: the navigator's status dot for `work-feed` flips from running to idle (or to needs-input if Claude is asking a permission question). Eventually (P2), an OS notification fires. I see it, jump to that agent with one keystroke, read what happened, respond.
 
 ## Scenario 3 — Peek-to-review spectrum
 

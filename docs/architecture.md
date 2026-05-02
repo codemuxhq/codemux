@@ -798,8 +798,8 @@ Triaged from the original brief:
   than the GUI path would have.
 - **Phone / iPad access.** P4 maybe. Would require a control socket and a thin
   web frontend — a meaningful re-spec, not a small feature.
-- **Devpod auth / host setup wizard.** Deferred. Today: manual `aifx login`
-  per host. Revisit post-P3.
+- **Devpod auth / host setup wizard.** Deferred. Today: manual per-host
+  login flow. Revisit post-P3.
 - **Color and accessibility.** P1 concern. Status signal uses shape + color,
   never color alone.
 - **Telemetry.** None. Ever. Maybe a local `sessions-per-day` counter for

@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn parse_ssh_hosts_skips_wildcards() {
         let got = parse_ssh_hosts(
-            "Host *\nHost *.uber.com\nHost real-host\nHost !excluded\nHost q?stion",
+            "Host *\nHost *.example.com\nHost real-host\nHost !excluded\nHost q?stion",
         );
         assert_eq!(got, vec!["real-host".to_string()]);
     }
@@ -320,8 +320,8 @@ mod tests {
         // against `~/.ssh/`, not the CWD or the including file's parent.
         let home = PathBuf::from("/Users/x");
         assert_eq!(
-            expand_include_path("config.d/uber", &home),
-            PathBuf::from("/Users/x/.ssh/config.d/uber"),
+            expand_include_path("config.d/work", &home),
+            PathBuf::from("/Users/x/.ssh/config.d/work"),
         );
     }
 
@@ -358,13 +358,13 @@ mod tests {
     /// The exact layout that triggered the bug report: a near-empty root
     /// config that just `Include`s a glob-expanded directory.
     #[test]
-    fn load_walks_uber_style_include_glob() {
+    fn load_walks_modular_include_glob() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
         write_file(&home.join(".ssh/config"), "Include config.d/*\n");
         write_file(&home.join(".ssh/config.d/common"), "Host *\n");
         write_file(
-            &home.join(".ssh/config.d/uber"),
+            &home.join(".ssh/config.d/work"),
             "Host devpod-go\nHost devpod-web\n",
         );
         write_file(

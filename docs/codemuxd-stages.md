@@ -368,7 +368,7 @@ Replace the `tracing::warn!` placeholder in
 
 End-to-end smoke passes:
 
-1. Reachable SSH host (e.g. an Uber devpod) with `cargo` installed
+1. Reachable SSH host (e.g. a remote dev VM) with `cargo` installed
 2. `just run` (local codemux)
 3. Open spawn modal (default: prefix + `c`), type
    `<hostname> : ~/some-repo`, Enter
