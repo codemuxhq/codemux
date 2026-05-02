@@ -149,7 +149,7 @@ pub struct Ui {
     pub subtle: bool,
 
     /// Per-host accent colors used for the host prefix on unfocused
-    /// tabs (e.g. `uber-laptop · main-claude`). Hosts not listed fall
+    /// tabs (e.g. `work-laptop · main-claude`). Hosts not listed fall
     /// back to the secondary chrome style — quiet by default, opt-in
     /// distinction for the hosts the user juggles often.
     ///
@@ -1013,12 +1013,12 @@ mod tests {
     fn host_colors_named_ansi_round_trips() {
         let toml_text = r#"
             [ui.host_colors]
-            uber = "blue"
+            work = "blue"
             personal = "lightred"
         "#;
         let config: Config = toml::from_str(toml_text).unwrap();
         assert_eq!(
-            config.ui.host_colors.get("uber"),
+            config.ui.host_colors.get("work"),
             Some(&ChromeColor::Named(Color::Blue)),
         );
         assert_eq!(
@@ -1054,12 +1054,12 @@ mod tests {
     fn host_colors_xterm_index_round_trips() {
         let toml_text = r"
             [ui.host_colors]
-            uber = 33
+            work = 33
             personal = 247
         ";
         let config: Config = toml::from_str(toml_text).unwrap();
         assert_eq!(
-            config.ui.host_colors.get("uber"),
+            config.ui.host_colors.get("work"),
             Some(&ChromeColor::Indexed(33)),
         );
         assert_eq!(
@@ -1074,12 +1074,12 @@ mod tests {
         // close a single-hash raw string early.
         let toml_text = r##"
             [ui.host_colors]
-            uber = "#0080ff"
+            work = "#0080ff"
             personal = "#D75F00"
         "##;
         let config: Config = toml::from_str(toml_text).unwrap();
         assert_eq!(
-            config.ui.host_colors.get("uber"),
+            config.ui.host_colors.get("work"),
             Some(&ChromeColor::Rgb(0x00, 0x80, 0xff)),
         );
         assert_eq!(
@@ -1096,7 +1096,7 @@ mod tests {
         // wondering why their config had no effect.
         let toml_text = r#"
             [ui.host_colors]
-            uber = "burgundy"
+            work = "burgundy"
         "#;
         let result: Result<Config, _> = toml::from_str(toml_text);
         let err = result.unwrap_err().to_string();

@@ -7434,7 +7434,7 @@ mod tests {
         // ChromeStyle::from_ui can't silently drop one branch.
         let mut host_colors = std::collections::HashMap::new();
         host_colors.insert(
-            "uber".to_string(),
+            "work".to_string(),
             crate::config::ChromeColor::Named(Color::Blue),
         );
         host_colors.insert(
@@ -7449,7 +7449,7 @@ mod tests {
             host_colors,
             ..Default::default()
         });
-        assert_eq!(chrome.host_style("uber").fg, Some(Color::Blue));
+        assert_eq!(chrome.host_style("work").fg, Some(Color::Blue));
         assert_eq!(chrome.host_style("personal").fg, Some(Color::Indexed(33)));
         assert_eq!(
             chrome.host_style("devpod").fg,
@@ -7466,7 +7466,7 @@ mod tests {
         // by `label_spans_renders_focused_spinner_with_reverse_style`.
         let mut host_colors = std::collections::HashMap::new();
         host_colors.insert(
-            "uber".to_string(),
+            "work".to_string(),
             crate::config::ChromeColor::Named(Color::Blue),
         );
         let chrome = ChromeStyle::from_ui(&crate::config::Ui {
@@ -7474,7 +7474,7 @@ mod tests {
             ..Default::default()
         });
         let spans = label_spans(
-            Some("uber"),
+            Some("work"),
             "claude",
             false,
             false,
@@ -7484,7 +7484,7 @@ mod tests {
         );
         let host_span = spans
             .iter()
-            .find(|s| s.content.contains("uber"))
+            .find(|s| s.content.contains("work"))
             .expect("host prefix span present");
         assert_eq!(
             host_span.style.fg,
