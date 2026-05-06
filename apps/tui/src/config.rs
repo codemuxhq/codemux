@@ -322,13 +322,13 @@ pub struct TokensSegmentConfig {
     /// Token count at which the segment turns yellow (warning level
     /// 1). Default `200_000` — aligned with aifx's threshold against
     /// the 400k effective compaction window.
-    pub yellow_threshold: i64,
+    pub yellow_threshold: u64,
     /// Token count at which the segment turns orange (warning level
     /// 2). Default `300_000`.
-    pub orange_threshold: i64,
+    pub orange_threshold: u64,
     /// Token count at which the segment turns red (warning level 3).
     /// Default `360_000`.
-    pub red_threshold: i64,
+    pub red_threshold: u64,
     /// Optional override for the effective context window used in
     /// percentage math and bar rendering. When `None` (the default)
     /// the segment trusts whatever `context_window_size` Claude Code
@@ -339,13 +339,21 @@ pub struct TokensSegmentConfig {
     /// is capped to the model's actual window when smaller. The
     /// `$CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var is consulted as a
     /// fallback when this field is unset, matching aifx.
-    pub auto_compact_window: Option<i64>,
+    pub auto_compact_window: Option<u64>,
     /// Forwarded to Claude Code as the statusLine `refreshInterval`
     /// (in seconds) when the per-agent `--settings` JSON is injected.
     /// `None` (the default) leaves Claude on event-driven cadence
     /// only — the segment ticks per assistant turn, on `/compact`,
     /// and on permission/vim mode changes. Set this to e.g. `5` to
     /// have the segment refresh during long-running tool calls.
+    ///
+    /// Cross-cutting note: this knob is read at agent spawn time by
+    /// `runtime::spawn_local_agent` to embed `refreshInterval` in the
+    /// injected `--settings` JSON. It lives under
+    /// `[ui.segments.tokens]` for user discoverability (the user
+    /// thinks of it as "how often does my token segment refresh"),
+    /// even though strict layering would put it in a separate
+    /// IPC-config section.
     pub refresh_interval_secs: Option<u32>,
 }
 

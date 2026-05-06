@@ -120,8 +120,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         // Best-effort tempfile cleanup; if rename failed the tempfile
-        // is the orphan we just made.
-        let _ = std::fs::remove_file(&tmp);
+        // is the orphan we just made. `.ok()` swallows the result the
+        // way the project's `let_underscore_must_use` lint expects.
+        std::fs::remove_file(&tmp).ok();
         return Err(e);
     }
     Ok(())
@@ -132,6 +133,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// for the same agent should not happen in practice (Claude Code
 /// debounces and cancels in-flight invocations), but if they did,
 /// PID-suffixing keeps them from clobbering each other's tempfiles.
+#[must_use]
 fn tmp_path_for(final_path: &Path) -> PathBuf {
     let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
     let name = final_path
@@ -181,7 +183,7 @@ pub fn build_settings_json(
 /// `statusLine` field is serialized so Claude Code's settings layering
 /// (managed → user → project → local) merges everything else from the
 /// existing files unchanged.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct SettingsOverlay<'a> {
     #[serde(rename = "statusLine")]
     status_line: StatusLineOverlay<'a>,
@@ -192,7 +194,7 @@ struct SettingsOverlay<'a> {
 /// statusLine schema. The `refreshInterval` field is opt-in
 /// (`skip_serializing_if`) so the JSON stays minimal when the user
 /// hasn't asked for time-based refresh.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct StatusLineOverlay<'a> {
     #[serde(rename = "type")]
     kind: &'a str,
@@ -205,6 +207,7 @@ struct StatusLineOverlay<'a> {
 /// `'` with `'\''`. Idempotent on strings with no special chars
 /// (modulo the wrapping quotes) and survives any byte sequence a
 /// filesystem path might legitimately contain.
+#[must_use]
 fn sh_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');

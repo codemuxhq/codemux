@@ -72,7 +72,7 @@ use crate::log_tail::LogTail;
 use crate::pty_title::TitleCapture;
 use crate::repo_name;
 use crate::spawn::{DirLister, HOST_PLACEHOLDER, ModalOutcome, SpawnMinibuffer};
-use crate::status_bar::{self, SegmentCtx, StatusSegment, render_segments};
+use crate::status_bar::{self, AgentView, SegmentCtx, StatusSegment, render_segments};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const NAV_PANE_WIDTH: u16 = 25;
@@ -4709,15 +4709,19 @@ fn render_status_bar(
     // shrinks the stack from the LEFT until it fits.
     let max_right = area.width.saturating_mul(3) / 5;
     let focused_agent = agents.get(focused);
-    let ctx = SegmentCtx {
-        repo: focused_agent.and_then(|a| a.repo.as_deref()),
-        branch: focused_agent.and_then(|a| a.branch.as_deref()),
-        model_effort: focused_agent.and_then(|a| a.model_effort.as_ref()),
-        token_usage: focused_agent.and_then(|a| a.token_usage.as_ref()),
-        cwd_basename: focused_agent
-            .and_then(|a| a.cwd.as_deref())
+    let agent = focused_agent.map_or_else(AgentView::empty, |a| AgentView {
+        repo: a.repo.as_deref(),
+        branch: a.branch.as_deref(),
+        model_effort: a.model_effort.as_ref(),
+        token_usage: a.token_usage.as_ref(),
+        cwd_basename: a
+            .cwd
+            .as_deref()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str()),
+    });
+    let ctx = SegmentCtx {
+        agent,
         prefix_state,
         bindings,
         secondary: chrome.secondary,
@@ -7900,15 +7904,13 @@ mod tests {
 
     #[test]
     fn prefix_hint_segment_idle_and_awaiting_command_render_different_text() {
-        use crate::status_bar::{SegmentCtx, StatusSegment, segments::PrefixHintSegment};
+        use crate::status_bar::{
+            AgentView, SegmentCtx, StatusSegment, segments::PrefixHintSegment,
+        };
         let bindings = defaults();
         let chrome = ChromeStyle::default();
         let mk = |state| SegmentCtx {
-            repo: None,
-            branch: None,
-            model_effort: None,
-            token_usage: None,
-            cwd_basename: None,
+            agent: AgentView::empty(),
             prefix_state: state,
             bindings: &bindings,
             secondary: chrome.secondary,

@@ -62,7 +62,7 @@ impl StatusSegment for ModelSegment {
     }
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
-        let me = ctx.model_effort?;
+        let me = ctx.agent.model_effort?;
         let short = shorten_model_name(&me.model);
         // Effort badge is suppressed when the level is "default" or
         // "medium" (claude's default). Otherwise we render a
@@ -166,7 +166,7 @@ impl StatusSegment for RepoSegment {
     }
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
-        let repo = ctx.repo?;
+        let repo = ctx.agent.repo?;
         Some(Line::from(Span::styled(
             format!("repo:{repo}"),
             ctx.secondary,
@@ -191,10 +191,10 @@ impl StatusSegment for WorktreeSegment {
     }
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
-        let cwd = ctx.cwd_basename?;
+        let cwd = ctx.agent.cwd_basename?;
         // In the main checkout, cwd basename matches the repo name —
         // the worktree label would just restate the repo. Skip.
-        if ctx.repo == Some(cwd) {
+        if ctx.agent.repo == Some(cwd) {
             return None;
         }
         Some(Line::from(Span::styled(format!("wt:{cwd}"), ctx.secondary)))
@@ -235,7 +235,7 @@ impl StatusSegment for BranchSegment {
     }
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
-        let branch = ctx.branch?;
+        let branch = ctx.agent.branch?;
         if self.default_branches.iter().any(|b| b == branch) {
             return None;
         }
@@ -287,10 +287,10 @@ impl TokenSegment {
     /// pure version directly so they don't depend on the test
     /// environment's env state (the user's shell may have it set
     /// from aifx, or any other tool that injects it).
-    fn effective_window(&self, context_window_size: i64) -> i64 {
+    fn effective_window(&self, context_window_size: u64) -> u64 {
         let env_window = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
             .ok()
-            .and_then(|s| s.parse::<i64>().ok())
+            .and_then(|s| s.parse::<u64>().ok())
             .filter(|v| *v > 0);
         Self::effective_window_pure(
             self.cfg.auto_compact_window,
@@ -311,11 +311,12 @@ impl TokenSegment {
     ///   do 200k there's no point pretending the ceiling is 400k.
     /// - With no override AND no reported window → fall back to 400k
     ///   as a last-resort guard so the percentage isn't 0/0.
+    #[must_use]
     fn effective_window_pure(
-        configured: Option<i64>,
-        env_window: Option<i64>,
-        context_window_size: i64,
-    ) -> i64 {
+        configured: Option<u64>,
+        env_window: Option<u64>,
+        context_window_size: u64,
+    ) -> u64 {
         let override_window = configured.filter(|v| *v > 0).or(env_window);
         match (override_window, context_window_size > 0) {
             (Some(override_w), true) => override_w.min(context_window_size),
@@ -331,7 +332,7 @@ impl TokenSegment {
     /// secondary style — keeps the segment looking like the rest of
     /// the bar at idle and drawing the eye only when there's actual
     /// pressure.
-    fn color_for(&self, total_tokens: i64) -> Option<Color> {
+    fn color_for(&self, total_tokens: u64) -> Option<Color> {
         if total_tokens >= self.cfg.red_threshold {
             Some(Color::Red)
         } else if total_tokens >= self.cfg.orange_threshold {
@@ -350,10 +351,13 @@ impl StatusSegment for TokenSegment {
     }
 
     fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
-        let usage = ctx.token_usage?;
-        let cache_total = usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
-        let total = usage.input_tokens + usage.output_tokens + cache_total;
-        if total <= 0 {
+        let usage = ctx.agent.token_usage?;
+        let cache_total = usage.cache_creation.saturating_add(usage.cache_read);
+        let total = usage
+            .input
+            .saturating_add(usage.output)
+            .saturating_add(cache_total);
+        if total == 0 {
             // First turn hasn't reported any tokens yet. Render
             // nothing — the slot collapses cleanly until the second
             // turn lands a non-zero count.
@@ -363,19 +367,20 @@ impl StatusSegment for TokenSegment {
         // does: input + cache_creation + cache_read (excludes output,
         // which doesn't contribute to the next turn's prompt
         // budget).
-        let context_used =
-            usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
-        let window = self.effective_window(usage.context_window_size);
+        let context_used = usage
+            .input
+            .saturating_add(usage.cache_creation)
+            .saturating_add(usage.cache_read);
+        let window = self.effective_window(usage.context_window);
         let pct = if window > 0 {
             // Saturating arithmetic guards against exotic scenarios
-            // where a misconfigured snapshot reports a huge negative
-            // window or a context_used > window. Clamping to 0..=100
-            // here keeps the bar render and the percentage label in
-            // the documented range.
+            // where a snapshot reports context_used > window (mid-
+            // /compact race, e.g.). Clamping to 0..=100 keeps the bar
+            // render and the percentage label in the documented range.
             context_used
                 .saturating_mul(100)
                 .saturating_div(window.max(1))
-                .clamp(0, 100)
+                .min(100)
         } else {
             0
         };
@@ -401,19 +406,21 @@ impl StatusSegment for TokenSegment {
 /// fixed (5 cells of fill, plus the two `[` `]` brackets) so the
 /// `WithBar` format is always 9 cells wide regardless of percentage —
 /// keeps the drop-from-the-left algorithm's width math stable.
-fn render_mini_bar(pct: i64) -> String {
-    const WIDTH: usize = 5;
-    let pct_clamped = pct.clamp(0, 100);
-    // Stay in usize from here on — the multiplication can't overflow
-    // because pct is already bounded to 100 and WIDTH is tiny.
-    let filled = (usize::try_from(pct_clamped).unwrap_or(0) * WIDTH) / 100;
-    let empty = WIDTH.saturating_sub(filled);
-    let mut s = String::with_capacity(2 + WIDTH * 3);
+#[must_use]
+fn render_mini_bar(pct: u64) -> String {
+    const WIDTH: u64 = 5;
+    let pct_clamped = pct.min(100);
+    let filled = pct_clamped.saturating_mul(WIDTH) / 100;
+    let filled_usize = usize::try_from(filled).unwrap_or(0);
+    let empty_usize = usize::try_from(WIDTH)
+        .unwrap_or(0)
+        .saturating_sub(filled_usize);
+    let mut s = String::with_capacity(2 + filled_usize + empty_usize);
     s.push('[');
-    for _ in 0..filled {
+    for _ in 0..filled_usize {
         s.push('▌');
     }
-    for _ in 0..empty {
+    for _ in 0..empty_usize {
         s.push(' ');
     }
     s.push(']');
@@ -423,10 +430,11 @@ fn render_mini_bar(pct: i64) -> String {
 /// Format a token count as `1.2k` / `1.5m` / `42` for compact display
 /// in the status bar. Matches aifx's `formatTokenCount` (floor for
 /// `k`, one-decimal for `m`).
-fn format_token_count(tokens: i64) -> String {
+#[must_use]
+fn format_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         // Floor-then-format keeps "1.0m" out of the very-low-million
-        // bucket. Multiply by 10 first so we keep one decimal place
+        // bucket. Divide by 100k first so we keep one decimal place
         // without floating-point math.
         let tenths = tokens / 100_000;
         let whole = tenths / 10;
@@ -491,6 +499,7 @@ mod tests {
     use super::*;
     use crate::agent_meta_worker::ModelEffort;
     use crate::keymap::Bindings;
+    use crate::status_bar::AgentView;
 
     fn ctx_with<'a>(
         bindings: &'a Bindings,
@@ -500,11 +509,12 @@ mod tests {
         prefix_state: PrefixState,
     ) -> SegmentCtx<'a> {
         SegmentCtx {
-            repo,
-            branch,
-            model_effort: None,
-            token_usage: None,
-            cwd_basename,
+            agent: AgentView {
+                repo,
+                branch,
+                cwd_basename,
+                ..AgentView::empty()
+            },
             prefix_state,
             bindings,
             secondary: Style::default(),
@@ -516,11 +526,10 @@ mod tests {
     /// `ModelEffort` so the borrow lives the length of the test.
     fn ctx_with_me<'a>(bindings: &'a Bindings, me: Option<&'a ModelEffort>) -> SegmentCtx<'a> {
         SegmentCtx {
-            repo: None,
-            branch: None,
-            model_effort: me,
-            token_usage: None,
-            cwd_basename: None,
+            agent: AgentView {
+                model_effort: me,
+                ..AgentView::empty()
+            },
             prefix_state: PrefixState::Idle,
             bindings,
             secondary: Style::default(),
@@ -541,11 +550,10 @@ mod tests {
     /// instance, not in the ctx.
     fn ctx_with_branch<'a>(bindings: &'a Bindings, branch: Option<&'a str>) -> SegmentCtx<'a> {
         SegmentCtx {
-            repo: None,
-            branch,
-            model_effort: None,
-            token_usage: None,
-            cwd_basename: None,
+            agent: AgentView {
+                branch,
+                ..AgentView::empty()
+            },
             prefix_state: PrefixState::Idle,
             bindings,
             secondary: Style::default(),
@@ -560,11 +568,10 @@ mod tests {
         usage: Option<&'a crate::agent_meta_worker::TokenUsage>,
     ) -> SegmentCtx<'a> {
         SegmentCtx {
-            repo: None,
-            branch: None,
-            model_effort: None,
-            token_usage: usage,
-            cwd_basename: None,
+            agent: AgentView {
+                token_usage: usage,
+                ..AgentView::empty()
+            },
             prefix_state: PrefixState::Idle,
             bindings,
             secondary: Style::default(),
@@ -745,11 +752,10 @@ mod tests {
         let secondary = Style::default().fg(Color::Indexed(247));
         let model = me("claude-opus-4-7", None);
         let ctx = SegmentCtx {
-            repo: None,
-            branch: None,
-            model_effort: Some(&model),
-            token_usage: None,
-            cwd_basename: None,
+            agent: AgentView {
+                model_effort: Some(&model),
+                ..AgentView::empty()
+            },
             prefix_state: PrefixState::Idle,
             bindings: &bindings,
             secondary,
@@ -872,21 +878,7 @@ mod tests {
 
     // ─── TokenSegment ──────────────────────────────────────────────
 
-    fn tu(
-        input: i64,
-        output: i64,
-        cache_creation: i64,
-        cache_read: i64,
-        window: i64,
-    ) -> crate::agent_meta_worker::TokenUsage {
-        crate::agent_meta_worker::TokenUsage {
-            input_tokens: input,
-            output_tokens: output,
-            cache_creation_input_tokens: cache_creation,
-            cache_read_input_tokens: cache_read,
-            context_window_size: window,
-        }
-    }
+    use crate::agent_meta_worker::TokenUsage;
 
     #[test]
     fn token_segment_returns_none_when_no_usage_yet() {
@@ -906,7 +898,10 @@ mod tests {
         // immediately after spawn), render nothing rather than `tok:0`.
         let bindings = Bindings::default();
         let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
-        let usage = tu(0, 0, 0, 0, 200_000);
+        let usage = TokenUsage {
+            context_window: 200_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         assert!(segment.render(&ctx).is_none());
     }
@@ -921,7 +916,12 @@ mod tests {
         // → 100/200 = 50%.
         let bindings = Bindings::default();
         let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
-        let usage = tu(100_000, 50_000, 0, 0, 200_000);
+        let usage = TokenUsage {
+            input: 100_000,
+            output: 50_000,
+            context_window: 200_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         let text = line_text(&line);
@@ -937,7 +937,12 @@ mod tests {
             ..Default::default()
         };
         let segment = TokenSegment::new(cfg);
-        let usage = tu(100_000, 50_000, 0, 0, 200_000);
+        let usage = TokenUsage {
+            input: 100_000,
+            output: 50_000,
+            context_window: 200_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "tok:150k");
@@ -956,7 +961,11 @@ mod tests {
         let segment = TokenSegment::new(cfg);
         // 100k input + 0 output + 0 cache, 400k effective window
         // → 25% → 1 of 5 fill cells.
-        let usage = tu(100_000, 0, 0, 0, 400_000);
+        let usage = TokenUsage {
+            input: 100_000,
+            context_window: 400_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         assert_eq!(line_text(&line), "tok:100k [▌    ]");
@@ -968,7 +977,11 @@ mod tests {
         // boundary must turn yellow — pin the comparison sense (>=).
         let bindings = Bindings::default();
         let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
-        let usage = tu(200_000, 0, 0, 0, 400_000);
+        let usage = TokenUsage {
+            input: 200_000,
+            context_window: 400_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         assert_eq!(
@@ -982,7 +995,11 @@ mod tests {
     fn token_segment_color_threshold_orange_at_300k() {
         let bindings = Bindings::default();
         let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
-        let usage = tu(300_000, 0, 0, 0, 400_000);
+        let usage = TokenUsage {
+            input: 300_000,
+            context_window: 400_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         assert_eq!(
@@ -995,7 +1012,11 @@ mod tests {
     fn token_segment_color_threshold_red_at_360k() {
         let bindings = Bindings::default();
         let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
-        let usage = tu(360_000, 0, 0, 0, 400_000);
+        let usage = TokenUsage {
+            input: 360_000,
+            context_window: 400_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         assert_eq!(
@@ -1012,13 +1033,16 @@ mod tests {
         let bindings = Bindings::default();
         let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
         let secondary = Style::default().fg(Color::Indexed(247));
-        let usage = tu(50_000, 0, 0, 0, 400_000);
+        let usage = TokenUsage {
+            input: 50_000,
+            context_window: 400_000,
+            ..Default::default()
+        };
         let ctx = SegmentCtx {
-            repo: None,
-            branch: None,
-            model_effort: None,
-            token_usage: Some(&usage),
-            cwd_basename: None,
+            agent: AgentView {
+                token_usage: Some(&usage),
+                ..AgentView::empty()
+            },
             prefix_state: PrefixState::Idle,
             bindings: &bindings,
             secondary,
@@ -1040,7 +1064,11 @@ mod tests {
             ..Default::default()
         };
         let segment = TokenSegment::new(cfg);
-        let usage = tu(60_000, 0, 0, 0, 400_000);
+        let usage = TokenUsage {
+            input: 60_000,
+            context_window: 400_000,
+            ..Default::default()
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         assert_eq!(
@@ -1059,7 +1087,13 @@ mod tests {
         // window 400k → total = 200k, context_used = 170k → 42%.
         let bindings = Bindings::default();
         let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
-        let usage = tu(50_000, 30_000, 20_000, 100_000, 400_000);
+        let usage = TokenUsage {
+            input: 50_000,
+            output: 30_000,
+            cache_creation: 20_000,
+            cache_read: 100_000,
+            context_window: 400_000,
+        };
         let ctx = ctx_with_tu(&bindings, Some(&usage));
         let line = segment.render(&ctx).unwrap();
         let text = line_text(&line);
@@ -1176,11 +1210,7 @@ mod tests {
         let bindings = Bindings::default();
         let secondary = Style::default().fg(Color::Indexed(247));
         let ctx = SegmentCtx {
-            repo: None,
-            branch: None,
-            model_effort: None,
-            token_usage: None,
-            cwd_basename: None,
+            agent: AgentView::empty(),
             prefix_state: PrefixState::Idle,
             bindings: &bindings,
             secondary,

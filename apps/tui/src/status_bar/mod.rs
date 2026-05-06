@@ -90,7 +90,39 @@ pub(crate) fn default_segment_ids() -> Vec<String> {
 /// access to the runtime's internal types — segments only see what
 /// they need to render. Built fresh each frame in
 /// `render_status_bar`.
+///
+/// Agent-derived fields are grouped into [`AgentView`] so segments
+/// access them as `ctx.agent.<field>`. Chrome / runtime-state fields
+/// (`prefix_state`, `bindings`, `secondary`) live at the top level
+/// because they're not per-agent.
 pub(crate) struct SegmentCtx<'a> {
+    /// All per-agent data the segments draw from. See [`AgentView`].
+    pub agent: AgentView<'a>,
+    /// Idle vs in-prefix-mode. Drives [`segments::PrefixHintSegment`]'s
+    /// label/badge swap.
+    pub prefix_state: PrefixState,
+    /// User key bindings — the prefix-hint segment renders the
+    /// configured prefix chord verbatim ("super+b for help").
+    pub bindings: &'a Bindings,
+    /// Pre-computed dim chrome style (separators, hint text, repo/model
+    /// labels). Built by [`crate::runtime::ChromeStyle::from_ui`] once
+    /// at startup — segments use it for ambient text so the chrome
+    /// reads as a single visual unit.
+    pub secondary: Style,
+}
+
+/// Per-agent data the segments draw from. Built fresh each frame from
+/// the focused [`crate::runtime::RuntimeAgent`] (and the runtime's
+/// agent-meta worker state). Grouping these into one struct keeps
+/// [`SegmentCtx`] from accumulating discrete fields every time a new
+/// per-agent telemetry source lands — adding a new agent-derived
+/// signal goes here, the segments read `ctx.agent.<field>`, and the
+/// chrome-side fields on `SegmentCtx` stay clean.
+///
+/// All fields are `Copy` references / values, so `AgentView` is
+/// cheap to clone and pass through helper functions if needed.
+#[derive(Clone, Copy)]
+pub(crate) struct AgentView<'a> {
     /// Repo name resolved for the focused agent (git root basename, or
     /// cwd basename outside a repo). `None` for failed/unresolvable
     /// agents — the segment renders nothing in that case.
@@ -119,17 +151,21 @@ pub(crate) struct SegmentCtx<'a> {
     /// checkout this is the repo basename; for a git worktree it's the
     /// worktree directory's name. `None` for SSH agents.
     pub cwd_basename: Option<&'a str>,
-    /// Idle vs in-prefix-mode. Drives [`segments::PrefixHintSegment`]'s
-    /// label/badge swap.
-    pub prefix_state: PrefixState,
-    /// User key bindings — the prefix-hint segment renders the
-    /// configured prefix chord verbatim ("super+b for help").
-    pub bindings: &'a Bindings,
-    /// Pre-computed dim chrome style (separators, hint text, repo/model
-    /// labels). Built by [`crate::runtime::ChromeStyle::from_ui`] once
-    /// at startup — segments use it for ambient text so the chrome
-    /// reads as a single visual unit.
-    pub secondary: Style,
+}
+
+impl AgentView<'_> {
+    /// Build an empty view — every field `None`. Useful in tests and
+    /// in the renderer's "no focused agent" path so the call site
+    /// doesn't have to spell out five `None`s.
+    pub(crate) fn empty() -> Self {
+        Self {
+            repo: None,
+            branch: None,
+            model_effort: None,
+            token_usage: None,
+            cwd_basename: None,
+        }
+    }
 }
 
 /// One segment in the status bar's right-side stack.
@@ -320,11 +356,7 @@ mod tests {
 
     fn ctx(bindings: &Bindings) -> SegmentCtx<'_> {
         SegmentCtx {
-            repo: None,
-            branch: None,
-            model_effort: None,
-            token_usage: None,
-            cwd_basename: None,
+            agent: AgentView::empty(),
             prefix_state: PrefixState::Idle,
             bindings,
             secondary: Style::default(),
