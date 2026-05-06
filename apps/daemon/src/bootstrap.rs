@@ -78,17 +78,10 @@ pub fn bring_up_with(
     pid_file: Option<&Path>,
     mut config: SupervisorConfig,
 ) -> Result<DaemonResources, Error> {
-    // Expand a leading `~/` (or bare `~`) in cwd against `$HOME`. The
-    // SSH bootstrap (crates/codemuxd-bootstrap) already does this on
-    // the local side using the remote `$HOME` captured during the
-    // version probe, but a daemon invoked directly (cargo run, manual
-    // ssh, smoke tests) gets no such pre-processing. Without this
-    // expansion, `cwd.exists()` returns false on a literal `~/...`
-    // path and the daemon dies with `Error::CwdNotFound` here — a
-    // confusing "does not exist" for what is, semantically, a valid
-    // path. Mutate the config so the expanded path also flows through
-    // to the child PTY's chdir target, otherwise the child would
-    // start in the unexpanded literal.
+    // Expand `~/` against `$HOME` (see `expand_local_tilde`) BEFORE
+    // the existence check, and mutate `config.cwd` so the absolute
+    // path also reaches the child PTY's chdir target — otherwise the
+    // child would inherit the unexpanded literal.
     if let Some(cwd) = config.cwd.as_deref() {
         config.cwd = Some(expand_local_tilde(cwd));
     }
@@ -468,6 +461,35 @@ mod tests {
              updated so the child PTY chdir uses the absolute path",
         );
         Ok(())
+    }
+
+    /// `expand_local_tilde` direct unit coverage. The integration test
+    /// above only exercises the `~/foo` branch via `bring_up_with`;
+    /// this covers bare `~` and a non-tilde fallthrough so each
+    /// reachable branch has explicit test coverage. Two branches
+    /// remain structurally untestable in this workspace: the non-UTF-8
+    /// `path.to_str() == None` branch (constructing such a path
+    /// requires platform-specific bytes that round-trip through
+    /// `OsString` in ways most CI environments reject) and the `$HOME`
+    /// unset branch (mutating env vars requires `unsafe { set_var }`,
+    /// which the workspace's `unsafe = "forbid"` blocks). Both branches
+    /// are simple `return path.to_path_buf();` early-outs whose
+    /// behavior is identical to the fallthrough.
+    #[test]
+    fn expand_local_tilde_handles_bare_tilde_and_fallthrough() {
+        let Some(home_os) = std::env::var_os("HOME") else {
+            panic!("HOME unset; test cannot run in this env");
+        };
+        let home = PathBuf::from(home_os);
+        assert_eq!(expand_local_tilde(Path::new("~")), home);
+        assert_eq!(expand_local_tilde(Path::new("~/foo")), home.join("foo"));
+        assert_eq!(
+            expand_local_tilde(Path::new("/srv/work")),
+            PathBuf::from("/srv/work"),
+        );
+        // `~user` (no slash) is unchanged because expanding it would
+        // require a `getpwnam` round trip we don't take.
+        assert_eq!(expand_local_tilde(Path::new("~bob")), PathBuf::from("~bob"),);
     }
 
     /// A pid file holding a definitely-dead pid (`u32::MAX`) is reaped

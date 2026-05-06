@@ -1310,26 +1310,21 @@ mod tests {
     #[test]
     fn expand_remote_tilde_handles_tilde_prefix_only() {
         let home = Path::new("/home/alice");
-        // Bare `~` -> remote home.
         assert_eq!(expand_remote_tilde(Path::new("~"), home), home);
-        // `~/...` -> joined under remote home.
         assert_eq!(
             expand_remote_tilde(Path::new("~/work/foo"), home),
             PathBuf::from("/home/alice/work/foo"),
         );
-        // Absolute -> unchanged.
         assert_eq!(
             expand_remote_tilde(Path::new("/srv/work"), home),
             PathBuf::from("/srv/work"),
         );
-        // Relative -> unchanged.
         assert_eq!(
             expand_remote_tilde(Path::new("work/foo"), home),
             PathBuf::from("work/foo"),
         );
-        // `~user` (no slash) -> unchanged. We only handle `~/` and bare
-        // `~` because expanding `~user` requires a remote getpwnam
-        // round trip we don't take.
+        // `~user` (no slash) is unchanged because expanding it would
+        // require a remote `getpwnam` round trip we don't take.
         assert_eq!(
             expand_remote_tilde(Path::new("~bob"), home),
             PathBuf::from("~bob"),
@@ -1338,7 +1333,6 @@ mod tests {
             expand_remote_tilde(Path::new("~bob/foo"), home),
             PathBuf::from("~bob/foo"),
         );
-        // Tilde mid-path -> unchanged (only a leading `~/` triggers).
         assert_eq!(
             expand_remote_tilde(Path::new("/x/~/y"), home),
             PathBuf::from("/x/~/y"),
