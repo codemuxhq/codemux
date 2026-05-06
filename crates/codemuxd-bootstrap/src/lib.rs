@@ -389,11 +389,28 @@ fn attach_socket(
     validate_agent_id(&cfg.agent_id)?;
 
     on_stage(Stage::DaemonSpawn);
+    // Expand a leading `~/` (or bare `~`) in the cwd against the remote
+    // `$HOME` captured by the probe step. The remote shell would
+    // normally do this, but `spawn_remote_daemon` single-quotes the cwd
+    // arg to defuse shell injection — single quotes also defeat tilde
+    // expansion. Without this expansion, a configured project like
+    // `path = "~/workbench/foo"` reaches the daemon as the literal
+    // string `~/workbench/foo`, `Path::exists()` returns false, the
+    // daemon dies in `bring_up` with `Error::CwdNotFound` BEFORE
+    // tracing flushes anything, and the user sees a 0-byte log file
+    // plus a "daemon socket did not appear within 5s" message with no
+    // diagnostic. Expanding here keeps the security property
+    // (single-quoted argv on the remote) while letting users write
+    // `~/...` paths in the spawn modal and `[[spawn.projects]]` entries.
+    let expanded_cwd = cfg
+        .cwd
+        .as_deref()
+        .map(|p| expand_remote_tilde(p, &prepared.remote_home));
     spawn_remote_daemon(
         runner,
         &cfg.host,
         &cfg.agent_id,
-        cfg.cwd.as_deref(),
+        expanded_cwd.as_deref(),
         prepared.binary_was_updated,
     )?;
 
@@ -452,6 +469,31 @@ fn validate_agent_id(agent_id: &str) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+/// Expand a leading `~/` (or bare `~`) in `path` against `remote_home`.
+/// Anything else is returned unchanged: absolute paths, relative paths,
+/// and `~user` (which would require a remote `getpwnam` round trip we
+/// don't take). Non-UTF-8 paths are returned unchanged because the
+/// shell-injection check downstream only operates on UTF-8 anyway.
+///
+/// Why this exists: `spawn_remote_daemon` single-quotes the cwd argv to
+/// defuse shell injection, which also defeats the remote shell's
+/// tilde expansion. Without this helper, `~/foo` reaches the daemon as
+/// a literal string and `Path::exists()` returns false. See the
+/// expansion call site in [`attach_socket`] for the full incident
+/// rationale.
+fn expand_remote_tilde(path: &Path, remote_home: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if s == "~" {
+        return remote_home.to_path_buf();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return remote_home.join(rest);
+    }
+    path.to_path_buf()
 }
 
 /// Result of the cheap probe step.
@@ -726,20 +768,25 @@ fn remote_build(runner: &dyn CommandRunner, host: &str, version: &str) -> Result
 /// daemon serving forever is strictly worse than a one-time session
 /// loss when the user knowingly installed a new version.
 ///
-/// Stdio redirection (`</dev/null >/dev/null 2>&1`) is **load-bearing**:
-/// `setsid -f` forks but doesn't reopen file descriptors, so without
-/// the redirect the daemon inherits the SSH session's pipes for
-/// stdin/stdout/stderr. ssh then waits for those pipes to close before
-/// exiting, which never happens (the daemon outlives ssh by design).
-/// The local `runner.run("ssh", ...)` call hangs forever, and the user
-/// sees a perpetual "bootstrapping" placeholder. Redirecting before
-/// `setsid` forks closes the pipes from the daemon's side; ssh
-/// observes EOF and exits cleanly. The cost is that any pre-tracing
-/// panic on the daemon side (e.g. a clap parse error before
-/// `init_tracing`) goes to /dev/null instead of the local terminal.
-/// That is an acceptable tradeoff — the alternative is a silent hang
-/// — and a future Stage-N task will fetch the daemon's log file post-
-/// failure for richer diagnostics.
+/// Stdio redirection is **load-bearing** for two reasons. First, the
+/// stdin/stdout/stderr fds are inherited across `setsid -f`'s fork —
+/// without redirecting them, the daemon keeps the SSH session's pipes
+/// open for stdin/stdout/stderr. ssh then waits for those pipes to
+/// close before exiting, which never happens (the daemon outlives ssh
+/// by design), and the local `runner.run("ssh", ...)` call hangs
+/// forever; the user sees a perpetual "bootstrapping" placeholder.
+/// Redirecting before `setsid` forks closes the pipes from the
+/// daemon's side; ssh observes EOF and exits cleanly.
+///
+/// Second, stderr specifically goes to a sibling `.stderr` file rather
+/// than `/dev/null` because pre-tracing failures inside the daemon
+/// (e.g. clap parse error, `Error::CwdNotFound` before
+/// `init_tracing` flushes anything to `--log-file`) would otherwise be
+/// invisible. The poll-and-fail branch tails BOTH `.log` and `.stderr`
+/// so an empty `.log` (typical of a pre-tracing crash) doesn't leave
+/// the user with zero diagnostic. The `.stderr` file is `>`-truncated
+/// on every spawn, so a healthy daemon (which never writes to stderr)
+/// leaves it empty and bounded.
 fn spawn_remote_daemon(
     runner: &dyn CommandRunner,
     host: &str,
@@ -811,7 +858,10 @@ fn spawn_remote_daemon(
     // The `tail -n 20 log 2>/dev/null` on failure is best-effort: if
     // the daemon couldn't even open its log file, the tail returns
     // empty and we still emit the "socket did not appear" message,
-    // which is a strict improvement over silent success.
+    // which is a strict improvement over silent success. The `.stderr`
+    // file captures the eyre / panic output the daemon writes BEFORE
+    // its tracing subscriber attaches to `--log-file`, which is the
+    // only place a pre-`init_tracing` failure leaves any trace.
     let cmd = format!(
         "{respawn_prelude}\
          setsid -f ~/.cache/codemuxd/bin/codemuxd \
@@ -819,7 +869,7 @@ fn spawn_remote_daemon(
          --pid-file ~/.cache/codemuxd/pids/{agent_id}.pid \
          --log-file ~/.cache/codemuxd/logs/{agent_id}.log \
          --agent-id {agent_id}{cwd_flag} \
-         </dev/null >/dev/null 2>&1\n\
+         </dev/null >~/.cache/codemuxd/logs/{agent_id}.stderr 2>&1\n\
          i=0\n\
          while [ ! -S ~/.cache/codemuxd/sockets/{agent_id}.sock ]; do \
            i=$((i + 1)); \
@@ -828,6 +878,9 @@ fn spawn_remote_daemon(
              echo '--- log tail (~/.cache/codemuxd/logs/{agent_id}.log) ---' >&2; \
              tail -n 20 ~/.cache/codemuxd/logs/{agent_id}.log 2>/dev/null >&2 \
                || echo '(log file missing or unreadable)' >&2; \
+             echo '--- stderr tail (~/.cache/codemuxd/logs/{agent_id}.stderr) ---' >&2; \
+             tail -n 20 ~/.cache/codemuxd/logs/{agent_id}.stderr 2>/dev/null >&2 \
+               || echo '(stderr file missing or unreadable)' >&2; \
              exit 1; \
            fi; \
            sleep 1; \
@@ -1244,6 +1297,54 @@ mod tests {
         }
     }
 
+    /// `expand_remote_tilde` substitutes `~` and `~/...` against the
+    /// remote `$HOME`. Anything else (absolute, relative, `~user`)
+    /// passes through unchanged. The original incident: a configured
+    /// project path of `~/workbench/foo` reached the daemon as the
+    /// literal string `~/workbench/foo` because
+    /// `spawn_remote_daemon` single-quotes its cwd argv and the remote
+    /// shell never gets to expand the tilde. The daemon then died at
+    /// `Path::exists()` with `Error::CwdNotFound` before tracing
+    /// flushed anything, leaving an empty log file and a
+    /// `daemon socket did not appear within 5s` from the bootstrap.
+    #[test]
+    fn expand_remote_tilde_handles_tilde_prefix_only() {
+        let home = Path::new("/home/alice");
+        // Bare `~` -> remote home.
+        assert_eq!(expand_remote_tilde(Path::new("~"), home), home);
+        // `~/...` -> joined under remote home.
+        assert_eq!(
+            expand_remote_tilde(Path::new("~/work/foo"), home),
+            PathBuf::from("/home/alice/work/foo"),
+        );
+        // Absolute -> unchanged.
+        assert_eq!(
+            expand_remote_tilde(Path::new("/srv/work"), home),
+            PathBuf::from("/srv/work"),
+        );
+        // Relative -> unchanged.
+        assert_eq!(
+            expand_remote_tilde(Path::new("work/foo"), home),
+            PathBuf::from("work/foo"),
+        );
+        // `~user` (no slash) -> unchanged. We only handle `~/` and bare
+        // `~` because expanding `~user` requires a remote getpwnam
+        // round trip we don't take.
+        assert_eq!(
+            expand_remote_tilde(Path::new("~bob"), home),
+            PathBuf::from("~bob"),
+        );
+        assert_eq!(
+            expand_remote_tilde(Path::new("~bob/foo"), home),
+            PathBuf::from("~bob/foo"),
+        );
+        // Tilde mid-path -> unchanged (only a leading `~/` triggers).
+        assert_eq!(
+            expand_remote_tilde(Path::new("/x/~/y"), home),
+            PathBuf::from("/x/~/y"),
+        );
+    }
+
     /// The probe step parses `$HOME` and returns version=None when the
     /// remote `agent.version` file is missing (fresh host). The `|| true`
     /// in the probe shell command keeps exit status 0, so a missing
@@ -1520,22 +1621,52 @@ mod tests {
     /// Regression for the silent ssh hang: `setsid -f` forks but does
     /// not reopen file descriptors, so the daemon inherits the SSH
     /// session's pipes for stdin/stdout/stderr. Without an explicit
-    /// `</dev/null >/dev/null 2>&1`, ssh waits forever for those pipes
+    /// `</dev/null >...stderr 2>&1`, ssh waits forever for those pipes
     /// to close (the daemon outlives ssh by design), and the local
     /// `runner.run("ssh", ...)` call hangs — the user sees a perpetual
     /// "bootstrapping" placeholder. We assert the redirect is present
     /// so a future refactor can't accidentally drop it. Verified by
     /// hand: `time ssh host 'setsid -f sleep 30'` hangs ≥3s; the same
     /// command with the redirect appended returns in <100ms.
+    ///
+    /// Stderr specifically goes to a sibling `.stderr` file rather than
+    /// `/dev/null` so that pre-tracing failures (e.g. `Error::CwdNotFound`
+    /// from `bring_up`, clap parse errors) leave a diagnostic instead
+    /// of vanishing — see [`spawn_remote_daemon`]'s docstring.
     #[test]
-    fn spawn_remote_daemon_redirects_stdio_to_devnull() {
+    fn spawn_remote_daemon_redirects_stdin_to_devnull_and_stderr_to_sibling_file() {
         let runner = RecordingRunner::new();
         spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp")), false).unwrap();
         let cmd = runner.last_run_cmd();
         assert!(
-            cmd.contains("</dev/null >/dev/null 2>&1"),
-            "cmd must redirect stdio to /dev/null so setsid -f can detach \
-             cleanly without ssh hanging on inherited pipes; got: {cmd}",
+            cmd.contains("</dev/null >~/.cache/codemuxd/logs/alpha.stderr 2>&1"),
+            "cmd must close stdin and route stdout+stderr to the agent's \
+             sibling .stderr file so setsid -f can detach cleanly without \
+             ssh hanging, AND so pre-tracing daemon failures leave a tail; \
+             got: {cmd}",
+        );
+    }
+
+    /// On daemon spawn failure, the polling branch must tail BOTH the
+    /// `.log` file (where tracing writes once `init_tracing` has set up
+    /// the file appender) AND the sibling `.stderr` file (where
+    /// `Error::CwdNotFound` and other pre-tracing eyre errors land).
+    /// Without the stderr tail, a `CwdNotFound` failure surfaces as a
+    /// 0-byte log + "daemon socket did not appear within 5s" and the
+    /// user has no diagnostic.
+    #[test]
+    fn spawn_remote_daemon_failure_branch_tails_both_log_and_stderr() {
+        let runner = RecordingRunner::new();
+        spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp")), false).unwrap();
+        let cmd = runner.last_run_cmd();
+        assert!(
+            cmd.contains("tail -n 20 ~/.cache/codemuxd/logs/alpha.log"),
+            "polling-failure branch must tail the .log file; got: {cmd}",
+        );
+        assert!(
+            cmd.contains("tail -n 20 ~/.cache/codemuxd/logs/alpha.stderr"),
+            "polling-failure branch must tail the .stderr file (where \
+             pre-tracing failures land); got: {cmd}",
         );
     }
 
@@ -2044,5 +2175,59 @@ mod tests {
         let _ = (&stream).write_all(b"x");
         let _ = tunnel.kill();
         let _ = tunnel.wait();
+    }
+
+    /// `attach_socket` must expand `~/...` in `cfg.cwd` against
+    /// `prepared.remote_home` BEFORE the cwd reaches `spawn_remote_daemon`,
+    /// because `spawn_remote_daemon` single-quotes the cwd argv (which
+    /// defeats the remote shell's tilde expansion). Without this, a
+    /// configured `[[spawn.projects]]` path of `~/workbench/foo`
+    /// reaches the daemon as a literal `~/workbench/foo` and dies
+    /// at `Path::exists()` with `Error::CwdNotFound`. We assert the
+    /// expanded path appears in the spawned ssh command line.
+    #[test]
+    fn attach_socket_expands_tilde_cwd_against_remote_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("sockets");
+        let agent_id = "tilde-agent";
+        let local_sock = socket_dir.join(format!("{agent_id}.sock"));
+        let local_sock_for_thread = local_sock.clone();
+        let _binder = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            let listener = std::os::unix::net::UnixListener::bind(&local_sock_for_thread).unwrap();
+            let _ = listener.accept();
+        });
+
+        let runner = RecordingRunner::new();
+        let prepared = PreparedHost {
+            remote_home: PathBuf::from("/home/fake"),
+            binary_was_updated: false,
+        };
+        let cfg = AttachConfig {
+            host: "fake-host".into(),
+            agent_id: agent_id.into(),
+            cwd: Some(PathBuf::from("~/workbench/foo")),
+            local_socket_dir: socket_dir,
+            rows: 24,
+            cols: 80,
+        };
+        let (stream, mut tunnel) = attach_socket(&runner, |_| {}, &prepared, &cfg).unwrap();
+        let _ = (&stream).write_all(b"x");
+        let _ = tunnel.kill();
+        let _ = tunnel.wait();
+
+        let cmd = runner.last_run_cmd();
+        assert!(
+            cmd.contains("--cwd '/home/fake/workbench/foo'"),
+            "attach_socket must expand `~/workbench/foo` to \
+             `/home/fake/workbench/foo` before passing to \
+             spawn_remote_daemon; got cmd: {cmd}",
+        );
+        assert!(
+            !cmd.contains("--cwd '~/"),
+            "attach_socket must not pass a literal `~/` cwd to the \
+             daemon (single-quoting defeats shell tilde expansion); \
+             got cmd: {cmd}",
+        );
     }
 }
