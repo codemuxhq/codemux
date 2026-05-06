@@ -1114,11 +1114,12 @@ struct PendingPrepare {
     remote_fs: Option<RemoteFs>,
     /// `Some(path)` when this prepare was triggered by a host-bound
     /// named project (`ModalOutcome::PrepareHostThenSpawn`). On
-    /// `Done(Ok)` the runtime dismisses the modal and synthesizes
-    /// the SSH spawn against this path instead of unlocking the
-    /// modal for user path entry. `None` for the regular
-    /// `PrepareHost` flow (host typed at the modal, user picks the
-    /// remote path manually after prepare).
+    /// `Done(Ok)` the runtime keeps the modal locked, swaps the
+    /// prepare spinner for the attach spinner, and synthesizes the
+    /// SSH spawn against this path instead of unlocking the modal
+    /// for user path entry. `None` for the regular `PrepareHost`
+    /// flow (host typed at the modal, user picks the remote path
+    /// manually after prepare).
     pending_project_path: Option<String>,
 }
 
@@ -1410,14 +1411,17 @@ fn spawn_local_agent(
 }
 
 /// Build the [`PendingAttach`] for an SSH spawn. Shared by the user-
-/// driven `Spawn { host, path }` path (modal stays open watching the
-/// attach with `modal_owner = true`) and the auto-spawn-after-prepare
-/// path triggered by `PrepareHostThenSpawn` (modal is dismissed before
-/// the call so `modal_owner = false`).
+/// driven `Spawn { host, path }` path and the auto-spawn-after-prepare
+/// path triggered by `PrepareHostThenSpawn`. Both flows pass
+/// `modal_owner = true` so the modal stays locked with the spinner
+/// through the attach phase and is dismissed by the attach drain when
+/// `AttachEvent::Done` arrives.
 ///
 /// Modal state (lock vs dismiss) is the caller's job — both flows
-/// agree on how the attach is launched, but disagree on what the modal
-/// should look like while it runs.
+/// agree on how the attach is launched and on the modal contract; the
+/// difference is just where the lock comes from (the user-driven arm
+/// re-locks an unlocked modal, the auto-spawn arm replaces the
+/// already-locked prepare view with a fresh attach view).
 ///
 /// Mirrors [`spawn_local_agent`] in shape: do the PTY/transport-shaped
 /// work in one place, return a value the caller threads into the
@@ -1546,10 +1550,24 @@ where
 ///    consumes the slot.
 ///
 /// 3. **Success → auto-spawn** (`pending_project_path: Some(path)`,
-///    set by `ModalOutcome::PrepareHostThenSpawn`) — the modal is
-///    dismissed, an attach is built via `build_remote_attach` against
-///    the stashed path, and pushed onto `attaches`. `*prepare` is
-///    `None` — the slot is consumed.
+///    set by `ModalOutcome::PrepareHostThenSpawn`) — the modal stays
+///    locked with the spinner and an attach is built via
+///    `build_remote_attach` (with `modal_owner = true`) against the
+///    stashed path and pushed onto `attaches`. The attach drain in
+///    `event_loop` dismisses the modal once `AttachEvent::Done`
+///    arrives. `*prepare` is `None` — the slot is consumed.
+///
+///    Why re-lock instead of dismissing right away: the prepare phase
+///    is fast (~1-2 s) but the attach phase that follows it
+///    (`DaemonSpawn` → `SocketTunnel` → `SocketConnect` → wire
+///    handshake) is also multi-second and emits its own stages.
+///    Dismissing the modal at prepare-Done leaves a visible blank gap
+///    where the user can't tell whether anything is happening, and
+///    the new agent tab only pops in once the attach finishes — the
+///    user-visible "I picked a project and nothing happened for a few
+///    seconds" complaint. Mirrors the user-driven
+///    `ModalOutcome::Spawn { host, path }` arm in `event_loop`,
+///    which re-locks for the same reason.
 ///
 /// Plus the failure branch: prepare reported `Done(Err)`, modal goes
 /// back to host zone with the structured error visible, `*prepare` is
@@ -1661,24 +1679,33 @@ where
                     *prepare = Some(slot);
                 }
                 Some(path) => {
-                    // PrepareHostThenSpawn flow: dismiss the modal and
-                    // launch the SSH attach against the stashed path.
+                    // PrepareHostThenSpawn flow: re-lock the modal
+                    // with the spinner and launch the SSH attach
+                    // against the stashed path. The attach drain
+                    // dismisses the modal on `AttachEvent::Done`
+                    // (because `modal_owner: true`). Mirrors the
+                    // user-driven `Spawn` arm in `event_loop`, which
+                    // re-locks for the same ~1-2 s attach phase.
+                    //
                     // Slot is consumed (not re-stashed) — the prepare
-                    // phase's purpose is fulfilled.
+                    // phase's purpose is fulfilled; only the attach
+                    // remains.
                     *spawn_counter += 1;
                     let (rows, cols) = pty_geom;
                     let attach = build_remote_attach(
                         prepared,
-                        slot.host,
+                        slot.host.clone(),
                         &path,
                         tui_pid,
                         *spawn_counter,
                         rows,
                         cols,
-                        /* modal_owner */ false,
+                        /* modal_owner */ true,
                         attach_factory,
                     );
-                    *spawn_ui = None;
+                    if let Some(ui) = spawn_ui.as_mut() {
+                        ui.lock_for_bootstrap(slot.host, Instant::now());
+                    }
                     attaches.push(attach);
                 }
             }
@@ -10220,10 +10247,11 @@ mod tests {
     }
 
     #[test]
-    fn drain_prepare_events_with_pending_path_dismisses_modal_and_launches_attach() {
+    fn drain_prepare_events_with_pending_path_relocks_modal_and_launches_attach() {
         // Auto-spawn-after-prepare: prepare reports Done(Ok) and the
-        // slot has a stashed path. Modal is dismissed, attach is
-        // queued. Slot is consumed.
+        // slot has a stashed path. Modal stays locked with the
+        // spinner through the attach phase (the attach drain
+        // dismisses it on Done). Slot is consumed.
         let mut prepare = Some(make_pending_prepare(
             "devpod",
             vec![PrepareEvent::Done(Ok(PrepareSuccess {
@@ -10255,14 +10283,19 @@ mod tests {
         });
 
         assert!(prepare.is_none(), "auto-spawn consumes the prepare slot");
-        assert!(spawn_ui.is_none(), "auto-spawn dismisses the modal");
+        assert!(
+            spawn_ui.is_some(),
+            "auto-spawn keeps the modal locked through the attach phase \
+             so the user sees a spinner instead of a blank gap",
+        );
         assert_eq!(attaches.len(), 1, "auto-spawn queues exactly one attach");
         assert_eq!(attaches[0].host, "devpod");
         assert_eq!(attaches[0].label, "devpod:agent-1");
         assert_eq!(attaches[0].repo.as_deref(), Some("p"));
         assert!(
-            !attaches[0].modal_owner,
-            "auto-spawn flow must not own the modal — it dismissed it",
+            attaches[0].modal_owner,
+            "auto-spawn now owns the modal so the attach drain dismisses \
+             it on Done — same contract as the user-driven Spawn arm",
         );
         assert_eq!(spawn_counter, 1, "spawn_counter incremented for the attach");
     }
