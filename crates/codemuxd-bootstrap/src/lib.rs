@@ -794,6 +794,40 @@ fn spawn_remote_daemon(
     cwd: Option<&Path>,
     force_respawn: bool,
 ) -> Result<(), Error> {
+    // Helper-defined inside-function so the load-bearing redirect order
+    // sits next to its only caller — extracting it to module scope would
+    // invite reuse with paths we haven't audited for shell-quoting safety.
+    //
+    // Returns a shell snippet that tails the last 20 lines of `path` to
+    // fd 2 (the spawn shell's stderr, which ssh propagates back to the
+    // bootstrap as `out.stderr`), or echoes `fallback_msg` if tail fails
+    // (e.g. the file doesn't exist). The `>&2 2>/dev/null` order is
+    // **load-bearing** — bash applies redirects left-to-right, so `>&2`
+    // dups whatever fd 2 currently points at onto fd 1. Reversing to
+    // `2>/dev/null >&2` first sends fd 2 to /dev/null, then dups
+    // /dev/null onto fd 1, which silently swallows tail's stdout. The
+    // pre-fix code shipped the reversed order; the daemon's color_eyre
+    // error sat in `agent.stderr` unread for several runs because the
+    // tail in this exact branch was eating its own output.
+    //
+    // `path` is interpolated unquoted because the only call sites pass
+    // tilde-prefixed paths under our own cache dir — adding quotes
+    // would defeat the remote shell's `~` expansion. `fallback_msg` is
+    // single-quoted; we assert at the call site that it contains no
+    // single quotes. The check uses `assert!` (not `debug_assert!`) so
+    // it stays active in release builds — a release-only shell-escape
+    // bug for what should be a static-string invariant is exactly the
+    // class of silent failure mode we just spent the rest of this PR
+    // hardening against.
+    #[must_use]
+    fn shell_tail_or_fallback(path: &str, fallback_msg: &str) -> String {
+        assert!(
+            !fallback_msg.contains('\''),
+            "fallback_msg must not contain single quotes (would break shell escaping): {fallback_msg:?}",
+        );
+        format!("tail -n 20 {path} >&2 2>/dev/null || echo '{fallback_msg}' >&2")
+    }
+
     let cwd_flag = match cwd {
         None => String::new(),
         Some(p) => {
@@ -855,13 +889,30 @@ fn spawn_remote_daemon(
     // healthy daemon binds in milliseconds; the 5 s budget is for cold
     // starts on slow disks, never the steady state.
     //
-    // The `tail -n 20 log 2>/dev/null` on failure is best-effort: if
-    // the daemon couldn't even open its log file, the tail returns
-    // empty and we still emit the "socket did not appear" message,
-    // which is a strict improvement over silent success. The `.stderr`
-    // file captures the eyre / panic output the daemon writes BEFORE
-    // its tracing subscriber attaches to `--log-file`, which is the
-    // only place a pre-`init_tracing` failure leaves any trace.
+    // The tail/fallback shell snippet is built by [`shell_tail_or_fallback`],
+    // which encapsulates the load-bearing `>&2 2>/dev/null` redirect order
+    // and its rationale — see that helper's docstring. A pre-fix copy of
+    // this code wrote `2>/dev/null >&2`, which silently swallowed tail's
+    // output; the helper exists to make a similar regression impossible
+    // by name.
+    //
+    // The `.stderr` file captures the eyre / panic output the daemon
+    // writes BEFORE its tracing subscriber attaches to `--log-file`,
+    // which is the only place a pre-`init_tracing` failure leaves any
+    // trace.
+    //
+    // FIXME(architecture): the whole spawn command is built by string
+    // concatenation, which makes shell-syntax mistakes (like the redirect
+    // order incident above) easy to introduce and only catchable via
+    // textual `cmd.contains(...)` tests. A structured shell-command
+    // builder (typed redirects, escaped argv, composable steps) would
+    // move the syntax invariants into the type system. Out of scope for
+    // a single bug fix, tracked here so the next significant change to
+    // this function considers extracting it.
+    let log_path = format!("~/.cache/codemuxd/logs/{agent_id}.log");
+    let stderr_path = format!("~/.cache/codemuxd/logs/{agent_id}.stderr");
+    let log_tail = shell_tail_or_fallback(&log_path, "(log file missing or unreadable)");
+    let stderr_tail = shell_tail_or_fallback(&stderr_path, "(stderr file missing or unreadable)");
     let cmd = format!(
         "{respawn_prelude}\
          setsid -f ~/.cache/codemuxd/bin/codemuxd \
@@ -875,12 +926,10 @@ fn spawn_remote_daemon(
            i=$((i + 1)); \
            if [ $i -ge 5 ]; then \
              echo 'daemon socket did not appear within 5s' >&2; \
-             echo '--- log tail (~/.cache/codemuxd/logs/{agent_id}.log) ---' >&2; \
-             tail -n 20 ~/.cache/codemuxd/logs/{agent_id}.log 2>/dev/null >&2 \
-               || echo '(log file missing or unreadable)' >&2; \
-             echo '--- stderr tail (~/.cache/codemuxd/logs/{agent_id}.stderr) ---' >&2; \
-             tail -n 20 ~/.cache/codemuxd/logs/{agent_id}.stderr 2>/dev/null >&2 \
-               || echo '(stderr file missing or unreadable)' >&2; \
+             echo '--- log tail ({log_path}) ---' >&2; \
+             {log_tail}; \
+             echo '--- stderr tail ({stderr_path}) ---' >&2; \
+             {stderr_tail}; \
              exit 1; \
            fi; \
            sleep 1; \
@@ -1648,19 +1697,35 @@ mod tests {
     /// Without the stderr tail, a `CwdNotFound` failure surfaces as a
     /// 0-byte log + "daemon socket did not appear within 5s" and the
     /// user has no diagnostic.
+    ///
+    /// Both tails go through `shell_tail_or_fallback`, which encodes the
+    /// load-bearing `>&2 2>/dev/null` redirect order. We assert the
+    /// helper's output appears in both spots so a future refactor that
+    /// inlines or bypasses it can't quietly re-introduce the silent-eat
+    /// bug (a previous shipped version had the redirects reversed and
+    /// the daemon's `color_eyre` error sat in `agent.stderr` unread for
+    /// several runs).
     #[test]
     fn spawn_remote_daemon_failure_branch_tails_both_log_and_stderr() {
         let runner = RecordingRunner::new();
         spawn_remote_daemon(&runner, "host", "alpha", Some(Path::new("/tmp")), false).unwrap();
         let cmd = runner.last_run_cmd();
         assert!(
-            cmd.contains("tail -n 20 ~/.cache/codemuxd/logs/alpha.log"),
-            "polling-failure branch must tail the .log file; got: {cmd}",
+            cmd.contains(
+                "tail -n 20 ~/.cache/codemuxd/logs/alpha.log >&2 2>/dev/null \
+                 || echo '(log file missing or unreadable)' >&2",
+            ),
+            "polling-failure branch must tail .log via shell_tail_or_fallback \
+             (preserves tail's stdout on the ssh-side stderr the bootstrap \
+             captures); got: {cmd}",
         );
         assert!(
-            cmd.contains("tail -n 20 ~/.cache/codemuxd/logs/alpha.stderr"),
-            "polling-failure branch must tail the .stderr file (where \
-             pre-tracing failures land); got: {cmd}",
+            cmd.contains(
+                "tail -n 20 ~/.cache/codemuxd/logs/alpha.stderr >&2 2>/dev/null \
+                 || echo '(stderr file missing or unreadable)' >&2",
+            ),
+            "polling-failure branch must tail .stderr via shell_tail_or_fallback \
+             (where pre-tracing failures land); got: {cmd}",
         );
     }
 
