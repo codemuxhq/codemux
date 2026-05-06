@@ -76,8 +76,22 @@ pub fn bring_up(cli: &Cli) -> Result<DaemonResources, Error> {
 pub fn bring_up_with(
     socket: &Path,
     pid_file: Option<&Path>,
-    config: SupervisorConfig,
+    mut config: SupervisorConfig,
 ) -> Result<DaemonResources, Error> {
+    // Expand a leading `~/` (or bare `~`) in cwd against `$HOME`. The
+    // SSH bootstrap (crates/codemuxd-bootstrap) already does this on
+    // the local side using the remote `$HOME` captured during the
+    // version probe, but a daemon invoked directly (cargo run, manual
+    // ssh, smoke tests) gets no such pre-processing. Without this
+    // expansion, `cwd.exists()` returns false on a literal `~/...`
+    // path and the daemon dies with `Error::CwdNotFound` here — a
+    // confusing "does not exist" for what is, semantically, a valid
+    // path. Mutate the config so the expanded path also flows through
+    // to the child PTY's chdir target, otherwise the child would
+    // start in the unexpanded literal.
+    if let Some(cwd) = config.cwd.as_deref() {
+        config.cwd = Some(expand_local_tilde(cwd));
+    }
     if let Some(cwd) = config.cwd.as_deref()
         && !cwd.exists()
     {
@@ -133,6 +147,35 @@ fn apply_socket_mode_or_cleanup(path: &Path) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+/// Expand a leading `~/` (or bare `~`) in `path` against `$HOME`.
+/// Anything else (absolute, relative, `~user`) passes through unchanged.
+/// Mirrors the bootstrap-side helper in `crates/codemuxd-bootstrap`,
+/// but uses the daemon's local `$HOME` rather than a remotely-probed
+/// one — this is the daemon-side defense for the same class of issue
+/// (literal `~/` in `--cwd` failing `Path::exists()`).
+///
+/// If `$HOME` is unset (very unusual on a real login session), the
+/// path is returned unchanged. Downstream `cwd.exists()` will then
+/// fail with `Error::CwdNotFound { path: "~/foo" }`, where the
+/// surviving literal tilde is itself the diagnostic — preferable to
+/// inventing a new error variant for an extremely rare environment.
+fn expand_local_tilde(path: &Path) -> PathBuf {
+    let Some(s) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.to_path_buf();
+    };
+    let home = PathBuf::from(home);
+    if s == "~" {
+        return home;
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
 }
 
 /// Best-effort unlink of a leftover socket from a previous daemon run.
@@ -376,6 +419,53 @@ mod tests {
         assert!(
             !socket.exists(),
             "bring_up failure must not create the socket",
+        );
+        Ok(())
+    }
+
+    /// `--cwd` with a leading `~/` is expanded against `$HOME` BEFORE
+    /// the existence check. Without this, `Path::exists()` returns
+    /// false on the literal `~/...` and the daemon dies with
+    /// `Error::CwdNotFound` for what is, semantically, a valid path.
+    /// The bootstrap-side helper in `crates/codemuxd-bootstrap` does
+    /// this on the local side using the remote `$HOME`; this test
+    /// covers the daemon-side defense for direct invocations
+    /// (foreground, smoke tests, manual `cargo run`).
+    ///
+    /// We don't `unsafe { set_var("HOME", ...) }` — the workspace
+    /// forbids unsafe — instead we rely on `$HOME` being set on every
+    /// real test environment and assert against the resolved path.
+    #[test]
+    fn tilde_cwd_is_expanded_against_home_before_existence_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let socket = dir.path().join("tilde.sock");
+
+        // Create a directory under $HOME that we know exists at test
+        // time. Use a unique suffix so parallel test runs don't collide.
+        let Some(home) = std::env::var_os("HOME") else {
+            panic!("HOME unset; test cannot run in this env");
+        };
+        let unique = format!("codemuxd-tilde-test-{}", std::process::id());
+        let real_dir = std::path::PathBuf::from(&home).join(&unique);
+        std::fs::create_dir_all(&real_dir)?;
+
+        let mut config = cat_config();
+        config.cwd = Some(std::path::PathBuf::from(format!("~/{unique}")));
+
+        let result = bring_up_with(&socket, None, config);
+        // Cleanup before any assertion so a failed assert doesn't leak.
+        let _ = std::fs::remove_dir_all(&real_dir);
+
+        let resources = result?;
+        // The expanded path must flow through to the supervisor config
+        // so the child PTY's chdir target is the absolute path, not
+        // the literal `~/...`.
+        assert_eq!(
+            resources.config.cwd.as_deref(),
+            Some(real_dir.as_path()),
+            "tilde must be expanded against $HOME and the config \
+             updated so the child PTY chdir uses the absolute path",
         );
         Ok(())
     }
