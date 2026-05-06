@@ -364,16 +364,19 @@ pub struct SpawnMinibuffer {
     /// `nucleo-matcher` against `name` (not the full path) and
     /// boosted above any auto-discovered repository.
     named_projects: Vec<NamedProject>,
-    /// Lookup table from `expand_named_project_path(np.path)` → host
-    /// alias, populated at `open()` from any `named_projects` entry
-    /// whose `host` is `Some` and non-empty. Used at commit time in
+    /// Lookup table from `resolve_named_project_path(np)` → host alias,
+    /// populated at `open()` from any `named_projects` entry whose
+    /// `host` is `Some` and non-empty. Used at commit time in
     /// [`Self::confirm`] to upgrade a plain `Spawn` to
     /// `PrepareHostThenSpawn` when the picked path matches an alias
     /// bound to a remote host.
     ///
-    /// Keyed by *expanded* path so the lookup matches what
-    /// `score_fuzzy` emits (the wildmenu shows the expanded path; the
-    /// confirm path resolves the same string back).
+    /// Host-bound entries are keyed by the *literal* `np.path` (no
+    /// local tilde expansion) — `~/` resolves on the remote against
+    /// `prepared.remote_home` during attach, not on the laptop. Local
+    /// expansion would send a `/Users/...` path to a Linux remote and
+    /// fail the daemon's `cwd.exists()` check. The wildmenu candidate
+    /// emitted by `score_fuzzy` is the same literal so the lookup hits.
     project_hosts: HashMap<String, String>,
     /// `true` when `filtered` may not reflect the current
     /// `fuzzy_query` because a fresh fuzzy search has been kicked off
@@ -1770,13 +1773,26 @@ pub(crate) fn score_fuzzy(query: &str, dirs: &[IndexedDir], named: &[NamedProjec
     let mut named_paths: HashSet<String> = HashSet::new();
 
     // Named projects first — score the user-friendly `name`, but emit
-    // the (tilde-expanded) `path` as the spawn target.
+    // the resolved `path` as the spawn target. For local projects that's
+    // the tilde-expanded absolute path; for host-bound projects it's the
+    // literal path so the bootstrap library can expand `~/` against the
+    // remote `$HOME` (see `resolve_named_project_path`).
     for np in named {
         let haystack = Utf32Str::new(&np.name, &mut buf);
         if let Some(score) = pattern.score(haystack, &mut matcher) {
             let expanded = expand_named_project_path(&np.path);
-            named_paths.insert(expanded.clone());
-            scored.push((score.saturating_add(BOOST_NAMED), expanded));
+            let candidate = if np.host.as_deref().is_some_and(|h| !h.is_empty()) {
+                np.path.clone()
+            } else {
+                expanded.clone()
+            };
+            // Dedup against indexed dirs always uses the local-expanded
+            // path: indexed dirs are absolute local paths, and a shared
+            // dir like `~/.dotfiles` (present on both laptop and devpod)
+            // should still drop its local entry from the wildmenu when a
+            // host-bound named project covers it.
+            named_paths.insert(expanded);
+            scored.push((score.saturating_add(BOOST_NAMED), candidate));
         }
     }
 
@@ -1827,11 +1843,36 @@ fn expand_named_project_path(path: &str) -> String {
     path.to_string()
 }
 
+/// The string the spawn modal emits for a named project — both as the
+/// wildmenu candidate and as the spawn target the runtime hands to the
+/// bootstrap worker.
+///
+/// Local projects (no `host`): tilde-expanded absolute path, matching
+/// the indexer's emission so dedup with auto-discovered dirs works.
+///
+/// Host-bound projects (`host: Some(non_empty)`): the literal `np.path`
+/// with `~/` preserved. The bootstrap library
+/// (`codemuxd_bootstrap::expand_remote_tilde`) expands against the
+/// captured remote `$HOME` during attach. Local-expanding here would
+/// send a `/Users/...` path to a Linux remote, where the daemon's
+/// `cwd.exists()` check fails before the supervisor binds — surfacing
+/// to the user as `bootstrap of <host> failed: cwd /Users/... does not
+/// exist`.
+#[must_use]
+fn resolve_named_project_path(np: &NamedProject) -> String {
+    if np.host.as_deref().is_some_and(|h| !h.is_empty()) {
+        return np.path.clone();
+    }
+    expand_named_project_path(&np.path)
+}
+
 /// Build the path → host lookup the spawn modal uses at commit time
 /// to upgrade a plain `Spawn` into `PrepareHostThenSpawn` for projects
 /// bound to an SSH alias. Empty/missing `host` is filtered out (treated
-/// as local). Keys are tilde-expanded so they match the strings
-/// `score_fuzzy` emits into the wildmenu.
+/// as local). Keys come from [`resolve_named_project_path`] so they
+/// match the strings `score_fuzzy` emits into the wildmenu — i.e. the
+/// literal `np.path` with `~/` preserved (host-bound entries always
+/// take that branch since they have a non-empty host).
 ///
 /// On a duplicate path with conflicting hosts the *first* entry wins —
 /// the user's config order is the tiebreaker. We don't bother warning;
@@ -1847,7 +1888,7 @@ fn build_project_hosts(projects: &[NamedProject]) -> HashMap<String, String> {
         if host.is_empty() {
             continue;
         }
-        map.entry(expand_named_project_path(&np.path))
+        map.entry(resolve_named_project_path(np))
             .or_insert_with(|| host.clone());
     }
     map
@@ -4289,10 +4330,14 @@ mod tests {
     }
 
     #[test]
-    fn build_project_hosts_keys_by_expanded_path() {
-        // Use an absolute path so the test doesn't depend on $HOME, but
-        // also cover a `~/...` entry to lock the tilde-expansion in.
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+    fn build_project_hosts_keys_by_literal_path_for_host_bound_entries() {
+        // Host-bound entries are keyed by the literal `np.path` (NOT
+        // local-expanded) so the lookup matches what `score_fuzzy`
+        // emits into the wildmenu and what the runtime later hands to
+        // the bootstrap library. The bootstrap library expands `~/`
+        // against the *remote* `$HOME` during attach; pre-expanding
+        // here would send a `/Users/...` path to a Linux remote and
+        // fail the daemon's `cwd.exists()` check.
         let projects = vec![
             NamedProject {
                 name: "abs".to_string(),
@@ -4307,10 +4352,88 @@ mod tests {
         ];
         let map = build_project_hosts(&projects);
         assert_eq!(map.get("/work/code").map(String::as_str), Some("devpod-1"));
-        if let Some(home) = home {
-            let expanded = home.join("dotfiles").to_string_lossy().into_owned();
-            assert_eq!(map.get(&expanded).map(String::as_str), Some("devpod-2"));
-        }
+        assert_eq!(
+            map.get("~/dotfiles").map(String::as_str),
+            Some("devpod-2"),
+            "host-bound entries must key by the literal path, not the \
+             local-expanded one — the remote daemon would never see \
+             `/Users/...` as a valid cwd. Got map = {map:?}",
+        );
+    }
+
+    /// Regression for the `[[spawn.projects]] host = "devpod-go"` flow
+    /// where every spawn died with `cwd /Users/.../workbench/... does
+    /// not exist` on the remote. Captures the full path:
+    ///
+    ///   1. `score_fuzzy` emits the literal `~/...` candidate (not the
+    ///      locally-expanded one).
+    ///   2. `confirm()` looks up the candidate in `project_hosts` and
+    ///      emits `PrepareHostThenSpawn { path: "~/..." }`.
+    ///
+    /// The bootstrap library's `expand_remote_tilde` then resolves the
+    /// tilde against `prepared.remote_home` during attach.
+    #[test]
+    fn host_bound_tilde_project_round_trips_as_literal_path() {
+        let np = NamedProject {
+            name: "eatsfeed".to_string(),
+            path: "~/workbench/repositories/go-code/eatsfeed".to_string(),
+            host: Some("devpod-go".to_string()),
+        };
+
+        // (1) score_fuzzy emits the literal candidate.
+        let result = score_fuzzy("eatsfeed", &[], std::slice::from_ref(&np));
+        assert_eq!(
+            result.first().map(String::as_str),
+            Some("~/workbench/repositories/go-code/eatsfeed"),
+            "host-bound project must surface its literal path in the \
+             wildmenu so the lookup in confirm() hits and the remote \
+             daemon receives a tilde-prefixed path it can expand: \
+             {result:?}",
+        );
+
+        // (2) confirm() round-trips the literal candidate into a
+        //     PrepareHostThenSpawn outcome with the same literal path.
+        let mut m = SpawnMinibuffer::open(Path::new("/tmp"), SearchMode::Precise, vec![np]);
+        m.host.clear();
+        m.path_origin = PathOrigin::UserTyped;
+        m.filtered = vec!["~/workbench/repositories/go-code/eatsfeed".to_string()];
+        m.selected = Some(0);
+        m.focused = Zone::Path;
+        let outcome = m.confirm(&mut DirLister::Local);
+        assert_eq!(
+            outcome,
+            ModalOutcome::PrepareHostThenSpawn {
+                host: "devpod-go".to_string(),
+                path: "~/workbench/repositories/go-code/eatsfeed".to_string(),
+            },
+            "the literal `~/...` path must flow through to \
+             PrepareHostThenSpawn unchanged",
+        );
+    }
+
+    /// Local-only named projects keep today's behavior: their `~/`
+    /// path is expanded against the local `$HOME` so the wildmenu
+    /// candidate is an absolute local path that dedups against any
+    /// indexed dir at the same place. Companion to the host-bound test
+    /// above so the two arms of `resolve_named_project_path` are both
+    /// covered through `score_fuzzy`.
+    #[test]
+    fn local_only_tilde_project_emits_locally_expanded_candidate() {
+        let Some(home_os) = std::env::var_os("HOME") else {
+            panic!("HOME unset; test cannot run in this env");
+        };
+        let home = PathBuf::from(home_os);
+        let np = NamedProject {
+            name: "df".to_string(),
+            path: "~/.dotfiles".to_string(),
+            host: None,
+        };
+        let result = score_fuzzy("df", &[], std::slice::from_ref(&np));
+        assert_eq!(
+            result.first().map(PathBuf::from),
+            Some(home.join(".dotfiles")),
+            "local-only project must surface the locally-expanded path: {result:?}",
+        );
     }
 
     #[test]
