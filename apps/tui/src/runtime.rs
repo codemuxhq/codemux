@@ -803,6 +803,21 @@ struct RuntimeAgent {
     /// for the focused agent's cwd. `None` outside a git repo, on
     /// HEAD-parse failures, and for SSH agents.
     branch: Option<String>,
+    /// Most-recent context-window usage snapshot for this agent,
+    /// reported by [`crate::agent_meta_worker`]. `None` until the
+    /// agent has completed its first turn (Claude Code only fires
+    /// the statusLine callback after a model response), and for SSH
+    /// agents (worker only handles local in v1). The data flows in
+    /// via the per-agent `statusline_path` written by the
+    /// `codemux statusline-tee` subcommand — see
+    /// `apps/tui/src/statusline_ipc.rs` for the on-disk layout.
+    token_usage: Option<crate::agent_meta_worker::TokenUsage>,
+    /// Per-agent statusLine snapshot path. `Some(path)` for local
+    /// Claude agents (set by `spawn_local_agent` so the worker can
+    /// read it), `None` for SSH/test agents where the statusLine
+    /// callback isn't wired. Owned by the agent so a Drop hook can
+    /// clean up the file on agent termination if we want that later.
+    statusline_path: Option<PathBuf>,
     /// Working state observed on the previous frame. The runtime
     /// compares this to `parser.callbacks().is_working()` each tick;
     /// a `true → false` transition while the agent is *not* focused
@@ -910,11 +925,11 @@ impl AgentState {
 }
 
 impl RuntimeAgent {
-    // 9 args after the agent_meta_worker landing; identity, label,
-    // working dir, host, transport, geometry, and scrollback budget
-    // are all distinct concerns that the single call site sets at
-    // once. A builder would add code without making any of these
-    // optional or composable.
+    // 10 args after the statusline-tee landing; identity, label,
+    // working dir, host, statusline-snapshot path, transport, geometry,
+    // and scrollback budget are all distinct concerns that the single
+    // call site sets at once. A builder would add code without making
+    // any of these optional or composable.
     #[allow(clippy::too_many_arguments)]
     fn ready(
         id: AgentId,
@@ -922,6 +937,7 @@ impl RuntimeAgent {
         repo: Option<String>,
         cwd: Option<PathBuf>,
         host: Option<String>,
+        statusline_path: Option<PathBuf>,
         transport: AgentTransport,
         rows: u16,
         cols: u16,
@@ -935,6 +951,8 @@ impl RuntimeAgent {
             host,
             model_effort: None,
             branch: None,
+            token_usage: None,
+            statusline_path,
             last_working: false,
             needs_attention: false,
             rows,
@@ -970,6 +988,8 @@ impl RuntimeAgent {
             host: Some(host),
             model_effort: None,
             branch: None,
+            token_usage: None,
+            statusline_path: None,
             last_working: false,
             needs_attention: false,
             rows,
@@ -1171,6 +1191,7 @@ pub fn run(
         pty_rows,
         pty_cols,
         config.scrollback_len,
+        &config.ui.segments.tokens,
     )?;
     let agents = vec![initial];
 
@@ -1273,6 +1294,7 @@ pub fn run(
         chrome: &chrome,
         spawn_config: &config.spawn,
         scrollback_len: config.scrollback_len,
+        tokens_cfg: &config.ui.segments.tokens,
         host_bell_on_finish: config.ui.host_bell_on_finish,
         mouse_captured,
         mouse_url_modifier: config.mouse_url_modifier,
@@ -1386,6 +1408,14 @@ fn tick_fuzzy_dispatch(
 /// owns the PTY shape (master + child + reader thread); the runtime
 /// keeps the renderable [`Parser`] alongside, since rendering is the
 /// runtime's job (AD-1) and not the transport's.
+///
+/// The `tokens_cfg` is used to inject `claude --settings '{...}'` so
+/// every spawn wires its own `statusLine.command` at
+/// `codemux statusline-tee --out <per-agent path>`. The user's existing
+/// `~/.claude/settings.json` (and any aifx config inside it) is layered
+/// normally — `--settings` overrides only the `statusLine` field for
+/// this single Claude invocation. See `apps/tui/src/statusline_ipc.rs`
+/// for the schema and the AD-1 carve-out rationale.
 fn spawn_local_agent(
     id: AgentId,
     label: String,
@@ -1393,8 +1423,11 @@ fn spawn_local_agent(
     rows: u16,
     cols: u16,
     scrollback_len: usize,
+    tokens_cfg: &crate::config::TokensSegmentConfig,
 ) -> Result<RuntimeAgent> {
-    let transport = AgentTransport::spawn_local(label.clone(), cwd, rows, cols)
+    let statusline_path = crate::statusline_ipc::statusline_path_for(&id);
+    let args = build_claude_args(&statusline_path, tokens_cfg);
+    let transport = AgentTransport::spawn_local(label.clone(), cwd, &args, rows, cols)
         .wrap_err("spawn local agent")?;
     let repo = cwd.and_then(repo_name::resolve_local);
     Ok(RuntimeAgent::ready(
@@ -1403,11 +1436,40 @@ fn spawn_local_agent(
         repo,
         cwd.map(Path::to_path_buf),
         None,
+        Some(statusline_path),
         transport,
         rows,
         cols,
         scrollback_len,
     ))
+}
+
+/// Build the argv slice passed to `claude` so the spawn carries the
+/// statusLine override. Returns `["--settings", "<json>"]`. The
+/// `current_exe` resolution is inside this helper (not in
+/// [`spawn_local_agent`]) so the helper can be exercised from a unit
+/// test without reaching for a process spawn.
+///
+/// On the rare failure to resolve `current_exe()` (e.g. the binary
+/// was unlinked while running), falls back to an empty argv so the
+/// spawn proceeds without statusLine wiring rather than failing the
+/// whole agent. The token segment will simply render nothing for
+/// that agent — same shape as "agent hasn't completed its first turn
+/// yet."
+fn build_claude_args(
+    statusline_path: &Path,
+    tokens_cfg: &crate::config::TokensSegmentConfig,
+) -> Vec<String> {
+    let Ok(bin) = std::env::current_exe() else {
+        tracing::warn!("std::env::current_exe failed; spawning claude without statusLine wiring");
+        return Vec::new();
+    };
+    let json = crate::statusline_ipc::build_settings_json(
+        &bin,
+        statusline_path,
+        tokens_cfg.refresh_interval_secs,
+    );
+    vec!["--settings".to_string(), json]
 }
 
 /// Build the [`PendingAttach`] for an SSH spawn. Shared by the user-
@@ -1814,17 +1876,18 @@ fn sync_meta_worker_target(
     // Only locally-spawned agents are polled in v1: SSH agents have
     // a remote cwd that the worker can't read. Detect them by the
     // absence of `cwd` (set only by `spawn_local_agent`).
-    let focused_local = nav
-        .agents
-        .get(nav.focused)
-        .and_then(|a| a.cwd.as_ref().map(|cwd| (&a.id, cwd)));
+    let focused_local = nav.agents.get(nav.focused).and_then(|a| {
+        a.cwd
+            .as_ref()
+            .map(|cwd| (&a.id, cwd, a.statusline_path.as_ref()))
+    });
     match (focused_local, last_sent.as_ref()) {
-        (Some((id, _)), Some(prev)) if *id == *prev => {
+        (Some((id, _, _)), Some(prev)) if *id == *prev => {
             // Same focused agent. Worker still polling it; no clones,
             // no channel sends.
         }
-        (Some((id, cwd)), _) => {
-            worker.set_target(id.clone(), cwd.clone());
+        (Some((id, cwd, statusline_path)), _) => {
+            worker.set_target(id.clone(), cwd.clone(), statusline_path.cloned());
             *last_sent = Some(id.clone());
         }
         (None, Some(_)) => {
@@ -1842,7 +1905,9 @@ fn sync_meta_worker_target(
 fn apply_meta_events(agents: &mut [RuntimeAgent], events: Vec<MetaEvent>) {
     for ev in events {
         let target_id = match &ev {
-            MetaEvent::Branch { agent_id, .. } | MetaEvent::Model { agent_id, .. } => agent_id,
+            MetaEvent::Branch { agent_id, .. }
+            | MetaEvent::Model { agent_id, .. }
+            | MetaEvent::Tokens { agent_id, .. } => agent_id,
         };
         let Some(agent) = agents.iter_mut().find(|a| &a.id == target_id) else {
             continue;
@@ -1850,6 +1915,7 @@ fn apply_meta_events(agents: &mut [RuntimeAgent], events: Vec<MetaEvent>) {
         match ev {
             MetaEvent::Branch { value, .. } => agent.branch = value,
             MetaEvent::Model { value, .. } => agent.model_effort = value,
+            MetaEvent::Tokens { value, .. } => agent.token_usage = value,
         }
     }
 }
@@ -2439,6 +2505,14 @@ struct RuntimeContext<'a> {
     spawn_config: &'a SpawnConfig,
     /// Per-agent vt100 scrollback budget, in rows.
     scrollback_len: usize,
+    /// Per-spawn config for the `tokens` status-bar segment. Read at
+    /// agent spawn time to assemble the `--settings` JSON injected
+    /// into `claude` (specifically, `refresh_interval_secs` becomes
+    /// the statusLine `refreshInterval`). Threaded through here so
+    /// `dispatch_key`'s spawn paths inherit the user's
+    /// `[ui.segments.tokens]` knobs without picking up a separate
+    /// reference to the global `Config`.
+    tokens_cfg: &'a crate::config::TokensSegmentConfig,
     /// When true, the event loop emits a host-terminal BEL on every
     /// agent's working → idle transition. See `[ui]
     /// host_bell_on_finish` in `Ui` for the user-facing knob.
@@ -2488,6 +2562,7 @@ fn event_loop(
         chrome,
         spawn_config,
         scrollback_len,
+        tokens_cfg,
         host_bell_on_finish,
         mouse_captured,
         mouse_url_modifier,
@@ -2716,6 +2791,14 @@ fn event_loop(
                             // skips SSH agents in v1.
                             None,
                             Some(attach.host.clone()),
+                            // SSH agents don't get a statusline
+                            // snapshot file: the tee subcommand only
+                            // exists in the local codemux binary, and
+                            // the `--settings` injection is local-only.
+                            // The tokens segment renders nothing for
+                            // SSH-backed agents (matches the
+                            // ModelSegment scope).
+                            None,
                             transport,
                             attach.rows,
                             attach.cols,
@@ -3125,6 +3208,7 @@ fn event_loop(
                                     rows,
                                     cols,
                                     scrollback_len,
+                                    tokens_cfg,
                                 ) {
                                     Ok(agent) => {
                                         nav.agents.push(agent);
@@ -3212,6 +3296,7 @@ fn event_loop(
                                     rows,
                                     cols,
                                     scrollback_len,
+                                    tokens_cfg,
                                 ) {
                                     Ok(agent) => {
                                         nav.agents.push(agent);
@@ -4628,6 +4713,7 @@ fn render_status_bar(
         repo: focused_agent.and_then(|a| a.repo.as_deref()),
         branch: focused_agent.and_then(|a| a.branch.as_deref()),
         model_effort: focused_agent.and_then(|a| a.model_effort.as_ref()),
+        token_usage: focused_agent.and_then(|a| a.token_usage.as_ref()),
         cwd_basename: focused_agent
             .and_then(|a| a.cwd.as_deref())
             .and_then(|p| p.file_name())
@@ -7290,6 +7376,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             transport,
             5,
             20,
@@ -7820,6 +7907,7 @@ mod tests {
             repo: None,
             branch: None,
             model_effort: None,
+            token_usage: None,
             cwd_basename: None,
             prefix_state: state,
             bindings: &bindings,
@@ -8129,6 +8217,7 @@ mod tests {
         RuntimeAgent::ready(
             AgentId::new("a"),
             "a".into(),
+            None,
             None,
             None,
             None,
@@ -9784,6 +9873,7 @@ mod tests {
         let mut agent = RuntimeAgent::ready(
             AgentId::new(id),
             id.into(),
+            None,
             None,
             None,
             None,

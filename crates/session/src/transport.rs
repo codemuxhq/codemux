@@ -69,6 +69,12 @@ impl AgentTransport {
     /// `label` is purely advisory; it appears in tracing breadcrumbs so
     /// a multi-agent log is easy to follow.
     ///
+    /// `args` are forwarded verbatim to the `claude` invocation. The
+    /// runtime uses this to inject `--settings '<json>'` overrides
+    /// (statusLine wiring, etc.) without baking codemux/Claude-specific
+    /// JSON into this vendor-neutral transport crate. Pass `&[]` when
+    /// no extra args are needed.
+    ///
     /// # Errors
     /// Returns [`Error::Pty`] when the kernel can't allocate a PTY, or
     /// [`Error::Spawn`] when `claude` (or whatever command was given)
@@ -76,10 +82,11 @@ impl AgentTransport {
     pub fn spawn_local(
         label: String,
         cwd: Option<&Path>,
+        args: &[String],
         rows: u16,
         cols: u16,
     ) -> Result<Self, Error> {
-        LocalPty::spawn("claude", &[], label, cwd, rows, cols).map(Self::Local)
+        LocalPty::spawn("claude", args, label, cwd, rows, cols).map(Self::Local)
     }
 
     /// Drain whatever bytes the transport has buffered since the last

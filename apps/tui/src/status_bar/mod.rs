@@ -30,10 +30,15 @@
 //!
 //! [`segments::ModelSegment`] reads `~/.claude/settings.json` to
 //! surface the user's currently-selected model alias and reasoning
-//! effort level. This is the single sanctioned exception to AD-1's
-//! "never semantically parse Claude Code" rule — bounded to one
-//! specific file, two specific fields, focused local agent only.
-//! See AD-1's amended prose in `docs/architecture.md`.
+//! effort level. [`segments::TokenSegment`] reads the per-agent
+//! statusLine snapshot written by `codemux statusline-tee` (the JSON
+//! Claude Code pipes to the configured `statusLine.command` after
+//! every assistant turn). These are the two sanctioned exceptions to
+//! AD-1's "never semantically parse Claude Code" rule — both consume
+//! Claude Code's documented configuration / callback contracts, not
+//! its rendered TUI output. Bounded to the focused local agent, fed
+//! by [`crate::agent_meta_worker`]. See AD-1's amended prose in
+//! `docs/architecture.md`.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -47,6 +52,7 @@ pub(crate) mod segments;
 /// constants too — the same string in two places without a source of
 /// truth would silently drift.
 pub(crate) const SEGMENT_MODEL: &str = "model";
+pub(crate) const SEGMENT_TOKENS: &str = "tokens";
 pub(crate) const SEGMENT_REPO: &str = "repo";
 pub(crate) const SEGMENT_WORKTREE: &str = "worktree";
 pub(crate) const SEGMENT_BRANCH: &str = "branch";
@@ -61,10 +67,18 @@ pub(crate) const SEGMENT_PREFIX_HINT: &str = "prefix_hint";
 /// user is inside a git worktree (whose directory name typically
 /// differs from the repo name). Users who want the old `repo` label
 /// can opt in via `[ui] status_bar_segments`.
+///
+/// `tokens` sits next to `model` (left of `worktree`) so the model
+/// + context-pressure pair reads as one visual unit on the bar.
+///
+/// Pressure-drop order is unchanged: under width pressure, `model`
+/// drops first, then `tokens`, then `worktree`, etc., always from
+/// the LEFT.
 #[must_use]
 pub(crate) fn default_segment_ids() -> Vec<String> {
     vec![
         SEGMENT_MODEL.into(),
+        SEGMENT_TOKENS.into(),
         SEGMENT_WORKTREE.into(),
         SEGMENT_BRANCH.into(),
         SEGMENT_PREFIX_HINT.into(),
@@ -93,6 +107,13 @@ pub(crate) struct SegmentCtx<'a> {
     /// `None` until the worker's first successful read and for SSH
     /// agents.
     pub model_effort: Option<&'a crate::agent_meta_worker::ModelEffort>,
+    /// Most-recent context-window usage snapshot for the focused
+    /// local agent, fed by [`crate::agent_meta_worker`] from the
+    /// per-agent statusLine JSON written by `codemux statusline-tee`.
+    /// `None` until the agent has completed its first turn (Claude
+    /// Code only fires the statusLine callback after a model
+    /// response) and for SSH agents.
+    pub token_usage: Option<&'a crate::agent_meta_worker::TokenUsage>,
     /// Basename of the focused agent's cwd, rendered by
     /// [`segments::WorktreeSegment`] as `wt:<basename>`. For a regular
     /// checkout this is the repo basename; for a git worktree it's the
@@ -144,6 +165,10 @@ pub(crate) fn build_segments(
     ids.iter()
         .filter_map(|id| match id.as_str() {
             SEGMENT_MODEL => Some(Box::new(segments::ModelSegment) as Box<dyn StatusSegment>),
+            SEGMENT_TOKENS => {
+                Some(Box::new(segments::TokenSegment::new(cfg.tokens.clone()))
+                    as Box<dyn StatusSegment>)
+            }
             SEGMENT_REPO => Some(Box::new(segments::RepoSegment) as Box<dyn StatusSegment>),
             SEGMENT_WORKTREE => Some(Box::new(segments::WorktreeSegment) as Box<dyn StatusSegment>),
             SEGMENT_BRANCH => Some(Box::new(segments::BranchSegment::new(
@@ -156,7 +181,7 @@ pub(crate) fn build_segments(
                 tracing::warn!(
                     segment = %other,
                     "unknown status_bar_segments id; skipping. \
-                     Known ids: model, repo, worktree, branch, prefix_hint",
+                     Known ids: model, tokens, repo, worktree, branch, prefix_hint",
                 );
                 None
             }
@@ -298,6 +323,7 @@ mod tests {
             repo: None,
             branch: None,
             model_effort: None,
+            token_usage: None,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings,
@@ -468,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn build_segments_default_set_is_model_worktree_branch_hint() {
+    fn build_segments_default_set_is_model_tokens_worktree_branch_hint() {
         let built = build_segments(
             &default_segment_ids(),
             &crate::config::SegmentConfig::default(),
@@ -478,6 +504,7 @@ mod tests {
             ids,
             vec![
                 SEGMENT_MODEL,
+                SEGMENT_TOKENS,
                 SEGMENT_WORKTREE,
                 SEGMENT_BRANCH,
                 SEGMENT_PREFIX_HINT

@@ -246,6 +246,199 @@ impl StatusSegment for BranchSegment {
     }
 }
 
+// ─── TokenSegment ─────────────────────────────────────────────────
+
+/// Renders the focused agent's context-window usage as
+/// `tok:<count> <pct>%` (or one of two other configurable formats —
+/// see [`crate::config::TokensFormat`]). Color-coded against
+/// configurable thresholds so the user notices context pressure at a
+/// glance:
+///
+/// - default (below `yellow_threshold`)  → ambient (chrome.secondary)
+/// - at/above `yellow_threshold`         → yellow
+/// - at/above `orange_threshold`         → orange (256-color 208)
+/// - at/above `red_threshold`            → red
+///
+/// Default thresholds (200k/300k/360k against a 400k effective
+/// compaction window) match aifx so a user coming from aifx sees the
+/// same transitions without writing config.
+///
+/// Data is supplied by [`crate::agent_meta_worker`] which reads the
+/// per-agent statusLine JSON snapshot written by the
+/// `codemux statusline-tee` subcommand (one file per `AgentId`, written
+/// atomically by Claude Code's own statusLine callback). See
+/// `apps/tui/src/statusline_ipc.rs` for the on-disk layout and the
+/// AD-1 carve-out rationale.
+pub(crate) struct TokenSegment {
+    cfg: crate::config::TokensSegmentConfig,
+}
+
+impl TokenSegment {
+    /// Construct with the user-configured policy (format choice,
+    /// color thresholds, optional auto-compact window override).
+    pub(crate) fn new(cfg: crate::config::TokensSegmentConfig) -> Self {
+        Self { cfg }
+    }
+
+    /// Resolve the effective context window used in percentage math
+    /// and bar rendering. Production wrapper around
+    /// [`Self::effective_window_pure`] that reads the
+    /// `$CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var. Tests call the
+    /// pure version directly so they don't depend on the test
+    /// environment's env state (the user's shell may have it set
+    /// from aifx, or any other tool that injects it).
+    fn effective_window(&self, context_window_size: i64) -> i64 {
+        let env_window = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|v| *v > 0);
+        Self::effective_window_pure(
+            self.cfg.auto_compact_window,
+            env_window,
+            context_window_size,
+        )
+    }
+
+    /// Pure resolution of the effective context window. Mirrors
+    /// aifx's `effectiveContextWindow` exactly:
+    ///
+    /// - With no override (config OR env) → trust the model's
+    ///   reported `context_window_size`. A user on Opus 1M sees the
+    ///   bar fill against 1M, not against a hidden 400k floor.
+    /// - With an override (config wins over env) → use it, but cap
+    ///   to `context_window_size` when smaller. The override is the
+    ///   auto-compact ceiling, not a floor; if your model can only
+    ///   do 200k there's no point pretending the ceiling is 400k.
+    /// - With no override AND no reported window → fall back to 400k
+    ///   as a last-resort guard so the percentage isn't 0/0.
+    fn effective_window_pure(
+        configured: Option<i64>,
+        env_window: Option<i64>,
+        context_window_size: i64,
+    ) -> i64 {
+        let override_window = configured.filter(|v| *v > 0).or(env_window);
+        match (override_window, context_window_size > 0) {
+            (Some(override_w), true) => override_w.min(context_window_size),
+            (Some(override_w), false) => override_w,
+            (None, true) => context_window_size,
+            (None, false) => 400_000,
+        }
+    }
+
+    /// Color picker keyed on the **headline** token count (input +
+    /// output + cache). Returns `None` for the green/below-threshold
+    /// bucket so the caller can fall back to the chrome's ambient
+    /// secondary style — keeps the segment looking like the rest of
+    /// the bar at idle and drawing the eye only when there's actual
+    /// pressure.
+    fn color_for(&self, total_tokens: i64) -> Option<Color> {
+        if total_tokens >= self.cfg.red_threshold {
+            Some(Color::Red)
+        } else if total_tokens >= self.cfg.orange_threshold {
+            Some(Color::Indexed(208))
+        } else if total_tokens >= self.cfg.yellow_threshold {
+            Some(Color::Yellow)
+        } else {
+            None
+        }
+    }
+}
+
+impl StatusSegment for TokenSegment {
+    fn id(&self) -> &'static str {
+        super::SEGMENT_TOKENS
+    }
+
+    fn render(&self, ctx: &SegmentCtx<'_>) -> Option<Line<'static>> {
+        let usage = ctx.token_usage?;
+        let cache_total = usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
+        let total = usage.input_tokens + usage.output_tokens + cache_total;
+        if total <= 0 {
+            // First turn hasn't reported any tokens yet. Render
+            // nothing — the slot collapses cleanly until the second
+            // turn lands a non-zero count.
+            return None;
+        }
+        // Numerator for the percentage uses the same definition aifx
+        // does: input + cache_creation + cache_read (excludes output,
+        // which doesn't contribute to the next turn's prompt
+        // budget).
+        let context_used =
+            usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
+        let window = self.effective_window(usage.context_window_size);
+        let pct = if window > 0 {
+            // Saturating arithmetic guards against exotic scenarios
+            // where a misconfigured snapshot reports a huge negative
+            // window or a context_used > window. Clamping to 0..=100
+            // here keeps the bar render and the percentage label in
+            // the documented range.
+            context_used
+                .saturating_mul(100)
+                .saturating_div(window.max(1))
+                .clamp(0, 100)
+        } else {
+            0
+        };
+
+        let count = format_token_count(total);
+        let style = match self.color_for(total) {
+            Some(c) => Style::default().fg(c),
+            None => ctx.secondary,
+        };
+
+        let text = match self.cfg.format {
+            crate::config::TokensFormat::Compact => format!("tok:{count}"),
+            crate::config::TokensFormat::WithPercent => format!("tok:{count} {pct}%"),
+            crate::config::TokensFormat::WithBar => {
+                format!("tok:{count} {}", render_mini_bar(pct))
+            }
+        };
+        Some(Line::from(Span::styled(text, style)))
+    }
+}
+
+/// Render a compact 5-cell progress bar like `[▌▌  ]`. Width is
+/// fixed (5 cells of fill, plus the two `[` `]` brackets) so the
+/// `WithBar` format is always 9 cells wide regardless of percentage —
+/// keeps the drop-from-the-left algorithm's width math stable.
+fn render_mini_bar(pct: i64) -> String {
+    const WIDTH: usize = 5;
+    let pct_clamped = pct.clamp(0, 100);
+    // Stay in usize from here on — the multiplication can't overflow
+    // because pct is already bounded to 100 and WIDTH is tiny.
+    let filled = (usize::try_from(pct_clamped).unwrap_or(0) * WIDTH) / 100;
+    let empty = WIDTH.saturating_sub(filled);
+    let mut s = String::with_capacity(2 + WIDTH * 3);
+    s.push('[');
+    for _ in 0..filled {
+        s.push('▌');
+    }
+    for _ in 0..empty {
+        s.push(' ');
+    }
+    s.push(']');
+    s
+}
+
+/// Format a token count as `1.2k` / `1.5m` / `42` for compact display
+/// in the status bar. Matches aifx's `formatTokenCount` (floor for
+/// `k`, one-decimal for `m`).
+fn format_token_count(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        // Floor-then-format keeps "1.0m" out of the very-low-million
+        // bucket. Multiply by 10 first so we keep one decimal place
+        // without floating-point math.
+        let tenths = tokens / 100_000;
+        let whole = tenths / 10;
+        let frac = tenths % 10;
+        format!("{whole}.{frac}m")
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        format!("{tokens}")
+    }
+}
+
 // ─── PrefixHintSegment ────────────────────────────────────────────
 
 /// The right-edge hint that's lived on the status bar since day one:
@@ -310,6 +503,7 @@ mod tests {
             repo,
             branch,
             model_effort: None,
+            token_usage: None,
             cwd_basename,
             prefix_state,
             bindings,
@@ -325,6 +519,7 @@ mod tests {
             repo: None,
             branch: None,
             model_effort: me,
+            token_usage: None,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings,
@@ -349,6 +544,26 @@ mod tests {
             repo: None,
             branch,
             model_effort: None,
+            token_usage: None,
+            cwd_basename: None,
+            prefix_state: PrefixState::Idle,
+            bindings,
+            secondary: Style::default(),
+        }
+    }
+
+    /// Test ctx for [`TokenSegment`]'s "usage is set" path. Mirrors
+    /// `ctx_with_me` for symmetry with the other meta-worker-fed
+    /// segment.
+    fn ctx_with_tu<'a>(
+        bindings: &'a Bindings,
+        usage: Option<&'a crate::agent_meta_worker::TokenUsage>,
+    ) -> SegmentCtx<'a> {
+        SegmentCtx {
+            repo: None,
+            branch: None,
+            model_effort: None,
+            token_usage: usage,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings,
@@ -533,6 +748,7 @@ mod tests {
             repo: None,
             branch: None,
             model_effort: Some(&model),
+            token_usage: None,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings: &bindings,
@@ -654,6 +870,282 @@ mod tests {
         assert!(segment.render(&ctx).is_none());
     }
 
+    // ─── TokenSegment ──────────────────────────────────────────────
+
+    fn tu(
+        input: i64,
+        output: i64,
+        cache_creation: i64,
+        cache_read: i64,
+        window: i64,
+    ) -> crate::agent_meta_worker::TokenUsage {
+        crate::agent_meta_worker::TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: cache_creation,
+            cache_read_input_tokens: cache_read,
+            context_window_size: window,
+        }
+    }
+
+    #[test]
+    fn token_segment_returns_none_when_no_usage_yet() {
+        // First-render path: the worker hasn't seen a snapshot file
+        // yet (the agent hasn't completed turn 1). The segment slot
+        // collapses cleanly — no `tok:0` placeholder.
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let ctx = ctx_with_tu(&bindings, None);
+        assert!(segment.render(&ctx).is_none());
+    }
+
+    #[test]
+    fn token_segment_returns_none_when_total_is_zero() {
+        // Defensive: if Claude Code ever fires the statusLine
+        // callback before any tokens have flowed (e.g. a `/compact`
+        // immediately after spawn), render nothing rather than `tok:0`.
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let usage = tu(0, 0, 0, 0, 200_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        assert!(segment.render(&ctx).is_none());
+    }
+
+    #[test]
+    fn token_segment_with_percent_renders_tok_count_and_percentage() {
+        // The default format. Headline number sums input+output+cache;
+        // the percentage divides input+cache by the effective window.
+        // 100k input + 50k output + 0 cache, against the 200k window
+        // reported in the snapshot: total = 150k → "150k",
+        // context_used = 100k, effective_window = min(200k, 400k) = 200k
+        // → 100/200 = 50%.
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let usage = tu(100_000, 50_000, 0, 0, 200_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        let text = line_text(&line);
+        assert!(text.starts_with("tok:150k"), "got {text:?}");
+        assert!(text.ends_with("50%"), "got {text:?}");
+    }
+
+    #[test]
+    fn token_segment_compact_format_omits_percentage() {
+        let bindings = Bindings::default();
+        let cfg = crate::config::TokensSegmentConfig {
+            format: crate::config::TokensFormat::Compact,
+            ..Default::default()
+        };
+        let segment = TokenSegment::new(cfg);
+        let usage = tu(100_000, 50_000, 0, 0, 200_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "tok:150k");
+    }
+
+    #[test]
+    fn token_segment_with_bar_renders_fixed_width_progress_bar() {
+        // The mini-bar is fixed at 5 fill cells + brackets so the
+        // segment width is stable across percentages — the
+        // drop-from-the-left algorithm relies on width staying put.
+        let bindings = Bindings::default();
+        let cfg = crate::config::TokensSegmentConfig {
+            format: crate::config::TokensFormat::WithBar,
+            ..Default::default()
+        };
+        let segment = TokenSegment::new(cfg);
+        // 100k input + 0 output + 0 cache, 400k effective window
+        // → 25% → 1 of 5 fill cells.
+        let usage = tu(100_000, 0, 0, 0, 400_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(line_text(&line), "tok:100k [▌    ]");
+    }
+
+    #[test]
+    fn token_segment_color_threshold_yellow_at_200k() {
+        // Default yellow threshold is 200k. A total at exactly the
+        // boundary must turn yellow — pin the comparison sense (>=).
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let usage = tu(200_000, 0, 0, 0, 400_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(
+            line.spans.first().map(|s| s.style.fg),
+            Some(Some(Color::Yellow)),
+            "at-threshold token count must paint the segment yellow",
+        );
+    }
+
+    #[test]
+    fn token_segment_color_threshold_orange_at_300k() {
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let usage = tu(300_000, 0, 0, 0, 400_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(
+            line.spans.first().map(|s| s.style.fg),
+            Some(Some(Color::Indexed(208))),
+        );
+    }
+
+    #[test]
+    fn token_segment_color_threshold_red_at_360k() {
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let usage = tu(360_000, 0, 0, 0, 400_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(
+            line.spans.first().map(|s| s.style.fg),
+            Some(Some(Color::Red)),
+        );
+    }
+
+    #[test]
+    fn token_segment_below_yellow_inherits_chrome_secondary_style() {
+        // Below the warning thresholds the segment must read as
+        // ambient chrome, not pop. That's what makes the color shift
+        // at 200k actually catch the eye.
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let secondary = Style::default().fg(Color::Indexed(247));
+        let usage = tu(50_000, 0, 0, 0, 400_000);
+        let ctx = SegmentCtx {
+            repo: None,
+            branch: None,
+            model_effort: None,
+            token_usage: Some(&usage),
+            cwd_basename: None,
+            prefix_state: PrefixState::Idle,
+            bindings: &bindings,
+            secondary,
+        };
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(line.spans.first().map(|s| s.style), Some(secondary));
+    }
+
+    #[test]
+    fn token_segment_thresholds_are_configurable() {
+        // Lower the yellow threshold dramatically — what would have
+        // been an ambient render at 60k must now turn yellow. Pin
+        // that the per-instance config is actually consulted (and
+        // not, say, a hardcoded constant the implementor forgot to
+        // wire to the config).
+        let bindings = Bindings::default();
+        let cfg = crate::config::TokensSegmentConfig {
+            yellow_threshold: 50_000,
+            ..Default::default()
+        };
+        let segment = TokenSegment::new(cfg);
+        let usage = tu(60_000, 0, 0, 0, 400_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        assert_eq!(
+            line.spans.first().map(|s| s.style.fg),
+            Some(Some(Color::Yellow)),
+        );
+    }
+
+    #[test]
+    fn token_segment_uses_cache_tokens_in_total_and_percentage() {
+        // Cache reads are part of the prompt budget — they count
+        // toward the headline number AND the percentage. Output
+        // tokens count toward the headline but NOT the percentage
+        // (output doesn't carry into the next turn's prompt budget).
+        // 50k input + 30k output + 20k cache_creation + 100k cache_read,
+        // window 400k → total = 200k, context_used = 170k → 42%.
+        let bindings = Bindings::default();
+        let segment = TokenSegment::new(crate::config::TokensSegmentConfig::default());
+        let usage = tu(50_000, 30_000, 20_000, 100_000, 400_000);
+        let ctx = ctx_with_tu(&bindings, Some(&usage));
+        let line = segment.render(&ctx).unwrap();
+        let text = line_text(&line);
+        assert!(text.starts_with("tok:200k"), "got {text:?}");
+        assert!(text.ends_with("42%"), "got {text:?}");
+    }
+
+    #[test]
+    fn token_segment_trusts_reported_window_for_large_context_models() {
+        // Regression for "418k 100% on a 1M-context model": the
+        // segment must NOT pin the denominator to a hidden 400k
+        // floor. Aifx clamps to 400k only because it sets the
+        // CLAUDE_CODE_AUTO_COMPACT_WINDOW env var itself; codemux
+        // doesn't, so the 1M window from the JSON should win.
+        //
+        // Pure-function call so the test isn't influenced by whatever
+        // the runner's shell sets — the user's terminal may export
+        // the env var from aifx and that would skew the math.
+        assert_eq!(
+            TokenSegment::effective_window_pure(None, None, 1_000_000),
+            1_000_000,
+            "no override, big window → trust the JSON window",
+        );
+    }
+
+    #[test]
+    fn token_segment_override_caps_to_reported_window_when_smaller() {
+        // User sets `auto_compact_window = 500_000` but the model is
+        // a 200k Sonnet. The override must NOT inflate the
+        // denominator past what the model can actually do — aifx's
+        // semantics: the override is a ceiling, capped by the real
+        // window.
+        assert_eq!(
+            TokenSegment::effective_window_pure(Some(500_000), None, 200_000),
+            200_000,
+            "config override capped by smaller reported window",
+        );
+    }
+
+    #[test]
+    fn token_segment_falls_back_to_400k_when_no_window_reported() {
+        // Defensive: if a future Claude Code version omits
+        // `context_window_size`, the segment must still render a
+        // sensible percentage rather than 0/0 = 0% or NaN.
+        assert_eq!(
+            TokenSegment::effective_window_pure(None, None, 0),
+            400_000,
+            "no override, no window → 400k last-resort guard",
+        );
+    }
+
+    #[test]
+    fn token_segment_config_override_wins_over_env() {
+        // Config takes priority over the env var when both are set.
+        // The end-to-end render test would race against whatever the
+        // shell exports; this pure check is hermetic.
+        assert_eq!(
+            TokenSegment::effective_window_pure(Some(300_000), Some(900_000), 1_000_000),
+            300_000,
+            "config override beats env override",
+        );
+    }
+
+    #[test]
+    fn token_segment_env_override_used_when_config_unset() {
+        // The env var is a hard ceiling honored by Claude Code's own
+        // compactor; the segment should respect it when the user
+        // hasn't provided an explicit config override.
+        assert_eq!(
+            TokenSegment::effective_window_pure(None, Some(400_000), 1_000_000),
+            400_000,
+            "env override used when config is None",
+        );
+    }
+
+    #[test]
+    fn token_segment_format_token_count_units_match_aifx() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_000), "1k");
+        assert_eq!(format_token_count(125_000), "125k");
+        // 1.25M floors to 1.2M with the one-decimal scheme.
+        assert_eq!(format_token_count(1_250_000), "1.2m");
+        assert_eq!(format_token_count(2_000_000), "2.0m");
+    }
+
     // ─── PrefixHintSegment ─────────────────────────────────────────
 
     #[test]
@@ -687,6 +1179,7 @@ mod tests {
             repo: None,
             branch: None,
             model_effort: None,
+            token_usage: None,
             cwd_basename: None,
             prefix_state: PrefixState::Idle,
             bindings: &bindings,

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::layer::SubscriberExt;
@@ -26,11 +26,13 @@ mod runtime;
 mod spawn;
 mod ssh_config;
 mod status_bar;
+mod statusline_ipc;
 mod url_scan;
 use runtime::NavStyle;
 
 #[derive(Debug, Parser)]
 #[command(name = "codemux", version, about)]
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     /// Working directory for the initial agent. Omit to inherit the
     /// shell's current pwd (the common case); pass a path to spawn the
@@ -53,11 +55,53 @@ struct Cli {
     /// normal use.
     #[arg(long, short = 'l', env = "CODEMUX_LOG")]
     log: bool,
+
+    /// Hidden IPC subcommands. The default `codemux [PATH]` invocation
+    /// stays a positional-only path; subcommands kick in only when
+    /// explicitly named. `args_conflicts_with_subcommands` keeps clap
+    /// from rejecting the no-subcommand path when no positional was
+    /// passed.
+    #[command(subcommand)]
+    cmd: Option<Command>,
+}
+
+/// Hidden IPC subcommands. Not surfaced in `--help` because they are
+/// internal plumbing — codemux invokes them on itself, not the user.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Tee a Claude Code statusLine JSON snapshot to a file.
+    ///
+    /// Reads stdin to EOF (Claude Code pipes the JSON in), atomically
+    /// writes to `--out`, exits silently with no stdout. Wired into
+    /// each spawned agent's `--settings '{statusLine.command:...}'`
+    /// override by [`runtime::spawn_local_agent`]; the per-agent
+    /// metadata worker reads the resulting file each tick to surface
+    /// token usage on the codemux status bar.
+    ///
+    /// See `apps/tui/src/statusline_ipc.rs` for the on-disk layout
+    /// (`$XDG_RUNTIME_DIR/codemux/agents/<id>.json`).
+    #[command(hide = true)]
+    StatuslineTee {
+        /// Absolute path to write the snapshot to. The parent
+        /// directory is created on demand.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
-    color_eyre::install()?;
     let cli = Cli::parse();
+    // Subcommand fast-path: short-circuit before color-eyre, tracing,
+    // or config load. The tee subcommand is invoked by Claude Code as
+    // a child process on every assistant turn; it must stay cheap and
+    // must not contaminate `~/.cache/codemux/logs/codemux.log` (tens
+    // of writes per session would drown out actual TUI logging).
+    if let Some(Command::StatuslineTee { out }) = &cli.cmd {
+        return statusline_ipc::run_tee(out)
+            .map_err(|e| color_eyre::eyre::eyre!("statusline-tee {}: {e}", out.display()));
+    }
+
+    color_eyre::install()?;
     // Build the in-memory tail buffer up-front so the tracing
     // subscriber and the runtime see the same Arc<Mutex<...>>. When
     // `--log` is off, the runtime keeps the buffer but never reads

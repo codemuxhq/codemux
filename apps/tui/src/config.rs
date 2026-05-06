@@ -202,6 +202,8 @@ pub struct Ui {
     ///
     /// Built-in IDs:
     /// - `"model"` — current Claude model on the focused agent
+    /// - `"tokens"` — context-window usage for the focused agent
+    ///   (`tok:Nk N%`), fed by Claude Code's statusLine callback
     /// - `"worktree"` — basename of the focused agent's working dir,
     ///   shown only when the worktree directory differs from the repo
     ///   name (i.e. you're not in the main checkout)
@@ -216,8 +218,8 @@ pub struct Ui {
     /// disables the right-side block entirely (the tab strip then
     /// fills the whole status bar).
     ///
-    /// Default: `["model", "worktree", "branch", "prefix_hint"]`. The
-    /// container's `#[serde(default)]` calls `Ui::default()` which
+    /// Default: `["model", "tokens", "worktree", "branch", "prefix_hint"]`.
+    /// The container's `#[serde(default)]` calls `Ui::default()` which
     /// fills the field — no field-level `default` attribute needed.
     pub status_bar_segments: Vec<String>,
 
@@ -258,6 +260,9 @@ pub struct SegmentConfig {
     /// Configuration for the `branch` built-in segment. See
     /// [`BranchSegmentConfig`].
     pub branch: BranchSegmentConfig,
+    /// Configuration for the `tokens` built-in segment. See
+    /// [`TokensSegmentConfig`].
+    pub tokens: TokensSegmentConfig,
 }
 
 /// Configuration for the status-bar `branch` segment.
@@ -286,6 +291,97 @@ impl Default for BranchSegmentConfig {
     fn default() -> Self {
         Self {
             default_branches: vec!["main".to_string(), "master".to_string()],
+        }
+    }
+}
+
+/// Configuration for the status-bar `tokens` segment.
+///
+/// The segment surfaces context-window usage for the focused agent,
+/// fed by Claude Code's documented `statusLine` callback contract
+/// (the per-spawn `--settings` injection in
+/// [`crate::runtime::spawn_local_agent`]). All knobs default to
+/// values that match aifx's behavior so users coming from aifx see
+/// the same color thresholds and effective-window math.
+///
+/// Example:
+///
+/// ```toml
+/// [ui.segments.tokens]
+/// format = "with_bar"
+/// yellow_threshold = 150000
+/// refresh_interval_secs = 5
+/// ```
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct TokensSegmentConfig {
+    /// How the segment renders its text. See [`TokensFormat`] for the
+    /// three variants. Default: [`TokensFormat::WithPercent`] —
+    /// `tok:125k 31%`.
+    pub format: TokensFormat,
+    /// Token count at which the segment turns yellow (warning level
+    /// 1). Default `200_000` — aligned with aifx's threshold against
+    /// the 400k effective compaction window.
+    pub yellow_threshold: i64,
+    /// Token count at which the segment turns orange (warning level
+    /// 2). Default `300_000`.
+    pub orange_threshold: i64,
+    /// Token count at which the segment turns red (warning level 3).
+    /// Default `360_000`.
+    pub red_threshold: i64,
+    /// Optional override for the effective context window used in
+    /// percentage math and bar rendering. When `None` (the default)
+    /// the segment trusts whatever `context_window_size` Claude Code
+    /// reports — so a user on Opus 1M sees the bar fill against 1M,
+    /// a user on a 200k Sonnet sees it fill against 200k. Set this
+    /// to force compaction-style accounting (e.g. `400_000` to mirror
+    /// aifx's behavior) — the override is treated as a ceiling and
+    /// is capped to the model's actual window when smaller. The
+    /// `$CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var is consulted as a
+    /// fallback when this field is unset, matching aifx.
+    pub auto_compact_window: Option<i64>,
+    /// Forwarded to Claude Code as the statusLine `refreshInterval`
+    /// (in seconds) when the per-agent `--settings` JSON is injected.
+    /// `None` (the default) leaves Claude on event-driven cadence
+    /// only — the segment ticks per assistant turn, on `/compact`,
+    /// and on permission/vim mode changes. Set this to e.g. `5` to
+    /// have the segment refresh during long-running tool calls.
+    pub refresh_interval_secs: Option<u32>,
+}
+
+/// Display format for the `tokens` segment.
+///
+/// `Compact` is the cheapest in cells and survives the longest under
+/// width pressure. `WithPercent` (the default) adds the percentage of
+/// the effective context window so the user can see headroom at a
+/// glance. `WithBar` adds a 5-cell mini progress bar — visually loud
+/// but useful when several agents are open and you want to compare.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokensFormat {
+    /// `tok:125k`
+    Compact,
+    /// `tok:125k 31%`
+    #[default]
+    WithPercent,
+    /// `tok:125k [▌▌  ]`
+    WithBar,
+}
+
+impl Default for TokensSegmentConfig {
+    fn default() -> Self {
+        // Defaults match aifx's behavior so a user coming from aifx
+        // sees the same yellow/orange/red transitions. The 400k
+        // effective compaction window is implicit (resolved at render
+        // time from `$CLAUDE_CODE_AUTO_COMPACT_WINDOW` or the
+        // hard-coded fallback).
+        Self {
+            format: TokensFormat::WithPercent,
+            yellow_threshold: 200_000,
+            orange_threshold: 300_000,
+            red_threshold: 360_000,
+            auto_compact_window: None,
+            refresh_interval_secs: None,
         }
     }
 }
@@ -914,15 +1010,16 @@ mod tests {
     }
 
     #[test]
-    fn ui_status_bar_segments_default_includes_all_four_built_ins() {
+    fn ui_status_bar_segments_default_includes_all_five_built_ins() {
         // Defaults define the out-of-the-box UX. New users see model,
-        // worktree, branch, prefix_hint without writing config. Repo
-        // is intentionally omitted (worktree covers the same need).
+        // tokens, worktree, branch, prefix_hint without writing config.
+        // Repo is intentionally omitted (worktree covers the same need).
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(
             config.ui.status_bar_segments,
             vec![
                 "model".to_string(),
+                "tokens".to_string(),
                 "worktree".to_string(),
                 "branch".to_string(),
                 "prefix_hint".to_string(),
@@ -992,6 +1089,77 @@ mod tests {
         let config: Config =
             toml::from_str("[ui.segments.branch]\ndefault_branches = []\n").unwrap();
         assert!(config.ui.segments.branch.default_branches.is_empty());
+    }
+
+    #[test]
+    fn ui_segments_tokens_defaults_match_aifx_thresholds() {
+        // The whole point of the defaults — a user coming from aifx
+        // sees the same yellow/orange/red transitions without writing
+        // any config. Pin the numbers so a future tweak is a
+        // deliberate decision (and shows up in a code review).
+        let config: Config = toml::from_str("").unwrap();
+        let cfg = config.ui.segments.tokens;
+        assert_eq!(cfg.format, TokensFormat::WithPercent);
+        assert_eq!(cfg.yellow_threshold, 200_000);
+        assert_eq!(cfg.orange_threshold, 300_000);
+        assert_eq!(cfg.red_threshold, 360_000);
+        assert!(cfg.auto_compact_window.is_none());
+        assert!(cfg.refresh_interval_secs.is_none());
+    }
+
+    #[test]
+    fn ui_segments_tokens_round_trips_user_overrides() {
+        // All five user-facing knobs in one TOML block. A regression
+        // here would silently revert a user's customisation, so each
+        // one is asserted against its TOML key.
+        let toml_text = r#"
+            [ui.segments.tokens]
+            format = "with_bar"
+            yellow_threshold = 150000
+            orange_threshold = 220000
+            red_threshold = 300000
+            auto_compact_window = 500000
+            refresh_interval_secs = 5
+        "#;
+        let config: Config = toml::from_str(toml_text).unwrap();
+        let cfg = config.ui.segments.tokens;
+        assert_eq!(cfg.format, TokensFormat::WithBar);
+        assert_eq!(cfg.yellow_threshold, 150_000);
+        assert_eq!(cfg.orange_threshold, 220_000);
+        assert_eq!(cfg.red_threshold, 300_000);
+        assert_eq!(cfg.auto_compact_window, Some(500_000));
+        assert_eq!(cfg.refresh_interval_secs, Some(5));
+    }
+
+    #[test]
+    fn ui_segments_tokens_format_accepts_all_three_variants() {
+        // The serde rename_all = "snake_case" derive must accept all
+        // three documented spellings. Done as one parametrised pin so
+        // adding a fourth later is a one-line diff.
+        for (literal, expected) in [
+            ("compact", TokensFormat::Compact),
+            ("with_percent", TokensFormat::WithPercent),
+            ("with_bar", TokensFormat::WithBar),
+        ] {
+            let toml_text = format!("[ui.segments.tokens]\nformat = \"{literal}\"\n");
+            let config: Config = toml::from_str(&toml_text).unwrap();
+            assert_eq!(
+                config.ui.segments.tokens.format, expected,
+                "format = \"{literal}\" should parse to {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ui_segments_tokens_section_is_optional() {
+        // A user with no [ui.segments.tokens] table at all still
+        // gets the aifx-aligned defaults via the container's
+        // #[serde(default)] cascade.
+        let config: Config = toml::from_str("[ui]\nsubtle = true\n").unwrap();
+        assert_eq!(
+            config.ui.segments.tokens.yellow_threshold, 200_000,
+            "missing [ui.segments.tokens] must keep the default thresholds",
+        );
     }
 
     #[test]

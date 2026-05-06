@@ -1,15 +1,18 @@
 //! Background worker that surfaces "what model + effort is the focused
-//! agent running, and what git branch is its cwd on" to the status bar.
+//! agent running, what git branch is its cwd on, and how many tokens
+//! has it consumed" to the status bar.
 //!
 //! ## Why a background worker
 //!
-//! Both lookups touch the filesystem — the branch lookup reads
-//! `<cwd>/.git/HEAD` (cheap, but still I/O), and the model lookup
-//! reads `~/.claude/settings.json` (small JSON config). Doing either
-//! inline on the render hot path would risk a stutter. We poll on a
-//! 2 s cadence — slow enough to be invisible to top, fast enough that
-//! a `/model` change in claude is reflected before the user has time
-//! to be confused about it.
+//! All three lookups touch the filesystem — the branch lookup reads
+//! `<cwd>/.git/HEAD` (cheap, but still I/O), the model lookup reads
+//! `~/.claude/settings.json` (small JSON), and the token lookup reads
+//! the per-agent statusLine snapshot written by `codemux statusline-tee`
+//! (also small JSON, written atomically by the tee subcommand). Doing
+//! any of these inline on the render hot path would risk a stutter. We
+//! poll on a 2 s cadence — slow enough to be invisible to top, fast
+//! enough that a `/model` change in claude is reflected before the user
+//! has time to be confused about it.
 //!
 //! ## Single coordinator, focused-agent only
 //!
@@ -18,24 +21,25 @@
 //! [`AgentMetaWorker::set_target`] when focus changes; the worker
 //! tracks the latest target and polls just that one. SSH agents are
 //! not handled in v1 (the worker silently ignores them): the branch
-//! lookup needs a local cwd, and the model/effort lookup reads the
-//! *local* user's settings, which may not match the remote claude
+//! lookup needs a local cwd, and the model/effort + token lookups
+//! read *local* files, which may not match the remote claude
 //! instance's state.
 //!
 //! ## AD-1 carve-out
 //!
-//! Reading `~/.claude/settings.json` is the single sanctioned
-//! exception to AD-1's "never semantically parse Claude Code" rule.
-//! We only read one specific file (the user's global claude config),
-//! only extract two fields (`model`, `effortLevel`), only for the
-//! focused local agent. The previous approach tailed the per-session
-//! JSONL transcript for the model; that was dropped because the
-//! "newest jsonl by mtime" heuristic was fragile when multiple
-//! sessions shared a project directory (the wrong session's transcript
-//! could win the mtime race, masking `/model` changes in the active
-//! agent). settings.json is a single-writer file that updates
-//! immediately on `/model`, so the bug class disappears. See AD-1's
-//! amended prose in `docs/architecture.md`.
+//! Reading `~/.claude/settings.json` and the per-agent statusLine
+//! JSON snapshot are the two sanctioned exceptions to AD-1's "never
+//! semantically parse Claude Code" rule. Both consume Claude Code's
+//! documented configuration / callback contracts — not its rendered
+//! TUI output. The previous transcript-tailing approach for the
+//! model was dropped because the "newest jsonl by mtime" heuristic
+//! was fragile when multiple sessions shared a project directory.
+//! settings.json is a single-writer file that updates immediately on
+//! `/model`. The statusLine snapshot is per-agent (one file per
+//! `AgentId`) and is written by Claude Code's own statusLine callback
+//! — see `apps/tui/src/statusline_ipc.rs` for the on-disk layout
+//! and the spawn-time settings injection. See AD-1's amended prose
+//! in `docs/architecture.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,6 +77,12 @@ pub trait MetaProbe: Send + Sync + 'static {
     /// absent from the file (older claude versions, default value
     /// not yet customised).
     fn read_model_effort(&self) -> Option<ModelEffort>;
+    /// Read the per-agent statusLine JSON snapshot at `path` (written
+    /// by the `codemux statusline-tee` subcommand). Returns `None`
+    /// when the file doesn't exist yet (the agent hasn't completed
+    /// its first turn), is malformed (mid-write race), or has no
+    /// `context_window` block.
+    fn read_token_usage(&self, path: &Path) -> Option<TokenUsage>;
 }
 
 /// Pair returned by [`MetaProbe::read_model_effort`]. The model alias
@@ -92,6 +102,43 @@ pub struct ModelEffort {
     pub effort: Option<String>,
 }
 
+/// Snapshot of context-window usage for one agent, derived from the
+/// JSON payload Claude Code pipes to the configured `statusLine.command`
+/// after every assistant turn.
+///
+/// Stored as raw token counts (not pre-computed totals or percentages)
+/// so the rendering segment owns the threshold/effective-window math
+/// — it's the segment that holds the user-configurable thresholds
+/// and the optional `auto_compact_window` override, and computing
+/// percentages here would require either passing the config through
+/// to the worker or duplicating the override logic in two places.
+///
+/// Fields mirror the Claude Code statusLine JSON's
+/// `context_window.current_usage.*` and `context_window.context_window_size`
+/// keys verbatim. See <https://code.claude.com/docs/en/statusline.md>
+/// for the upstream schema and `apps/tui/src/statusline_ipc.rs` for
+/// how the JSON gets to disk.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TokenUsage {
+    /// Tokens fed into the model on the current turn (excluding
+    /// cached). From `current_usage.input_tokens`.
+    pub input_tokens: i64,
+    /// Tokens generated by the model on the current turn. From
+    /// `current_usage.output_tokens`.
+    pub output_tokens: i64,
+    /// Tokens written to the prompt cache on the current turn.
+    /// From `current_usage.cache_creation_input_tokens`.
+    pub cache_creation_input_tokens: i64,
+    /// Tokens read from the prompt cache on the current turn.
+    /// From `current_usage.cache_read_input_tokens`.
+    pub cache_read_input_tokens: i64,
+    /// Total context window size the model is configured for. From
+    /// `context_window.context_window_size`. May be `0` when the JSON
+    /// is missing the field — the segment falls back to its
+    /// `auto_compact_window` config in that case.
+    pub context_window_size: i64,
+}
+
 /// Production [`MetaProbe`]: forwards to the real filesystem readers.
 /// Stateless; spawn one per worker. Tests substitute a scripted
 /// implementation that records calls and returns canned values.
@@ -104,6 +151,10 @@ impl MetaProbe for RealProbe {
 
     fn read_model_effort(&self) -> Option<ModelEffort> {
         current_model_and_effort()
+    }
+
+    fn read_token_usage(&self, path: &Path) -> Option<TokenUsage> {
+        read_token_usage_from(path)
     }
 }
 
@@ -129,14 +180,31 @@ pub enum MetaEvent {
         agent_id: AgentId,
         value: Option<ModelEffort>,
     },
+    /// New context-window usage reading. `value = None` means the
+    /// per-agent statusLine snapshot file doesn't exist yet (the
+    /// agent hasn't completed its first turn), is malformed
+    /// (mid-write race), or has no `context_window` block — the
+    /// segment renders nothing in those cases.
+    Tokens {
+        agent_id: AgentId,
+        value: Option<TokenUsage>,
+    },
 }
 
 /// Control message the runtime sends to the worker. Single-target —
 /// the worker keeps the most recent and discards earlier ones if the
 /// user mashes through agents fast.
 enum Control {
-    /// Focus is on this agent; poll its branch and model.
-    SetTarget { agent_id: AgentId, cwd: PathBuf },
+    /// Focus is on this agent; poll its branch and model. The
+    /// statusLine snapshot path is `Some(path)` for local agents
+    /// (where `codemux statusline-tee` will write per-turn), `None`
+    /// for SSH agents and any other context where token reading
+    /// isn't applicable.
+    SetTarget {
+        agent_id: AgentId,
+        cwd: PathBuf,
+        statusline_path: Option<PathBuf>,
+    },
     /// Focus moved to an agent the worker shouldn't poll (SSH agent,
     /// failed agent, no agents at all). Stop polling until the next
     /// `SetTarget`.
@@ -188,11 +256,20 @@ impl AgentMetaWorker {
     }
 
     /// Tell the worker to track this agent. Idempotent: repeated calls
-    /// with the same `(agent_id, cwd)` simply reset the poll cadence.
-    /// A different agent supersedes the previous target on the next
-    /// poll boundary.
-    pub fn set_target(&self, agent_id: AgentId, cwd: PathBuf) {
-        let _ = self.control_tx.send(Control::SetTarget { agent_id, cwd });
+    /// with the same `(agent_id, cwd, statusline_path)` simply reset
+    /// the poll cadence. A different agent supersedes the previous
+    /// target on the next poll boundary.
+    ///
+    /// `statusline_path` should be `Some(path)` for local agents
+    /// where `codemux statusline-tee` is wired into Claude Code's
+    /// statusLine config, and `None` otherwise (the worker will skip
+    /// the token-usage poll for that agent).
+    pub fn set_target(&self, agent_id: AgentId, cwd: PathBuf, statusline_path: Option<PathBuf>) {
+        let _ = self.control_tx.send(Control::SetTarget {
+            agent_id,
+            cwd,
+            statusline_path,
+        });
     }
 
     /// Clear the worker's target — used when focus moves to an SSH
@@ -237,13 +314,14 @@ fn worker_loop(
     probe: &dyn MetaProbe,
     poll_interval: Duration,
 ) {
-    let mut target: Option<(AgentId, PathBuf)> = None;
+    let mut target: Option<(AgentId, PathBuf, Option<PathBuf>)> = None;
     let mut last_branch: Option<String> = None;
     let mut last_model_effort: Option<ModelEffort> = None;
+    let mut last_token_usage: Option<TokenUsage> = None;
 
     while !cancel.load(Ordering::Relaxed) {
         let has_target = target.is_some();
-        if let Some((agent_id, cwd)) = &target {
+        if let Some((agent_id, cwd, statusline_path)) = &target {
             // Branch lookup: cheap. Only emit when the value changed
             // so we don't spam the runtime with no-op events.
             let branch = probe.read_branch(cwd);
@@ -275,17 +353,44 @@ fn worker_loop(
                     return;
                 }
             }
+            // Token usage lookup: only meaningful when the runtime
+            // gave us a per-agent statusline path (local agents). The
+            // file may be absent (no turns yet) or mid-write (parse
+            // returns None) — both surface as a `None` event so the
+            // segment renders nothing rather than a stale value.
+            if let Some(path) = statusline_path {
+                let token_usage = probe.read_token_usage(path);
+                if token_usage != last_token_usage {
+                    last_token_usage = token_usage;
+                    if events_tx
+                        .send(MetaEvent::Tokens {
+                            agent_id: agent_id.clone(),
+                            value: token_usage,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
         }
         // The immutable borrow of `target` ends here so apply_control
         // can take the &mut. Splitting the loop body this way avoids
-        // cloning the (AgentId, PathBuf) every tick just to satisfy
-        // the borrow checker — a real perf hit on a 50 ms test cycle.
+        // cloning the (AgentId, PathBuf, Option<PathBuf>) every tick
+        // just to satisfy the borrow checker — a real perf hit on a
+        // 50 ms test cycle.
         if has_target {
             // Wait up to poll_interval for the next control message
             // or the next poll cycle, whichever comes first.
             match control_rx.recv_timeout(poll_interval) {
                 Ok(msg) => {
-                    apply_control(msg, &mut target, &mut last_branch, &mut last_model_effort);
+                    apply_control(
+                        msg,
+                        &mut target,
+                        &mut last_branch,
+                        &mut last_model_effort,
+                        &mut last_token_usage,
+                    );
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -294,7 +399,13 @@ fn worker_loop(
             // Idle: block until the runtime hands us a target.
             match control_rx.recv() {
                 Ok(msg) => {
-                    apply_control(msg, &mut target, &mut last_branch, &mut last_model_effort);
+                    apply_control(
+                        msg,
+                        &mut target,
+                        &mut last_branch,
+                        &mut last_model_effort,
+                        &mut last_token_usage,
+                    );
                 }
                 Err(_) => return,
             }
@@ -307,26 +418,33 @@ fn worker_loop(
 /// inherit the previous agent's last reading.
 fn apply_control(
     msg: Control,
-    target: &mut Option<(AgentId, PathBuf)>,
+    target: &mut Option<(AgentId, PathBuf, Option<PathBuf>)>,
     last_branch: &mut Option<String>,
     last_model_effort: &mut Option<ModelEffort>,
+    last_token_usage: &mut Option<TokenUsage>,
 ) {
     match msg {
-        Control::SetTarget { agent_id, cwd } => {
-            let same_target = target.as_ref().is_some_and(|(id, _)| id == &agent_id);
+        Control::SetTarget {
+            agent_id,
+            cwd,
+            statusline_path,
+        } => {
+            let same_target = target.as_ref().is_some_and(|(id, _, _)| id == &agent_id);
             if !same_target {
                 // Focus moved; flush cache so the new agent gets a
                 // fresh poll instead of inheriting the previous
                 // agent's last reading.
                 *last_branch = None;
                 *last_model_effort = None;
+                *last_token_usage = None;
             }
-            *target = Some((agent_id, cwd));
+            *target = Some((agent_id, cwd, statusline_path));
         }
         Control::ClearTarget => {
             *target = None;
             *last_branch = None;
             *last_model_effort = None;
+            *last_token_usage = None;
         }
     }
 }
@@ -376,6 +494,58 @@ pub fn read_model_effort_from(path: &Path) -> Option<ModelEffort> {
     Some(ModelEffort {
         model,
         effort: parsed.effort_level,
+    })
+}
+
+/// Parse `path` as a Claude Code statusLine JSON snapshot (written by
+/// `codemux statusline-tee`) and pull out the context-window usage
+/// fields. Returns `None` when the file is missing, mid-write,
+/// malformed, or has no `context_window.current_usage` block.
+///
+/// Counterpart to [`read_model_effort_from`] for the token-usage
+/// reading path. Same fail-silent semantics — a parse error becomes
+/// a `None` event so the segment renders nothing on the next frame
+/// rather than holding a stale value.
+///
+/// The JSON shape is documented at
+/// <https://code.claude.com/docs/en/statusline.md>. Fields not used
+/// by the tokens segment (cost, model, workspace, etc.) are ignored
+/// without failing the parse so a future Claude Code version that
+/// adds new keys doesn't break us.
+#[must_use]
+pub fn read_token_usage_from(path: &Path) -> Option<TokenUsage> {
+    #[derive(serde::Deserialize)]
+    #[allow(clippy::struct_field_names)] // mirrors the upstream JSON keys verbatim
+    struct CurrentUsage {
+        #[serde(default)]
+        input_tokens: i64,
+        #[serde(default)]
+        output_tokens: i64,
+        #[serde(default)]
+        cache_creation_input_tokens: i64,
+        #[serde(default)]
+        cache_read_input_tokens: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct ContextWindow {
+        current_usage: Option<CurrentUsage>,
+        #[serde(default)]
+        context_window_size: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct Partial {
+        context_window: Option<ContextWindow>,
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let parsed: Partial = serde_json::from_slice(&bytes).ok()?;
+    let cw = parsed.context_window?;
+    let cu = cw.current_usage?;
+    Some(TokenUsage {
+        input_tokens: cu.input_tokens,
+        output_tokens: cu.output_tokens,
+        cache_creation_input_tokens: cu.cache_creation_input_tokens,
+        cache_read_input_tokens: cu.cache_read_input_tokens,
+        context_window_size: cw.context_window_size,
     })
 }
 
@@ -457,25 +627,141 @@ mod tests {
         assert!(read_model_effort_from(&path).is_none());
     }
 
+    // ─── read_token_usage_from ─────────────────────────────────────
+
+    #[test]
+    fn read_token_usage_returns_all_fields_when_full_json_present() {
+        // The full Claude Code statusLine schema (verified against the
+        // upstream docs). Other top-level keys (model, cost, workspace,
+        // etc.) must be ignored without failing the parse — the parser
+        // only cares about `context_window`.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("statusline.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "model": {"id":"opus","display_name":"Opus"},
+                "cost": {"total_cost_usd": 1.23},
+                "context_window": {
+                    "context_window_size": 200000,
+                    "used_percentage": 31,
+                    "current_usage": {
+                        "input_tokens": 8500,
+                        "output_tokens": 1200,
+                        "cache_creation_input_tokens": 5000,
+                        "cache_read_input_tokens": 2000
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let got = read_token_usage_from(&path).unwrap();
+        assert_eq!(got.input_tokens, 8500);
+        assert_eq!(got.output_tokens, 1200);
+        assert_eq!(got.cache_creation_input_tokens, 5000);
+        assert_eq!(got.cache_read_input_tokens, 2000);
+        assert_eq!(got.context_window_size, 200_000);
+    }
+
+    #[test]
+    fn read_token_usage_zeros_missing_usage_fields() {
+        // Older Claude Code versions might omit the cache fields
+        // entirely. The `#[serde(default)]` on each field makes them
+        // default to 0 rather than failing the parse.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("statusline.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "context_window": {
+                    "context_window_size": 200000,
+                    "current_usage": {"input_tokens": 100, "output_tokens": 50}
+                }
+            }"#,
+        )
+        .unwrap();
+        let got = read_token_usage_from(&path).unwrap();
+        assert_eq!(got.input_tokens, 100);
+        assert_eq!(got.output_tokens, 50);
+        assert_eq!(got.cache_creation_input_tokens, 0);
+        assert_eq!(got.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn read_token_usage_returns_none_when_context_window_block_absent() {
+        // No context_window key → no usage to report. Segment will
+        // render nothing on the next frame instead of holding stale.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("statusline.json");
+        std::fs::write(&path, r#"{"model":{"display_name":"Opus"}}"#).unwrap();
+        assert!(read_token_usage_from(&path).is_none());
+    }
+
+    #[test]
+    fn read_token_usage_returns_none_when_current_usage_block_absent() {
+        // context_window present but no current_usage. We don't fall
+        // back to the (deprecated) flat `total_input_tokens` /
+        // `total_output_tokens` fields — they'd give a misleading
+        // number that excludes cache reads. Better to render nothing.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("statusline.json");
+        std::fs::write(
+            &path,
+            r#"{"context_window":{"context_window_size":200000}}"#,
+        )
+        .unwrap();
+        assert!(read_token_usage_from(&path).is_none());
+    }
+
+    #[test]
+    fn read_token_usage_returns_none_for_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("nope.json");
+        assert!(read_token_usage_from(&missing).is_none());
+    }
+
+    #[test]
+    fn read_token_usage_returns_none_for_malformed_json() {
+        // Mid-write race — tee subcommand writes atomically (rename),
+        // but on the off chance a reader hits a partial file (e.g.
+        // because it's reading a non-tee-written file), parse must
+        // return None rather than panic.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("statusline.json");
+        std::fs::write(&path, r#"{"context_window":{"current_usage":"#).unwrap();
+        assert!(read_token_usage_from(&path).is_none());
+    }
+
     // ─── apply_control ─────────────────────────────────────────────
 
     #[test]
     fn apply_control_set_target_when_idle_caches_nothing_yet() {
-        let mut target: Option<(AgentId, PathBuf)> = None;
+        let mut target: Option<(AgentId, PathBuf, Option<PathBuf>)> = None;
         let mut last_branch: Option<String> = None;
         let mut last_model_effort: Option<ModelEffort> = None;
+        let mut last_token_usage: Option<TokenUsage> = None;
         apply_control(
             Control::SetTarget {
                 agent_id: AgentId::new("a"),
                 cwd: PathBuf::from("/tmp/a"),
+                statusline_path: Some(PathBuf::from("/tmp/sl/a.json")),
             },
             &mut target,
             &mut last_branch,
             &mut last_model_effort,
+            &mut last_token_usage,
         );
-        assert_eq!(target, Some((AgentId::new("a"), PathBuf::from("/tmp/a"))),);
+        assert_eq!(
+            target,
+            Some((
+                AgentId::new("a"),
+                PathBuf::from("/tmp/a"),
+                Some(PathBuf::from("/tmp/sl/a.json")),
+            )),
+        );
         assert!(last_branch.is_none());
         assert!(last_model_effort.is_none());
+        assert!(last_token_usage.is_none());
     }
 
     #[test]
@@ -483,31 +769,47 @@ mod tests {
         // Switching focus must drop the previous agent's cached
         // values so the new agent's first poll posts a fresh
         // event — otherwise the user sees the previous agent's
-        // model/branch flash for ~2s after switching. With model+
-        // effort now coming from a global file the per-agent flush
-        // is technically redundant for the model side (everyone
-        // reads the same value), but keeping it symmetric with the
-        // branch side avoids a special case in the cache logic.
-        let mut target: Option<(AgentId, PathBuf)> =
-            Some((AgentId::new("a"), PathBuf::from("/tmp/a")));
+        // model/branch/tokens flash for ~2s after switching. With
+        // model+effort coming from a global file the per-agent flush
+        // is technically redundant for the model side (everyone reads
+        // the same value), but keeping it symmetric with the branch
+        // and tokens sides avoids a special case in the cache logic.
+        let mut target: Option<(AgentId, PathBuf, Option<PathBuf>)> = Some((
+            AgentId::new("a"),
+            PathBuf::from("/tmp/a"),
+            Some(PathBuf::from("/tmp/sl/a.json")),
+        ));
         let mut last_branch = Some("main".to_string());
         let mut last_model_effort = Some(ModelEffort {
             model: "opus[1m]".into(),
             effort: Some("xhigh".into()),
         });
+        let mut last_token_usage = Some(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            context_window_size: 200_000,
+        });
         apply_control(
             Control::SetTarget {
                 agent_id: AgentId::new("b"),
                 cwd: PathBuf::from("/tmp/b"),
+                statusline_path: Some(PathBuf::from("/tmp/sl/b.json")),
             },
             &mut target,
             &mut last_branch,
             &mut last_model_effort,
+            &mut last_token_usage,
         );
         assert_eq!(target.as_ref().unwrap().0, AgentId::new("b"));
         assert!(last_branch.is_none(), "cache must flush on agent change");
         assert!(
             last_model_effort.is_none(),
+            "cache must flush on agent change"
+        );
+        assert!(
+            last_token_usage.is_none(),
             "cache must flush on agent change"
         );
     }
@@ -518,47 +820,72 @@ mod tests {
         // a duplicate notification) must NOT flush the cache —
         // otherwise the very next poll re-emits the same value as a
         // "change," doubling traffic on the events channel.
-        let mut target: Option<(AgentId, PathBuf)> =
-            Some((AgentId::new("a"), PathBuf::from("/tmp/a")));
+        let mut target: Option<(AgentId, PathBuf, Option<PathBuf>)> =
+            Some((AgentId::new("a"), PathBuf::from("/tmp/a"), None));
         let mut last_branch = Some("main".to_string());
         let mut last_model_effort = Some(ModelEffort {
             model: "opus[1m]".into(),
             effort: None,
         });
+        let mut last_token_usage = Some(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            context_window_size: 200_000,
+        });
         apply_control(
             Control::SetTarget {
                 agent_id: AgentId::new("a"),
                 cwd: PathBuf::from("/tmp/a"),
+                statusline_path: None,
             },
             &mut target,
             &mut last_branch,
             &mut last_model_effort,
+            &mut last_token_usage,
         );
         assert_eq!(last_branch.as_deref(), Some("main"));
         assert_eq!(
             last_model_effort.as_ref().map(|m| m.model.as_str()),
             Some("opus[1m]")
         );
+        assert!(
+            last_token_usage.is_some(),
+            "token cache must survive same-target reset"
+        );
     }
 
     #[test]
     fn apply_control_clear_target_drops_target_and_cache() {
-        let mut target: Option<(AgentId, PathBuf)> =
-            Some((AgentId::new("a"), PathBuf::from("/tmp/a")));
+        let mut target: Option<(AgentId, PathBuf, Option<PathBuf>)> = Some((
+            AgentId::new("a"),
+            PathBuf::from("/tmp/a"),
+            Some(PathBuf::from("/tmp/sl/a.json")),
+        ));
         let mut last_branch = Some("main".to_string());
         let mut last_model_effort = Some(ModelEffort {
             model: "opus[1m]".into(),
             effort: Some("xhigh".into()),
+        });
+        let mut last_token_usage = Some(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            context_window_size: 200_000,
         });
         apply_control(
             Control::ClearTarget,
             &mut target,
             &mut last_branch,
             &mut last_model_effort,
+            &mut last_token_usage,
         );
         assert!(target.is_none());
         assert!(last_branch.is_none());
         assert!(last_model_effort.is_none());
+        assert!(last_token_usage.is_none());
     }
 
     // ─── worker integration tests ──────────────────────────────────
@@ -569,26 +896,39 @@ mod tests {
     // production 2 s cadence and without touching the real filesystem.
 
     /// `MetaProbe` whose return values for each `read_branch` /
-    /// `read_model_effort` call are scripted in advance. Records
-    /// every call (path arg, count) so a test can assert the worker
-    /// queried the right agent. When the script runs out, the **last**
-    /// scripted value repeats forever — that mirrors a stable file
-    /// state and keeps the "no-change → no-emit" tests deterministic
-    /// across extra polls a slow CI box might race in.
+    /// `read_model_effort` / `read_token_usage` call are scripted in
+    /// advance. Records every call (path arg, count) so a test can
+    /// assert the worker queried the right agent. When the script
+    /// runs out, the **last** scripted value repeats forever — that
+    /// mirrors a stable file state and keeps the "no-change → no-emit"
+    /// tests deterministic across extra polls a slow CI box might
+    /// race in.
     struct ScriptedProbe {
         branch_script: Mutex<Vec<Option<String>>>,
         model_script: Mutex<Vec<Option<ModelEffort>>>,
+        token_script: Mutex<Vec<Option<TokenUsage>>>,
         branch_calls: Mutex<Vec<PathBuf>>,
         model_calls: Mutex<u64>,
+        token_calls: Mutex<Vec<PathBuf>>,
     }
 
     impl ScriptedProbe {
         fn new(branches: Vec<Option<String>>, models: Vec<Option<ModelEffort>>) -> Self {
+            Self::with_tokens(branches, models, vec![None])
+        }
+
+        fn with_tokens(
+            branches: Vec<Option<String>>,
+            models: Vec<Option<ModelEffort>>,
+            tokens: Vec<Option<TokenUsage>>,
+        ) -> Self {
             Self {
                 branch_script: Mutex::new(branches.into_iter().rev().collect()),
                 model_script: Mutex::new(models.into_iter().rev().collect()),
+                token_script: Mutex::new(tokens.into_iter().rev().collect()),
                 branch_calls: Mutex::new(Vec::new()),
                 model_calls: Mutex::new(0),
+                token_calls: Mutex::new(Vec::new()),
             }
         }
     }
@@ -614,6 +954,11 @@ mod tests {
         fn read_model_effort(&self) -> Option<ModelEffort> {
             *self.model_calls.lock().unwrap() += 1;
             pop_or_repeat(&self.model_script)
+        }
+
+        fn read_token_usage(&self, path: &Path) -> Option<TokenUsage> {
+            self.token_calls.lock().unwrap().push(path.to_path_buf());
+            pop_or_repeat(&self.token_script)
         }
     }
 
@@ -644,7 +989,7 @@ mod tests {
             })],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
-        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
+        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"), None);
 
         let events = drain_until(&worker, 2);
         assert!(
@@ -685,7 +1030,7 @@ mod tests {
             vec![Some(me.clone()), Some(me.clone()), Some(me.clone())],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
-        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
+        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"), None);
 
         // Wait long enough for ~3 poll cycles, then count.
         thread::sleep(Duration::from_millis(250));
@@ -725,7 +1070,7 @@ mod tests {
             ],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
-        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
+        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"), None);
 
         // Wait for both Model events.
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -767,7 +1112,7 @@ mod tests {
             })],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
-        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
+        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"), None);
         // Wait for the initial events, then clear.
         let _ = drain_until(&worker, 2);
         worker.clear_target();
@@ -792,7 +1137,7 @@ mod tests {
             vec![None, None],
         ));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
-        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
+        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"), None);
         // Wait for A's Branch event.
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
@@ -802,7 +1147,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         // Switch to B.
-        worker.set_target(AgentId::new("b"), PathBuf::from("/tmp/b"));
+        worker.set_target(AgentId::new("b"), PathBuf::from("/tmp/b"), None);
         // Expect a Branch event for B with value "main" (cache was
         // flushed on the agent change so the same value re-emits).
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -821,6 +1166,78 @@ mod tests {
     }
 
     #[test]
+    fn worker_emits_tokens_when_statusline_path_is_set() {
+        // Token reading kicks in only when the runtime hands the
+        // worker a statusline_path. With one set, the scripted token
+        // value should round-trip through the worker as a Tokens
+        // event tagged to the right agent.
+        let usage = TokenUsage {
+            input_tokens: 8500,
+            output_tokens: 1200,
+            cache_creation_input_tokens: 5000,
+            cache_read_input_tokens: 2000,
+            context_window_size: 200_000,
+        };
+        let probe = Box::new(ScriptedProbe::with_tokens(
+            vec![None],
+            vec![None],
+            vec![Some(usage)],
+        ));
+        let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
+        worker.set_target(
+            AgentId::new("a"),
+            PathBuf::from("/tmp/a"),
+            Some(PathBuf::from("/tmp/sl/a.json")),
+        );
+
+        let events = drain_until(&worker, 1);
+        assert!(
+            events.contains(&MetaEvent::Tokens {
+                agent_id: AgentId::new("a"),
+                value: Some(usage),
+            }),
+            "expected Tokens event in {events:?}",
+        );
+    }
+
+    #[test]
+    fn worker_skips_token_poll_when_statusline_path_is_none() {
+        // Without a statusline_path (e.g. SSH agents in v1) the worker
+        // must NOT call read_token_usage and must NOT emit any Tokens
+        // event. The token script would have produced an event if
+        // the probe was queried — its absence is the assertion.
+        let probe = Box::new(ScriptedProbe::with_tokens(
+            vec![Some("main".to_string())],
+            vec![None],
+            vec![Some(TokenUsage {
+                input_tokens: 1,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                context_window_size: 200_000,
+            })],
+        ));
+        let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
+        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"), None);
+
+        // Wait long enough for several poll cycles to definitely
+        // happen, then drain. Branch must arrive (it's scripted),
+        // Tokens must NOT — that's the contract for None.
+        thread::sleep(Duration::from_millis(250));
+        let events = worker.drain();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, MetaEvent::Branch { value: Some(b), .. } if b == "main")),
+            "expected Branch event in {events:?}",
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, MetaEvent::Tokens { .. })),
+            "Tokens event should NOT fire without a statusline_path; got {events:?}",
+        );
+    }
+
+    #[test]
     fn worker_drop_signals_cancel_and_thread_exits() {
         // Sanity-check the Drop impl: the worker thread should
         // observe the cancel flag at its next wakeup and stop.
@@ -830,7 +1247,7 @@ mod tests {
         // poison anything global).
         let probe = Box::new(ScriptedProbe::new(vec![None], vec![None]));
         let worker = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
-        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"));
+        worker.set_target(AgentId::new("a"), PathBuf::from("/tmp/a"), None);
         thread::sleep(Duration::from_millis(80));
         drop(worker);
 
@@ -841,7 +1258,7 @@ mod tests {
             vec![None],
         ));
         let worker2 = AgentMetaWorker::start_with(probe, Duration::from_millis(50));
-        worker2.set_target(AgentId::new("b"), PathBuf::from("/tmp/b"));
+        worker2.set_target(AgentId::new("b"), PathBuf::from("/tmp/b"), None);
         let events = drain_until(&worker2, 1);
         assert!(
             events
