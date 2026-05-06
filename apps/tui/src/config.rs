@@ -66,6 +66,20 @@ pub struct Config {
     /// Default: `cmd` on macOS (Ghostty/iTerm2 use Cmd for URLs there),
     /// `ctrl` elsewhere.
     pub mouse_url_modifier: MouseUrlModifier,
+    /// When `true`, codemux yields mouse capture for the entire focused
+    /// pane any time the focused agent is in a terminal-failure state
+    /// (`Failed`). Trade: the host terminal's native I-beam cursor + click-
+    /// drag-copy gesture light up on the failure pane, BUT clicks land on
+    /// the terminal instead of codemux while focus is there — so tab
+    /// clicks, scroll-wheel scrolling, and the in-app drag-to-select
+    /// overlay all stop responding until focus moves to a non-Failed
+    /// agent. Default `false`: in-app selection (reverse-video highlight,
+    /// OSC 52 to clipboard) covers Failed panes too, so the only thing
+    /// the user gives up by leaving this off is the cursor-shape change.
+    /// Opt in if you specifically want the native gesture and accept
+    /// switching tabs via the keyboard chord while on a Failed pane.
+    #[serde(default)]
+    pub mouse_yield_on_failed: bool,
 }
 
 impl Default for Config {
@@ -76,6 +90,7 @@ impl Default for Config {
             ui: Ui::default(),
             spawn: SpawnConfig::default(),
             mouse_url_modifier: MouseUrlModifier::default(),
+            mouse_yield_on_failed: false,
         }
     }
 }
@@ -1515,5 +1530,32 @@ mod tests {
     fn mouse_url_modifier_rejects_unknown_value() {
         let res: Result<Config, _> = toml::from_str("mouse_url_modifier = \"bogus\"");
         assert!(res.is_err(), "unknown modifier should fail to parse");
+    }
+
+    /// `mouse_yield_on_failed` defaults to `false` so users get the
+    /// in-app selection UX (tab clicks + scroll wheel + drag-to-select
+    /// overlay all keep working on Failed panes). Locked down because a
+    /// silent flip to `true` would break tab clicks for everyone who
+    /// hasn't read the changelog — much higher cost than the cursor-
+    /// shape change the opt-in delivers.
+    #[test]
+    fn mouse_yield_on_failed_defaults_to_false() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(
+            !cfg.mouse_yield_on_failed,
+            "default must be off so tab clicks keep working on Failed",
+        );
+    }
+
+    /// The flag round-trips both spellings the TOML parser accepts
+    /// (true / false). Sanity check that the explicit opt-in path
+    /// works — without this a serde rename of the field would silently
+    /// drop user opt-ins back to the default.
+    #[test]
+    fn mouse_yield_on_failed_parses_explicit_value() {
+        let cfg: Config = toml::from_str("mouse_yield_on_failed = true").unwrap();
+        assert!(cfg.mouse_yield_on_failed);
+        let cfg: Config = toml::from_str("mouse_yield_on_failed = false").unwrap();
+        assert!(!cfg.mouse_yield_on_failed);
     }
 }

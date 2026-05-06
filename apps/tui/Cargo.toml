@@ -42,6 +42,13 @@ nucleo-matcher.workspace = true
 # adds an unsafe nibble surface; the crate is ~5 KB compiled.
 base64 = "0.22"
 
+# Display-width measurement for the failure pane's centering math —
+# `str::chars().count()` is wrong for wide glyphs (CJK, emoji) and
+# would shift selection-extraction off the cells the renderer drew.
+# Already pulled in transitively by ratatui; declared explicitly so
+# the failure-pane code can use it directly.
+unicode-width = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 # `test-util` exposes `AgentTransport::for_test`, used by runtime unit

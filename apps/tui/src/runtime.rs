@@ -54,6 +54,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
+use unicode_width::UnicodeWidthStr;
 use vt100::Parser;
 
 use crate::agent_meta_worker::{AgentMetaWorker, MetaEvent};
@@ -1274,6 +1275,7 @@ pub fn run(
         host_bell_on_finish: config.ui.host_bell_on_finish,
         mouse_captured,
         mouse_url_modifier: config.mouse_url_modifier,
+        mouse_yield_on_failed: config.mouse_yield_on_failed,
         segments: &segments,
     };
     event_loop(
@@ -2040,28 +2042,47 @@ fn pane_mouse_dispatch(
     }
 }
 
-/// Pull text from the focused agent's vt100 parser for the given
-/// selection range and write it to the system clipboard via OSC 52.
+/// Pull text from the focused agent's pane for the given selection
+/// range and write it to the system clipboard via OSC 52.
 ///
 /// Lookup is by stable [`AgentId`], not by index, so a tab switch /
 /// agent reap between Down and Up cancels gracefully — `position`
 /// returns `None` and we silently bail without writing.
 ///
-/// `vt100::Screen::contents_between` walks `visible_rows()`, so the
-/// selection respects the parser's current scrollback offset (selection
-/// while scrolled-back yields scrollback text, not live text). Empty
-/// selections (zero-width or all-whitespace cells in trimmed regions)
-/// produce empty strings; we skip the OSC 52 write in that case to
-/// avoid clobbering whatever was on the clipboard before.
-fn commit_selection(sel: &Selection, agents: &[RuntimeAgent]) {
+/// Two extraction paths share a single OSC 52 write tail:
+/// - `Ready` / `Crashed`: `vt100::Screen::contents_between` walks
+///   `visible_rows()`, so the selection respects the parser's current
+///   scrollback offset (selection while scrolled-back yields
+///   scrollback text, not live text).
+/// - `Failed`: [`failure_text_in_range`] mirrors the same cell-range
+///   semantics over the centered failure layout. The pane area is
+///   read off `pane_hitbox` because the Failed branch has no parser
+///   that owns the dimensions.
+///
+/// Empty selections (zero-width or all-whitespace cells in trimmed
+/// regions) produce empty strings; we skip the OSC 52 write in that
+/// case to avoid clobbering whatever was on the clipboard before.
+fn commit_selection(sel: &Selection, agents: &[RuntimeAgent], pane_hitbox: &PaneHitbox) {
     let Some(agent) = agents.iter().find(|a| a.id == sel.agent) else {
         return;
     };
-    let Some(screen) = agent.state.screen() else {
-        return;
-    };
     let (start, end) = normalized_range(sel.anchor, sel.head);
-    let text = screen.contents_between(start.row, start.col, end.row, end.col.saturating_add(1));
+    let text = match &agent.state {
+        AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => parser
+            .screen()
+            .contents_between(start.row, start.col, end.row, end.col.saturating_add(1)),
+        AgentState::Failed { error } => {
+            // Pane area is required to recompute the centered layout
+            // — without it the cells the user clicked don't map back
+            // to chars. Bail silently if the hitbox wasn't recorded
+            // (e.g. layout had zero pane area this frame).
+            let Some(area) = pane_hitbox.rect() else {
+                return;
+            };
+            let host = agent.host.as_deref().unwrap_or("");
+            failure_text_in_range(host, &error.user_message(), area, start, end)
+        }
+    };
     if text.is_empty() {
         return;
     }
@@ -2153,38 +2174,50 @@ impl UrlOpener for OsUrlOpener {
 }
 
 /// Tracks whether codemux has temporarily yielded mouse capture to the
-/// host terminal so the user can use the host's native URL-hover and
-/// click-to-open UX. The yield happens on bare-modifier press (Cmd by
-/// default on macOS, Ctrl elsewhere — configurable via
-/// [`MouseUrlModifier`]); reclaim happens on release or focus loss.
+/// host terminal, and the independent reasons that may demand a yield.
+/// Capture is yielded iff at least one reason is active and reclaimed
+/// only when every reason has cleared.
+///
+/// Yield reasons:
+/// - **URL-modifier hold**: user is holding Cmd / Ctrl (configurable
+///   via [`MouseUrlModifier`]) so the host terminal's native URL
+///   hover/click UX can run. Driven by KKP bare-modifier press/release
+///   events.
+/// - **Focused-Failed pane**: the focused agent is in
+///   [`AgentState::Failed`] and has no live PTY — yielding lets the
+///   user use their terminal's native click-drag-copy on the error
+///   text as a fallback for terminals where OSC 52 (the in-app
+///   selection's clipboard write path) is not honored.
 ///
 /// Why this is needed at all: any DEC mouse capture mode silences
 /// Ghostty's URL hover detector (verified empirically — see the test
 /// trail in commit history). The SGR mouse encoding cannot deliver
 /// Super/Cmd, so the only path to native Cmd-click is to step out of
-/// capture entirely while the modifier is held.
+/// capture entirely while the modifier is held. The Failed-pane reason
+/// extends the same machinery to the case where the in-app text-grid
+/// has no rows the user might want to copy.
 ///
-/// Tracks whether codemux has temporarily yielded mouse capture to the
-/// host terminal so the user can use the host's native URL-hover and
-/// click-to-open UX. The yield happens on bare-modifier press (Cmd by
-/// default on macOS, Ctrl elsewhere — configurable via
-/// [`MouseUrlModifier`]); reclaim happens on release or focus loss.
-///
-/// Why this is needed at all: any DEC mouse capture mode silences
-/// Ghostty's URL hover detector (verified empirically — see the test
-/// trail in commit history). The SGR mouse encoding cannot deliver
-/// Super/Cmd, so the only path to native Cmd-click is to step out of
-/// capture entirely while the modifier is held.
-///
-/// Modeled as an enum (not a `{ active: bool, yielded: bool }` struct)
-/// so the invalid combination `active=false && yielded=true` cannot be
-/// represented at all — terminals that refused our initial
-/// `EnableMouseCapture` stay in [`Self::Disabled`] forever and the
-/// yield/reclaim methods are pure no-ops on that variant. Idempotent in
-/// both directions: repeated presses without an intervening release
-/// (e.g. sticky keys) don't over-emit escape sequences.
+/// Modeled as a `mode` + `reasons` pair (rather than a flat enum) so
+/// the two reasons stay independent: a mid-hold focus change to a
+/// non-Failed agent must NOT clobber the URL-modifier reason. Idempotent
+/// on every setter — repeated calls (sticky modifier, redundant focus
+/// syncs from per-iteration recomputation) don't over-emit escape
+/// sequences. Terminals that refused our initial `EnableMouseCapture`
+/// stay in [`CaptureMode::Disabled`] forever and every setter is a
+/// pure no-op.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MouseCaptureState {
+struct MouseCaptureState {
+    mode: CaptureMode,
+    reasons: YieldReasons,
+}
+
+/// What the host terminal's mouse-capture mode is currently set to.
+/// Distinguishes "we never had capture" from "capture is held" from
+/// "capture was held and we've since yielded" — the renderer never
+/// looks at this; only the per-iteration sync compares it against
+/// `reasons.any()` to decide whether to flip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureMode {
     /// Initial `EnableMouseCapture` failed or was never attempted.
     /// Yield/reclaim are no-ops; the host terminal already owns mouse
     /// events.
@@ -2193,46 +2226,103 @@ enum MouseCaptureState {
     /// SGR mouse encoding and the host terminal's native URL handler
     /// is silenced.
     Captured,
-    /// Capture was temporarily released (the user is holding the URL
-    /// modifier). Mouse events go to the host terminal so its native
-    /// URL UX can run; reclaimed on modifier release or focus loss.
+    /// Capture was temporarily released. Mouse events go to the host
+    /// terminal so its native UX (URL hover, click-drag selection) can
+    /// run; reclaimed when the last yield reason clears.
     Yielded,
+}
+
+/// The set of independent reasons that demand a mouse-capture yield.
+/// Capture is yielded iff [`Self::any`] is true. Setters in
+/// [`MouseCaptureState`] update one bit at a time so a focus change
+/// during a modifier hold leaves the modifier bit intact (and vice
+/// versa).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct YieldReasons {
+    /// User is holding the configured URL modifier (Cmd / Ctrl /
+    /// Alt / Shift per [`MouseUrlModifier`]). Driven by KKP bare-
+    /// modifier press/release events; cleared on terminal focus loss
+    /// because the OS swallows the release when the window changes.
+    url_modifier_held: bool,
+    /// Focused agent is in `Failed` state. Driven by a per-iteration
+    /// sync against `nav.focused`; not cleared on focus loss because
+    /// alt-tabbing back to a Failed pane should re-yield without the
+    /// user needing to click into the pane first.
+    focused_failed: bool,
+}
+
+impl YieldReasons {
+    fn any(self) -> bool {
+        self.url_modifier_held || self.focused_failed
+    }
 }
 
 impl MouseCaptureState {
     fn new(mode_active: bool) -> Self {
-        if mode_active {
-            Self::Captured
-        } else {
-            Self::Disabled
+        Self {
+            mode: if mode_active {
+                CaptureMode::Captured
+            } else {
+                CaptureMode::Disabled
+            },
+            reasons: YieldReasons::default(),
         }
     }
 
-    /// Step out of mouse capture so the host terminal can run its
-    /// native URL hover/click handler. No-op on `Disabled` (capture
-    /// was never enabled) and `Yielded` (already stepped out). Failure
-    /// to write `DisableMouseCapture` leaves us in `Captured` so the
-    /// next press can retry.
-    fn yield_to_host(&mut self) {
-        if !matches!(self, Self::Captured) {
+    /// Update the URL-modifier reason and re-sync the OS mode. Called
+    /// from the bare-modifier press/release arms of the input loop.
+    fn set_url_modifier_held(&mut self, held: bool) {
+        if self.reasons.url_modifier_held == held {
             return;
         }
-        if execute!(io::stdout(), DisableMouseCapture).is_ok() {
-            *self = Self::Yielded;
-        }
+        self.reasons.url_modifier_held = held;
+        self.sync();
     }
 
-    /// Re-enable mouse capture after the user releases the URL
-    /// modifier (or after focus loss while held). Same idempotency
-    /// posture as [`Self::yield_to_host`] — `Disabled` and `Captured`
-    /// are no-ops; failure leaves us in `Yielded` so the next reclaim
-    /// attempt retries.
-    fn reclaim(&mut self) {
-        if !matches!(self, Self::Yielded) {
+    /// Update the focused-Failed reason and re-sync the OS mode. The
+    /// per-iteration sync in `event_loop` calls this with the current
+    /// focused agent's state; idempotent so a stable focused-Failed
+    /// across many iterations doesn't churn.
+    fn set_focused_failed(&mut self, failed: bool) {
+        if self.reasons.focused_failed == failed {
             return;
         }
-        if execute!(io::stdout(), EnableMouseCapture).is_ok() {
-            *self = Self::Captured;
+        self.reasons.focused_failed = failed;
+        self.sync();
+    }
+
+    /// Terminal focus loss: clear the URL-modifier bit (the OS won't
+    /// deliver the release when the window changes) and re-sync. The
+    /// focused-Failed bit is left alone — the focused agent didn't
+    /// move, only the host window's keyboard focus did, and re-entering
+    /// the codemux window with focus on a Failed pane should still
+    /// land in the yielded state.
+    fn lose_focus(&mut self) {
+        self.set_url_modifier_held(false);
+    }
+
+    /// Reconcile [`Self::mode`] with [`Self::reasons`]: yield if any
+    /// reason is active and we're currently `Captured`; reclaim if no
+    /// reason is active and we're currently `Yielded`. `Disabled` is a
+    /// no-op (terminal never gave us capture, so we have nothing to
+    /// flip). Failure to write the escape sequence leaves `mode`
+    /// unchanged so the next sync retries.
+    fn sync(&mut self) {
+        match (self.mode, self.reasons.any()) {
+            (CaptureMode::Captured, true) => {
+                if execute!(io::stdout(), DisableMouseCapture).is_ok() {
+                    self.mode = CaptureMode::Yielded;
+                }
+            }
+            (CaptureMode::Yielded, false) => {
+                if execute!(io::stdout(), EnableMouseCapture).is_ok() {
+                    self.mode = CaptureMode::Captured;
+                }
+            }
+            // (Captured, false) — already in the right state.
+            // (Yielded, true) — already yielded for at least one reason.
+            // (Disabled, _) — terminal refused capture, nothing to do.
+            _ => {}
         }
     }
 }
@@ -2333,6 +2423,16 @@ struct RuntimeContext<'a> {
     /// Modifier key the user holds to make codemux yield mouse capture
     /// for the host's native URL hover/click UX. See [`MouseUrlModifier`].
     mouse_url_modifier: MouseUrlModifier,
+    /// When `true`, codemux yields mouse capture whenever the focused
+    /// agent is in `Failed` state — opt-in trade where the user gets the
+    /// host terminal's native I-beam cursor and click-drag-copy on the
+    /// failure pane in exchange for losing tab clicks / scroll wheel /
+    /// the in-app drag-to-select overlay while focus stays there. Default
+    /// `false`: in-app selection covers Failed panes via `commit_selection`'s
+    /// Failed branch, so this knob is for users who specifically prefer
+    /// the native gesture and accept the keyboard-only tab switching
+    /// while on a Failed pane.
+    mouse_yield_on_failed: bool,
     /// Status-bar right-side segments, built from
     /// `config.ui.status_bar_segments`. Owned by the caller of
     /// `event_loop`; threaded through to `render_status_bar` so
@@ -2364,6 +2464,7 @@ fn event_loop(
         host_bell_on_finish,
         mouse_captured,
         mouse_url_modifier,
+        mouse_yield_on_failed,
         segments,
     } = *ctx;
     let mut prefix_state = PrefixState::default();
@@ -2694,6 +2795,27 @@ fn event_loop(
         {
             selection = None;
         }
+        // Sync the focused-Failed mouse-capture yield. Off by default
+        // because yielding capture also drops tab clicks, scroll-wheel,
+        // and the in-app drag-to-select overlay for as long as focus
+        // stays on the Failed pane — which most users don't want, since
+        // in-app selection (reverse-video highlight + OSC 52 to clipboard)
+        // already covers Failed panes via `commit_selection`'s Failed
+        // branch. Opt-in via `mouse_yield_on_failed = true` for users
+        // who specifically prefer the host terminal's native I-beam
+        // cursor and click-drag-copy gesture and accept switching tabs
+        // via the keyboard chord while focused on a Failed pane.
+        //
+        // The setter is always called with the AND of the two conditions
+        // rather than wrapped in an `if mouse_yield_on_failed { ... }` so
+        // a hypothetical hot-reload of the config from true → false
+        // clears the bit instead of leaving it stuck — keeps the state
+        // machine the authoritative source of truth.
+        let focused_failed = nav
+            .agents
+            .get(nav.focused)
+            .is_some_and(|a| matches!(a.state, AgentState::Failed { .. }));
+        mouse_capture_state.set_focused_failed(focused_failed && mouse_yield_on_failed);
         // Same staleness guard for the Ctrl-hover URL highlight: if the
         // focused agent went away (reap, popup pick, dismiss), the cell
         // coordinates point at an agent that no longer renders here.
@@ -2804,24 +2926,25 @@ fn event_loop(
                 {
                     tracing::debug!(?mk, kind = ?key.kind, "url-modifier event");
                     match key.kind {
-                        KeyEventKind::Press => mouse_capture_state.yield_to_host(),
-                        KeyEventKind::Release => mouse_capture_state.reclaim(),
+                        KeyEventKind::Press => mouse_capture_state.set_url_modifier_held(true),
+                        KeyEventKind::Release => mouse_capture_state.set_url_modifier_held(false),
                         KeyEventKind::Repeat => {}
                     }
                 }
             }
-            // User alt-tabbed away: if we yielded mouse capture for a
-            // modifier hold, reclaim now. Without this, a focus-loss
-            // mid-hold would leave codemux in the yielded state until
-            // some unrelated event coincidentally sees the modifier
-            // released — the user would notice that wheel/tabs stopped
-            // responding for the duration. `Event::FocusGained` needs
-            // no explicit handler: capture is already in whatever
-            // state we left it (yielded if the user alt-tabbed back
-            // while still holding, else captured) and falls through
-            // the catch-all arm at the bottom.
+            // User alt-tabbed away: clear the URL-modifier yield reason
+            // so we can reclaim if it was the only reason in play.
+            // Without this, a focus-loss mid-hold would leave codemux in
+            // the yielded state until some unrelated event coincidentally
+            // sees the modifier released — the user would notice that
+            // wheel/tabs stopped responding for the duration. The
+            // focused-Failed reason is left intact so re-entering the
+            // window with focus still on a Failed pane stays yielded.
+            // `Event::FocusGained` needs no explicit handler: capture is
+            // already in whatever state we left it and falls through the
+            // catch-all arm at the bottom.
             Event::FocusLost => {
-                mouse_capture_state.reclaim();
+                mouse_capture_state.lose_focus();
                 let transition = update_hover(&mut hover, None);
                 if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
                     tracing::debug!(?err, "hover cursor update failed");
@@ -3445,7 +3568,7 @@ fn event_loop(
                             }
                             Some(PaneMouseDispatch::Commit) => {
                                 if let Some(sel) = selection.take() {
-                                    commit_selection(&sel, &nav.agents);
+                                    commit_selection(&sel, &nav.agents, &pane_hitbox);
                                 }
                                 true
                             }
@@ -3793,10 +3916,16 @@ fn render_agent_pane(
             render_crash_banner(frame, area, *exit_code, dismiss_label);
         }
         AgentState::Failed { error } => {
-            // No pane hitbox for Failed agents — there is no live PTY
-            // surface to select text from, just an error message.
+            // Failed panes record a hitbox and paint the selection
+            // overlay so the user can drag-to-copy the error text.
+            // There's no live PTY here, so the selection commit path
+            // routes to `failure_text_in_range` (the centered-layout
+            // mirror of `vt100::Screen::contents_between`) rather
+            // than the parser screen.
             let host = agent.host.as_deref().unwrap_or("");
             render_failure_pane(frame, area, host, &error.user_message());
+            pane_hitbox.record(area, agent.id.clone());
+            paint_selection_if_active(frame, area, &agent.id, overlay.selection);
         }
     }
 }
@@ -4152,48 +4281,181 @@ fn render_scroll_indicator(frame: &mut Frame<'_>, area: Rect, offset: usize) {
     frame.render_widget(widget, badge_area);
 }
 
+/// One visible row of the failure pane after centering has been
+/// applied. The renderer paints these directly; the selection
+/// extractor reads cell ranges off the same data so what the user
+/// drag-selects is exactly what lands on the clipboard.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct FailureLine {
+    /// Pane-relative row this content lands on (0 = top of pane).
+    row: u16,
+    /// Original (unpadded) content, sourced from
+    /// [`failure_source_lines`]. Used by the renderer for styling.
+    content: String,
+    /// Pane-relative column where `content` starts after horizontal
+    /// centering. The renderer paints at `(area.x + col, area.y + row)`;
+    /// the extractor uses `col` to map cell offsets back onto chars.
+    col: u16,
+    /// True for the "✗ bootstrap of {host} failed" header line so
+    /// the renderer can paint it bold; body lines render as plain
+    /// red. Off-screen lines (clipped by a too-short pane) are
+    /// excluded entirely from the returned vec.
+    is_header: bool,
+}
+
+/// The unstyled, unpadded source lines that the failure pane shows.
+/// Source of truth for both rendering and selection extraction so the
+/// two never disagree about what text is on screen.
+///
+/// Layout: header on row 0, blank spacer on row 1, then one row per
+/// line of `error.user_message()`. Lifted out of `render_failure_pane`
+/// so the cell-to-text path (selection commit) reuses the same content
+/// without re-deriving the format.
+fn failure_source_lines(host: &str, err: &str) -> Vec<String> {
+    let mut lines = Vec::with_capacity(2 + err.lines().count());
+    lines.push(format!("✗ bootstrap of {host} failed"));
+    lines.push(String::new());
+    for line in err.lines() {
+        lines.push(line.to_string());
+    }
+    lines
+}
+
+/// Apply horizontal + vertical centering against `area` and return one
+/// `FailureLine` per visible row. Off-screen rows (vertical overflow)
+/// are dropped so the caller can paint without clipping bookkeeping.
+///
+/// Centering math mirrors `Paragraph::Center`: `(area_dim - content) / 2`
+/// for the leading pad, with `saturating_sub` so overflow stays at 0
+/// (content rendered top-left, clipped on the right). Display width
+/// uses `UnicodeWidthStr::width` rather than `chars().count()` so wide
+/// glyphs (CJK, emoji) center on the same cells the renderer's
+/// `Paragraph::Center` lands on — without it, a wide char would shift
+/// selection-extraction off the rendered cells by the glyph's width
+/// minus one column per row.
+fn failure_layout(host: &str, err: &str, area: Rect) -> Vec<FailureLine> {
+    let lines = failure_source_lines(host, err);
+    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let top_pad = area.height.saturating_sub(content_height) / 2;
+    let max_visible = area.height.saturating_sub(top_pad);
+
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, content) in lines.into_iter().enumerate() {
+        let Ok(offset) = u16::try_from(i) else { break };
+        if offset >= max_visible {
+            break;
+        }
+        let row = top_pad.saturating_add(offset);
+        let width = u16::try_from(UnicodeWidthStr::width(content.as_str())).unwrap_or(u16::MAX);
+        let col = area.width.saturating_sub(width) / 2;
+        out.push(FailureLine {
+            row,
+            col,
+            content,
+            is_header: i == 0,
+        });
+    }
+    out
+}
+
+/// Extract the text covered by a pane-relative cell range from a
+/// failure pane. Mirrors `vt100::Screen::contents_between` semantics:
+/// `start..=end` rows, `row_bounds` gives the column slice per row,
+/// blank cells outside any centered line read as spaces.
+///
+/// Used by `commit_selection` for `Failed` agents — the live-PTY path
+/// goes through vt100 instead. Returns an empty string when the
+/// selection covers only padding so the caller can skip the OSC 52
+/// write (matches the `text.is_empty()` short-circuit on the live
+/// path).
+fn failure_text_in_range(
+    host: &str,
+    err: &str,
+    area: Rect,
+    start: CellPos,
+    end: CellPos,
+) -> String {
+    // Pre-collect each visible row's chars into a Vec so the per-cell
+    // lookup below is O(1). The naive `content.chars().nth(c)` walks
+    // the string from the start on every cell — O(cells × chars) per
+    // row, which is fine for our tiny failure messages but reads as a
+    // performance smell against the Rust style guide.
+    let layout: Vec<(u16, u16, Vec<char>)> = failure_layout(host, err, area)
+        .into_iter()
+        .map(|l| (l.row, l.col, l.content.chars().collect()))
+        .collect();
+    let mut out = String::new();
+    for row in start.row..=end.row {
+        if row > start.row {
+            out.push('\n');
+        }
+        let (col_lo, col_hi) = row_bounds(start, end, row, area.width);
+        let line = layout.iter().find(|(r, _, _)| *r == row);
+        for col in col_lo..col_hi {
+            let ch = line
+                .and_then(|(_, line_col, chars)| {
+                    let c = col.checked_sub(*line_col)?;
+                    chars.get(usize::from(c)).copied()
+                })
+                .unwrap_or(' ');
+            out.push(ch);
+        }
+    }
+    // Strip trailing whitespace per line so a drag that overshoots the
+    // right margin doesn't paste a wall of spaces. Mirrors the practical
+    // effect of vt100's `contents_between` on idle cells (which also
+    // skips empties). Uses `split('\n')` not `lines()` so a trailing
+    // newline (impossible in current code, but defensive) survives the
+    // round-trip rather than being silently dropped.
+    let trimmed = out
+        .split('\n')
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if trimmed.trim().is_empty() {
+        String::new()
+    } else {
+        trimmed
+    }
+}
+
 /// Centered failure pane shown when an SSH bootstrap returned an
 /// error after the spawn modal closed. Renders without a border so
 /// the pane reads as "this slot is dead" rather than "here is a real
 /// UI element"; the in-flight phase has its own UX inside the spawn
 /// modal and never reaches this renderer.
+///
+/// Painting goes through `failure_layout` so the cell coordinates
+/// the renderer writes match the cells `failure_text_in_range`
+/// extracts during a selection commit — the user copying their drag
+/// gets exactly what they saw on screen.
 fn render_failure_pane(frame: &mut Frame<'_>, area: Rect, host: &str, err: &str) {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::styled(
-        format!("✗ bootstrap of {host} failed"),
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-    ));
-    lines.push(Line::raw(""));
-    for line in err.lines() {
-        lines.push(Line::styled(
-            line.to_string(),
-            Style::default().fg(Color::Red),
-        ));
-    }
-
-    // Vertical centering: top filler, content, bottom filler. The
-    // content gets exactly its line count so it sits on a single
-    // row in the visual middle.
-    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(content_height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    // Wipe the entire pane area first. The vertical centering layout
-    // only paints `chunks[1]`; the top/bottom `Min(0)` regions are
-    // never written. Without an explicit clear, whatever the previous
+    // Wipe the entire pane area first. We only paint individual line
+    // cells below; without an explicit clear, whatever the previous
     // frame's renderer left in those cells (e.g. PTY content from a
     // local agent the user just switched away from) bleeds through
     // and reads as garbled characters around the centered text.
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Center),
-        chunks[1],
-    );
+
+    let header_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(Color::Red);
+    for line in failure_layout(host, err, area) {
+        let style = if line.is_header {
+            header_style
+        } else {
+            body_style
+        };
+        let row_area = Rect {
+            x: area.x.saturating_add(line.col),
+            y: area.y.saturating_add(line.row),
+            width: area.width.saturating_sub(line.col),
+            height: 1,
+        };
+        if row_area.width == 0 {
+            continue;
+        }
+        frame.render_widget(Paragraph::new(Line::styled(line.content, style)), row_area);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8943,6 +9205,217 @@ mod tests {
         }
     }
 
+    /// `failure_layout` centers each line in the pane area both
+    /// vertically (top pad = `(height - lines) / 2`) and horizontally
+    /// (left pad = `(width - len) / 2`). The header line gets
+    /// `is_header: true` so the renderer can pick the bold style.
+    /// Locked down so a future refactor of the layout math doesn't
+    /// silently shift cells the user clicks.
+    #[test]
+    fn failure_layout_centers_lines_and_marks_header() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let layout = failure_layout("foo", "boom\nbang", area);
+        // header + blank + 2 body lines = 4 visible rows; (10 - 4) / 2 = 3.
+        assert_eq!(layout.len(), 4, "header + blank + 2 body lines");
+        assert_eq!(layout[0].row, 3, "vertical centering pads top by 3");
+        assert!(layout[0].is_header, "row 0 is the header");
+        assert_eq!(
+            layout[0].content, "✗ bootstrap of foo failed",
+            "header copy includes host",
+        );
+        // (40 - 25) / 2 = 7 for the header (25 visible chars).
+        assert_eq!(layout[0].col, 7, "header centered horizontally");
+        // Blank line (row 4) — still emitted so the row mapping stays
+        // gap-free, useful for the renderer painting a contiguous block.
+        assert_eq!(layout[1].row, 4);
+        assert!(layout[1].content.is_empty());
+        assert!(!layout[1].is_header);
+        // Body lines (rows 5, 6).
+        assert_eq!(layout[2].row, 5);
+        assert_eq!(layout[2].content, "boom");
+        assert_eq!(layout[3].row, 6);
+        assert_eq!(layout[3].content, "bang");
+    }
+
+    /// When the pane is too short for all the content lines, vertical
+    /// centering pads the top to 0 and the layout drops the rows that
+    /// fall off the bottom. Ensures the failure renderer never tries
+    /// to paint past the pane and that the selection extractor agrees
+    /// on what's on screen.
+    #[test]
+    fn failure_layout_clips_when_pane_too_short() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 2,
+        };
+        let layout = failure_layout("foo", "line1\nline2\nline3", area);
+        assert_eq!(layout.len(), 2, "only first 2 lines fit in height=2");
+        assert_eq!(layout[0].row, 0);
+        assert_eq!(layout[1].row, 1);
+    }
+
+    /// `failure_layout` uses `UnicodeWidthStr::width` rather than
+    /// `chars().count()` so wide glyphs (CJK, emoji) center on the same
+    /// cells the renderer's `Paragraph::Center` lands on. Locked down
+    /// because a regression to char count would shift selection-extraction
+    /// off the rendered cells by `width - 1` columns per wide glyph and
+    /// the user would copy garbage.
+    #[test]
+    fn failure_layout_centers_using_display_width_not_char_count() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        // Body line `"橋橋橋"` — three CJK glyphs, each 2 cells wide.
+        // Display width = 6, char count = 3. Header centering for host "f"
+        // is independent and isolates the body-line math.
+        let layout = failure_layout("f", "橋橋橋", area);
+        // Body line is the third entry (header, blank, body).
+        let body = &layout[2];
+        assert_eq!(body.content, "橋橋橋");
+        // (40 - 6) / 2 = 17, NOT (40 - 3) / 2 = 18 if we'd used char count.
+        assert_eq!(
+            body.col, 17,
+            "centering must use display width (6 cells), not char count (3)",
+        );
+    }
+
+    /// `failure_text_in_range` mirrors `vt100::Screen::contents_between`
+    /// for the Failed pane: drag-selecting cells over the centered
+    /// text returns exactly those characters, with leading-pad cells
+    /// outside any line content reading as spaces (preserved at the
+    /// front, trimmed at the trailing end so the clipboard doesn't
+    /// get a wall of right-margin padding).
+    #[test]
+    fn failure_text_in_range_extracts_centered_content() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        // From earlier test: header lands at row 3, col 7, content
+        // "✗ bootstrap of foo failed" (25 chars).
+        // Drag covering the entire header row (row 3, cols 0..40):
+        // 7 leading pad cells + 25 content chars; trailing pad stripped.
+        let text = failure_text_in_range(
+            "foo",
+            "boom",
+            area,
+            CellPos { row: 3, col: 0 },
+            CellPos { row: 3, col: 39 },
+        );
+        assert_eq!(
+            text, "       ✗ bootstrap of foo failed",
+            "leading padding preserved (matches vt100), trailing trimmed",
+        );
+
+        // Sub-range inside the header — only the inclusive cells.
+        // Header content starts at col 7, so col 9 = 'b' of "bootstrap".
+        let text = failure_text_in_range(
+            "foo",
+            "boom",
+            area,
+            CellPos { row: 3, col: 9 },
+            CellPos { row: 3, col: 17 },
+        );
+        assert_eq!(text, "bootstrap", "sub-range extracts inner chars");
+    }
+
+    /// Multi-row drag spans the header, the blank spacer row, and a
+    /// body line — the result preserves leading pad on each row and
+    /// trims trailing, matching vt100's per-row behavior. Each row is
+    /// joined with `\n` so the user copies the visual line structure.
+    #[test]
+    fn failure_text_in_range_spans_multiple_rows() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        // Header row 3 (col 7..32), blank row 4, body row 5 ("boom" at col 18..22).
+        let text = failure_text_in_range(
+            "foo",
+            "boom",
+            area,
+            CellPos { row: 3, col: 0 },
+            CellPos { row: 5, col: 39 },
+        );
+        assert_eq!(
+            text,
+            "       ✗ bootstrap of foo failed\n\n                  boom",
+        );
+    }
+
+    /// A drag that lands entirely on padding (above the centered text,
+    /// below the centered text, or in the side margins) returns "" so
+    /// `commit_selection`'s `text.is_empty()` short-circuit skips the
+    /// OSC 52 write and the user's existing clipboard isn't clobbered
+    /// by an accidental click on dead space.
+    #[test]
+    fn failure_text_in_range_returns_empty_for_pure_padding() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        // Row 0 is above the centered content (which starts at row 3).
+        let text = failure_text_in_range(
+            "foo",
+            "boom",
+            area,
+            CellPos { row: 0, col: 0 },
+            CellPos { row: 0, col: 39 },
+        );
+        assert!(text.is_empty(), "padding-only drag yields empty string");
+    }
+
+    /// End-to-end check that `render_failure_pane` paints text at the
+    /// same cells `failure_text_in_range` extracts from. Regression
+    /// guard — the renderer and extractor must stay in lockstep, or
+    /// drag-to-copy returns text the user didn't actually highlight.
+    #[test]
+    fn render_failure_pane_paints_at_extractor_cells() {
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        terminal
+            .draw(|frame| {
+                render_failure_pane(frame, area, "foo", "boom");
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Header lands at row 3, col 7..32 ("✗ bootstrap of foo failed").
+        // Verify a known cell — row 3, col 9 — holds the 'b' of
+        // "bootstrap" and that cell 0 (a padding cell) is blank.
+        assert_eq!(
+            buf[(9, 3)].symbol(),
+            "b",
+            "header 'b' at the cell the extractor picks for col=9",
+        );
+        assert_eq!(
+            buf[(0, 3)].symbol(),
+            " ",
+            "left margin of the header row is padding",
+        );
+    }
+
     #[test]
     fn paint_hover_url_if_active_underlines_url_range_and_tints_cyan() {
         // Mirrors paint_selection_if_active_flips_reversed_modifier_on_selected_cells.
@@ -9420,24 +9893,93 @@ mod tests {
         }
     }
 
-    /// `MouseCaptureState::Disabled` short-circuits both `yield_to_host`
-    /// and `reclaim` — yielding from a state that never had capture
-    /// would emit a `?1006l` for a terminal that never opted into
-    /// `?1006h`, which is at best wasted bytes and at worst a
-    /// state-machine confusion in some terminal emulators. The state
-    /// assertions below don't write to stdout because the methods
-    /// short-circuit before the `execute!` call.
+    /// `CaptureMode::Disabled` short-circuits every yield-reason
+    /// setter — yielding from a state that never had capture would
+    /// emit a `?1006l` for a terminal that never opted into `?1006h`,
+    /// which is at best wasted bytes and at worst a state-machine
+    /// confusion in some terminal emulators. The state assertions
+    /// below don't write to stdout because `sync` short-circuits on
+    /// the `Disabled` arm before any `execute!` call.
     #[test]
     fn mouse_capture_state_no_op_when_capture_inactive() {
         let mut s = MouseCaptureState::new(false);
-        assert_eq!(s, MouseCaptureState::Disabled);
-        s.yield_to_host();
-        assert_eq!(s, MouseCaptureState::Disabled, "yield must not transition");
-        s.reclaim();
+        assert_eq!(s.mode, CaptureMode::Disabled);
+        s.set_url_modifier_held(true);
         assert_eq!(
-            s,
-            MouseCaptureState::Disabled,
-            "reclaim must not transition",
+            s.mode,
+            CaptureMode::Disabled,
+            "url-modifier yield must not transition Disabled mode",
+        );
+        assert!(s.reasons.url_modifier_held, "reason bit still tracks");
+        s.set_url_modifier_held(false);
+        assert_eq!(
+            s.mode,
+            CaptureMode::Disabled,
+            "url-modifier release must not transition Disabled mode",
+        );
+        s.set_focused_failed(true);
+        assert_eq!(
+            s.mode,
+            CaptureMode::Disabled,
+            "focused-Failed yield must not transition Disabled mode",
+        );
+        s.lose_focus();
+        assert_eq!(
+            s.mode,
+            CaptureMode::Disabled,
+            "focus loss must not transition Disabled mode",
+        );
+    }
+
+    /// Two yield reasons (URL modifier, focused-Failed) are independent:
+    /// either one alone keeps capture yielded, and capture only reclaims
+    /// when both clear. Locked down so a future refactor that consolidates
+    /// reasons into a single bool can't silently regress the "alt-tab to
+    /// a Ready agent while still holding Cmd" interaction.
+    #[test]
+    fn mouse_capture_state_yield_reasons_compose_independently() {
+        // Construct in `Captured` mode without going through `new` so
+        // the test doesn't write to stdout. `sync` is what would emit;
+        // we mutate `mode` directly to simulate "terminal accepted the
+        // initial enable" without actually touching the OS.
+        let mut s = MouseCaptureState {
+            mode: CaptureMode::Captured,
+            reasons: YieldReasons::default(),
+        };
+        assert!(!s.reasons.any(), "no reasons → captured");
+
+        s.reasons.url_modifier_held = true;
+        s.reasons.focused_failed = true;
+        assert!(s.reasons.any(), "both reasons → would yield");
+
+        s.reasons.url_modifier_held = false;
+        assert!(
+            s.reasons.any(),
+            "focused-Failed alone keeps capture yielded",
+        );
+
+        s.reasons.focused_failed = false;
+        assert!(!s.reasons.any(), "no reasons → would reclaim");
+    }
+
+    /// `lose_focus` clears the URL-modifier bit (the OS swallows the
+    /// release on alt-tab) but leaves `focused_failed` intact — re-
+    /// entering the codemux window with focus still on a Failed pane
+    /// must stay yielded without the user clicking back into the pane.
+    #[test]
+    fn mouse_capture_state_lose_focus_preserves_focused_failed() {
+        let mut s = MouseCaptureState {
+            mode: CaptureMode::Disabled,
+            reasons: YieldReasons {
+                url_modifier_held: true,
+                focused_failed: true,
+            },
+        };
+        s.lose_focus();
+        assert!(!s.reasons.url_modifier_held, "url-modifier bit cleared");
+        assert!(
+            s.reasons.focused_failed,
+            "focused-Failed bit preserved across alt-tab",
         );
     }
 
