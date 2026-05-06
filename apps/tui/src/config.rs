@@ -107,6 +107,24 @@ impl Default for Config {
 /// when `REPORT_ALL_KEYS_AS_ESCAPE_CODES` + `REPORT_EVENT_TYPES` are
 /// pushed.
 ///
+/// **Dead-key trade-off (intl layouts).** Pushing
+/// `REPORT_ALL_KEYS_AS_ESCAPE_CODES` also bypasses OS-level dead-key
+/// composition: pressing dead-tilde + space on a US-International or
+/// Brazilian intl layout no longer produces a literal `~` for the
+/// application — the dead-key arrives as an unmatched Release event
+/// and only the composing space surfaces. The runtime mitigates the
+/// dead-tilde case via a per-character recovery (`runtime.rs`) but
+/// other dead-keys (`"`, `'`, `^`, `` ` ``) round-trip incorrectly.
+///
+/// To avoid the issue entirely, choose anything other than `Cmd` —
+/// only `Cmd` requires the offending KKP flag (because Cmd doesn't
+/// have a bit in the SGR mouse encoding). For `Ctrl` / `Alt` /
+/// `Shift` / `None`, codemux negotiates with just
+/// `DISAMBIGUATE_ESCAPE_CODES` and the OS keeps composing dead-keys
+/// natively; the cost is that the native terminal URL hover yield
+/// doesn't fire (use the in-app Ctrl+hover overlay + Ctrl+Click
+/// handler instead).
+///
 /// `None` disables the yield behavior entirely (in-app Ctrl+click is
 /// the only path).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -127,6 +145,24 @@ pub enum MouseUrlModifier {
     Alt,
     /// Yield while the user holds Shift.
     Shift,
+}
+
+impl MouseUrlModifier {
+    /// Whether codemux must request KKP `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
+    /// (and `REPORT_EVENT_TYPES`) so the terminal delivers bare-modifier
+    /// press/release events. Only `Cmd` needs them: SGR 1006 mouse
+    /// encoding does not carry a Cmd / Super bit, so the keyboard
+    /// channel is the only signal that the user is holding the
+    /// modifier. `Ctrl` / `Alt` / `Shift` are reported on the mouse
+    /// event itself; `None` never yields.
+    ///
+    /// Encapsulated here (rather than as a `match` in the runtime) so
+    /// the runtime stays ignorant of *why* the flags are needed and a
+    /// future variant cannot silently miss the negotiation step.
+    #[must_use]
+    pub fn requires_bare_modifier_events(self) -> bool {
+        matches!(self, Self::Cmd)
+    }
 }
 
 impl Default for MouseUrlModifier {
@@ -1653,6 +1689,21 @@ mod tests {
             config.spawn.remote_scratch_dir(Path::new("/root")),
             Some(PathBuf::from("/root/.codemux/scratch")),
         );
+    }
+
+    /// `requires_bare_modifier_events` is the gate that decides
+    /// whether the runtime pushes KKP `REPORT_ALL_KEYS_AS_ESCAPE_CODES`.
+    /// Only Cmd needs it (no Cmd bit in SGR 1006); Ctrl / Alt / Shift
+    /// ride on the mouse event's own modifier bits, and None never
+    /// yields. Locking the matrix down so a future variant can't
+    /// silently miss the flag-negotiation step.
+    #[test]
+    fn requires_bare_modifier_events_only_true_for_cmd() {
+        assert!(MouseUrlModifier::Cmd.requires_bare_modifier_events());
+        assert!(!MouseUrlModifier::Ctrl.requires_bare_modifier_events());
+        assert!(!MouseUrlModifier::Alt.requires_bare_modifier_events());
+        assert!(!MouseUrlModifier::Shift.requires_bare_modifier_events());
+        assert!(!MouseUrlModifier::None.requires_bare_modifier_events());
     }
 
     /// Default `mouse_url_modifier` follows the host platform's URL

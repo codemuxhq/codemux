@@ -1238,11 +1238,12 @@ pub fn run(
     // Terminals that do not understand the negotiation simply ignore it.
     let needs_super_keys = config.bindings.uses_super_modifier();
     let needs_modifier_events = !matches!(config.mouse_url_modifier, MouseUrlModifier::None);
+    let needs_bare_modifier_events = config.mouse_url_modifier.requires_bare_modifier_events();
     let mut keyboard_flags = KeyboardEnhancementFlags::empty();
     if needs_super_keys || needs_modifier_events {
         keyboard_flags |= KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
     }
-    if needs_modifier_events {
+    if needs_bare_modifier_events {
         keyboard_flags |= KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
         keyboard_flags |= KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
         // Also push REPORT_ALTERNATE_KEYS so the terminal includes the
@@ -2214,6 +2215,126 @@ fn compute_hover(
     })
 }
 
+/// Low-level pre-processor that interprets raw terminal escape
+/// sequences (KKP-emitted dead-key events, future similar oddities)
+/// and yields clean keystrokes to the event-loop dispatcher.
+///
+/// Why a dedicated type: the recovery logic is a state machine that
+/// spans multiple events and isn't part of the dispatcher's job.
+/// Inlining the state in the loop reduces cohesion and tangles
+/// terminal-input infrastructure with application orchestration.
+/// Concentrating it here keeps the loop body declarative and lets
+/// the state transitions be unit-tested in isolation.
+///
+/// Currently tracks one machine — KKP dead-tilde recovery — but the
+/// shape is intentionally generic: future dead-keys (`'`, `^`, `"`)
+/// or other terminal idiosyncrasies plug in as additional arms in
+/// [`Self::process`] without churning the loop site.
+#[derive(Debug, Default)]
+struct InputPreprocessor {
+    /// Armed when we observe the KKP dead-tilde signature (a
+    /// `Char(backtick)` Release with SHIFT under
+    /// `REPORT_ALL_KEYS_AS_ESCAPE_CODES`). The OS holds the Press
+    /// for the dead-key while it waits for the composing keystroke;
+    /// when composition declines, the terminal surfaces the
+    /// unmatched *release* of the base key and forwards the
+    /// composing space as a normal Press separately. We do NOT
+    /// synthesize the `~` until the space arrives — firing nav-at-
+    /// home or sending `~` to the PTY on the dead-key alone would
+    /// be premature.
+    pending_dead_tilde: bool,
+}
+
+impl InputPreprocessor {
+    /// Feed a raw terminal event through the recovery state machine.
+    ///
+    /// Returns:
+    /// - `None` when the event is consumed by the pre-processor
+    ///   (e.g. the dead-tilde half of a `~ + space` gesture, which
+    ///   we drop while we wait for the composing space).
+    /// - `Some(event)` to forward to the dispatcher — either the
+    ///   original event passed through unchanged, or a synthesized
+    ///   event that replaces a multi-event gesture with one clean
+    ///   keystroke.
+    fn process(&mut self, raw: Event) -> Option<Event> {
+        match raw {
+            Event::Key(k)
+                if k.kind == KeyEventKind::Release
+                    && matches!(k.code, KeyCode::Char('`'))
+                    && k.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                tracing::debug!("input: dead-tilde armed, awaiting composing key");
+                self.pending_dead_tilde = true;
+                None
+            }
+            Event::Key(k)
+                if self.pending_dead_tilde
+                    && k.kind == KeyEventKind::Press
+                    && matches!(k.code, KeyCode::Char(' ')) =>
+            {
+                tracing::debug!("input: dead-tilde composed → synthesizing Char('~') Press");
+                self.pending_dead_tilde = false;
+                Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char('~'),
+                    KeyModifiers::empty(),
+                )))
+            }
+            other => {
+                if self.pending_dead_tilde && matches!(other, Event::Key(_)) {
+                    tracing::debug!(
+                        "input: dead-tilde aborted (intervening event); treating as no-op"
+                    );
+                    self.pending_dead_tilde = false;
+                }
+                Some(other)
+            }
+        }
+    }
+}
+
+/// How long a URL-open toast stays on screen before auto-dismissing.
+/// Long enough to read; short enough not to crowd the agent pane.
+const URL_TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// One-row banner rendered at the top of the screen after a URL open
+/// attempt completes. Cleared automatically once
+/// [`URL_TOAST_TTL`] elapses, or earlier on the next mouse / key
+/// event so the user's interaction doesn't get visually stalled.
+#[derive(Debug, Clone)]
+struct UrlOpenToast {
+    text: String,
+    started_at: std::time::Instant,
+    /// `true` for the success toast (rendered with a neutral / accent
+    /// style), `false` for failure (rendered with the same red
+    /// background as `render_crash_banner` so it reads as "something
+    /// went wrong, here's the fallback").
+    success: bool,
+}
+
+/// Result of attempting to open a URL via the OS handler. Reported
+/// asynchronously: the spawn itself returns immediately (so the event
+/// loop never blocks) and a worker thread waits on the child to
+/// produce the actual outcome.
+#[derive(Debug, Clone)]
+enum UrlOpenOutcome {
+    /// Handler exited 0 — URL was successfully delegated to the
+    /// platform browser (or whatever the user has configured).
+    Opened,
+    /// Handler exited non-zero (typical SSH-without-DISPLAY case for
+    /// `xdg-open`) or failed to spawn at all. Carries the captured
+    /// stderr (trimmed, non-empty) so the runtime can show the user
+    /// why the open didn't take and fall back to OSC 52 clipboard.
+    Failed { error: String },
+}
+
+/// What the worker thread sends back to the runtime after waiting on
+/// a URL-handler subprocess.
+#[derive(Debug, Clone)]
+struct UrlOpenReport {
+    url: String,
+    outcome: UrlOpenOutcome,
+}
+
 /// Abstraction over the OS-level "open this URL" call. The event loop
 /// holds a `&dyn UrlOpener` rather than calling the platform-specific
 /// command directly — surfaced in arch review as a Dependency Inversion
@@ -2221,12 +2342,13 @@ fn compute_hover(
 /// crate. Production wires [`OsUrlOpener`]; tests can swap in a mock
 /// that records the URLs without spawning a browser.
 ///
-/// Returns `io::Result<()>` rather than swallowing internally so the
-/// caller decides whether to log or surface the failure — the runtime
-/// loop logs via `tracing::debug!` and continues; a future test could
-/// assert on the error.
+/// Fire-and-forget: `open` returns immediately. The actual result
+/// (success / failure with stderr) is reported asynchronously via the
+/// `mpsc::Sender<UrlOpenReport>` the opener was constructed with. The
+/// runtime drains those reports each tick and surfaces a toast +
+/// optionally falls back to OSC 52 clipboard copy.
 trait UrlOpener {
-    fn open(&self, url: &str) -> io::Result<()>;
+    fn open(&self, url: &str);
 }
 
 /// Production [`UrlOpener`]: spawns the host OS's URL handler.
@@ -2235,34 +2357,158 @@ trait UrlOpener {
 /// start "" <url>` (the empty quoted string is `start`'s "no window
 /// title" sentinel; without it the URL would be parsed as the title).
 ///
-/// Best-effort: spawn-only, no wait, no output capture. The URL is
-/// passed as a single argv entry — never through a shell — so a
-/// quote/space/`;` in the URL can't escape into the user's environment.
-/// Same threat model as iTerm2's Cmd+Click.
-struct OsUrlOpener;
+/// The URL is passed as a single argv entry — never through a shell
+/// — so a quote/space/`;` in the URL can't escape into the user's
+/// environment. Same threat model as iTerm2's Cmd+Click.
+///
+/// stderr is piped (not `/dev/null`) so the worker thread can capture
+/// it for the failure report — the SSH-without-DISPLAY case for
+/// `xdg-open` is the prime example of a spawn that succeeds but exits
+/// non-zero shortly after.
+struct OsUrlOpener {
+    tx: std::sync::mpsc::Sender<UrlOpenReport>,
+}
 
 impl UrlOpener for OsUrlOpener {
-    fn open(&self, url: &str) -> io::Result<()> {
-        use std::process::{Command, Stdio};
-        let mut command = if cfg!(target_os = "macos") {
-            let mut c = Command::new("open");
-            c.arg(url);
-            c
-        } else if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", "start", "", url]);
-            c
-        } else {
-            let mut c = Command::new("xdg-open");
-            c.arg(url);
-            c
-        };
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map(|_child| ())
+    fn open(&self, url: &str) {
+        let url = url.to_string();
+        let tx = self.tx.clone();
+        // Detached worker: spawn the handler, wait for it, capture
+        // stderr, send the outcome back. We don't keep a handle —
+        // the runtime cares about the report, not the thread.
+        std::thread::spawn(move || {
+            let outcome = run_url_open(&url);
+            // Drop the report on a closed receiver — happens during
+            // shutdown when the runtime has already torn down its
+            // event loop. Nothing meaningful to do.
+            let _ = tx.send(UrlOpenReport { url, outcome });
+        });
+    }
+}
+
+/// What the runtime should do in response to a [`UrlOpenReport`].
+/// Pure data: the runtime drives the actual side effects
+/// (clipboard write) and toast construction itself, keeping this
+/// projection trivially testable.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum UrlOpenAction {
+    /// Worker reported success; just confirm to the user.
+    Confirm,
+    /// Worker reported failure; the runtime should attempt the
+    /// OSC 52 clipboard fallback and report whether it took.
+    FallbackToClipboard { error: String },
+}
+
+/// Pure projection: read a [`UrlOpenReport`] and return the action
+/// the runtime should perform. Split out from the toast construction
+/// so the side effect (writing OSC 52 to stdout) lives at a single,
+/// orchestrated call site rather than buried inside a helper that
+/// also returns a value (CQS violation).
+fn project_url_open_report(report: &UrlOpenReport) -> UrlOpenAction {
+    match &report.outcome {
+        UrlOpenOutcome::Opened => UrlOpenAction::Confirm,
+        UrlOpenOutcome::Failed { error } => UrlOpenAction::FallbackToClipboard {
+            error: error.clone(),
+        },
+    }
+}
+
+/// Pure: build the user-facing toast from the worker outcome plus
+/// whether the OSC 52 clipboard fallback succeeded. Caller decides
+/// whether (and when) to attempt the clipboard write; we just
+/// describe what happened.
+fn build_url_open_toast(url: &str, action: &UrlOpenAction, clipboard_copied: bool) -> UrlOpenToast {
+    match action {
+        UrlOpenAction::Confirm => UrlOpenToast {
+            text: format!(" ✓ opened {url} "),
+            started_at: std::time::Instant::now(),
+            success: true,
+        },
+        UrlOpenAction::FallbackToClipboard { error } => {
+            let text = if clipboard_copied {
+                format!(
+                    " ✗ {} failed ({error}) — URL copied to clipboard ",
+                    url_handler_name(),
+                )
+            } else {
+                format!(
+                    " ✗ {} failed ({error}); clipboard fallback also failed ",
+                    url_handler_name(),
+                )
+            };
+            UrlOpenToast {
+                text,
+                started_at: std::time::Instant::now(),
+                success: false,
+            }
+        }
+    }
+}
+
+/// Platform-specific name of the URL handler we tried to spawn —
+/// used purely for toast text so the user sees the actual command
+/// that failed (`xdg-open: no DISPLAY` is much more actionable than
+/// "URL handler failed").
+fn url_handler_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "start"
+    } else {
+        "xdg-open"
+    }
+}
+
+/// Synchronous worker that actually runs the OS URL handler. Lives
+/// outside [`OsUrlOpener::open`] so the spawn / wait / capture logic
+/// is testable against a stubbed-out command in the future without
+/// having to thread the `mpsc::Sender` through.
+fn run_url_open(url: &str) -> UrlOpenOutcome {
+    use std::process::{Command, Stdio};
+    let mut command = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(err) => {
+            return UrlOpenOutcome::Failed {
+                error: format!("spawn failed: {err}"),
+            };
+        }
+    };
+    match child.wait_with_output() {
+        Ok(out) if out.status.success() => UrlOpenOutcome::Opened,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let exit = out
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| format!("exit {c}"));
+            let error = if stderr.is_empty() {
+                exit
+            } else {
+                format!("{exit}: {stderr}")
+            };
+            UrlOpenOutcome::Failed { error }
+        }
+        Err(err) => UrlOpenOutcome::Failed {
+            error: format!("wait failed: {err}"),
+        },
     }
 }
 
@@ -2653,15 +2899,26 @@ fn event_loop(
     // (in the mouse handler). Cleared on resize, focused-agent change,
     // and any motion event that arrives without Ctrl held.
     let mut hover: Option<HoverUrl> = None;
+    // One-shot toast surfaced after a Ctrl+Click URL open completes.
+    // The worker thread reports `UrlOpenOutcome::Opened` or
+    // `Failed { error }` via `url_open_rx` after the OS handler exits;
+    // the runtime drains the channel each tick, falls back to OSC 52
+    // clipboard on failure, and parks a banner here for [`URL_TOAST_TTL`]
+    // before auto-dismissing.
+    let mut url_toast: Option<UrlOpenToast> = None;
     // Tracks whether mouse capture has been temporarily yielded to the
     // host terminal so the user's URL modifier can drive Ghostty's
     // (or iTerm2's, Kitty's, ...) native URL hover/click handler. See
     // the type doc for why this exists at all.
     let mut mouse_capture_state = MouseCaptureState::new(mouse_captured);
-    // Production URL opener: spawns `open` / `xdg-open` / `cmd start`.
-    // Held behind the [`UrlOpener`] trait so a future test can swap in
-    // a recording mock without spawning a real browser.
-    let url_opener: &dyn UrlOpener = &OsUrlOpener;
+    // Production URL opener: spawns `open` / `xdg-open` / `cmd start`
+    // in a worker thread, captures stderr, and reports the outcome
+    // via `url_open_rx`. Held behind the [`UrlOpener`] trait so a
+    // future test can swap in a recording mock without spawning a
+    // real browser. The channel is unbounded — one report per click,
+    // and clicks are user-paced.
+    let (url_open_tx, url_open_rx) = std::sync::mpsc::channel::<UrlOpenReport>();
+    let url_opener: &dyn UrlOpener = &OsUrlOpener { tx: url_open_tx };
     let mut spawn_counter: usize = initial_count;
     // PID of this codemux invocation, used to namespace SSH daemon
     // agent_ids so a relaunch can never collide with a still-running
@@ -2696,7 +2953,32 @@ fn event_loop(
     let mut meta_worker_target: Option<AgentId> = None;
     sync_meta_worker_target(&meta_worker, &nav, &mut meta_worker_target);
 
+    // Owns the multi-event recovery state machines (today: KKP
+    // dead-tilde; future dead-keys plug in similarly). Sits between
+    // the raw `event::read()` and the dispatcher so the loop body
+    // never has to reason about "is this a real event or part of a
+    // composition we haven't finished?".
+    let mut input_preprocessor = InputPreprocessor::default();
+
     loop {
+        // Drain URL-open outcomes from the worker threads spawned by
+        // [`OsUrlOpener::open`]. Project the report into an action
+        // (pure), perform any side effect here (OSC 52 clipboard
+        // fallback on failure), then build the toast from the
+        // outcome plus the side effect's result.
+        while let Ok(report) = url_open_rx.try_recv() {
+            let action = project_url_open_report(&report);
+            let clipboard_copied = matches!(action, UrlOpenAction::FallbackToClipboard { .. })
+                && write_clipboard_to(&mut io::stdout(), &report.url).is_ok();
+            url_toast = Some(build_url_open_toast(&report.url, &action, clipboard_copied));
+        }
+        // Auto-dismiss the toast once its TTL elapses. Cleared on
+        // the next user input too; whichever fires first wins.
+        if let Some(t) = &url_toast
+            && t.started_at.elapsed() >= URL_TOAST_TTL
+        {
+            url_toast = None;
+        }
         // Drain in-flight index events for every host (local + each
         // SSH host the user has spawned to), update states, and
         // dispatch any completed walks to a detached disk-save
@@ -2988,6 +3270,9 @@ fn event_loop(
                     modal_index_state,
                     segments,
                 );
+                if let Some(toast) = url_toast.as_ref() {
+                    render_url_toast(frame, frame.area(), toast);
+                }
             })
             .wrap_err("draw frame")?;
 
@@ -3020,7 +3305,16 @@ fn event_loop(
             continue;
         }
 
-        match event::read().wrap_err("read input")? {
+        let raw_event = event::read().wrap_err("read input")?;
+        // Hand the raw event through the pre-processor. `None` means
+        // the event was consumed (e.g. the dead-tilde half of a
+        // `~ + space` gesture); `Some(e)` is the event the
+        // dispatcher should see — either passed through or
+        // synthesized.
+        let Some(raw_event) = input_preprocessor.process(raw_event) else {
+            continue;
+        };
+        match raw_event {
             // Bare-modifier press/release (e.g. Cmd alone) drives the
             // URL-yield state machine: while held, codemux releases mouse
             // capture so the host terminal can run its native URL UX. The
@@ -3641,9 +3935,7 @@ fn event_loop(
                             && let Some(span) =
                                 compute_hover(&pane_hitbox, &nav.agents, column, row)
                         {
-                            if let Err(err) = url_opener.open(&span.url) {
-                                tracing::debug!(?err, url = %span.url, "URL opener failed");
-                            }
+                            url_opener.open(&span.url);
                             let transition = update_hover(&mut hover, Some(span));
                             if let Err(err) = apply_hover_cursor(&mut io::stdout(), transition) {
                                 tracing::debug!(?err, "hover cursor update failed");
@@ -4009,6 +4301,26 @@ fn render_agent_pane(
             let offset = parser.screen().scrollback();
             if offset > 0 {
                 render_scroll_indicator(frame, area, offset);
+            } else {
+                // Project the inner PTY's cursor onto the host
+                // terminal's real cursor so OS dead-key previews
+                // (intl-layout `~` / `'` / etc. that the terminal
+                // overlays at the cursor while waiting for the
+                // composing key) land where Claude is actually
+                // accepting input — not at the rightmost edge of
+                // whatever ratatui wrote last. Skipped while the
+                // user is scrolled back: the live cursor is off-
+                // screen, and pinning it to a virtual cell would
+                // mislead. Modals (spawn / help) call
+                // `set_cursor_position` after this, overriding.
+                let (vt_row, vt_col) = parser.screen().cursor_position();
+                let cursor_x = area.x.saturating_add(vt_col);
+                let cursor_y = area.y.saturating_add(vt_row);
+                if cursor_x < area.x.saturating_add(area.width)
+                    && cursor_y < area.y.saturating_add(area.height)
+                {
+                    frame.set_cursor_position((cursor_x, cursor_y));
+                }
             }
         }
         AgentState::Crashed { parser, exit_code } => {
@@ -4332,6 +4644,44 @@ fn paint_hover_url_if_active(
 /// `"d"` or `"ctrl+x"`), resolved by the orchestration layer rather
 /// than the renderer. Keeps `&Bindings` out of the render path so
 /// the renderer stays decoupled from input config.
+/// One-row banner at the top of the screen that surfaces the result
+/// of a Ctrl+Click URL open. Success uses an inverse cyan accent so
+/// it reads as confirmation; failure uses the same red background as
+/// [`render_crash_banner`] so the user immediately knows the open
+/// didn't take and the (already-effected) clipboard fallback was the
+/// best codemux could do.
+///
+/// Auto-dismissed after [`URL_TOAST_TTL`] in the event loop; this
+/// renderer is a pure projection of `toast` and runs every frame
+/// while the toast is live.
+fn render_url_toast(frame: &mut Frame<'_>, area: Rect, toast: &UrlOpenToast) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let banner_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    let style = if toast.success {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    };
+    let widget = Paragraph::new(Line::raw(toast.text.clone()))
+        .alignment(Alignment::Left)
+        .style(style);
+    frame.render_widget(Clear, banner_area);
+    frame.render_widget(widget, banner_area);
+}
+
 fn render_crash_banner(frame: &mut Frame<'_>, area: Rect, exit_code: i32, dismiss_label: &str) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -8733,6 +9083,110 @@ mod tests {
             .collect::<String>()
     }
 
+    /// Toast `TestBackend` tests. Render `render_url_toast` against
+    /// an 80x24 buffer and assert: text content lands on row 0,
+    /// success uses cyan bg, failure uses red bg.
+    #[test]
+    fn render_url_toast_success_paints_cyan_top_row() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let toast = UrlOpenToast {
+            text: " ✓ opened https://example.com ".to_string(),
+            started_at: std::time::Instant::now(),
+            success: true,
+        };
+        terminal
+            .draw(|frame| {
+                render_url_toast(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &toast,
+                );
+            })
+            .unwrap();
+        let row = top_row_text(&terminal);
+        assert!(
+            row.contains("opened https://example.com"),
+            "toast text missing from top row: {row:?}",
+        );
+        let buf = terminal.backend().buffer();
+        // The first cell of the row should carry the success cyan bg.
+        assert_eq!(buf[(0, 0)].bg, Color::Cyan);
+        assert_eq!(buf[(0, 0)].fg, Color::Black);
+    }
+
+    #[test]
+    fn render_url_toast_failure_paints_red_top_row() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let toast = UrlOpenToast {
+            text: " ✗ xdg-open failed (no DISPLAY) — copied ".to_string(),
+            started_at: std::time::Instant::now(),
+            success: false,
+        };
+        terminal
+            .draw(|frame| {
+                render_url_toast(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &toast,
+                );
+            })
+            .unwrap();
+        let row = top_row_text(&terminal);
+        assert!(
+            row.contains("xdg-open failed"),
+            "toast text missing from top row: {row:?}",
+        );
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(0, 0)].bg, Color::Red);
+        assert_eq!(buf[(0, 0)].fg, Color::White);
+    }
+
+    /// Zero-area Rect must short-circuit cleanly — no panic, no
+    /// rendering. Guards the early-return branch in
+    /// `render_url_toast`.
+    #[test]
+    fn render_url_toast_zero_area_is_a_noop() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let toast = UrlOpenToast {
+            text: "  ignored  ".to_string(),
+            started_at: std::time::Instant::now(),
+            success: true,
+        };
+        terminal
+            .draw(|frame| {
+                render_url_toast(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                    &toast,
+                );
+            })
+            .unwrap();
+        // Top row must remain blank — toast was a no-op.
+        let row = top_row_text(&terminal);
+        assert!(
+            row.trim().is_empty(),
+            "zero-area toast must not paint: {row:?}",
+        );
+    }
+
     #[test]
     fn render_agent_pane_paints_red_banner_for_nonzero_exit_code() {
         let backend = TestBackend::new(80, 24);
@@ -9956,20 +10410,165 @@ mod tests {
             calls: RefCell<Vec<String>>,
         }
         impl UrlOpener for Recorder {
-            fn open(&self, url: &str) -> io::Result<()> {
+            fn open(&self, url: &str) {
                 self.calls.borrow_mut().push(url.to_string());
-                Ok(())
             }
         }
         let r = Recorder {
             calls: RefCell::new(Vec::new()),
         };
         let opener: &dyn UrlOpener = &r;
-        opener.open("https://example.com").unwrap();
-        opener.open("https://second.example").unwrap();
+        opener.open("https://example.com");
+        opener.open("https://second.example");
         assert_eq!(
             r.calls.borrow().as_slice(),
             &["https://example.com", "https://second.example"],
+        );
+    }
+
+    fn dead_tilde_release() -> Event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('`'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::empty(),
+        })
+    }
+
+    fn space_press() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()))
+    }
+
+    fn char_press(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+    }
+
+    #[test]
+    fn input_preprocessor_passes_through_unrelated_events() {
+        let mut p = InputPreprocessor::default();
+        let out = p.process(char_press('a'));
+        assert!(matches!(out, Some(Event::Key(k)) if k.code == KeyCode::Char('a')));
+        assert!(!p.pending_dead_tilde);
+    }
+
+    #[test]
+    fn input_preprocessor_drops_dead_tilde_release_and_arms() {
+        let mut p = InputPreprocessor::default();
+        let out = p.process(dead_tilde_release());
+        assert!(out.is_none(), "dead-tilde release must not be dispatched");
+        assert!(p.pending_dead_tilde, "the next space must be expected");
+    }
+
+    #[test]
+    fn input_preprocessor_synthesizes_tilde_when_armed_and_space_arrives() {
+        let mut p = InputPreprocessor::default();
+        p.process(dead_tilde_release());
+        let out = p.process(space_press());
+        match out {
+            Some(Event::Key(k)) => {
+                assert_eq!(k.code, KeyCode::Char('~'));
+                assert_eq!(k.kind, KeyEventKind::Press);
+                assert!(k.modifiers.is_empty());
+            }
+            other => panic!("expected synthesized Char('~') Press, got {other:?}"),
+        }
+        assert!(
+            !p.pending_dead_tilde,
+            "synthesizing the tilde must clear the arm",
+        );
+    }
+
+    #[test]
+    fn input_preprocessor_clears_arm_on_intervening_event() {
+        let mut p = InputPreprocessor::default();
+        p.process(dead_tilde_release());
+        // User pressed something other than the composing space:
+        // the dead-tilde is treated as a no-op and the new key
+        // dispatches normally.
+        let out = p.process(char_press('a'));
+        assert!(matches!(out, Some(Event::Key(k)) if k.code == KeyCode::Char('a')));
+        assert!(!p.pending_dead_tilde);
+    }
+
+    #[test]
+    fn input_preprocessor_does_not_swallow_space_when_not_armed() {
+        let mut p = InputPreprocessor::default();
+        let out = p.process(space_press());
+        assert!(matches!(out, Some(Event::Key(k)) if k.code == KeyCode::Char(' ')));
+    }
+
+    #[test]
+    fn project_url_open_report_opened_yields_confirm() {
+        let report = UrlOpenReport {
+            url: "https://example.com".to_string(),
+            outcome: UrlOpenOutcome::Opened,
+        };
+        assert_eq!(project_url_open_report(&report), UrlOpenAction::Confirm);
+    }
+
+    #[test]
+    fn project_url_open_report_failed_yields_fallback_with_error() {
+        let report = UrlOpenReport {
+            url: "https://example.com".to_string(),
+            outcome: UrlOpenOutcome::Failed {
+                error: "exit 3: no display".to_string(),
+            },
+        };
+        assert_eq!(
+            project_url_open_report(&report),
+            UrlOpenAction::FallbackToClipboard {
+                error: "exit 3: no display".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn build_url_open_toast_confirm_returns_success_with_url() {
+        let toast = build_url_open_toast("https://example.com", &UrlOpenAction::Confirm, false);
+        assert!(toast.success);
+        assert!(
+            toast.text.contains("https://example.com"),
+            "toast text must reference the URL: {}",
+            toast.text,
+        );
+        assert!(toast.text.contains("opened"));
+    }
+
+    #[test]
+    fn build_url_open_toast_fallback_with_clipboard_success() {
+        let action = UrlOpenAction::FallbackToClipboard {
+            error: "exit 3: no display".to_string(),
+        };
+        let toast = build_url_open_toast("https://example.com", &action, true);
+        assert!(!toast.success);
+        assert!(
+            toast.text.contains(url_handler_name()),
+            "toast must name the handler that failed: {}",
+            toast.text,
+        );
+        assert!(
+            toast.text.contains("exit 3: no display"),
+            "toast must surface the captured stderr: {}",
+            toast.text,
+        );
+        assert!(
+            toast.text.contains("copied to clipboard"),
+            "successful clipboard fallback must be acknowledged: {}",
+            toast.text,
+        );
+    }
+
+    #[test]
+    fn build_url_open_toast_fallback_with_clipboard_failure_says_so() {
+        let action = UrlOpenAction::FallbackToClipboard {
+            error: "exit 3: no display".to_string(),
+        };
+        let toast = build_url_open_toast("https://example.com", &action, false);
+        assert!(!toast.success);
+        assert!(
+            toast.text.contains("clipboard fallback also failed"),
+            "user must see that the second-line fallback didn't take: {}",
+            toast.text,
         );
     }
 

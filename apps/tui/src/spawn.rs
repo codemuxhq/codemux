@@ -91,7 +91,13 @@ use crate::index_worker::{IndexState, IndexedDir, ProjectKind};
 use crate::keymap::{ModalAction, ModalBindings};
 use crate::ssh_config::load_ssh_hosts;
 
-const WILDMENU_ROWS: u16 = 4;
+/// Total rows reserved at the bottom of the screen for the wildmenu
+/// strip. The top row of those is the border, so the actual visible
+/// candidate rows are `WILDMENU_ROWS - 1` (see [`wildmenu_view`] for
+/// the use of the `usable` window). Tuned to comfortably show ~6
+/// candidates without dominating the screen on a typical terminal —
+/// scroll-into-view kicks in past that.
+const WILDMENU_ROWS: u16 = 7;
 const STRIP_ROWS: u16 = WILDMENU_ROWS + 1;
 const MAX_COMPLETIONS: usize = 8;
 /// Cap on fuzzy-mode wildmenu candidates returned per query. The
@@ -387,6 +393,24 @@ pub struct SpawnMinibuffer {
     /// wildmenu so the user can see results are "in flight" without
     /// the menu blanking. No effect outside Fuzzy + Path mode.
     filtered_stale: bool,
+    /// Set to `true` for the duration of one frame after Tab/Enter
+    /// descends into a folder via [`Self::apply_path_completion`].
+    /// Drives a momentary visual: the freshly-picked leaf folder
+    /// renders in cyan/bold WITHOUT its trailing `/`, confirming
+    /// the pick. Cleared at the top of the next [`Self::handle`]
+    /// call so the very next arrow / keystroke flips back to the
+    /// usual nav-mode rendering (default style, slash visible).
+    just_descended: bool,
+    /// Set when an `enter_navigation_mode_with_seed('~', _)` was
+    /// triggered by a tilde *variant* (combining tilde U+0303 or
+    /// modifier-letter small tilde U+02DC) — i.e. the OS / terminal
+    /// did not compose a literal `~` from the user's intl-layout
+    /// dead key. The very next Char event is almost always the
+    /// composing space; we swallow it so the user doesn't end up
+    /// with `~/ ` (a literal space appended to the seeded home).
+    /// Cleared at the top of the next [`Self::handle`] call so a
+    /// later space has no special meaning.
+    tilde_compose_armed: bool,
 }
 
 impl SpawnMinibuffer {
@@ -426,6 +450,8 @@ impl SpawnMinibuffer {
             named_projects,
             project_hosts,
             filtered_stale: false,
+            just_descended: false,
+            tilde_compose_armed: false,
         };
         if default_mode == SearchMode::Precise {
             m.seed_path_with_cwd();
@@ -590,6 +616,15 @@ impl SpawnMinibuffer {
             };
         }
 
+        // One-frame visual flags. `just_descended` clears here so any
+        // keystroke flips the prompt back to default rendering;
+        // `apply_path_completion` re-sets it on the way out for the
+        // descend gesture itself. `tilde_compose_armed` is captured
+        // and cleared so the Char arm below can read it once.
+        self.just_descended = false;
+        let tilde_armed_before = self.tilde_compose_armed;
+        self.tilde_compose_armed = false;
+
         // Named Ctrl-keyed actions (default ToggleSearchMode = ctrl+t,
         // RefreshIndex = ctrl+r) need to escape the generic Ctrl
         // early-exit just below — that exit drops every Ctrl key the
@@ -666,19 +701,52 @@ impl SpawnMinibuffer {
 
         match key.code {
             KeyCode::Char(c) => {
-                // Auto-enter navigation: typing `/` or `~` from an
-                // empty fuzzy query is a "I want to navigate by path"
-                // gesture. Switch to Precise mode and seed the path
-                // field at root (`/`) or the (local or remote) `$HOME`
+                // Intl dead-key compose: when the previous Char was
+                // a tilde *variant* (combining or modifier-letter
+                // tilde — produced by uncomposed dead-key input),
+                // the OS / terminal commonly delivers the composing
+                // space as the next event. Swallow it so the user
+                // who just typed `~ + space` to mean a literal `~`
+                // doesn't end up with a stray space appended to the
+                // seeded `~/`. Cleared above; one-shot.
+                if tilde_armed_before && c == ' ' {
+                    return ModalOutcome::None;
+                }
+                // Auto-enter navigation: typing `/` or `~` against a
+                // fresh path field is the "I want to navigate by
+                // path" gesture. Switch to Precise mode and seed the
+                // path at root (`/`) or the (local or remote) `$HOME`
                 // (`~`). The user's preferred mode is preserved
-                // (`user_search_mode` is not touched), so the next
-                // modal open returns to Fuzzy.
-                if self.focused == Zone::Path
-                    && self.search_mode == SearchMode::Fuzzy
-                    && self.fuzzy_query.is_empty()
-                    && (c == '/' || c == '~')
-                {
-                    self.enter_navigation_mode_with_seed(c, lister);
+                // (`user_search_mode` is not touched).
+                //
+                // "Fresh" depends on the active engine:
+                //   - Fuzzy: the typed query is empty.
+                //   - Precise: the path is empty OR still the auto-
+                //     seeded cwd (the modal just opened, the user
+                //     hasn't edited). User-typed paths preserve `~`
+                //     as a literal char so power users can build a
+                //     path containing `~` if they really want to.
+                //
+                // Tilde recognition is broadened to the unicode
+                // variants intl layouts emit when dead-key composition
+                // doesn't fire (combining tilde U+0303, modifier-letter
+                // small tilde U+02DC). On hit, we also arm
+                // `tilde_compose_armed` so the next-event space (the
+                // composing key) gets swallowed instead of polluting
+                // the seeded path.
+                let is_tilde_variant = matches!(c, '~' | '\u{02DC}' | '\u{0303}');
+                let path_is_initial = match self.search_mode {
+                    SearchMode::Fuzzy => self.fuzzy_query.is_empty(),
+                    SearchMode::Precise => {
+                        self.path.is_empty() || self.path_origin == PathOrigin::AutoSeeded
+                    }
+                };
+                if self.focused == Zone::Path && path_is_initial && (c == '/' || is_tilde_variant) {
+                    let trigger = if c == '/' { '/' } else { '~' };
+                    self.enter_navigation_mode_with_seed(trigger, lister);
+                    if c != '~' && is_tilde_variant {
+                        self.tilde_compose_armed = true;
+                    }
                     return ModalOutcome::None;
                 }
                 if self.focused == Zone::Path {
@@ -779,14 +847,35 @@ impl SpawnMinibuffer {
     /// Cancel handler. Esc in the host zone is "back" — switch to the
     /// path zone and re-seed the cwd if the path field was previously
     /// cleared (the `@`-into-host clear, or the user backspaced it
-    /// to nothing). Esc in the path zone closes the modal entirely.
+    /// to nothing).
+    ///
+    /// Esc in the path zone (Precise mode) is "back out of
+    /// search/selection": if a wildmenu row is highlighted OR the
+    /// path has characters typed after the last `/` (search mode),
+    /// one Esc clears both — selection drops, filter chars truncate
+    /// to the last `/` so the wildmenu falls back to nav mode at the
+    /// current dir. A second Esc (with nothing left to clear) closes
+    /// the modal. In Fuzzy mode and the no-selection-no-filter case,
+    /// Esc closes immediately.
     fn cancel(&mut self, lister: &mut DirLister<'_>) -> ModalOutcome {
         if self.focused == Zone::Host {
             self.transition_to_path_zone(lister);
-            ModalOutcome::None
-        } else {
-            ModalOutcome::Cancel
+            return ModalOutcome::None;
         }
+        if self.search_mode == SearchMode::Precise {
+            let has_filter = !self.path.is_empty() && !self.path.ends_with('/');
+            if self.selected.is_some() || has_filter {
+                if has_filter {
+                    let truncate_to = self.path.rfind('/').map_or(0, |i| i + 1);
+                    self.path.truncate(truncate_to);
+                    self.path_origin = PathOrigin::UserTyped;
+                }
+                self.selected = None;
+                self.refresh(lister);
+                return ModalOutcome::None;
+            }
+        }
+        ModalOutcome::Cancel
     }
 
     /// Tab dispatch. Behavior depends on the focused zone:
@@ -827,15 +916,15 @@ impl SpawnMinibuffer {
         }
     }
 
-    /// Tab in the path zone applies the highlighted wildmenu
-    /// candidate. The first Tab applies the basename WITHOUT the
-    /// trailing `/` so the wildmenu doesn't immediately descend into
-    /// the folder — matching zsh / fish autocomplete: the first Tab
-    /// confirms what you picked, then you descend either by typing
-    /// `/` yourself or by hitting Tab again. The second Tab is
-    /// detected by `path == candidate-without-slash` and applies the
-    /// candidate WITH the slash, which makes `refresh` list the
-    /// folder's contents.
+    /// Tab/Enter in the path zone applies the highlighted wildmenu
+    /// candidate as a one-step descend: the candidate (which already
+    /// carries its trailing `/` from [`path_completions`]) becomes
+    /// the new path, the selection is cleared, and the next refresh
+    /// lists the new directory's children with no preselected row —
+    /// the user is now navigating inside the picked folder. From
+    /// here, typing chars enters search mode (auto-selects the first
+    /// match); pressing Enter again with no selection spawns at the
+    /// current path.
     ///
     /// No-op when nothing is selected — the user can hit Down to
     /// start cycling, or just type a prefix which auto-highlights
@@ -844,19 +933,18 @@ impl SpawnMinibuffer {
         if let Some(idx) = self.selected
             && let Some(candidate) = self.filtered.get(idx).cloned()
         {
-            let trimmed = candidate.strip_suffix('/').unwrap_or(&candidate);
-            self.path = if self.path == trimmed {
-                // Second Tab on the same folder → descend.
-                candidate
-            } else {
-                // First Tab → apply without trailing slash so the
-                // wildmenu stays at the same level.
-                trimmed.to_string()
-            };
-            // Tab-applying a completion is an explicit user choice;
-            // the seeded cwd is no longer the literal value in the
-            // field, so the auto-seeded marker no longer applies.
+            self.path = candidate;
+            self.selected = None;
+            // Tab/Enter-applying a completion is an explicit user
+            // choice; the seeded cwd is no longer the literal value
+            // in the field, so the auto-seeded marker no longer
+            // applies.
             self.path_origin = PathOrigin::UserTyped;
+            // Momentary "you just landed at this folder" cue. The
+            // top of `handle` clears this flag, so the next arrow
+            // / keystroke flips the prompt back to the usual nav
+            // rendering (default style, slash visible).
+            self.just_descended = true;
             self.refresh(lister);
         }
     }
@@ -924,6 +1012,25 @@ impl SpawnMinibuffer {
             // used everywhere else).
             self.host.clear();
             self.transition_to_path_zone(lister);
+            return ModalOutcome::None;
+        }
+
+        // Path zone + Precise mode + a highlighted wildmenu pick:
+        // descend into the picked folder, don't spawn. The user must
+        // press Enter again (with no selection) to commit at the
+        // current path. Decoupling navigate-from-spawn this way means
+        // a confident Tab-then-Enter rhythm walks the tree instead
+        // of silently committing at whatever level the user happened
+        // to be when the autocomplete fired.
+        //
+        // Fuzzy mode keeps the historical "Enter applies the
+        // highlight then spawns" semantics — there's no concept of
+        // "descend into" a fuzzy hit.
+        if self.focused == Zone::Path
+            && self.search_mode == SearchMode::Precise
+            && self.selected.is_some()
+        {
+            self.apply_path_completion(lister);
             return ModalOutcome::None;
         }
 
@@ -1111,11 +1218,21 @@ impl SpawnMinibuffer {
         // entry would silently commit it on Enter. Once they type a prefix,
         // the first match is highlighted as you'd expect from any
         // autocomplete.
-        self.selected = if self.filtered.is_empty() || self.current_field().is_empty() {
-            None
-        } else {
-            Some(0)
-        };
+        //
+        // Precise + Path also treats "input ends with `/`" as nav mode:
+        // the wildmenu shows the children of that directory but no row
+        // is preselected, because the user hasn't started narrowing yet.
+        // Selection only auto-arms when chars are typed AFTER the last
+        // `/` (search mode). Down/Up still arms a selection manually.
+        let nav_mode_no_select = self.focused == Zone::Path
+            && self.search_mode == SearchMode::Precise
+            && self.path.ends_with('/');
+        self.selected =
+            if self.filtered.is_empty() || self.current_field().is_empty() || nav_mode_no_select {
+                None
+            } else {
+                Some(0)
+            };
     }
 
     /// Toggle the path zone between Fuzzy and Precise. Updates the
@@ -1298,6 +1415,73 @@ impl SpawnMinibuffer {
             wildmenu_area,
         );
         frame.render_widget(self.prompt_view(bindings), prompt_area);
+
+        // Position the real terminal cursor at the prompt's input
+        // position so OS dead-key previews (e.g. the small `~` an
+        // intl layout draws while waiting for the composing space)
+        // land where the user is typing — not at the rightmost edge
+        // of the prompt line, where ratatui would otherwise leave
+        // the cursor after the hint span. Skipped while the path
+        // zone is locked for bootstrap (no input is accepted there).
+        if self.bootstrap_view.is_none() {
+            let offset = self.prompt_cursor_offset();
+            let cursor_x = prompt_area.x.saturating_add(offset).min(
+                prompt_area
+                    .x
+                    .saturating_add(prompt_area.width)
+                    .saturating_sub(1),
+            );
+            frame.set_cursor_position((cursor_x, prompt_area.y));
+        }
+    }
+
+    /// Column offset of the input cursor within the prompt row,
+    /// measured from the row's start. Mirrors the span ordering in
+    /// [`Self::prompt_view`]: `label` + `@` + `host_zone` + ` : ` +
+    /// `path_zone`, with the cursor sitting at the end of whichever
+    /// zone is focused (or at the first placeholder char when that
+    /// zone is empty — matching `zone_spans`'s overlay behavior).
+    ///
+    /// Used by [`Self::render`] to drive `frame.set_cursor_position`
+    /// so dead-key previews land at the input position.
+    fn prompt_cursor_offset(&self) -> u16 {
+        // Fixed prefix: "spawn: " / "find:  " (both 7 ASCII bytes /
+        // chars) followed by `@` (1).
+        let mut x: u16 = 7 + 1;
+
+        // Host zone width: cursor on first placeholder char when
+        // focused-and-empty; cursor at end of value otherwise.
+        if self.focused == Zone::Host && self.host.is_empty() {
+            return x;
+        }
+        let host_width = if self.host.is_empty() {
+            u16::try_from(HOST_PLACEHOLDER.chars().count()).unwrap_or(u16::MAX)
+        } else {
+            u16::try_from(self.host.chars().count()).unwrap_or(u16::MAX)
+        };
+        x = x.saturating_add(host_width);
+        if self.focused == Zone::Host {
+            return x;
+        }
+
+        // Separator ` : ` (3 chars).
+        x = x.saturating_add(3);
+
+        // Path zone. Honors the same `just_descended` trim as
+        // `prompt_view` so the cursor lands at the visible
+        // (slash-stripped) end of the path that frame.
+        let path_text = if self.search_mode == SearchMode::Fuzzy && self.focused == Zone::Path {
+            self.fuzzy_query.as_str()
+        } else if self.just_descended && self.focused == Zone::Path && self.path.ends_with('/') {
+            &self.path[..self.path.len() - 1]
+        } else {
+            self.path.as_str()
+        };
+        if path_text.is_empty() && self.focused == Zone::Path {
+            return x;
+        }
+        let path_width = u16::try_from(path_text.chars().count()).unwrap_or(u16::MAX);
+        x.saturating_add(path_width)
     }
 
     fn wildmenu_view(&self, width: usize, index: Option<&IndexState>) -> Paragraph<'_> {
@@ -1385,13 +1569,30 @@ impl SpawnMinibuffer {
         // so arrow/Enter stays unambiguous. Only relevant in Fuzzy
         // + Path mode — `filtered_stale` is never set otherwise.
         let stale = fuzzy && zone == Zone::Path && self.filtered_stale;
+        // Precise + Path uses search-mode rendering (full candidate
+        // path, parent dim + leaf cyan/bold) when the user has
+        // typed chars after the last `/`. Nav mode (path ends `/`
+        // or empty) keeps the basename-only rendering — the parent
+        // context already lives in the prompt above.
+        let precise_search =
+            !fuzzy && zone == Zone::Path && !self.path.is_empty() && !self.path.ends_with('/');
+        // Scroll-into-view: when the selection is past the bottom of
+        // the visible window, slide the start so the selected row sits
+        // at the last visible position. `enumerate` runs BEFORE `skip`
+        // so each row's `i` is its absolute index in `self.filtered`,
+        // which keeps the `is_selected` check correct.
+        let scroll = wildmenu_scroll_offset(self.selected, usable);
         let lines: Vec<Line> = self
             .filtered
             .iter()
-            .take(usable)
             .enumerate()
+            .skip(scroll)
+            .take(usable)
             .map(|(i, c)| {
                 let is_selected = Some(i) == self.selected;
+                if precise_search {
+                    return precise_search_row(c, is_selected, width);
+                }
                 let marker = if is_selected { " ▸ " } else { "   " };
                 let mut line_style = if is_selected {
                     Style::default()
@@ -1406,7 +1607,7 @@ impl SpawnMinibuffer {
                 }
                 // In fuzzy mode the full path *is* the signal — basename
                 // alone strips the directory context that the user is
-                // searching for. Precise / Host modes keep the existing
+                // searching for. Precise nav and Host modes keep the
                 // basename-or-literal display.
                 let display_str = if fuzzy && zone == Zone::Path {
                     c.clone()
@@ -1553,11 +1754,26 @@ impl SpawnMinibuffer {
         // placeholder flips with the mode so the empty state reads
         // either `<find>` or `<cwd>` depending on what Enter would
         // commit.
+        //
+        // Just-descended override: for the one frame after Tab/Enter
+        // descended into a folder, render the path WITHOUT its
+        // trailing `/` by slicing one byte off the end (the trailing
+        // `/` is always single-byte ASCII). `zone_spans` then splits
+        // at the next-to-last `/` and shows the freshly-picked leaf
+        // folder in cyan/bold, confirming the pick. `self.path`
+        // keeps the slash so refresh continues to list children —
+        // this is purely a render-time transform.
+        let path_after_trim =
+            if self.just_descended && self.focused == Zone::Path && self.path.ends_with('/') {
+                &self.path[..self.path.len() - 1]
+            } else {
+                self.path.as_str()
+            };
         let (path_text, path_placeholder) =
             if self.search_mode == SearchMode::Fuzzy && self.focused == Zone::Path {
                 (self.fuzzy_query.as_str(), FUZZY_PLACEHOLDER)
             } else {
-                (self.path.as_str(), PATH_PLACEHOLDER)
+                (path_after_trim, PATH_PLACEHOLDER)
             };
         spans.extend(zone_spans(
             self.focused == Zone::Path,
@@ -1623,13 +1839,14 @@ impl SpawnMinibuffer {
 
 /// Build the spans for one zone of the prompt.
 ///
-/// Placeholder semantics: when `value` is empty, render `placeholder` in
-/// dim style. When focused, the cursor overlays the FIRST character of the
-/// placeholder — like a terminal block cursor sits ON the next character
-/// to be typed (vim, emacs, the standard `█` in shells), not beside it.
-/// So `local` becomes `█ocal` with a cyan block where the `l` would be.
-/// Real input gets the focused/non-focused value style and the cursor at
-/// the end, where typing extends it.
+/// Placeholder semantics: when `value` is empty, render the full
+/// `placeholder` in dim style. When focused, the real terminal
+/// cursor — positioned by the caller via `frame.set_cursor_position`
+/// — sits over the first placeholder character so OS dead-key
+/// previews land at the right spot. We deliberately do NOT render a
+/// `█` glyph here: doing so duplicated the cursor visually and (on
+/// some terminals) the block drew over the placeholder's first
+/// character, leaving e.g. `find>` instead of `<find>`.
 ///
 /// `highlight_basename` is true for the path zone: when the value is
 /// non-empty, focused, and contains a `/`, only the trailing component
@@ -1650,33 +1867,26 @@ impl SpawnMinibuffer {
 /// `Span`s can borrow from both. ratatui is immediate-mode and redraws on
 /// every event/tick, so we deliberately avoid `to_string()` /
 /// `chars().collect()` allocations on the render path.
+///
+/// `cursor_style` is currently unused (kept in the signature so call
+/// sites don't churn while the cursor strategy is in flux); the
+/// terminal cursor inherits whatever attrs the host emulator applies.
 fn zone_spans<'a>(
     focused: bool,
     value: &'a str,
     placeholder: &'a str,
     placeholder_style: Style,
-    cursor_style: Style,
+    _cursor_style: Style,
     highlight_basename: bool,
     unfocused_value_style: Style,
 ) -> Vec<Span<'a>> {
-    const CURSOR: &str = "█";
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(2);
     if value.is_empty() {
-        if focused {
-            out.push(Span::styled(CURSOR, cursor_style));
-            // Drop the first char without allocating: advance the iterator
-            // and re-borrow what's left as a `&str` slice. Direct
-            // `&placeholder[1..]` would panic on multi-byte first chars.
-            let mut chars = placeholder.chars();
-            chars.next();
-            let rest = chars.as_str();
-            if !rest.is_empty() {
-                out.push(Span::styled(rest, placeholder_style));
-            }
-        } else {
-            out.push(Span::styled(placeholder, placeholder_style));
-        }
-    } else {
+        out.push(Span::styled(placeholder, placeholder_style));
+    } else if focused
+        && highlight_basename
+        && let Some(slash) = value.rfind('/')
+    {
         // Path basename split: when focused on the path zone and the
         // value has at least one `/`, render the parent prefix
         // (including the trailing slash) in the default style and
@@ -1684,27 +1894,19 @@ fn zone_spans<'a>(
         // returns a byte index; `/` is a single byte in UTF-8 so
         // `slash + 1` is always a valid char boundary regardless of
         // any multi-byte chars elsewhere in the path.
-        if focused
-            && highlight_basename
-            && let Some(slash) = value.rfind('/')
-        {
-            let split = slash + 1;
-            let (prefix, tail) = value.split_at(split);
-            out.push(Span::styled(prefix, Style::default()));
-            if !tail.is_empty() {
-                out.push(Span::styled(tail, focused_value_style()));
-            }
+        let split = slash + 1;
+        let (prefix, tail) = value.split_at(split);
+        out.push(Span::styled(prefix, Style::default()));
+        if !tail.is_empty() {
+            out.push(Span::styled(tail, focused_value_style()));
+        }
+    } else {
+        let style = if focused {
+            focused_value_style()
         } else {
-            let style = if focused {
-                focused_value_style()
-            } else {
-                unfocused_value_style
-            };
-            out.push(Span::styled(value, style));
-        }
-        if focused {
-            out.push(Span::styled(CURSOR, cursor_style));
-        }
+            unfocused_value_style
+        };
+        out.push(Span::styled(value, style));
     }
     out
 }
@@ -2141,6 +2343,24 @@ fn delete_word_backward(s: &mut String) {
     }
 }
 
+/// Compute how many leading rows to skip in the wildmenu so the
+/// selected candidate stays visible inside a window of `usable`
+/// rows. Returns 0 when no row is selected or when the selection is
+/// already inside the first `usable` rows; otherwise slides the
+/// start forward so the selected row lands at the last visible
+/// position.
+///
+/// Works in tandem with `enumerate().skip(scroll).take(usable)` in
+/// the wildmenu render — `enumerate` runs first so each row keeps
+/// its absolute index for the `is_selected` check.
+#[must_use]
+fn wildmenu_scroll_offset(selected: Option<usize>, usable: usize) -> usize {
+    let Some(sel) = selected else {
+        return 0;
+    };
+    sel.saturating_sub(usable.saturating_sub(1))
+}
+
 /// Pick the wildmenu display text for a candidate. Path-zone
 /// candidates collapse to the leaf folder (`apps/`) because the path
 /// field already shows the parent context; host-zone candidates show
@@ -2151,6 +2371,60 @@ fn wildmenu_display_text(zone: Zone, candidate: &str) -> String {
     match zone {
         Zone::Path => basename_for_display(candidate),
         Zone::Host => candidate.to_string(),
+    }
+}
+
+/// Build a wildmenu row for a Precise + Path candidate while the
+/// user is in *search mode* (typing chars after the last `/`). The
+/// full candidate path is shown so the user can confirm which
+/// directory the autocomplete is offering, with the parent prefix
+/// dimmed and the leaf folder rendered in cyan/bold so the eye lands
+/// on the part being filtered.
+///
+/// Selected rows skip the parent/leaf split and render as a single
+/// span with the modal's cyan-bg highlight — uniform background
+/// reads as "this is the active pick" without competing colors.
+fn precise_search_row(candidate: &str, is_selected: bool, width: usize) -> Line<'static> {
+    let marker = if is_selected { " ▸ " } else { "   " };
+    let clipped = clip_middle(candidate, width.saturating_sub(3));
+    if is_selected {
+        let style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        return Line::styled(format!("{marker}{clipped}"), style);
+    }
+    // Strip the candidate's own trailing `/` (if any) before locating
+    // the parent slash so the rsplit hits the leaf's parent — not the
+    // dir's terminator — then re-attach the slash to the leaf.
+    let stem = clipped.strip_suffix('/').unwrap_or(&clipped);
+    let suffix = if clipped.ends_with('/') { "/" } else { "" };
+    if let Some(slash) = stem.rfind('/') {
+        let split = slash + 1;
+        let (parent, leaf) = stem.split_at(split);
+        Line::from(vec![
+            Span::raw(marker.to_string()),
+            Span::styled(
+                parent.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                format!("{leaf}{suffix}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(marker.to_string()),
+            Span::styled(
+                clipped,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
     }
 }
 
@@ -2270,6 +2544,8 @@ mod tests {
             named_projects: Vec::new(),
             project_hosts: HashMap::new(),
             filtered_stale: false,
+            just_descended: false,
+            tilde_compose_armed: false,
         };
         m.refresh(&mut local());
         m
@@ -2283,13 +2559,49 @@ mod tests {
         assert_eq!(m.path, "/tmp");
     }
 
+    /// Esc in the path zone closes the modal when there's nothing
+    /// left to "back out of": no wildmenu selection, and the path is
+    /// in nav mode (ends with `/` or is empty). The two-step
+    /// "clear-search-then-close" behavior is covered by the
+    /// `esc_clears_*` tests further down.
     #[test]
-    fn esc_returns_cancel() {
-        let mut m = mb("", "/tmp", Zone::Path, &[]);
+    fn esc_in_nav_mode_with_no_selection_closes_modal() {
+        let mut m = mb("", "/tmp/", Zone::Path, &[]);
+        m.selected = None;
         assert_eq!(
             m.handle(&key(KeyCode::Esc), &b(), &mut local()),
             ModalOutcome::Cancel
         );
+    }
+
+    /// Esc in the path zone with filter chars typed after the last
+    /// `/` (search mode) clears them — truncating the path back to
+    /// the parent dir — instead of closing the modal. A second Esc
+    /// (now in nav mode with no selection) closes it.
+    #[test]
+    fn esc_in_search_mode_clears_filter_chars() {
+        let mut m = mb("", "/tmp/al", Zone::Path, &["alpha", "beta"]);
+        // mb() ran refresh; selection is auto-armed in search mode.
+        m.selected = Some(0);
+        let outcome = m.handle(&key(KeyCode::Esc), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "/tmp/", "filter chars must be truncated");
+        assert_eq!(m.selected, None, "selection must drop");
+    }
+
+    /// Esc in nav mode with only a selection (no filter chars)
+    /// clears the selection and stays open. Useful when the user
+    /// arrowed into the wildmenu to look around then changed their
+    /// mind — Enter after this Esc spawns at the current dir.
+    #[test]
+    fn esc_in_nav_mode_with_selection_clears_selection() {
+        let mut m = mb("", "/tmp/", Zone::Path, &[]);
+        m.filtered = vec!["/tmp/alpha/".into(), "/tmp/beta/".into()];
+        m.selected = Some(0);
+        let outcome = m.handle(&key(KeyCode::Esc), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "/tmp/", "path must be unchanged");
+        assert_eq!(m.selected, None, "selection must drop");
     }
 
     /// Esc in the host zone is "back to path", not "close modal" —
@@ -2468,10 +2780,90 @@ mod tests {
         assert_eq!(m.path_origin, PathOrigin::UserTyped);
     }
 
+    /// In Precise + Path nav mode (input ends `/`), refresh leaves
+    /// selection unset even when the wildmenu has candidates — the
+    /// user hasn't typed a filter, so we don't auto-arm a row.
+    /// They still get one with the first Down/Up.
+    #[test]
+    fn refresh_in_precise_nav_mode_leaves_selection_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        // `open()` runs an initial refresh against the cwd's children.
+        let m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
+        assert!(m.path.ends_with('/'), "path must end with `/` (nav mode)");
+        assert_eq!(m.selected, None, "no auto-armed selection in nav mode");
+    }
+
+    /// In Precise + Path search mode (chars after the last `/`),
+    /// refresh auto-arms the first match so Enter immediately
+    /// descends into the highlighted candidate. Uses a tempdir with
+    /// a known child so `path_completions` returns a deterministic
+    /// match.
+    #[test]
+    fn refresh_in_precise_search_mode_auto_arms_first_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
+        // Type one char to enter search mode (`/.../alp` → only `alpha/`).
+        m.handle(&key(KeyCode::Char('a')), &b(), &mut local());
+        assert!(
+            !m.path.ends_with('/'),
+            "path must have filter chars after `/` (search mode)"
+        );
+        assert_eq!(m.selected, Some(0), "first match must auto-arm");
+    }
+
+    /// Cursor offset when the path zone is focused and empty: the
+    /// cursor sits on the first placeholder char, just after
+    /// `label + @ + host_zone + " : "`. Verifies the offset accounts
+    /// for the host zone's placeholder width even when host is empty.
+    #[test]
+    fn prompt_cursor_offset_path_focused_empty() {
+        let m = mb("", "", Zone::Path, &[]);
+        // "spawn: " (7) + "@" (1) + "local" (5 placeholder) + " : " (3) = 16
+        assert_eq!(m.prompt_cursor_offset(), 16);
+    }
+
+    /// Path focused with typed value: cursor lands at the cell AFTER
+    /// the value (no trailing-slash trim because `just_descended` is
+    /// false on this fixture).
+    #[test]
+    fn prompt_cursor_offset_path_focused_with_value() {
+        let m = mb("", "/tmp/al", Zone::Path, &[]);
+        // 16 (prefix) + len("/tmp/al") = 23
+        assert_eq!(m.prompt_cursor_offset(), 23);
+    }
+
+    /// Path focused with `just_descended` set and a trailing slash:
+    /// cursor lands at the slash position (the rendered path is
+    /// trimmed by one byte for visual confirmation).
+    #[test]
+    fn prompt_cursor_offset_just_descended_trims_trailing_slash() {
+        let mut m = mb("", "/tmp/alpha/", Zone::Path, &[]);
+        m.just_descended = true;
+        // 16 (prefix) + len("/tmp/alpha") (no trailing /) = 26
+        assert_eq!(m.prompt_cursor_offset(), 26);
+    }
+
+    /// Host zone focused, empty host: cursor sits on the first char
+    /// of the `local` placeholder (offset 8 = "spawn: " + "@").
+    #[test]
+    fn prompt_cursor_offset_host_focused_empty() {
+        let m = mb("", "", Zone::Host, &[]);
+        assert_eq!(m.prompt_cursor_offset(), 8);
+    }
+
+    /// Host zone focused with typed value: cursor at end of host text.
+    #[test]
+    fn prompt_cursor_offset_host_focused_with_value() {
+        let m = mb("alpha", "/tmp", Zone::Host, &[]);
+        // 8 (label + @) + len("alpha") = 13
+        assert_eq!(m.prompt_cursor_offset(), 13);
+    }
+
     /// Tab-applying a wildmenu candidate is also a user choice; the
-    /// resulting path is the candidate's value (without the trailing
-    /// slash on first Tab, see [`SpawnMinibuffer::apply_path_completion`]),
-    /// not the auto-seeded cwd, so the marker is cleared.
+    /// resulting path is the candidate's value (full path with
+    /// trailing slash, since Tab now descends in one step), not the
+    /// auto-seeded cwd, so the marker is cleared.
     #[test]
     fn tab_completion_in_path_zone_clears_auto_seeded() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
@@ -2479,8 +2871,7 @@ mod tests {
         m.filtered = vec!["/tmp/alpha/".into()];
         m.selected = Some(0);
         m.handle(&key(KeyCode::Tab), &b(), &mut local());
-        // First Tab applies the basename without the trailing slash.
-        assert_eq!(m.path, "/tmp/alpha");
+        assert_eq!(m.path, "/tmp/alpha/");
         assert_eq!(m.path_origin, PathOrigin::UserTyped);
     }
 
@@ -2685,20 +3076,20 @@ mod tests {
     }
 
     /// Tab in the path zone is autocomplete: it replaces the path
-    /// field with the highlighted wildmenu candidate and stays in the
-    /// path zone. This is the main UX change — Tab no longer crosses
-    /// into the host zone (only `@` does).
+    /// field with the highlighted wildmenu candidate (full path
+    /// including the trailing `/`) and stays in the path zone. Tab
+    /// no longer crosses into the host zone — only `@` does.
     #[test]
     fn tab_in_path_zone_applies_highlighted_candidate() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        m.filtered = vec!["/tmp/alpha".into(), "/tmp/beta".into()];
+        m.filtered = vec!["/tmp/alpha/".into(), "/tmp/beta/".into()];
         m.selected = Some(1);
         let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
         assert_eq!(m.focused, Zone::Path, "must stay in the path zone");
         assert_eq!(
-            m.path, "/tmp/beta",
-            "field must reflect the picked candidate"
+            m.path, "/tmp/beta/",
+            "field must reflect the picked candidate verbatim"
         );
     }
 
@@ -2709,7 +3100,7 @@ mod tests {
     #[test]
     fn tab_in_path_zone_with_no_selection_is_noop() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        m.filtered = vec!["/tmp/alpha".into()];
+        m.filtered = vec!["/tmp/alpha/".into()];
         m.selected = None;
         let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
@@ -2717,33 +3108,54 @@ mod tests {
         assert_eq!(m.path, "/tmp", "field must be unchanged");
     }
 
-    /// First Tab on a folder candidate applies the basename WITHOUT
-    /// the trailing slash, so the wildmenu stays at the same level
-    /// (the user is "selecting" the folder, not descending into it).
-    /// Mirrors zsh / fish autocomplete: confirm the pick, then choose
-    /// to descend.
+    /// Tab on a folder candidate descends in one step: the
+    /// candidate's full path (including trailing slash) becomes the
+    /// new path, refresh lists the folder's children, and the
+    /// selection drops so a follow-up Enter spawns at the new dir
+    /// rather than walking deeper.
     #[test]
-    fn first_tab_on_folder_applies_without_trailing_slash() {
+    fn tab_descends_into_folder_in_one_step() {
         let mut m = mb("", "/tmp/", Zone::Path, &[]);
         m.filtered = vec!["/tmp/alpha/".into(), "/tmp/beta/".into()];
         m.selected = Some(0);
         let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
         assert_eq!(outcome, ModalOutcome::None);
-        assert_eq!(m.path, "/tmp/alpha");
+        assert_eq!(m.path, "/tmp/alpha/");
+        assert_eq!(m.selected, None, "selection must clear after descend");
     }
 
-    /// Second Tab on the same folder (path already matches the
-    /// trimmed candidate) applies WITH the trailing slash, which
-    /// causes `refresh` to list the folder's contents — i.e.
-    /// descend.
+    /// Descending sets `just_descended` so the next render highlights
+    /// the freshly-picked leaf folder without its trailing slash —
+    /// momentary visual confirmation of the pick.
     #[test]
-    fn second_tab_on_same_folder_descends() {
-        let mut m = mb("", "/tmp/alpha", Zone::Path, &[]);
+    fn descend_sets_just_descended_flag() {
+        let mut m = mb("", "/tmp/", Zone::Path, &[]);
         m.filtered = vec!["/tmp/alpha/".into()];
         m.selected = Some(0);
-        let outcome = m.handle(&key(KeyCode::Tab), &b(), &mut local());
-        assert_eq!(outcome, ModalOutcome::None);
-        assert_eq!(m.path, "/tmp/alpha/");
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert!(
+            m.just_descended,
+            "descend must arm the post-descend visual flag",
+        );
+    }
+
+    /// The `just_descended` flag is one-frame: any subsequent
+    /// keystroke (arrow, type, backspace) clears it so the prompt
+    /// reverts to the standard nav-mode rendering. Confirmed via
+    /// `move_selection_forward` here; the same clear-at-top-of-handle
+    /// applies to every other key path.
+    #[test]
+    fn next_keystroke_clears_just_descended() {
+        let mut m = mb("", "/tmp/", Zone::Path, &[]);
+        m.filtered = vec!["/tmp/alpha/".into(), "/tmp/beta/".into()];
+        m.selected = Some(0);
+        m.handle(&key(KeyCode::Tab), &b(), &mut local());
+        assert!(m.just_descended);
+        m.handle(&key(KeyCode::Down), &b(), &mut local());
+        assert!(
+            !m.just_descended,
+            "any subsequent key must clear the visual flag",
+        );
     }
 
     /// Typing `/` after a first Tab also descends (refresh re-runs
@@ -2856,13 +3268,32 @@ mod tests {
         );
     }
 
-    /// A wildmenu pick beats the scratch fallback. The user explicitly
-    /// chose something — the modal must commit that choice, not shunt
-    /// them into the sandbox dir.
+    /// A wildmenu pick in Precise mode beats the scratch fallback,
+    /// but the meaning of "beats" changed: instead of spawning at
+    /// the candidate, Enter descends into it. The user must press
+    /// Enter again (with no selection) to commit. Either way, the
+    /// scratch dir doesn't fire.
     #[test]
     fn highlighted_candidate_overrides_scratch_fallback() {
         let mut m = mb("", "", Zone::Path, &[]);
         m.path_origin = PathOrigin::AutoSeeded;
+        m.filtered = vec!["/tmp/alpha/".into()];
+        m.selected = Some(0);
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None, "Enter descends, not spawn");
+        assert_eq!(m.path, "/tmp/alpha/");
+        assert_eq!(m.selected, None, "selection cleared after descend");
+    }
+
+    /// A wildmenu pick in Fuzzy mode keeps the historical
+    /// "Enter applies the highlight then spawns" semantics — there's
+    /// no concept of "descend into" a fuzzy hit.
+    #[test]
+    fn fuzzy_highlighted_candidate_spawns_on_enter() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "alp".into();
         m.filtered = vec!["/tmp/alpha".into()];
         m.selected = Some(0);
         let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
@@ -2899,17 +3330,38 @@ mod tests {
         );
     }
 
+    /// Enter in Precise + Path with a highlighted candidate descends
+    /// into the picked folder rather than spawning there. A second
+    /// Enter (with no selection) is what commits. This is the core
+    /// of the navigate-vs-spawn split: a wildmenu pick is "I want to
+    /// look inside this," not "I want to land here."
     #[test]
-    fn enter_uses_highlighted_path_candidate() {
+    fn enter_with_selection_in_precise_descends() {
         let mut m = mb("", "/tmp", Zone::Path, &[]);
-        m.filtered = vec!["/tmp/alpha".into(), "/tmp/beta".into()];
+        m.filtered = vec!["/tmp/alpha/".into(), "/tmp/beta/".into()];
         m.selected = Some(1);
+        let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, "/tmp/beta/");
+        assert_eq!(m.selected, None);
+    }
+
+    /// Enter in Precise + Path with NO selection commits at the
+    /// current path. Pairs with the descend-on-selection test above
+    /// to define the two-step "Enter to descend, Enter again to
+    /// spawn" rhythm.
+    #[test]
+    fn enter_without_selection_in_precise_spawns() {
+        let mut m = mb("", "/tmp/alpha/", Zone::Path, &[]);
+        m.path_origin = PathOrigin::UserTyped;
+        m.filtered = vec![];
+        m.selected = None;
         let outcome = m.handle(&key(KeyCode::Enter), &b(), &mut local());
         assert_eq!(
             outcome,
             ModalOutcome::Spawn {
                 host: "local".into(),
-                path: "/tmp/beta".into()
+                path: "/tmp/alpha/".into(),
             },
         );
     }
@@ -3171,6 +3623,74 @@ mod tests {
         assert_eq!(wildmenu_display_text(Zone::Host, "devpod-go"), "devpod-go");
     }
 
+    /// Non-selected search-mode rows split into marker + parent
+    /// (DIM) + leaf (cyan/bold), so the user's eye lands on the
+    /// segment they're filtering for.
+    #[test]
+    fn precise_search_row_splits_parent_and_leaf_when_unselected() {
+        let line = precise_search_row("/home/df/codemux/apps/", false, 80);
+        assert_eq!(line.spans.len(), 3, "marker + parent + leaf");
+        assert_eq!(line.spans[0].content, "   ");
+        assert_eq!(line.spans[1].content, "/home/df/codemux/");
+        assert!(
+            line.spans[1].style.add_modifier.contains(Modifier::DIM),
+            "parent prefix must be dimmed",
+        );
+        assert_eq!(line.spans[2].content, "apps/");
+        assert_eq!(line.spans[2].style.fg, Some(Color::Cyan));
+        assert!(line.spans[2].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// Scroll-into-view: when no row is selected, the wildmenu
+    /// renders from the top — no scroll needed.
+    #[test]
+    fn wildmenu_scroll_offset_no_selection_is_zero() {
+        assert_eq!(wildmenu_scroll_offset(None, 6), 0);
+    }
+
+    /// Scroll-into-view: a selection inside the first `usable`
+    /// rows still renders from the top.
+    #[test]
+    fn wildmenu_scroll_offset_selection_within_window_is_zero() {
+        // usable=6 → rows 0..5 visible at offset 0; sel=4 fits.
+        assert_eq!(wildmenu_scroll_offset(Some(4), 6), 0);
+        assert_eq!(wildmenu_scroll_offset(Some(5), 6), 0);
+    }
+
+    /// Scroll-into-view: a selection past the last visible row
+    /// slides the start forward so the selected row sits at the
+    /// last visible position.
+    #[test]
+    fn wildmenu_scroll_offset_slides_when_selection_below_window() {
+        // usable=6 → window is 6 rows wide; sel=6 → start=1 (rows 1..6 visible).
+        assert_eq!(wildmenu_scroll_offset(Some(6), 6), 1);
+        assert_eq!(wildmenu_scroll_offset(Some(10), 6), 5);
+    }
+
+    /// Scroll-into-view: zero-width usable window degrades safely
+    /// — saturating subtraction keeps offsets non-negative.
+    #[test]
+    fn wildmenu_scroll_offset_zero_usable_does_not_panic() {
+        // `usable.saturating_sub(1)` is 0 for usable in {0, 1};
+        // offset just becomes the selection index.
+        assert_eq!(wildmenu_scroll_offset(Some(7), 0), 7);
+        assert_eq!(wildmenu_scroll_offset(Some(7), 1), 7);
+    }
+
+    /// Selected rows render as a single highlighted span — the
+    /// uniform cyan background is a stronger signal than a per-
+    /// segment color split. Style sits at the Line level
+    /// (`Line::styled`) so ratatui composes it across the row.
+    #[test]
+    fn precise_search_row_selected_uses_single_highlight_span() {
+        let line = precise_search_row("/home/df/codemux/apps/", true, 80);
+        assert_eq!(line.spans.len(), 1);
+        assert!(line.spans[0].content.starts_with(" ▸ "));
+        assert_eq!(line.style.bg, Some(Color::Cyan));
+        assert_eq!(line.style.fg, Some(Color::Black));
+        assert!(line.style.add_modifier.contains(Modifier::BOLD));
+    }
+
     /// `delete_word_backward` operates on path-segment boundaries:
     /// drop the trailing `/` if any, then drop everything back to
     /// (and including) the previous `/`. If there's nothing left to
@@ -3290,50 +3810,31 @@ mod tests {
     }
 
     /// Empty + focused: cursor overlays the FIRST char of the placeholder
-    /// (`local` → `█ocal`), and the remainder renders dim. This is the bug
-    /// fix from the user report — previously the placeholder rendered in
-    /// cyan/bold (focused style) with the cursor at the end, making
-    /// "local" look like real typed input.
+    /// Empty + focused: the full placeholder is rendered (no `█`
+    /// glyph). The real terminal cursor — set by the caller via
+    /// `frame.set_cursor_position` — sits on the first placeholder
+    /// char so dead-key previews land at the input position. This
+    /// replaces the previous `█ocal` rendering, which duplicated the
+    /// cursor visually and obscured the placeholder's first char.
     #[test]
-    fn zone_spans_empty_focused_overlays_cursor_on_first_placeholder_char() {
+    fn zone_spans_empty_focused_renders_full_placeholder_dim() {
         let placeholder_style = Style::default().add_modifier(Modifier::DIM);
-        let cursor_style = Style::default().fg(Color::Cyan);
         let spans = zone_spans(
             true,
             "",
             "local",
             placeholder_style,
-            cursor_style,
-            false,
-            path_unfocused_value_style(),
-        );
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].content, "█");
-        // First char of "local" is consumed by the cursor; "ocal" remains.
-        assert_eq!(spans[1].content, "ocal");
-        assert!(spans[1].style.add_modifier.contains(Modifier::DIM));
-        // Critically, the remainder is NOT rendered in the focused
-        // (cyan + bold) style.
-        assert!(!spans[1].style.add_modifier.contains(Modifier::BOLD));
-        assert_ne!(spans[1].style.fg, Some(Color::Cyan));
-    }
-
-    /// A 1-char placeholder is fully consumed by the cursor; no remainder
-    /// span is emitted (otherwise we'd push an empty `Span` and ratatui
-    /// would still allocate a row cell for it).
-    #[test]
-    fn zone_spans_empty_focused_with_single_char_placeholder_omits_remainder() {
-        let spans = zone_spans(
-            true,
-            "",
-            "x",
-            Style::default(),
             Style::default(),
             false,
             path_unfocused_value_style(),
         );
         assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content, "█");
+        assert_eq!(spans[0].content, "local");
+        assert!(spans[0].style.add_modifier.contains(Modifier::DIM));
+        // Critically, the placeholder is NOT rendered in the focused
+        // (cyan + bold) style — that would read as real input.
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_ne!(spans[0].style.fg, Some(Color::Cyan));
     }
 
     #[test]
@@ -3353,22 +3854,21 @@ mod tests {
         assert_eq!(spans[0].content, "local");
     }
 
+    /// Non-empty + focused: just the value, no `█` glyph. Terminal
+    /// cursor (set by the caller) lands at the cell after the value.
     #[test]
-    fn zone_spans_non_empty_focused_puts_cursor_after_value() {
-        let placeholder_style = Style::default();
-        let cursor_style = Style::default().fg(Color::Cyan);
+    fn zone_spans_non_empty_focused_emits_value_only() {
         let spans = zone_spans(
             true,
             "alpha",
             "local",
-            placeholder_style,
-            cursor_style,
+            Style::default(),
+            Style::default(),
             false,
             path_unfocused_value_style(),
         );
-        assert_eq!(spans.len(), 2);
+        assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "alpha");
-        assert_eq!(spans[1].content, "█");
     }
 
     #[test]
@@ -3427,8 +3927,8 @@ mod tests {
             true,
             path_unfocused_value_style(),
         );
-        // prefix + tail + cursor = 3 spans
-        assert_eq!(spans.len(), 3);
+        // prefix + tail = 2 spans (no `█` cursor — terminal cursor handles it)
+        assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "/home/df/");
         // Prefix is plain default — no fg, no BOLD.
         assert_eq!(spans[0].style, Style::default());
@@ -3436,12 +3936,11 @@ mod tests {
         // Tail uses the focused value style (cyan + bold).
         assert_eq!(spans[1].style.fg, Some(Color::Cyan));
         assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(spans[2].content, "█");
     }
 
     /// A path that ends in `/` (e.g. just-seeded remote $HOME) has no
-    /// trailing component. Render the prefix in default style, no
-    /// tail span, then the cursor.
+    /// trailing component — just the prefix span; terminal cursor
+    /// sits at the cell after.
     #[test]
     fn zone_spans_focused_path_with_trailing_slash_emits_no_tail_span() {
         let spans = zone_spans(
@@ -3453,10 +3952,9 @@ mod tests {
             true,
             path_unfocused_value_style(),
         );
-        assert_eq!(spans.len(), 2);
+        assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "/home/df/");
         assert_eq!(spans[0].style, Style::default());
-        assert_eq!(spans[1].content, "█");
     }
 
     /// A path with no `/` (relative single segment) falls through to
@@ -3472,11 +3970,10 @@ mod tests {
             true,
             path_unfocused_value_style(),
         );
-        assert_eq!(spans.len(), 2);
+        assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "repos");
         assert_eq!(spans[0].style.fg, Some(Color::Cyan));
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(spans[1].content, "█");
     }
 
     /// Unfocused path: no highlight regardless of `highlight_basename`.
@@ -4392,10 +4889,16 @@ mod tests {
         );
 
         // (2) confirm() round-trips the literal candidate into a
-        //     PrepareHostThenSpawn outcome with the same literal path.
-        let mut m = SpawnMinibuffer::open(Path::new("/tmp"), SearchMode::Precise, vec![np]);
+        //     PrepareHostThenSpawn outcome with the same literal
+        //     path. Fuzzy mode is the only place named projects
+        //     actually surface in the wildmenu (score_fuzzy is the
+        //     fuzzy worker's scoring function), so the test has to
+        //     run in Fuzzy — Precise mode treats Enter+selection as
+        //     "descend," which is the right behavior for directory
+        //     completions but not for project picks.
+        let mut m = SpawnMinibuffer::open(Path::new("/tmp"), SearchMode::Fuzzy, vec![np]);
         m.host.clear();
-        m.path_origin = PathOrigin::UserTyped;
+        m.fuzzy_query = "eatsfeed".to_string();
         m.filtered = vec!["~/workbench/repositories/go-code/eatsfeed".to_string()];
         m.selected = Some(0);
         m.focused = Zone::Path;
@@ -4439,12 +4942,12 @@ mod tests {
     #[test]
     fn confirm_local_project_emits_plain_spawn() {
         // A project without `host` keeps today's behavior: confirming
-        // its path emits `Spawn { host: "local", path }`. Simulates
-        // the real flow: project shows in the wildmenu, user picks
-        // it, the resolved path is the project's expanded path.
+        // its path emits `Spawn { host: "local", path }`. Fuzzy mode
+        // is where named projects actually surface in the wildmenu;
+        // Precise mode now treats Enter+selection as descend.
         let mut m = SpawnMinibuffer::open(
             Path::new("/tmp"),
-            SearchMode::Precise,
+            SearchMode::Fuzzy,
             vec![NamedProject {
                 name: "p".to_string(),
                 path: "/tmp/p".to_string(),
@@ -4452,7 +4955,7 @@ mod tests {
             }],
         );
         m.host.clear();
-        m.path_origin = PathOrigin::UserTyped;
+        m.fuzzy_query = "p".to_string();
         m.filtered = vec!["/tmp/p".to_string()];
         m.selected = Some(0);
         m.focused = Zone::Path;
@@ -4470,12 +4973,10 @@ mod tests {
     fn confirm_host_bound_project_emits_prepare_host_then_spawn() {
         // A project with `host = "devpod-1"` is upgraded to
         // `PrepareHostThenSpawn`, regardless of what's in the host
-        // zone. The project alias is the more specific signal. The
-        // wildmenu pick is the project's expanded path (just like the
-        // local case above).
+        // zone. Fuzzy mode (where named projects actually surface).
         let mut m = SpawnMinibuffer::open(
             Path::new("/tmp"),
-            SearchMode::Precise,
+            SearchMode::Fuzzy,
             vec![NamedProject {
                 name: "p".to_string(),
                 path: "/work/p".to_string(),
@@ -4483,7 +4984,7 @@ mod tests {
             }],
         );
         m.host = "ignored-typed-host".to_string();
-        m.path_origin = PathOrigin::UserTyped;
+        m.fuzzy_query = "p".to_string();
         m.filtered = vec!["/work/p".to_string()];
         m.selected = Some(0);
         m.focused = Zone::Path;
@@ -4572,6 +5073,102 @@ mod tests {
         );
         assert_eq!(m.path, expected_home);
         assert!(m.fuzzy_query.is_empty());
+    }
+
+    /// `~` typed against an autoseeded Precise path (i.e. just-
+    /// opened modal) triggers the nav-at-home gesture, just like
+    /// in Fuzzy mode. Without this the user types `~` and the
+    /// modal appends a literal tilde to the seeded cwd, then the
+    /// next char looks like a fuzzy "no matches" result.
+    #[test]
+    fn tilde_in_precise_with_autoseeded_path_enters_navigation_at_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
+        m.handle(&key(KeyCode::Char('~')), &b(), &mut local());
+        assert!(m.path.ends_with('/'), "tilde must seed at $HOME/");
+        let expected_home = std::env::var_os("HOME").map_or_else(
+            || "~/".to_string(),
+            |h| format!("{}/", h.to_string_lossy().trim_end_matches('/')),
+        );
+        assert_eq!(m.path, expected_home);
+    }
+
+    /// `/` typed against an autoseeded Precise path replaces the
+    /// seed with `/` (root) — the Precise companion to the existing
+    /// Fuzzy `/`-at-empty-query behavior.
+    #[test]
+    fn slash_in_precise_with_autoseeded_path_enters_navigation_at_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = SpawnMinibuffer::open(dir.path(), SearchMode::Precise, Vec::new());
+        assert_eq!(m.path_origin, PathOrigin::AutoSeeded);
+        m.handle(&key(KeyCode::Char('/')), &b(), &mut local());
+        assert_eq!(m.path, "/");
+    }
+
+    /// `~` typed against a USER-typed Precise path is preserved as
+    /// a literal char, since the user has expressed a path-building
+    /// intent and we shouldn't blow it away.
+    #[test]
+    fn tilde_in_precise_with_user_typed_path_is_literal() {
+        let mut m = mb("", "/work/proj", Zone::Path, &[]);
+        m.path_origin = PathOrigin::UserTyped;
+        m.handle(&key(KeyCode::Char('~')), &b(), &mut local());
+        assert_eq!(m.path, "/work/proj~");
+    }
+
+    /// Intl layouts whose dead-key tilde doesn't compose with the
+    /// next keystroke deliver the combining tilde (U+0303) directly.
+    /// The auto-nav gesture must accept this variant so users on
+    /// these layouts get the same `~`-then-home behavior as users
+    /// whose terminals compose into a literal `~`.
+    #[test]
+    fn combining_tilde_in_fuzzy_with_empty_query_enters_navigation_at_home() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        let outcome = m.handle(&key(KeyCode::Char('\u{0303}')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.search_mode, SearchMode::Precise);
+        assert!(m.path.ends_with('/'));
+        assert!(
+            m.tilde_compose_armed,
+            "non-literal tilde variant must arm the compose-space swallow",
+        );
+    }
+
+    /// After a non-literal tilde variant fires the nav-at-home
+    /// gesture, the OS / terminal commonly delivers the composing
+    /// space as the next event. Swallow it so the user doesn't end
+    /// up with `~/ ` (a stray space appended to the seeded home).
+    #[test]
+    fn space_after_combining_tilde_is_swallowed() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.handle(&key(KeyCode::Char('\u{0303}')), &b(), &mut local());
+        let path_before = m.path.clone();
+        let outcome = m.handle(&key(KeyCode::Char(' ')), &b(), &mut local());
+        assert_eq!(outcome, ModalOutcome::None);
+        assert_eq!(m.path, path_before, "space must not append to seeded path");
+        assert!(
+            !m.tilde_compose_armed,
+            "the swallow is one-shot — flag must drop",
+        );
+    }
+
+    /// A literal `~` is unambiguous (no dead-key composition needed),
+    /// so the compose-space swallow does NOT arm. A subsequent space
+    /// behaves like any other Precise-mode char and gets appended,
+    /// matching today's behavior on standard layouts.
+    #[test]
+    fn literal_tilde_does_not_arm_compose_swallow() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.handle(&key(KeyCode::Char('~')), &b(), &mut local());
+        assert!(
+            !m.tilde_compose_armed,
+            "literal `~` must not arm the swallow",
+        );
     }
 
     /// `/` typed mid-query should NOT trigger the auto-switch — the
