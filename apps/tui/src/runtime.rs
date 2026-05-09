@@ -5360,8 +5360,8 @@ const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "�
 ///
 /// - `⠋` is a Braille spinner frame, rendered when the foreground
 ///   process is mid-turn (its OSC title carries Claude's spinner /
-///   ✱ glyph). Cycles via [`AnimationPhase`] at ~10 Hz so the motion
-///   reads as ambient liveness.
+///   asterisk glyph). Cycles via [`AnimationPhase`] at ~10 Hz so the
+///   motion reads as ambient liveness.
 /// - `host` (dim/gray) is shown only for SSH-backed agents so the
 ///   user can tell at a glance which devpod the agent lives on
 /// - `●` is a soft pulsing dot rendered only when an unfocused tab

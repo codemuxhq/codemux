@@ -47,10 +47,11 @@ impl TitleCapture {
     }
 
     /// Whether the most recent title carried a leading "in progress"
-    /// glyph (✱ or a Braille spinner frame). Cleared when the next
-    /// title arrives without one. The runtime uses this to drive the
-    /// navigator spinner and to detect working→idle transitions for
-    /// the "finished while unfocused" blink.
+    /// glyph (any Dingbats asterisk/star Claude rotates through, or a
+    /// Braille spinner frame). Cleared when the next title arrives
+    /// without one. The runtime uses this to drive the navigator
+    /// spinner and to detect working→idle transitions for the
+    /// "finished while unfocused" blink.
     pub fn is_working(&self) -> bool {
         self.working
     }
@@ -89,21 +90,31 @@ fn sanitize(raw: &str) -> String {
 }
 
 /// Characters we treat as "decoration" at the start of a title:
-/// whitespace, the ✱ star Claude uses, and the Braille spinner
-/// glyphs (`U+2800..=U+28FF`) most TUI spinners draw from. Used
-/// only by [`sanitize`] — the working-state detector restricts
-/// itself to [`is_status_glyph`] so a leading space alone never
-/// flips an agent into "working".
+/// whitespace, the asterisk/star spinner glyphs Claude Code cycles
+/// through, and the Braille spinner glyphs (`U+2800..=U+28FF`) most
+/// other TUI spinners draw from. Used only by [`sanitize`] — the
+/// working-state detector restricts itself to [`is_status_glyph`] so
+/// a leading space alone never flips an agent into "working".
 fn is_decoration(c: char) -> bool {
     c.is_whitespace() || is_status_glyph(c)
 }
 
 /// The subset of decoration characters that signal "this process is
 /// in the middle of a turn." Whitespace alone doesn't qualify (lots
-/// of titles pad themselves); only the deliberate spinner / star
-/// glyphs do.
+/// of titles pad themselves); only the deliberate spinner glyphs do.
+// The matched glyphs are the four Dingbats asterisks observed
+// rotating in Claude Code 2.x's title spinner: ✱ (HEAVY ASTERISK),
+// ✳ (EIGHT SPOKED ASTERISK), ✶ (SIX POINTED BLACK STAR), and
+// ✻ (TEARDROP-SPOKED ASTERISK). Add a glyph here only when a real
+// agent emits one — we deliberately avoid pre-matching the rest of
+// the Dingbats block so a legitimate title that happens to start
+// with an unrelated star (e.g. a project named `✦ infra`) isn't
+// silently stripped.
 fn is_status_glyph(c: char) -> bool {
-    matches!(c, '✱' | '\u{2800}'..='\u{28FF}')
+    matches!(
+        c,
+        '\u{2731}' | '\u{2733}' | '\u{2736}' | '\u{273B}' | '\u{2800}'..='\u{28FF}'
+    )
 }
 
 #[cfg(test)]
@@ -141,6 +152,26 @@ mod tests {
     fn leading_star_glyph_is_stripped() {
         let p = parse("\x1b]2;✱ Add tab names\x07".as_bytes());
         assert_eq!(p.callbacks().title(), Some("Add tab names"));
+    }
+
+    #[test]
+    fn leading_dingbats_star_variants_are_stripped() {
+        // Pin every Dingbats spinner glyph the matched set covers
+        // beyond the original ✱ (which has its own test above): if
+        // is_status_glyph drops one, the tab label keeps the noise.
+        for glyph in ['✳', '✶', '✻'] {
+            let raw = format!("\x1b]2;{glyph} Thinking\x07");
+            let p = parse(raw.as_bytes());
+            assert_eq!(
+                p.callbacks().title(),
+                Some("Thinking"),
+                "glyph {glyph:?} should be stripped"
+            );
+            assert!(
+                p.callbacks().is_working(),
+                "glyph {glyph:?} should mark working"
+            );
+        }
     }
 
     #[test]
