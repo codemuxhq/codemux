@@ -71,7 +71,7 @@ impl Callbacks for TitleCapture {
         self.working = raw
             .chars()
             .find(|c| !c.is_control() && !c.is_whitespace())
-            .is_some_and(is_status_glyph);
+            .is_some_and(is_working_glyph);
         let cleaned = sanitize(&raw);
         self.title = (!cleaned.is_empty()).then_some(cleaned);
     }
@@ -93,28 +93,45 @@ fn sanitize(raw: &str) -> String {
 /// whitespace, the asterisk/star spinner glyphs Claude Code cycles
 /// through, and the Braille spinner glyphs (`U+2800..=U+28FF`) most
 /// other TUI spinners draw from. Used only by [`sanitize`] — the
-/// working-state detector restricts itself to [`is_status_glyph`] so
+/// working-state detector restricts itself to [`is_working_glyph`] so
 /// a leading space alone never flips an agent into "working".
 fn is_decoration(c: char) -> bool {
-    c.is_whitespace() || is_status_glyph(c)
+    c.is_whitespace() || is_decoration_glyph(c)
 }
 
-/// The subset of decoration characters that signal "this process is
-/// in the middle of a turn." Whitespace alone doesn't qualify (lots
-/// of titles pad themselves); only the deliberate spinner glyphs do.
-// The matched glyphs are the four Dingbats asterisks observed
-// rotating in Claude Code 2.x's title spinner: ✱ (HEAVY ASTERISK),
+/// Glyphs to strip from the start of a title so the user-visible
+/// label stays readable. Broader than [`is_working_glyph`] because
+/// Claude Code prefixes its idle title with a static star too — we
+/// want all of those gone from the label, even though only the
+/// rotating subset means "the agent is busy."
+// The matched glyphs are the four Dingbats asterisks observed in
+// Claude Code 2.x's titles: ✱ (HEAVY ASTERISK),
 // ✳ (EIGHT SPOKED ASTERISK), ✶ (SIX POINTED BLACK STAR), and
 // ✻ (TEARDROP-SPOKED ASTERISK). Add a glyph here only when a real
 // agent emits one — we deliberately avoid pre-matching the rest of
 // the Dingbats block so a legitimate title that happens to start
 // with an unrelated star (e.g. a project named `✦ infra`) isn't
 // silently stripped.
-fn is_status_glyph(c: char) -> bool {
+fn is_decoration_glyph(c: char) -> bool {
     matches!(
         c,
         '\u{2731}' | '\u{2733}' | '\u{2736}' | '\u{273B}' | '\u{2800}'..='\u{28FF}'
     )
+}
+
+/// Glyphs whose presence at the start of a title means "this process
+/// is actively in the middle of a turn." The runtime uses this to
+/// drive the per-tab Braille overlay and the finished-while-unfocused
+/// blink — false positives leave the spinner stuck on forever.
+// Strict subset of [`is_decoration_glyph`]: Claude Code's idle title
+// also carries a leading Dingbats star (a static brand prefix, not a
+// rotating spinner frame). Treating that idle prefix as "working"
+// pinned every tab into a permanent spinner. We match only glyphs
+// that have been confirmed to appear ONLY mid-turn — currently
+// ✱ (U+2731) and the Braille block. Add more here only after
+// observing them rotate, never just because they look spinner-y.
+fn is_working_glyph(c: char) -> bool {
+    matches!(c, '\u{2731}' | '\u{2800}'..='\u{28FF}')
 }
 
 #[cfg(test)]
@@ -156,9 +173,9 @@ mod tests {
 
     #[test]
     fn leading_dingbats_star_variants_are_stripped() {
-        // Pin every Dingbats spinner glyph the matched set covers
-        // beyond the original ✱ (which has its own test above): if
-        // is_status_glyph drops one, the tab label keeps the noise.
+        // Pin every Dingbats star variant the strip set covers beyond
+        // the original ✱: if is_decoration_glyph drops one, the tab
+        // label keeps the noise.
         for glyph in ['✳', '✶', '✻'] {
             let raw = format!("\x1b]2;{glyph} Thinking\x07");
             let p = parse(raw.as_bytes());
@@ -167,9 +184,24 @@ mod tests {
                 Some("Thinking"),
                 "glyph {glyph:?} should be stripped"
             );
+        }
+    }
+
+    #[test]
+    fn idle_dingbats_star_prefix_does_not_flip_working() {
+        // Regression guard. Claude Code prefixes its IDLE title with
+        // a static Dingbats star too (not a rotating spinner frame).
+        // If the working detector matches that prefix, every tab gets
+        // pinned into a permanent spinner. Working detection must stay
+        // narrower than decoration stripping — only glyphs Claude
+        // actually rotates through count.
+        for glyph in ['✳', '✶', '✻'] {
+            let raw = format!("\x1b]2;{glyph} ProjectName\x07");
+            let p = parse(raw.as_bytes());
             assert!(
-                p.callbacks().is_working(),
-                "glyph {glyph:?} should mark working"
+                !p.callbacks().is_working(),
+                "glyph {glyph:?} is also used as Claude's idle prefix; \
+                 must not trigger working state"
             );
         }
     }
