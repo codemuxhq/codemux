@@ -1,4 +1,4 @@
-# Use cases
+# Scenarios
 
 ## Shape of the work
 
