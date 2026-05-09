@@ -1,5 +1,45 @@
 # Acceptance criteria
 
+## Contents
+
+- [Spawn](#spawn)
+  - [AC-001: Spawn the initial agent at launch](#ac-001-spawn-the-initial-agent-at-launch)
+  - [AC-002: Spawn a local agent in the scratch directory](#ac-002-spawn-a-local-agent-in-the-scratch-directory)
+  - [AC-003: Spawn a remote agent over SSH (cold-start bootstrap)](#ac-003-spawn-a-remote-agent-over-ssh-cold-start-bootstrap)
+  - [AC-004: Path-zone wildmenu autocompletes against the focused host](#ac-004-path-zone-wildmenu-autocompletes-against-the-focused-host)
+  - [AC-005: Quick-switch to precise mode by typing `~` or `/`](#ac-005-quick-switch-to-precise-mode-by-typing--or-)
+  - [AC-006: Drill into a folder, then spawn at the chosen depth](#ac-006-drill-into-a-folder-then-spawn-at-the-chosen-depth)
+  - [AC-007: Saved project alias resolves through the minibuffer](#ac-007-saved-project-alias-resolves-through-the-minibuffer)
+  - [AC-008: Cancel the spawn minibuffer](#ac-008-cancel-the-spawn-minibuffer)
+- [Navigation](#navigation)
+  - [AC-009: Cycle focus between agents](#ac-009-cycle-focus-between-agents)
+  - [AC-010: Focus an agent by ordinal digit](#ac-010-focus-an-agent-by-ordinal-digit)
+  - [AC-011: Bounce to the previously-focused agent](#ac-011-bounce-to-the-previously-focused-agent)
+  - [AC-012: Switcher popup picks an agent by name](#ac-012-switcher-popup-picks-an-agent-by-name)
+  - [AC-013: Toggle the navigator chrome](#ac-013-toggle-the-navigator-chrome)
+- [Agent lifecycle](#agent-lifecycle)
+  - [AC-014: Force-close a live agent](#ac-014-force-close-a-live-agent)
+  - [AC-015: Dismiss a crashed or failed agent (no-op on live)](#ac-015-dismiss-a-crashed-or-failed-agent-no-op-on-live)
+  - [AC-016: Quit codemux cleanly](#ac-016-quit-codemux-cleanly)
+- [Scrollback](#scrollback)
+  - [AC-017: Enter scroll mode and navigate history](#ac-017-enter-scroll-mode-and-navigate-history)
+  - [AC-018: Typing snaps to live; navigation preserves scroll](#ac-018-typing-snaps-to-live-navigation-preserves-scroll)
+- [Mouse](#mouse)
+  - [AC-019: Click a tab to focus it](#ac-019-click-a-tab-to-focus-it)
+  - [AC-020: Drag a tab to reorder](#ac-020-drag-a-tab-to-reorder)
+  - [AC-021: Drag-to-select and copy via OSC 52](#ac-021-drag-to-select-and-copy-via-osc-52)
+- [Status bar](#status-bar)
+  - [AC-022: Configured segments render in order](#ac-022-configured-segments-render-in-order)
+  - [AC-023: Segments drop from the left under width pressure](#ac-023-segments-drop-from-the-left-under-width-pressure)
+- [Help](#help)
+  - [AC-024: Help screen reflects the live keymap](#ac-024-help-screen-reflects-the-live-keymap)
+- [Daemon](#daemon)
+  - [AC-025: Reattach replays the screen state](#ac-025-reattach-replays-the-screen-state)
+- [Config and CLI](#config-and-cli)
+  - [AC-026: Missing config file falls back to defaults](#ac-026-missing-config-file-falls-back-to-defaults)
+  - [AC-027: Invalid config fails loud before raw mode](#ac-027-invalid-config-fails-loud-before-raw-mode)
+  - [AC-028: Invalid `[PATH]` arg fails loud before raw mode](#ac-028-invalid-path-arg-fails-loud-before-raw-mode)
+
 ## Spawn
 
 ### AC-001: Spawn the initial agent at launch
