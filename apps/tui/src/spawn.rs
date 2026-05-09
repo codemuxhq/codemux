@@ -1350,10 +1350,25 @@ impl SpawnMinibuffer {
     /// whose `(host, query)` tag doesn't match the modal's current
     /// `(active_host_key, fuzzy_query)` — the natural race when the
     /// user types fast: an in-flight `c` result lands after the
-    /// modal has already moved on to `co`. On match, replaces
-    /// `filtered`, clears the stale flag, and resets `selected` to
-    /// the first hit (or `None` for empty hits so Enter doesn't
-    /// commit a non-candidate).
+    /// modal has already moved on to `co`.
+    ///
+    /// On match, replaces `filtered` and clears the stale flag.
+    /// Selection is preserved by candidate identity (the path string)
+    /// across re-scores: if the previously-selected path is still in
+    /// the new hits, selection follows it to its new index. This
+    /// matters during background indexing, where the runtime triggers
+    /// a re-score on every batch of newly-indexed dirs (each batch
+    /// bumps the per-host index generation, which clears the
+    /// last-pushed-query memo in `tick_fuzzy_dispatch`). Without
+    /// identity preservation, every batch would clobber the user's
+    /// Down/Up pick — the symptom is "I press Down and selection
+    /// snaps back to the top while the indexer is still working."
+    ///
+    /// Falls back to `Some(0)` when there was no prior selection or
+    /// the previously-selected path dropped out of the new hits, so
+    /// the auto-arm-first-hit autocomplete UX still applies on the
+    /// initial result for a fresh query. Empty hits clear `selected`
+    /// so Enter doesn't commit a non-candidate.
     pub fn set_fuzzy_results(&mut self, result: FuzzyResult) {
         if result.host != self.active_host_key() {
             tracing::trace!(
@@ -1371,8 +1386,17 @@ impl SpawnMinibuffer {
             );
             return;
         }
+        let prior_selected_path = self.selected.and_then(|i| self.filtered.get(i)).cloned();
         self.filtered = result.hits;
-        self.selected = (!self.filtered.is_empty()).then_some(0);
+        self.selected = if self.filtered.is_empty() {
+            None
+        } else if let Some(path) = prior_selected_path
+            && let Some(new_idx) = self.filtered.iter().position(|p| p == &path)
+        {
+            Some(new_idx)
+        } else {
+            Some(0)
+        };
         self.filtered_stale = false;
     }
 
@@ -2554,14 +2578,19 @@ fn tilde_collapse(path: &str) -> String {
 /// Build a wildmenu row for a saved project (`[[spawn.projects]]`
 /// entry). The leading `★` marks the row as user-curated (versus an
 /// auto-discovered indexed dir); the project's `name` lands on the
-/// left, and the resolved path is right-aligned and dimmed so the
-/// eye lands on the alias while the path stays available as
-/// confirmation. Host-bound entries append a dim ` @host` badge so
-/// the user can tell remote saved projects apart from local ones.
+/// left followed by an optional ` @host` badge for remote-bound
+/// entries (greyed out so it reads as secondary metadata next to the
+/// name). The resolved path is right-aligned and dimmed so the eye
+/// lands on the alias while the path stays available as confirmation.
+/// Local saved projects omit the badge entirely — its presence alone
+/// signals "this spawns on a remote".
 ///
-/// Selected rows render as a single span with the modal's cyan-bg
-/// highlight — uniform background reads as "this is the active pick"
-/// without competing colors. Same convention as `precise_search_row`.
+/// Both selected and unselected rows share the same span layout; the
+/// selection highlight is applied at the line level via `patch_style`
+/// so the cyan-bg/black-fg/bold treatment paints the entire row
+/// uniformly. Per-span DIM modifiers on the badge and path stay set,
+/// which combines with the line-level BOLD on selection — terminals
+/// render BOLD as the dominant signal so the highlight still reads.
 ///
 /// Width budget: when the row doesn't fit, the path is the first
 /// thing to lose space (middle-clipped via [`clip_middle`]); the
@@ -2579,9 +2608,9 @@ fn named_project_row(
     is_selected: bool,
     width: usize,
 ) -> Line<'static> {
-    let marker = if is_selected { " ▸ " } else { "   " };
-    let star = "★ ";
-    let badge = host.map(|h| format!("  @{h}")).unwrap_or_default();
+    let marker: &'static str = if is_selected { " ▸ " } else { "   " };
+    let star: &'static str = "★ ";
+    let badge = host.map(|h| format!(" @{h}")).unwrap_or_default();
     // Display path: tilde-collapse only when the candidate is an
     // absolute local path. Host-bound candidates already arrive as
     // literal `~/...` (per `resolve_named_project_path`) so a second
@@ -2593,8 +2622,8 @@ fn named_project_row(
     // construction; everything user-supplied measures in terminal
     // columns.
     let used = 3 + 2 + UnicodeWidthStr::width(name) + UnicodeWidthStr::width(badge.as_str());
-    // Reserve at least 2 spaces between name and path; if we can't
-    // afford that plus a single path character, drop the path
+    // Reserve at least 2 spaces between name+badge and path; if we
+    // can't afford that plus a single path character, drop the path
     // entirely so the name + badge stay legible.
     let path_budget = width.saturating_sub(used).saturating_sub(2);
     let (gap, path_text) = if path_budget == 0 {
@@ -2607,35 +2636,33 @@ fn named_project_row(
         (" ".repeat(gap_len), clipped)
     };
 
-    if is_selected {
-        let style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-        return Line::styled(
-            format!("{marker}{star}{name}{gap}{path_text}{badge}"),
-            style,
-        );
-    }
+    let star_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
     let mut spans = vec![
-        Span::raw(marker.to_string()),
-        Span::styled(
-            star.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::raw(marker),
+        Span::styled(star, star_style),
         Span::raw(name.to_string()),
-        Span::raw(gap),
-        Span::styled(path_text, Style::default().add_modifier(Modifier::DIM)),
     ];
     if !badge.is_empty() {
-        spans.push(Span::styled(
-            badge,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-        ));
+        spans.push(Span::styled(badge, dim));
     }
-    Line::from(spans)
+    spans.push(Span::raw(gap));
+    spans.push(Span::styled(path_text, dim));
+
+    let line = Line::from(spans);
+    if is_selected {
+        line.patch_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        line
+    }
 }
 
 fn clip_middle(s: &str, width: usize) -> String {
@@ -5302,16 +5329,38 @@ mod tests {
     }
 
     #[test]
-    fn named_project_row_appends_host_badge_when_bound() {
+    fn named_project_row_renders_host_badge_next_to_name() {
+        // Remote-bound saved projects show the ` @host` badge
+        // immediately after the name (greyed out) so the host is
+        // visible in the same eye-stroke as the project name. The
+        // badge sits BEFORE the gap+path, not at the end of the row.
         let row = named_project_row("codemux", "~/codemux", Some("devpod-go"), false, 60);
-        let last = row
-            .spans
-            .last()
-            .unwrap_or_else(|| panic!("row must have at least one span"));
-        assert_eq!(last.content.as_ref(), "  @devpod-go");
+        // Expected layout: [marker, star, name, badge, gap, path].
+        assert_eq!(row.spans[0].content.as_ref(), "   ", "marker");
+        assert_eq!(row.spans[1].content.as_ref(), "★ ", "star");
+        assert_eq!(row.spans[2].content.as_ref(), "codemux", "name");
+        assert_eq!(
+            row.spans[3].content.as_ref(),
+            " @devpod-go",
+            "host badge follows the name with a single-space separator",
+        );
         assert!(
-            last.style.add_modifier.contains(Modifier::DIM),
-            "host badge must render dim so it doesn't compete with the name",
+            row.spans[3].style.add_modifier.contains(Modifier::DIM),
+            "host badge must render dim so it reads as secondary to the name",
+        );
+        assert!(
+            row.spans[3].style.fg.is_none(),
+            "host badge uses default fg + DIM (greyed out), no accent color",
+        );
+        // Gap + path still close out the row.
+        assert!(
+            row.spans[4].content.chars().all(|c| c == ' '),
+            "gap is whitespace-only padding (got {:?})",
+            row.spans[4].content,
+        );
+        assert!(
+            row.spans[5].content.ends_with("/codemux"),
+            "path span trails the row",
         );
     }
 
@@ -5320,7 +5369,7 @@ mod tests {
         let row = named_project_row("codemux", "/Users/x/codemux", None, false, 60);
         for span in &row.spans {
             assert!(
-                !span.content.starts_with("  @"),
+                !span.content.contains('@'),
                 "no host badge expected on local saved projects (got {:?})",
                 span.content,
             );
@@ -5328,29 +5377,33 @@ mod tests {
     }
 
     #[test]
-    fn named_project_row_selected_collapses_to_single_styled_line() {
-        // Selected rows render as one span with the cyan-bg highlight —
-        // uniform background reads as "this is the active pick" without
-        // competing colors. Mirrors `precise_search_row`.
+    fn named_project_row_selected_applies_highlight_at_line_level() {
+        // Selected rows share the unselected span layout but get the
+        // cyan-bg/black-fg/bold highlight applied at the line level via
+        // patch_style. Building the spans once for both states avoids
+        // the per-frame format!() allocation the old single-span
+        // selected branch used.
         let row = named_project_row("codemux", "/Users/x/codemux", Some("devpod-go"), true, 60);
-        assert_eq!(
-            row.spans.len(),
-            1,
-            "selected row must collapse to a single styled span: {:?}",
-            row.spans,
-        );
-        // `Line::styled` puts the style on the line itself, not on the
-        // single span — same shape as precise_search_row's selected
-        // branch.
+        // Span shape matches the unselected layout: marker, star, name,
+        // badge, gap, path.
+        assert_eq!(row.spans.len(), 6, "got {:?}", row.spans);
+        assert_eq!(row.spans[0].content.as_ref(), " ▸ ", "selected marker");
+        assert_eq!(row.spans[1].content.as_ref(), "★ ");
+        assert_eq!(row.spans[2].content.as_ref(), "codemux");
+        assert_eq!(row.spans[3].content.as_ref(), " @devpod-go");
+        // Selection styling lives on the line, not on individual spans.
+        assert_eq!(row.style.fg, Some(Color::Black));
         assert_eq!(row.style.bg, Some(Color::Cyan));
-        let text = &row.spans[0].content;
-        assert!(text.starts_with(" ▸ ★ codemux"), "got {text:?}");
-        assert!(text.ends_with("@devpod-go"), "got {text:?}");
+        assert!(
+            row.style.add_modifier.contains(Modifier::BOLD),
+            "selected line must carry BOLD: {:?}",
+            row.style,
+        );
     }
 
     #[test]
     fn named_project_row_drops_path_when_width_is_too_tight() {
-        // 22 columns: marker(3) + "★ "(2) + "codemux"(7) + "  @devpod-go"(12) = 24
+        // 22 columns: marker(3) + "★ "(2) + "codemux"(7) + " @devpod-go"(11) = 23
         // → no room for path. Falls back to keeping star+name+badge legible.
         let row = named_project_row("codemux", "/Users/x/codemux", Some("devpod-go"), false, 22);
         let path_span_present = row
@@ -5922,6 +5975,89 @@ mod tests {
         m.set_fuzzy_results(result);
         assert_eq!(m.filtered.len(), 2);
         assert!(!m.filtered_stale);
+    }
+
+    /// Regression: during background indexing, every batch of newly-
+    /// indexed dirs triggers a re-score (the runtime clears the
+    /// last-pushed-query memo when the per-host generation bumps).
+    /// The user-visible bug was: I press Down to pick the second
+    /// candidate, the next batch lands a few hundred ms later, and my
+    /// selection snaps back to the top because the old code reset
+    /// `selected = Some(0)` on every result. Identity-preservation
+    /// keeps the user's pick anchored to the path string.
+    #[test]
+    fn set_fuzzy_results_preserves_user_selection_across_rescore() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        let first = FuzzyResult {
+            host: HOST_PLACEHOLDER.to_string(),
+            query: "code".to_string(),
+            hits: vec![
+                "/home/df/code-utils".to_string(),
+                "/home/df/Workbench/codemux".to_string(),
+            ],
+        };
+        m.set_fuzzy_results(first);
+        // User presses Down once: selection now on /home/df/Workbench/codemux.
+        m.move_selection_forward();
+        assert_eq!(m.selected, Some(1));
+
+        // Indexer batch lands; worker re-scores with a larger dir set
+        // and the same hits land in a different order (a new dir
+        // outscores /home/df/code-utils).
+        let second = FuzzyResult {
+            host: HOST_PLACEHOLDER.to_string(),
+            query: "code".to_string(),
+            hits: vec![
+                "/home/df/Workbench/code-stuff".to_string(),
+                "/home/df/code-utils".to_string(),
+                "/home/df/Workbench/codemux".to_string(),
+            ],
+        };
+        m.set_fuzzy_results(second);
+        assert_eq!(
+            m.selected,
+            Some(2),
+            "selection must follow the user's pick to its new index"
+        );
+    }
+
+    /// When the previously-selected path drops out of the new hits
+    /// (e.g. the index now contains a path that displaces the user's
+    /// pick beyond the cap), fall back to the first hit so Enter
+    /// still commits a valid candidate.
+    #[test]
+    fn set_fuzzy_results_falls_back_to_first_when_selection_dropped() {
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.fuzzy_query = "code".to_string();
+        let first = FuzzyResult {
+            host: HOST_PLACEHOLDER.to_string(),
+            query: "code".to_string(),
+            hits: vec![
+                "/home/df/code-utils".to_string(),
+                "/home/df/Workbench/codemux".to_string(),
+            ],
+        };
+        m.set_fuzzy_results(first);
+        m.move_selection_forward();
+        assert_eq!(m.selected, Some(1));
+
+        let second = FuzzyResult {
+            host: HOST_PLACEHOLDER.to_string(),
+            query: "code".to_string(),
+            hits: vec![
+                "/home/df/code-utils".to_string(),
+                "/home/df/code-vault".to_string(),
+            ],
+        };
+        m.set_fuzzy_results(second);
+        assert_eq!(
+            m.selected,
+            Some(0),
+            "missing prior selection falls back to first hit"
+        );
     }
 
     // ── active_host_key ──────────────────────────────────────────
