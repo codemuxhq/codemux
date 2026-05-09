@@ -17,13 +17,24 @@ For verbose tracing: `RUST_LOG=codemux=debug just run` (the `EnvFilter` is scope
 
 ## Repo layout
 
-Cargo workspace, edition 2024, resolver 3. Three crates:
+Cargo workspace, edition 2024, resolver 3. Two binaries and four libraries:
 
-- `apps/tui` — binary `codemux`. Owns PTYs, runs the event loop, renders chrome.
-- `crates/session` — agent lifecycle bounded context (mostly P1.4+ scope).
+- `apps/tui` — binary `codemux`. Owns local PTYs, runs the event loop, renders chrome.
+- `apps/daemon` — binary `codemuxd`. Per-host daemon (AD-3) that owns remote PTYs and mirrors the child's screen with `vt100` for replay-on-attach. Exposes its supervisor as a `lib.rs` so integration tests can drive it in-process without forking.
+- `crates/session` — agent lifecycle bounded context. Application core; has a `test-util` feature.
 - `crates/shared-kernel` — IDs only (`HostId`, `AgentId`, `GroupId`); zero vendor deps.
+- `crates/wire` — protocol message types between `codemux` and `codemuxd`. Pure data, depends only on `thiserror`.
+- `crates/codemuxd-bootstrap` — SSH adapter. A `build.rs` assembles a daemon tarball; the crate ships it to remote hosts on first connect. Consumed by `apps/tui`.
 
-Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term/vt100/crossterm`. `session → shared-kernel`. **Never** the other direction; **never** any TUI dep in `crates/*`. Architecture rationale lives in `docs/architecture.md` (AD-1 through AD-28).
+Dependency edges:
+
+- `apps/tui → session, shared-kernel, codemuxd-bootstrap, ratatui/tui-term/crossterm`
+- `apps/daemon → wire, portable-pty, vt100` — the `vt100` edge is **the one deliberate carve-out** to "no TUI deps outside `apps/tui`": the daemon needs a pure parser to mirror remote screens for replay-on-attach.
+- `codemuxd-bootstrap → session`
+- `session → shared-kernel`
+- `wire → nothing`
+
+**Never** any TUI-rendering dep (ratatui, tui-term, crossterm) outside `apps/tui`. Architecture rationale lives in `docs/architecture.md` (AD-1 through AD-28).
 
 ## Where things live
 
@@ -36,6 +47,10 @@ Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term
 | CLI flags and env vars | `apps/tui/src/main.rs` `Cli` struct |
 | Config file format | `apps/tui/src/config.rs` + the `Bindings` types in `keymap.rs` |
 | Agent / Host / status domain types | `crates/session/src/domain.rs` |
+| Daemon supervisor, remote PTY ownership | `apps/daemon/src/lib.rs` (binary entry in `main.rs` is a thin shell) |
+| Wire protocol message types | `crates/wire/src/` |
+| SSH bootstrap / daemon tarball assembly | `crates/codemuxd-bootstrap/` (`build.rs` rebuilds the embedded tarball when `apps/daemon`, `crates/wire`, or `Cargo.lock` change) |
+| E2E test strategy and roadmap | `docs/testing.md` (TUI tests live in `apps/tui/tests/`, daemon tests in `apps/daemon/tests/`) |
 
 ## Key invariants worth knowing
 
@@ -52,3 +67,4 @@ Allowed dependency edges: `apps/tui → session, shared-kernel, ratatui/tui-term
 - [`docs/architecture.md`](docs/architecture.md) — stack, data model, all architecture decisions
 - [`docs/roadmap.md`](docs/roadmap.md) — phased plan, ship criteria, explicit non-milestones
 - [`docs/codemuxd-stages.md`](docs/codemuxd-stages.md) — live tracker for the AD-3 daemon build-out (Stages 0–5)
+- [`docs/testing.md`](docs/testing.md) — testing stack, layout, invariants, and roadmap
