@@ -40,7 +40,7 @@ The rules. When in doubt, the principle wins over the feature.
 
 4. **Grouping is mine.** I tag things how I think about them, not how the filesystem or git is organized. The app remembers.
 
-5. **Edits are a peek, not a workflow.** The diff panel is for awareness. Deep review happens in `$EDITOR`. codemux is never a code-review tool.
+5. **Edits are a peek, not a workflow.** The diff panel is for awareness. Deep review happens in `$EDITOR`.
 
 6. **No surprise resurrection.** If a session is dead, it shows dead. If reattach fails, it tells me. Never silently start a new conversation behind a familiar label.
 
