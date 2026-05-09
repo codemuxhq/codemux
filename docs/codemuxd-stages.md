@@ -382,7 +382,7 @@ End-to-end smoke passes:
 7. Spawn a second agent on the same host. Verify a second daemon process
    exists (one-per-agent model from AD-3)
 8. Switch focus between local and remote agents in a single keystroke.
-   This reproduces Scenario 1 from `docs/use-cases.md`
+   This reproduces Scenario 1 from `docs/002--use-cases.md`
 
 ---
 
