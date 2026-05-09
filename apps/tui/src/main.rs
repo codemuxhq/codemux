@@ -27,6 +27,7 @@ mod spawn;
 mod ssh_config;
 mod status_bar;
 mod statusline_ipc;
+mod toast;
 mod url_scan;
 use runtime::NavStyle;
 

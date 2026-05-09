@@ -73,6 +73,7 @@ use crate::pty_title::TitleCapture;
 use crate::repo_name;
 use crate::spawn::{DirLister, HOST_PLACEHOLDER, ModalOutcome, SpawnMinibuffer};
 use crate::status_bar::{self, AgentView, SegmentCtx, StatusSegment, render_segments};
+use crate::toast::{Toast, ToastDeck, render_toast};
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const NAV_PANE_WIDTH: u16 = 25;
@@ -2188,25 +2189,6 @@ fn compute_hover(
     })
 }
 
-/// How long a URL-open toast stays on screen before auto-dismissing.
-/// Long enough to read; short enough not to crowd the agent pane.
-const URL_TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// One-row banner rendered at the top of the screen after a URL open
-/// attempt completes. Cleared automatically once
-/// [`URL_TOAST_TTL`] elapses, or earlier on the next mouse / key
-/// event so the user's interaction doesn't get visually stalled.
-#[derive(Debug, Clone)]
-struct UrlOpenToast {
-    text: String,
-    started_at: std::time::Instant,
-    /// `true` for the success toast (rendered with a neutral / accent
-    /// style), `false` for failure (rendered with the same red
-    /// background as `render_crash_banner` so it reads as "something
-    /// went wrong, here's the fallback").
-    success: bool,
-}
-
 /// Result of attempting to open a URL via the OS handler. Reported
 /// asynchronously: the spawn itself returns immediately (so the event
 /// loop never blocks) and a worker thread waits on the child to
@@ -2309,33 +2291,33 @@ fn project_url_open_report(report: &UrlOpenReport) -> UrlOpenAction {
     }
 }
 
-/// Pure: build the user-facing toast from the worker outcome plus
-/// whether the OSC 52 clipboard fallback succeeded. Caller decides
-/// whether (and when) to attempt the clipboard write; we just
-/// describe what happened.
-fn build_url_open_toast(url: &str, action: &UrlOpenAction, clipboard_copied: bool) -> UrlOpenToast {
+/// Pure: project a URL-open outcome into an optional toast for the
+/// centralized [`crate::toast::ToastDeck`]. **Returns `None` on
+/// success** — a successful open is its own confirmation (the user
+/// sees their browser come up); a green pill on top of the agent
+/// pane just adds noise. Only failures (and partial failures) get a
+/// toast.
+///
+/// Severity laddering:
+/// - Clipboard fallback succeeded → `Warning`. The user has a
+///   workaround (paste); we tell them what happened but don't paint
+///   the screen blood-red over a recoverable case.
+/// - Clipboard fallback also failed → `Error`. There's no recovery
+///   path left; the user needs to know the URL is gone.
+fn url_open_toast(url: &str, action: &UrlOpenAction, clipboard_copied: bool) -> Option<Toast> {
     match action {
-        UrlOpenAction::Confirm => UrlOpenToast {
-            text: format!(" ✓ opened {url} "),
-            started_at: std::time::Instant::now(),
-            success: true,
-        },
+        UrlOpenAction::Confirm => None,
         UrlOpenAction::FallbackToClipboard { error } => {
-            let text = if clipboard_copied {
-                format!(
-                    " ✗ {} failed ({error}) — URL copied to clipboard ",
+            if clipboard_copied {
+                Some(Toast::warning(format!(
+                    "{} failed ({error}) — {url} copied to clipboard",
                     url_handler_name(),
-                )
+                )))
             } else {
-                format!(
-                    " ✗ {} failed ({error}); clipboard fallback also failed ",
+                Some(Toast::error(format!(
+                    "{} failed ({error}); clipboard fallback also failed",
                     url_handler_name(),
-                )
-            };
-            UrlOpenToast {
-                text,
-                started_at: std::time::Instant::now(),
-                success: false,
+                )))
             }
         }
     }
@@ -2699,13 +2681,14 @@ fn event_loop(
     // (in the mouse handler). Cleared on resize, focused-agent change,
     // and any motion event that arrives without Ctrl held.
     let mut hover: Option<HoverUrl> = None;
-    // One-shot toast surfaced after a Ctrl+Click URL open completes.
-    // The worker thread reports `UrlOpenOutcome::Opened` or
-    // `Failed { error }` via `url_open_rx` after the OS handler exits;
-    // the runtime drains the channel each tick, falls back to OSC 52
-    // clipboard on failure, and parks a banner here for [`URL_TOAST_TTL`]
-    // before auto-dismissing.
-    let mut url_toast: Option<UrlOpenToast> = None;
+    // Centralized toast surface — drained from `url_open_rx` (and
+    // any future async event source). URL-open success doesn't push
+    // anything; only failures do. When a toast is active, Esc
+    // dismisses it AND consumes the keystroke so a UI-clear gesture
+    // doesn't leak into the agent (which would abort whatever
+    // Claude is mid-stream of). When the deck is empty Esc passes
+    // through to its normal handler chain.
+    let mut toasts = ToastDeck::new();
     // Tracks whether mouse capture has been temporarily yielded to the
     // host terminal so the user's URL modifier can drive Ghostty's
     // (or iTerm2's, Kitty's, ...) native URL hover/click handler. See
@@ -2757,21 +2740,22 @@ fn event_loop(
         // Drain URL-open outcomes from the worker threads spawned by
         // [`OsUrlOpener::open`]. Project the report into an action
         // (pure), perform any side effect here (OSC 52 clipboard
-        // fallback on failure), then build the toast from the
-        // outcome plus the side effect's result.
+        // fallback on failure), then push a toast — but only on the
+        // failure / partial-failure paths. Successful opens are their
+        // own confirmation (the user sees their browser come up); a
+        // green pill on top of the agent pane just adds visual debt.
         while let Ok(report) = url_open_rx.try_recv() {
             let action = project_url_open_report(&report);
             let clipboard_copied = matches!(action, UrlOpenAction::FallbackToClipboard { .. })
                 && write_clipboard_to(&mut io::stdout(), &report.url).is_ok();
-            url_toast = Some(build_url_open_toast(&report.url, &action, clipboard_copied));
+            if let Some(toast) = url_open_toast(&report.url, &action, clipboard_copied) {
+                toasts.push(toast);
+            }
         }
-        // Auto-dismiss the toast once its TTL elapses. Cleared on
-        // the next user input too; whichever fires first wins.
-        if let Some(t) = &url_toast
-            && t.started_at.elapsed() >= URL_TOAST_TTL
-        {
-            url_toast = None;
-        }
+        // Evict any TTL-expired toast. Cheap when the deck is empty.
+        // The user can also dismiss earlier with Esc — handled in the
+        // key dispatcher below.
+        toasts.tick();
         // Drain in-flight index events for every host (local + each
         // SSH host the user has spawned to), update states, and
         // dispatch any completed walks to a detached disk-save
@@ -3063,8 +3047,8 @@ fn event_loop(
                     modal_index_state,
                     segments,
                 );
-                if let Some(toast) = url_toast.as_ref() {
-                    render_url_toast(frame, frame.area(), toast);
+                if let Some(toast) = toasts.current() {
+                    render_toast(frame, frame.area(), toast);
                 }
             })
             .wrap_err("draw frame")?;
@@ -3123,6 +3107,22 @@ fn event_loop(
                 // opened help by accident).
                 if matches!(help_state, HelpState::Open) {
                     help_state = HelpState::Closed;
+                    continue;
+                }
+
+                // Esc with an active toast: dismiss and consume the
+                // keystroke. Forwarding Esc to the agent here would
+                // mean a user pressing Esc *just* to clear an error
+                // pill also aborts whatever Claude is mid-stream of
+                // — that's a UI-layer interaction leaking into the
+                // domain layer. When no toast is active the branch
+                // is skipped and Esc reaches its normal handler
+                // (agent interrupt, modal close, etc.).
+                if key.code == KeyCode::Esc
+                    && key.modifiers.is_empty()
+                    && toasts.current().is_some()
+                {
+                    toasts.dismiss();
                     continue;
                 }
 
@@ -4402,44 +4402,6 @@ fn paint_hover_url_if_active(
 /// `"d"` or `"ctrl+x"`), resolved by the orchestration layer rather
 /// than the renderer. Keeps `&Bindings` out of the render path so
 /// the renderer stays decoupled from input config.
-/// One-row banner at the top of the screen that surfaces the result
-/// of a Ctrl+Click URL open. Success uses an inverse cyan accent so
-/// it reads as confirmation; failure uses the same red background as
-/// [`render_crash_banner`] so the user immediately knows the open
-/// didn't take and the (already-effected) clipboard fallback was the
-/// best codemux could do.
-///
-/// Auto-dismissed after [`URL_TOAST_TTL`] in the event loop; this
-/// renderer is a pure projection of `toast` and runs every frame
-/// while the toast is live.
-fn render_url_toast(frame: &mut Frame<'_>, area: Rect, toast: &UrlOpenToast) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let banner_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: 1,
-    };
-    let style = if toast.success {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::Red)
-            .add_modifier(Modifier::BOLD)
-    };
-    let widget = Paragraph::new(Line::raw(toast.text.clone()))
-        .alignment(Alignment::Left)
-        .style(style);
-    frame.render_widget(Clear, banner_area);
-    frame.render_widget(widget, banner_area);
-}
-
 fn render_crash_banner(frame: &mut Frame<'_>, area: Rect, exit_code: i32, dismiss_label: &str) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -8841,109 +8803,10 @@ mod tests {
             .collect::<String>()
     }
 
-    /// Toast `TestBackend` tests. Render `render_url_toast` against
-    /// an 80x24 buffer and assert: text content lands on row 0,
-    /// success uses cyan bg, failure uses red bg.
-    #[test]
-    fn render_url_toast_success_paints_cyan_top_row() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let toast = UrlOpenToast {
-            text: " ✓ opened https://example.com ".to_string(),
-            started_at: std::time::Instant::now(),
-            success: true,
-        };
-        terminal
-            .draw(|frame| {
-                render_url_toast(
-                    frame,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: 80,
-                        height: 24,
-                    },
-                    &toast,
-                );
-            })
-            .unwrap();
-        let row = top_row_text(&terminal);
-        assert!(
-            row.contains("opened https://example.com"),
-            "toast text missing from top row: {row:?}",
-        );
-        let buf = terminal.backend().buffer();
-        // The first cell of the row should carry the success cyan bg.
-        assert_eq!(buf[(0, 0)].bg, Color::Cyan);
-        assert_eq!(buf[(0, 0)].fg, Color::Black);
-    }
-
-    #[test]
-    fn render_url_toast_failure_paints_red_top_row() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let toast = UrlOpenToast {
-            text: " ✗ xdg-open failed (no DISPLAY) — copied ".to_string(),
-            started_at: std::time::Instant::now(),
-            success: false,
-        };
-        terminal
-            .draw(|frame| {
-                render_url_toast(
-                    frame,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: 80,
-                        height: 24,
-                    },
-                    &toast,
-                );
-            })
-            .unwrap();
-        let row = top_row_text(&terminal);
-        assert!(
-            row.contains("xdg-open failed"),
-            "toast text missing from top row: {row:?}",
-        );
-        let buf = terminal.backend().buffer();
-        assert_eq!(buf[(0, 0)].bg, Color::Red);
-        assert_eq!(buf[(0, 0)].fg, Color::White);
-    }
-
-    /// Zero-area Rect must short-circuit cleanly — no panic, no
-    /// rendering. Guards the early-return branch in
-    /// `render_url_toast`.
-    #[test]
-    fn render_url_toast_zero_area_is_a_noop() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let toast = UrlOpenToast {
-            text: "  ignored  ".to_string(),
-            started_at: std::time::Instant::now(),
-            success: true,
-        };
-        terminal
-            .draw(|frame| {
-                render_url_toast(
-                    frame,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 0,
-                    },
-                    &toast,
-                );
-            })
-            .unwrap();
-        // Top row must remain blank — toast was a no-op.
-        let row = top_row_text(&terminal);
-        assert!(
-            row.trim().is_empty(),
-            "zero-area toast must not paint: {row:?}",
-        );
-    }
+    /// Toast rendering and severity behavior is exercised in
+    /// `crate::toast::tests`. The runtime no longer owns a
+    /// URL-specific renderer — the URL flow projects to a generic
+    /// `Toast` and the centralized `render_toast` paints it.
 
     #[test]
     fn render_agent_pane_paints_red_banner_for_nonzero_exit_code() {
@@ -10209,53 +10072,61 @@ mod tests {
         );
     }
 
+    /// Successful URL opens are their own confirmation — the user
+    /// sees their browser come up. The helper must return `None`
+    /// here; surfacing a "✓ opened" pill on top of the agent pane
+    /// is just visual debt.
     #[test]
-    fn build_url_open_toast_confirm_returns_success_with_url() {
-        let toast = build_url_open_toast("https://example.com", &UrlOpenAction::Confirm, false);
-        assert!(toast.success);
+    fn url_open_toast_confirm_returns_none() {
+        let toast = url_open_toast("https://example.com", &UrlOpenAction::Confirm, false);
         assert!(
-            toast.text.contains("https://example.com"),
-            "toast text must reference the URL: {}",
-            toast.text,
-        );
-        assert!(toast.text.contains("opened"));
-    }
-
-    #[test]
-    fn build_url_open_toast_fallback_with_clipboard_success() {
-        let action = UrlOpenAction::FallbackToClipboard {
-            error: "exit 3: no display".to_string(),
-        };
-        let toast = build_url_open_toast("https://example.com", &action, true);
-        assert!(!toast.success);
-        assert!(
-            toast.text.contains(url_handler_name()),
-            "toast must name the handler that failed: {}",
-            toast.text,
-        );
-        assert!(
-            toast.text.contains("exit 3: no display"),
-            "toast must surface the captured stderr: {}",
-            toast.text,
-        );
-        assert!(
-            toast.text.contains("copied to clipboard"),
-            "successful clipboard fallback must be acknowledged: {}",
-            toast.text,
+            toast.is_none(),
+            "successful open must not push a toast: {toast:?}",
         );
     }
 
+    /// Clipboard fallback worked → Warning severity. Recoverable, so
+    /// no need to paint the screen blood-red. Message must surface
+    /// the handler name and the captured stderr so the user knows
+    /// what failed and why; must also acknowledge the clipboard
+    /// recovery so the user knows where the URL went.
     #[test]
-    fn build_url_open_toast_fallback_with_clipboard_failure_says_so() {
+    fn url_open_toast_fallback_with_clipboard_success_is_warning() {
         let action = UrlOpenAction::FallbackToClipboard {
             error: "exit 3: no display".to_string(),
         };
-        let toast = build_url_open_toast("https://example.com", &action, false);
-        assert!(!toast.success);
+        let toast = url_open_toast("https://example.com", &action, true)
+            .expect("clipboard-recovered failure must produce a toast");
+        assert_eq!(toast.severity(), crate::toast::ToastSeverity::Warning);
+        let text = toast.text();
         assert!(
-            toast.text.contains("clipboard fallback also failed"),
+            text.contains(url_handler_name()),
+            "toast must name the handler that failed: {text}",
+        );
+        assert!(
+            text.contains("exit 3: no display"),
+            "toast must surface the captured stderr: {text}",
+        );
+        assert!(
+            text.contains("copied to clipboard"),
+            "successful clipboard fallback must be acknowledged: {text}",
+        );
+    }
+
+    /// Clipboard fallback ALSO failed → Error severity. There's no
+    /// recovery path left; the user needs to know the URL is gone.
+    #[test]
+    fn url_open_toast_fallback_with_clipboard_failure_is_error() {
+        let action = UrlOpenAction::FallbackToClipboard {
+            error: "exit 3: no display".to_string(),
+        };
+        let toast = url_open_toast("https://example.com", &action, false)
+            .expect("unrecoverable failure must produce a toast");
+        assert_eq!(toast.severity(), crate::toast::ToastSeverity::Error);
+        assert!(
+            toast.text().contains("clipboard fallback also failed"),
             "user must see that the second-line fallback didn't take: {}",
-            toast.text,
+            toast.text(),
         );
     }
 
