@@ -1225,11 +1225,12 @@ pub fn run(
     // recent Alacritty, Foot) cannot deliver Cmd events at all.
     // Terminals that do not understand the negotiation simply ignore it.
     let needs_super_keys = config.bindings.uses_super_modifier();
-    let mut keyboard_flags = KeyboardEnhancementFlags::empty();
-    if needs_super_keys {
-        keyboard_flags |= KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
-    }
-    let enhanced_keyboard = !keyboard_flags.is_empty()
+    let keyboard_flags = if needs_super_keys {
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+    } else {
+        KeyboardEnhancementFlags::empty()
+    };
+    let enhanced_keyboard = needs_super_keys
         && execute!(io::stdout(), PushKeyboardEnhancementFlags(keyboard_flags)).is_ok();
     if enhanced_keyboard {
         tracing::debug!(
@@ -3113,8 +3114,9 @@ fn event_loop(
             // Press: forwarded to the dispatcher for handling. Without
             // KKP `REPORT_EVENT_TYPES` we don't see Release events for
             // non-modifier keys, so the catch-all at the bottom never
-            // fires for those. Repeat is included for forward-compat
-            // with terminals that may emit it on their own.
+            // fires for those. Repeat is included for the Windows
+            // backend, which reports `Repeat` natively via the Win32
+            // Console API regardless of KKP.
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 // Help screen takes the highest priority: any key closes it
                 // (including the prefix key, which is friendly when the user
