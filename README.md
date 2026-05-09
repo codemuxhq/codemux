@@ -72,7 +72,7 @@ This works in **Ghostty, Kitty, WezTerm, recent Alacritty, Foot, and partially i
 
 ## Docs
 
-- [`docs/vision.md`](docs/vision.md) — what codemux is and why
+- [`docs/001-vision.md`](docs/001-vision.md) — what codemux is and why
 - [`docs/use-cases.md`](docs/use-cases.md) — the concrete workflows it's designed for
 - [`docs/architecture.md`](docs/architecture.md) — stack, data model, architecture decisions
 - [`docs/roadmap.md`](docs/roadmap.md) — phased plan, ship criteria, non-milestones

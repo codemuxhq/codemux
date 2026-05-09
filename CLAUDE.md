@@ -1,6 +1,6 @@
 # codemux
 
-Personal TUI multiplexer for Claude Code agent sessions. Single-user, Rust, ratatui + portable-pty + tui-term. See `docs/vision.md` for the full pitch and `docs/roadmap.md` for current phase and sequencing.
+Personal TUI multiplexer for Claude Code agent sessions. Single-user, Rust, ratatui + portable-pty + tui-term. See `docs/001-vision.md` for the full pitch and `docs/roadmap.md` for current phase and sequencing.
 
 ## Workflow conventions
 
@@ -62,7 +62,7 @@ Dependency edges:
 
 ## Docs
 
-- [`docs/vision.md`](docs/vision.md) — what codemux is and the eight UX principles
+- [`docs/001-vision.md`](docs/001-vision.md) — what codemux is and the eight UX principles
 - [`docs/use-cases.md`](docs/use-cases.md) — the four concrete workflows it's designed for
 - [`docs/architecture.md`](docs/architecture.md) — stack, data model, all architecture decisions
 - [`docs/roadmap.md`](docs/roadmap.md) — phased plan, ship criteria, explicit non-milestones

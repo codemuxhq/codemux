@@ -82,4 +82,4 @@ Things codemux commits to NOT building, even when they seem "just one more featu
 - Auth beyond the P4 phone-view re-spec
 - Telemetry
 
-If any of these start to feel tempting, re-read `docs/vision.md`.
+If any of these start to feel tempting, re-read `docs/001-vision.md`.
