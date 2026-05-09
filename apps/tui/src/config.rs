@@ -55,17 +55,6 @@ pub struct Config {
     /// Knobs for the spawn modal — search engine choice and the roots
     /// the fuzzy directory indexer walks.
     pub spawn: SpawnConfig,
-    /// Modifier the user holds to enable host-terminal URL handling
-    /// (Ghostty / iTerm2 / Kitty cursor change + Cmd-click open). When
-    /// the user holds this key, codemux temporarily yields mouse capture
-    /// to the host so its URL hover detector can run; on release we
-    /// reclaim. Independent of the in-app Ctrl+click handler, which
-    /// always works as a fallback whenever mouse capture is active and
-    /// the click arrives with `KeyModifiers::CONTROL` set.
-    ///
-    /// Default: `cmd` on macOS (Ghostty/iTerm2 use Cmd for URLs there),
-    /// `ctrl` elsewhere.
-    pub mouse_url_modifier: MouseUrlModifier,
     /// When `true`, codemux yields mouse capture for the entire focused
     /// pane any time the focused agent is in a terminal-failure state
     /// (`Failed`). Trade: the host terminal's native I-beam cursor + click-
@@ -89,88 +78,7 @@ impl Default for Config {
             scrollback_len: default_scrollback_len(),
             ui: Ui::default(),
             spawn: SpawnConfig::default(),
-            mouse_url_modifier: MouseUrlModifier::default(),
             mouse_yield_on_failed: false,
-        }
-    }
-}
-
-/// Modifier key the user holds to make codemux yield mouse capture so
-/// the host terminal can run its native URL hover-and-open UX.
-///
-/// Why this exists: any DEC mouse capture mode (`?1000h`, `?1002h`,
-/// `?1003h`) silences Ghostty's URL hover detector. We can't deliver
-/// Cmd over the SGR mouse encoding (only shift/alt/ctrl bits exist),
-/// so the only path to native Cmd-click is to temporarily release
-/// capture on the user's modifier press, then reclaim on release. The
-/// Kitty Keyboard Protocol delivers bare-modifier press/release events
-/// when `REPORT_ALL_KEYS_AS_ESCAPE_CODES` + `REPORT_EVENT_TYPES` are
-/// pushed.
-///
-/// **Dead-key trade-off (intl layouts).** Pushing
-/// `REPORT_ALL_KEYS_AS_ESCAPE_CODES` also bypasses OS-level dead-key
-/// composition: pressing dead-tilde + space on a US-International or
-/// Brazilian intl layout no longer produces a literal `~` for the
-/// application — the dead-key arrives as an unmatched Release event
-/// and only the composing space surfaces. The runtime mitigates the
-/// dead-tilde case via a per-character recovery (`runtime.rs`) but
-/// other dead-keys (`"`, `'`, `^`, `` ` ``) round-trip incorrectly.
-///
-/// To avoid the issue entirely, choose anything other than `Cmd` —
-/// only `Cmd` requires the offending KKP flag (because Cmd doesn't
-/// have a bit in the SGR mouse encoding). For `Ctrl` / `Alt` /
-/// `Shift` / `None`, codemux negotiates with just
-/// `DISAMBIGUATE_ESCAPE_CODES` and the OS keeps composing dead-keys
-/// natively; the cost is that the native terminal URL hover yield
-/// doesn't fire (use the in-app Ctrl+hover overlay + Ctrl+Click
-/// handler instead).
-///
-/// `None` disables the yield behavior entirely (in-app Ctrl+click is
-/// the only path).
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum MouseUrlModifier {
-    /// Never yield. Only the in-app Ctrl+click handler fires.
-    None,
-    /// Yield while the user holds Cmd (macOS) / Win / Super.
-    /// Aliases: `super`, `win`, `command`.
-    #[serde(alias = "super", alias = "win", alias = "command")]
-    Cmd,
-    /// Yield while the user holds Control. Alias: `control`.
-    #[serde(alias = "control")]
-    Ctrl,
-    /// Yield while the user holds Alt / Option / Meta.
-    /// Aliases: `option`, `meta`.
-    #[serde(alias = "option", alias = "meta")]
-    Alt,
-    /// Yield while the user holds Shift.
-    Shift,
-}
-
-impl MouseUrlModifier {
-    /// Whether codemux must request KKP `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-    /// (and `REPORT_EVENT_TYPES`) so the terminal delivers bare-modifier
-    /// press/release events. Only `Cmd` needs them: SGR 1006 mouse
-    /// encoding does not carry a Cmd / Super bit, so the keyboard
-    /// channel is the only signal that the user is holding the
-    /// modifier. `Ctrl` / `Alt` / `Shift` are reported on the mouse
-    /// event itself; `None` never yields.
-    ///
-    /// Encapsulated here (rather than as a `match` in the runtime) so
-    /// the runtime stays ignorant of *why* the flags are needed and a
-    /// future variant cannot silently miss the negotiation step.
-    #[must_use]
-    pub fn requires_bare_modifier_events(self) -> bool {
-        matches!(self, Self::Cmd)
-    }
-}
-
-impl Default for MouseUrlModifier {
-    fn default() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Cmd
-        } else {
-            Self::Ctrl
         }
     }
 }
@@ -1689,74 +1597,6 @@ mod tests {
             config.spawn.remote_scratch_dir(Path::new("/root")),
             Some(PathBuf::from("/root/.codemux/scratch")),
         );
-    }
-
-    /// `requires_bare_modifier_events` is the gate that decides
-    /// whether the runtime pushes KKP `REPORT_ALL_KEYS_AS_ESCAPE_CODES`.
-    /// Only Cmd needs it (no Cmd bit in SGR 1006); Ctrl / Alt / Shift
-    /// ride on the mouse event's own modifier bits, and None never
-    /// yields. Locking the matrix down so a future variant can't
-    /// silently miss the flag-negotiation step.
-    #[test]
-    fn requires_bare_modifier_events_only_true_for_cmd() {
-        assert!(MouseUrlModifier::Cmd.requires_bare_modifier_events());
-        assert!(!MouseUrlModifier::Ctrl.requires_bare_modifier_events());
-        assert!(!MouseUrlModifier::Alt.requires_bare_modifier_events());
-        assert!(!MouseUrlModifier::Shift.requires_bare_modifier_events());
-        assert!(!MouseUrlModifier::None.requires_bare_modifier_events());
-    }
-
-    /// Default `mouse_url_modifier` follows the host platform's URL
-    /// convention: Cmd on macOS (Ghostty/iTerm2 use Cmd for URLs),
-    /// Ctrl elsewhere. Locking the default down so a future
-    /// platform-default refactor can't silently flip it.
-    #[test]
-    fn mouse_url_modifier_default_is_platform_aware() {
-        let expected = if cfg!(target_os = "macos") {
-            MouseUrlModifier::Cmd
-        } else {
-            MouseUrlModifier::Ctrl
-        };
-        assert_eq!(MouseUrlModifier::default(), expected);
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.mouse_url_modifier, expected);
-    }
-
-    /// The user-facing config accepts every spelling each modifier
-    /// goes by in the wild. If a future serde rename drops one of
-    /// these aliases, every config file using that spelling silently
-    /// stops parsing — this test catches the regression.
-    #[test]
-    fn mouse_url_modifier_parses_all_documented_spellings() {
-        for spelling in ["cmd", "super", "win", "command"] {
-            let cfg: Config =
-                toml::from_str(&format!("mouse_url_modifier = \"{spelling}\"")).unwrap();
-            assert_eq!(
-                cfg.mouse_url_modifier,
-                MouseUrlModifier::Cmd,
-                "{spelling} should map to Cmd",
-            );
-        }
-        for spelling in ["ctrl", "control"] {
-            let cfg: Config =
-                toml::from_str(&format!("mouse_url_modifier = \"{spelling}\"")).unwrap();
-            assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::Ctrl);
-        }
-        for spelling in ["alt", "option", "meta"] {
-            let cfg: Config =
-                toml::from_str(&format!("mouse_url_modifier = \"{spelling}\"")).unwrap();
-            assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::Alt);
-        }
-        let cfg: Config = toml::from_str("mouse_url_modifier = \"shift\"").unwrap();
-        assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::Shift);
-        let cfg: Config = toml::from_str("mouse_url_modifier = \"none\"").unwrap();
-        assert_eq!(cfg.mouse_url_modifier, MouseUrlModifier::None);
-    }
-
-    #[test]
-    fn mouse_url_modifier_rejects_unknown_value() {
-        let res: Result<Config, _> = toml::from_str("mouse_url_modifier = \"bogus\"");
-        assert!(res.is_err(), "unknown modifier should fail to parse");
     }
 
     /// `mouse_yield_on_failed` defaults to `false` so users get the
