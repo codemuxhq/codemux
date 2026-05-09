@@ -28,7 +28,7 @@ use std::thread;
 use std::time::Duration;
 
 use codemux_wire::{self as wire, Message, Signal};
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::error::Error;
@@ -46,6 +46,17 @@ const SOCKET_READ_BUF: usize = 8 * 1024;
 /// before declaring the handshake stalled. Longer than the daemon's
 /// matching timeout because the SSH tunnel adds first-byte latency.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Outbound frame queue depth for the SSH writer thread.
+///
+/// The writer thread owns the unix-socket write half and drains this
+/// queue with blocking `write_all`s; the runtime's `write_frame` only
+/// ever does a non-blocking `try_send` so a stalled SSH tunnel can
+/// never freeze the event loop. 256 frames is generous for normal
+/// interactive use (a user typing 10 keys/sec fills it in ~25 s) — if
+/// it ever saturates, the link is genuinely stuck and the agent
+/// transitions to Crashed via the existing exit-code reaper.
+const WRITER_QUEUE_CAPACITY: usize = 256;
 
 /// Where an agent's PTY actually lives. The runtime owns one of these
 /// per agent and only ever talks to it through the inherent methods on
@@ -375,15 +386,19 @@ impl Drop for LocalPty {
 /// Tunnels the agent's PTY through `codemuxd` running on a remote host.
 ///
 /// Owns four pieces:
-/// - `socket_writer`: the local end of the unix-socket tunnel; all
-///   outbound frames (`PtyData`/`Resize`/`Signal`) are encoded and
-///   written here.
+/// - `writer_tx`: bounded queue feeding the writer thread. The runtime
+///   pushes encoded frames here via non-blocking `try_send`; the writer
+///   thread owns the socket write-half and drains the queue with
+///   blocking `write_all`s. This is the decoupling that keeps the
+///   event loop responsive when the SSH tunnel slows down — see
+///   [`WRITER_QUEUE_CAPACITY`] for the rationale.
 /// - `rx`: PTY chunks the framed reader thread drained from the
 ///   socket. Other inbound frames (`Pong`, `Error`) are absorbed
 ///   silently; `ChildExited` sets `exit_code` and ends the reader.
-/// - `exit_code`: a single-set cell shared with the reader thread.
-///   Empty while the remote child is alive; populated once
-///   `ChildExited` arrives or the socket EOFs. [`OnceLock`] gives us
+/// - `exit_code`: a single-set cell shared with the reader and writer
+///   threads. Empty while the remote child is alive; populated once
+///   `ChildExited` arrives, the socket EOFs, the writer hits an I/O
+///   error, or the writer queue saturates. [`OnceLock`] gives us
 ///   write-once semantics without the lock-and-poison plumbing a
 ///   `Mutex<Option<i32>>` would impose.
 /// - `tunnel`: the `ssh -N -L` subprocess. Killed on `Drop` so we
@@ -392,7 +407,7 @@ impl Drop for LocalPty {
 ///   tunnel.
 pub struct SshDaemonPty {
     label: String,
-    socket_writer: UnixStream,
+    writer_tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
     exit_code: Arc<OnceLock<i32>>,
     /// Diagnostic only — the daemon's pid on the remote host. Logged
@@ -455,6 +470,18 @@ impl SshDaemonPty {
         })?;
         let exit_code = Arc::new(OnceLock::new());
         let rx = spawn_framed_reader_thread(read_stream, Arc::clone(&exit_code));
+        // The writer thread takes ownership of the original `stream`;
+        // the reader already has its own clone. When `SshDaemonPty`
+        // drops, `writer_tx` drops first, the writer thread's `recv`
+        // returns Err, the thread exits, the original FD closes, and
+        // the reader hits EOF on its own clone (or has already exited
+        // via `ChildExited`).
+        let writer_tx = spawn_framed_writer_thread(
+            stream,
+            Arc::clone(&exit_code),
+            label.clone(),
+            WRITER_QUEUE_CAPACITY,
+        );
 
         tracing::info!(
             label = %label,
@@ -463,7 +490,7 @@ impl SshDaemonPty {
         );
         Ok(Self {
             label,
-            socket_writer: stream,
+            writer_tx,
             rx,
             exit_code,
             daemon_pid,
@@ -481,12 +508,12 @@ impl SshDaemonPty {
 
     fn write(&mut self, data: &[u8]) -> Result<(), Error> {
         let frame = Message::PtyData(data.to_vec()).encode()?;
-        self.write_frame(&frame)
+        self.enqueue_frame(frame)
     }
 
     fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Error> {
         let frame = Message::Resize { rows, cols }.encode()?;
-        self.write_frame(&frame)
+        self.enqueue_frame(frame)
     }
 
     fn signal(&mut self, sig: Signal) -> Result<(), Error> {
@@ -498,7 +525,7 @@ impl SshDaemonPty {
             return Err(Error::SignalNotSupported { signal: sig });
         }
         let frame = Message::Signal(sig).encode()?;
-        self.write_frame(&frame)
+        self.enqueue_frame(frame)
     }
 
     fn try_wait(&mut self) -> Option<i32> {
@@ -512,17 +539,35 @@ impl SshDaemonPty {
         self.signal(Signal::Kill)
     }
 
-    /// Write an already-encoded frame to the socket. Centralizes the
-    /// `Pty`-error mapping so each public method stays one line.
-    fn write_frame(&mut self, frame: &[u8]) -> Result<(), Error> {
-        self.socket_writer
-            .write_all(frame)
-            .map_err(|e| Error::Pty {
-                source: Box::new(e),
-            })?;
-        self.socket_writer.flush().map_err(|e| Error::Pty {
-            source: Box::new(e),
-        })
+    /// Hand an already-encoded frame to the writer thread.
+    ///
+    /// Non-blocking by design: the producer (the runtime's event loop)
+    /// must never stall on a slow SSH tunnel. On a full or disconnected
+    /// queue the agent is marked exited so the runtime reaps it via the
+    /// existing Crashed path on the next frame, and the caller gets a
+    /// `Pty` error to surface.
+    fn enqueue_frame(&mut self, frame: Vec<u8>) -> Result<(), Error> {
+        match self.writer_tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(
+                    label = %self.label,
+                    capacity = WRITER_QUEUE_CAPACITY,
+                    "SSH writer queue saturated; tunnel stalled, marking agent exited",
+                );
+                let _ = self.exit_code.set(-1);
+                Err(Error::Pty {
+                    source: "SSH writer queue saturated".into(),
+                })
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                // Writer thread exited (write error). It already set
+                // exit_code; surface the failure to the caller.
+                Err(Error::Pty {
+                    source: "SSH writer thread closed".into(),
+                })
+            }
+        }
     }
 }
 
@@ -707,6 +752,43 @@ fn spawn_framed_reader_thread(
         }
     });
     rx
+}
+
+/// Background writer: drains a bounded queue of pre-encoded frames and
+/// performs the blocking `write_all` on the unix socket. The runtime's
+/// `enqueue_frame` only ever does a non-blocking `try_send` against
+/// the returned `Sender`, so a slow or stalled SSH tunnel can never
+/// freeze the event loop.
+///
+/// Exits on:
+/// - sender side dropped (the `SshDaemonPty` was dropped) — clean
+///   shutdown; the original socket FD is closed by the local `stream`
+///   moving out of scope.
+/// - any `write_all` failure — sets `exit_code(-1)` so the runtime
+///   reaps the agent into Crashed on its next poll.
+fn spawn_framed_writer_thread(
+    mut stream: UnixStream,
+    exit_code: Arc<OnceLock<i32>>,
+    label: String,
+    capacity: usize,
+) -> Sender<Vec<u8>> {
+    let (tx, rx) = bounded::<Vec<u8>>(capacity);
+    thread::spawn(move || {
+        for frame in rx {
+            if let Err(e) = stream.write_all(&frame) {
+                tracing::debug!(label = %label, "framed writer write_all failed: {e}");
+                let _ = exit_code.set(-1);
+                break;
+            }
+            // `UnixStream::flush` is a no-op (no userspace buffer); the
+            // local PTY writer doesn't call it either, so we mirror
+            // that and avoid an untestable error branch.
+        }
+        // `stream` drops here, closing the writer's FD. The reader's
+        // clone may still be alive; it'll exit via EOF (after tunnel
+        // teardown) or via `ChildExited`.
+    });
+    tx
 }
 
 /// Background reader: drains the PTY master and pushes chunks into a
@@ -990,6 +1072,105 @@ mod tests {
         }
     }
 
+    /// Producer-side writes never block the runtime when the SSH
+    /// tunnel is wedged. The fake daemon completes the handshake then
+    /// stops reading; the kernel send buffer fills, the writer thread
+    /// blocks on `write_all`, then the bounded producer queue
+    /// saturates. Each `write` call must return promptly (Ok or Err),
+    /// and the agent must transition to "exited" so the runtime can
+    /// reap it via the existing Crashed path.
+    ///
+    /// Regression for the freeze the user could trigger over slow
+    /// SSH: the synchronous `socket_writer.write_all` in the event
+    /// loop would block until TCP backpressure cleared (or
+    /// `ServerAliveCountMax` killed the tunnel ~45 s later).
+    #[test]
+    fn ssh_transport_writes_do_not_block_when_daemon_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::handshake_then_silent());
+        let stream = wait_for_connect(&sock_path);
+        let mut pty =
+            SshDaemonPty::attach(stream, "test-stuck".into(), "agent-0", 24, 80, None).unwrap();
+
+        // Push large frames until either we hit the queue-saturated
+        // error or we've exceeded a sane upper bound. Each call is
+        // bounded (the producer is non-blocking) so the whole loop
+        // must complete well within the deadline. With 8 KiB payloads
+        // we fill macOS' default UnixStream send buffer + the 256-deep
+        // producer queue in well under 1000 iterations.
+        let payload = vec![b'x'; 8 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saturated = false;
+        for i in 0..2000 {
+            assert!(
+                Instant::now() < deadline,
+                "producer must not block: still spinning at iteration {i}",
+            );
+            match pty.write(&payload) {
+                Ok(()) => {}
+                Err(Error::Pty { .. }) => {
+                    saturated = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error from non-blocking write: {other:?}"),
+            }
+        }
+        assert!(
+            saturated,
+            "expected the bounded writer queue to surface a Pty error within 2000 iterations",
+        );
+
+        // Once saturation is reported, the agent must look exited so
+        // `reap_dead_transports` transitions it to Crashed on the
+        // next frame.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(code) = pty.try_wait() {
+                assert_eq!(code, -1);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected try_wait to report exit within 2s of writer saturation",
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `enqueue_frame` surfaces a `Pty` error once the writer thread
+    /// has exited, even if the queue itself isn't yet saturated. The
+    /// fake daemon closes the connection right after the handshake;
+    /// the writer thread observes EPIPE on its first `write_all`,
+    /// drops the channel receiver, and any subsequent producer-side
+    /// `write` lands on the `TrySendError::Disconnected` branch.
+    #[test]
+    fn ssh_transport_writes_after_writer_exit_return_pty_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("daemon.sock");
+        let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::handshake_then_close());
+        let stream = wait_for_connect(&sock_path);
+        let mut pty =
+            SshDaemonPty::attach(stream, "test-disconn".into(), "agent-0", 24, 80, None).unwrap();
+
+        // Push frames until the producer reports a `Pty` error. The
+        // first call may succeed (frame queued before the writer fails)
+        // but subsequent calls land on `Disconnected` once the writer
+        // thread has dropped the receiver.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "expected writer thread to exit and surface Pty error within 2s",
+            );
+            match pty.write(b"x") {
+                Ok(()) => thread::sleep(Duration::from_millis(20)),
+                Err(Error::Pty { .. }) => return,
+                Err(other) => panic!("unexpected error from disconnected writer: {other:?}"),
+            }
+        }
+    }
+
     // ----- Test helpers -----
 
     /// Hand-rolled in-process daemon for SSH transport tests. Plays
@@ -1051,6 +1232,12 @@ mod tests {
         RecordResize(Arc<Mutex<Option<(u16, u16)>>>),
         /// Close the connection immediately (test EOF handling).
         HandshakeThenClose,
+        /// Hold the connection open after the handshake but never read
+        /// from it again. The kernel send buffer fills, then the
+        /// writer thread blocks on `write_all`, then the runtime's
+        /// bounded producer queue saturates — the path that proves
+        /// non-blocking write semantics.
+        HandshakeThenSilent,
     }
 
     impl FakeDaemonScript {
@@ -1069,9 +1256,20 @@ mod tests {
         fn handshake_then_close() -> Self {
             Self::HandshakeThenClose
         }
+        fn handshake_then_silent() -> Self {
+            Self::HandshakeThenSilent
+        }
 
         fn run(self, mut stream: UnixStream) {
             if matches!(self, Self::HandshakeThenClose) {
+                drop(stream);
+                return;
+            }
+            if matches!(self, Self::HandshakeThenSilent) {
+                // Park the stream alive without reading. Keeping a
+                // reference holds the FD open so the client side sees
+                // backpressure rather than EOF.
+                std::thread::park();
                 drop(stream);
                 return;
             }
