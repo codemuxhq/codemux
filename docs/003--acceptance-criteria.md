@@ -30,15 +30,16 @@
   - [AC-021: Drag-to-select and copy via OSC 52](#ac-021-drag-to-select-and-copy-via-osc-52)
 - [Status bar](#status-bar)
   - [AC-022: Configured segments render in order](#ac-022-configured-segments-render-in-order)
-  - [AC-023: Segments drop from the left under width pressure](#ac-023-segments-drop-from-the-left-under-width-pressure)
+  - [AC-023: Customize the status bar via config](#ac-023-customize-the-status-bar-via-config)
+  - [AC-024: Segments drop from the left under width pressure](#ac-024-segments-drop-from-the-left-under-width-pressure)
 - [Help](#help)
-  - [AC-024: Help screen reflects the live keymap](#ac-024-help-screen-reflects-the-live-keymap)
+  - [AC-025: Help screen reflects the live keymap](#ac-025-help-screen-reflects-the-live-keymap)
 - [Daemon](#daemon)
-  - [AC-025: Reattach replays the screen state](#ac-025-reattach-replays-the-screen-state)
+  - [AC-026: Reattach replays the screen state](#ac-026-reattach-replays-the-screen-state)
 - [Config and CLI](#config-and-cli)
-  - [AC-026: Missing config file falls back to defaults](#ac-026-missing-config-file-falls-back-to-defaults)
-  - [AC-027: Invalid config fails loud before raw mode](#ac-027-invalid-config-fails-loud-before-raw-mode)
-  - [AC-028: Invalid `[PATH]` arg fails loud before raw mode](#ac-028-invalid-path-arg-fails-loud-before-raw-mode)
+  - [AC-027: Missing config file falls back to defaults](#ac-027-missing-config-file-falls-back-to-defaults)
+  - [AC-028: Invalid config fails loud before raw mode](#ac-028-invalid-config-fails-loud-before-raw-mode)
+  - [AC-029: Invalid `[PATH]` arg fails loud before raw mode](#ac-029-invalid-path-arg-fails-loud-before-raw-mode)
 
 ## Spawn
 
@@ -57,7 +58,7 @@
 
 **Failure modes:**
 - **Claude binary not on `$PATH`:** the initial tab enters the `Failed` state; the pane shows a crash banner with the spawn error.
-- **Invalid `<PATH>` argument** (missing or not a directory): see AC-028; the process exits non-zero before raw mode.
+- **Invalid `<PATH>` argument** (missing or not a directory): see AC-029; the process exits non-zero before raw mode.
 
 ### AC-002: Spawn a local agent in the scratch directory
 
@@ -460,7 +461,28 @@
 - **Focused agent is SSH:** `model` and `branch` skip (v1 reads only the local user's settings/git, which don't reflect the remote agent's state).
 - **Statusline JSON missing** (Claude has not yet written for this agent): `tokens` renders nothing; populates after the first turn.
 
-### AC-023: Segments drop from the left under width pressure
+### AC-023: Customize the status bar via config
+
+**Given:**
+- `config.toml` has a `[ui]` section.
+- The known segment IDs are `model`, `tokens`, `repo`, `worktree`, `branch`, `prefix_hint` (the closed set per AD-29; adding a new segment requires a Rust change).
+
+**When:**
+1. Set `status_bar_segments = ["repo", "tokens", "branch", "prefix_hint"]` (a custom subset and order, dropping `model` and `worktree` and opting `repo` in).
+2. Optionally tune a segment under `[ui.segments.branch] default_branches = ["main", "develop"]` or `[ui.segments.tokens]`.
+3. Restart codemux.
+
+**Then:**
+- The right side of the status bar renders only the listed segments, in the listed order, separated by `│`.
+- Segment-specific sub-config under `[ui.segments.<id>]` is fed into the matching segment when it is built; segments not in `status_bar_segments` ignore their sub-config blocks.
+- Setting `status_bar_segments = []` disables the right-side block entirely (no segments, no separators, no `prefix_hint`).
+- Omitting `status_bar_segments` falls back to the default order: `model, tokens, worktree, branch, prefix_hint` (`repo` is opt-in, not in defaults).
+
+**Failure modes:**
+- **Unknown segment ID** (e.g. `status_bar_segments = ["model", "uptime"]`): the unknown ID is logged once at startup with the list of known IDs and skipped; the rest of the list still renders. The config does NOT fail to load over a typo.
+- **Sub-config with invalid values** (e.g. malformed TOML in `[ui.segments.branch]`): falls under AC-028; the process exits non-zero before raw mode.
+
+### AC-024: Segments drop from the left under width pressure
 
 **Given:**
 - The same config as AC-022.
@@ -479,7 +501,7 @@
 
 ## Help
 
-### AC-024: Help screen reflects the live keymap
+### AC-025: Help screen reflects the live keymap
 
 **Given:**
 - `config.toml` rebinds `prefix` to `cmd+b` and `on_prefix.spawn_agent` to `s`.
@@ -500,7 +522,7 @@
 
 ## Daemon
 
-### AC-025: Reattach replays the screen state
+### AC-026: Reattach replays the screen state
 
 **Given:**
 - A remote agent is `Ready` on host `H`. The user has produced enough output that the visible grid is not empty.
@@ -523,7 +545,7 @@
 
 ## Config and CLI
 
-### AC-026: Missing config file falls back to defaults
+### AC-027: Missing config file falls back to defaults
 
 **Given:**
 - `$XDG_CONFIG_HOME/codemux/config.toml` does not exist (and neither does `~/.config/codemux/config.toml`).
@@ -537,7 +559,7 @@
 
 **Failure modes:** none.
 
-### AC-027: Invalid config fails loud before raw mode
+### AC-028: Invalid config fails loud before raw mode
 
 **Given:**
 - `~/.config/codemux/config.toml` exists but contains malformed TOML or an invalid value (e.g. `prefix = "ctrl+nonsense"`, or an unparseable hex color in `[ui.host_colors]`).
@@ -552,7 +574,7 @@
 
 **Failure modes:** none. The loud-fail is the design.
 
-### AC-028: Invalid `[PATH]` arg fails loud before raw mode
+### AC-029: Invalid `[PATH]` arg fails loud before raw mode
 
 **Given:**
 - The user invokes `codemux /tmp/does-not-exist` or `codemux /etc/passwd`.
