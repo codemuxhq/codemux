@@ -84,6 +84,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::{NamedProject, SearchMode};
 use crate::fuzzy_worker::FuzzyResult;
@@ -284,6 +285,31 @@ enum Zone {
     Host,
 }
 
+/// Per-frame render context the wildmenu hands to each row builder.
+/// Bundled to keep [`SpawnMinibuffer::wildmenu_row`] under clippy's
+/// `too_many_arguments` cap; every field is constant for the lifetime
+/// of one [`SpawnMinibuffer::wildmenu_view`] call.
+#[derive(Clone, Copy, Debug)]
+struct WildmenuRowContext {
+    width: usize,
+    zone: Zone,
+    fuzzy: bool,
+    precise_search: bool,
+    stale: bool,
+}
+
+/// Saved-project metadata indexed off the candidate path string.
+/// Carries the display name (always present) plus the SSH host alias
+/// (`Some` only when the user explicitly bound the project to a
+/// remote via `[[spawn.projects]] host = "alias"`). Single source of
+/// truth for what [`SpawnMinibuffer::project_meta`] knows about a
+/// candidate — `confirm` reads `host`, `wildmenu_row` reads both.
+#[derive(Clone, Debug)]
+struct NamedProjectMeta {
+    name: String,
+    host: Option<String>,
+}
+
 /// Provenance of the `path` field's current value. See
 /// [`SpawnMinibuffer::path_origin`] for the contract.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -377,13 +403,27 @@ pub struct SpawnMinibuffer {
     /// `PrepareHostThenSpawn` when the picked path matches an alias
     /// bound to a remote host.
     ///
+    /// Per-project metadata indexed by the candidate path string
+    /// `score_fuzzy` emits — `resolve_named_project_path(np)` for both
+    /// local and host-bound entries (see [`build_project_meta`]). One
+    /// map covers every saved-project lookup the modal needs:
+    ///
+    /// * commit-time host upgrade (`Self::confirm` consults `host` to
+    ///   route a path to `PrepareHostThenSpawn` when bound to an SSH
+    ///   alias); `host: None` is the local default and emits a plain
+    ///   `Spawn`.
+    /// * render-time row swap (`Self::wildmenu_row` reads `name` to
+    ///   build the `★ name … ~/path` row, and `host` to render the
+    ///   `@host` badge).
+    ///
     /// Host-bound entries are keyed by the *literal* `np.path` (no
     /// local tilde expansion) — `~/` resolves on the remote against
     /// `prepared.remote_home` during attach, not on the laptop. Local
     /// expansion would send a `/Users/...` path to a Linux remote and
     /// fail the daemon's `cwd.exists()` check. The wildmenu candidate
-    /// emitted by `score_fuzzy` is the same literal so the lookup hits.
-    project_hosts: HashMap<String, String>,
+    /// emitted by `score_fuzzy` is the same literal so the lookup
+    /// hits.
+    project_meta: HashMap<String, NamedProjectMeta>,
     /// `true` when `filtered` may not reflect the current
     /// `fuzzy_query` because a fresh fuzzy search has been kicked off
     /// (background worker in `crate::fuzzy_worker`) but its result
@@ -431,7 +471,7 @@ impl SpawnMinibuffer {
     /// user-typed path.
     #[must_use]
     pub fn open(cwd: &Path, default_mode: SearchMode, named_projects: Vec<NamedProject>) -> Self {
-        let project_hosts = build_project_hosts(&named_projects);
+        let project_meta = build_project_meta(&named_projects);
         let mut m = Self {
             host: String::new(),
             path: String::new(),
@@ -448,7 +488,7 @@ impl SpawnMinibuffer {
             user_search_mode: default_mode,
             fuzzy_query: String::new(),
             named_projects,
-            project_hosts,
+            project_meta,
             filtered_stale: false,
             just_descended: false,
             tilde_compose_armed: false,
@@ -1083,10 +1123,11 @@ impl SpawnMinibuffer {
         // active prepare slot — see the `runtime.rs` "modal state
         // machine bug" guard). The project alias is the more specific
         // signal, so it overrides whatever the user typed in the host
-        // zone.
-        if let Some(project_host) = self.project_hosts.get(&path) {
+        // zone. Local-only entries (host: None) skip this branch and
+        // fall through to the plain `Spawn` below.
+        if let Some(project_host) = self.project_meta.get(&path).and_then(|m| m.host.as_deref()) {
             return ModalOutcome::PrepareHostThenSpawn {
-                host: project_host.clone(),
+                host: project_host.to_string(),
                 path,
             };
         }
@@ -1582,43 +1623,78 @@ impl SpawnMinibuffer {
         // so each row's `i` is its absolute index in `self.filtered`,
         // which keeps the `is_selected` check correct.
         let scroll = wildmenu_scroll_offset(self.selected, usable);
+        let ctx = WildmenuRowContext {
+            width,
+            zone,
+            fuzzy,
+            precise_search,
+            stale,
+        };
         let lines: Vec<Line> = self
             .filtered
             .iter()
             .enumerate()
             .skip(scroll)
             .take(usable)
-            .map(|(i, c)| {
-                let is_selected = Some(i) == self.selected;
-                if precise_search {
-                    return precise_search_row(c, is_selected, width);
-                }
-                let marker = if is_selected { " ▸ " } else { "   " };
-                let mut line_style = if is_selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                if stale && !is_selected {
-                    line_style = line_style.add_modifier(Modifier::DIM);
-                }
-                // In fuzzy mode the full path *is* the signal — basename
-                // alone strips the directory context that the user is
-                // searching for. Precise nav and Host modes keep the
-                // basename-or-literal display.
-                let display_str = if fuzzy && zone == Zone::Path {
-                    c.clone()
-                } else {
-                    wildmenu_display_text(zone, c)
-                };
-                let display = clip_middle(&display_str, width.saturating_sub(3));
-                Line::styled(format!("{marker}{display}"), line_style)
-            })
+            .map(|(i, c)| self.wildmenu_row(c, i, &ctx))
             .collect();
         Paragraph::new(lines).block(block)
+    }
+
+    /// Build a single wildmenu row. Extracted from [`Self::wildmenu_view`]
+    /// purely to keep that function under clippy's `too_many_lines`
+    /// threshold; the per-row branching (precise-search / saved-project /
+    /// generic) lives here so the caller stays focused on the framing
+    /// (block, scroll math, sentinel branches).
+    fn wildmenu_row(&self, candidate: &str, i: usize, ctx: &WildmenuRowContext) -> Line<'static> {
+        let is_selected = Some(i) == self.selected;
+        if ctx.precise_search {
+            return precise_search_row(candidate, is_selected, ctx.width);
+        }
+        // Saved-project row: only meaningful in fuzzy + path mode
+        // (named projects are matched via `score_fuzzy`, which only
+        // runs in that mode). Nav-mode candidates are always
+        // indexed-dir paths, never named-project candidates, so the
+        // lookup would miss anyway.
+        if ctx.fuzzy
+            && ctx.zone == Zone::Path
+            && let Some(meta) = self.project_meta.get(candidate)
+        {
+            let mut row = named_project_row(
+                &meta.name,
+                candidate,
+                meta.host.as_deref(),
+                is_selected,
+                ctx.width,
+            );
+            if ctx.stale && !is_selected {
+                row = row.patch_style(Style::default().add_modifier(Modifier::DIM));
+            }
+            return row;
+        }
+        let marker = if is_selected { " ▸ " } else { "   " };
+        let mut line_style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        if ctx.stale && !is_selected {
+            line_style = line_style.add_modifier(Modifier::DIM);
+        }
+        // In fuzzy mode the full path *is* the signal — basename alone
+        // strips the directory context that the user is searching for.
+        // Precise nav and Host modes keep the basename-or-literal
+        // display.
+        let display_str = if ctx.fuzzy && ctx.zone == Zone::Path {
+            candidate.to_string()
+        } else {
+            wildmenu_display_text(ctx.zone, candidate)
+        };
+        let display = clip_middle(&display_str, ctx.width.saturating_sub(3));
+        Line::styled(format!("{marker}{display}"), line_style)
     }
 
     /// Build the fuzzy-state sentinel paragraph for the wildmenu strip.
@@ -2068,30 +2144,35 @@ fn resolve_named_project_path(np: &NamedProject) -> String {
     expand_named_project_path(&np.path)
 }
 
-/// Build the path → host lookup the spawn modal uses at commit time
-/// to upgrade a plain `Spawn` into `PrepareHostThenSpawn` for projects
-/// bound to an SSH alias. Empty/missing `host` is filtered out (treated
-/// as local). Keys come from [`resolve_named_project_path`] so they
-/// match the strings `score_fuzzy` emits into the wildmenu — i.e. the
-/// literal `np.path` with `~/` preserved (host-bound entries always
-/// take that branch since they have a non-empty host).
+/// Build the path → metadata lookup the spawn modal consults at
+/// commit time (`Self::confirm` reads `host` to upgrade `Spawn` →
+/// `PrepareHostThenSpawn`) and at render time (`Self::wildmenu_row`
+/// reads `name` to render the `★ alias` row and `host` to render the
+/// `@host` badge). Keys come from [`resolve_named_project_path`] so
+/// they match the strings `score_fuzzy` emits into the wildmenu —
+/// i.e. the locally-expanded path for local entries and the literal
+/// `np.path` (with `~/` preserved) for host-bound entries.
 ///
-/// On a duplicate path with conflicting hosts the *first* entry wins —
-/// the user's config order is the tiebreaker. We don't bother warning;
-/// duplicate paths in `[[spawn.projects]]` are already a config smell
-/// that the existing dedup in `score_fuzzy` papers over.
+/// Every named project gets an entry. `host` is `Some(non_empty)`
+/// only when the user explicitly bound the project to an SSH alias;
+/// `None` and `Some("")` both collapse to "local" so the commit-time
+/// branch in `confirm` skips the host upgrade and emits a plain
+/// `Spawn`.
+///
+/// On a duplicate path the *first* entry wins — the user's config
+/// order is the tiebreaker. We don't bother warning; duplicate paths
+/// in `[[spawn.projects]]` are already a config smell that the
+/// existing dedup in `score_fuzzy` papers over.
 #[must_use]
-fn build_project_hosts(projects: &[NamedProject]) -> HashMap<String, String> {
+fn build_project_meta(projects: &[NamedProject]) -> HashMap<String, NamedProjectMeta> {
     let mut map = HashMap::new();
     for np in projects {
-        let Some(host) = np.host.as_ref() else {
-            continue;
-        };
-        if host.is_empty() {
-            continue;
-        }
+        let host = np.host.clone().filter(|h| !h.is_empty());
         map.entry(resolve_named_project_path(np))
-            .or_insert_with(|| host.clone());
+            .or_insert_with(|| NamedProjectMeta {
+                name: np.name.clone(),
+                host,
+            });
     }
     map
 }
@@ -2428,6 +2509,135 @@ fn precise_search_row(candidate: &str, is_selected: bool, width: usize) -> Line<
     }
 }
 
+/// Collapse a `$HOME`-prefixed absolute path to `~/...` for display.
+/// Pure render-time transform — never feed the result back into the
+/// spawn pipeline (the bootstrap library and daemon want absolute
+/// paths for local hosts). When `home` is `None` or empty, or when
+/// `path` doesn't share the prefix, returns the input unchanged.
+///
+/// Splitting the env read ([`tilde_collapse`]) from the pure
+/// substitution ([`tilde_collapse_with_home`]) keeps the defensive
+/// branches (HOME unset / empty) reachable from a unit test without
+/// needing to mutate process env across test threads — which `std`
+/// flags as unsafe in newer rustc.
+#[must_use]
+fn tilde_collapse_with_home(path: &str, home: Option<&str>) -> String {
+    let Some(home_str) = home else {
+        return path.to_string();
+    };
+    if home_str.is_empty() {
+        return path.to_string();
+    }
+    if path == home_str {
+        return "~".to_string();
+    }
+    if let Some(rest) = path
+        .strip_prefix(home_str)
+        .and_then(|r| r.strip_prefix('/'))
+    {
+        return format!("~/{rest}");
+    }
+    path.to_string()
+}
+
+/// Convenience wrapper that reads `$HOME` from the process env and
+/// delegates to [`tilde_collapse_with_home`]. The wildmenu render
+/// path uses this; tests for the env-aware logic call the underlying
+/// helper directly with a synthetic home string.
+#[must_use]
+fn tilde_collapse(path: &str) -> String {
+    let home = std::env::var_os("HOME");
+    let home_str = home.as_ref().map(|h| h.to_string_lossy());
+    tilde_collapse_with_home(path, home_str.as_deref())
+}
+
+/// Build a wildmenu row for a saved project (`[[spawn.projects]]`
+/// entry). The leading `★` marks the row as user-curated (versus an
+/// auto-discovered indexed dir); the project's `name` lands on the
+/// left, and the resolved path is right-aligned and dimmed so the
+/// eye lands on the alias while the path stays available as
+/// confirmation. Host-bound entries append a dim ` @host` badge so
+/// the user can tell remote saved projects apart from local ones.
+///
+/// Selected rows render as a single span with the modal's cyan-bg
+/// highlight — uniform background reads as "this is the active pick"
+/// without competing colors. Same convention as `precise_search_row`.
+///
+/// Width budget: when the row doesn't fit, the path is the first
+/// thing to lose space (middle-clipped via [`clip_middle`]); the
+/// star, name, and host badge stay intact since they're the load-
+/// bearing identifying signal. Variable-width components measure via
+/// [`UnicodeWidthStr::width`] so a project name with a wide-glyph
+/// character (CJK, emoji, combining marks) doesn't overflow the row;
+/// constant components use literal column counts because their
+/// glyphs are known to be single-cell (`★` U+2605, `▸` U+25B8).
+#[must_use]
+fn named_project_row(
+    name: &str,
+    path: &str,
+    host: Option<&str>,
+    is_selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let marker = if is_selected { " ▸ " } else { "   " };
+    let star = "★ ";
+    let badge = host.map(|h| format!("  @{h}")).unwrap_or_default();
+    // Display path: tilde-collapse only when the candidate is an
+    // absolute local path. Host-bound candidates already arrive as
+    // literal `~/...` (per `resolve_named_project_path`) so a second
+    // pass is a no-op there.
+    let display_path = tilde_collapse(path);
+
+    // Marker (3 cols) + star+space (2 cols) + variable-width name +
+    // variable-width badge. The literals are fixed-width by
+    // construction; everything user-supplied measures in terminal
+    // columns.
+    let used = 3 + 2 + UnicodeWidthStr::width(name) + UnicodeWidthStr::width(badge.as_str());
+    // Reserve at least 2 spaces between name and path; if we can't
+    // afford that plus a single path character, drop the path
+    // entirely so the name + badge stay legible.
+    let path_budget = width.saturating_sub(used).saturating_sub(2);
+    let (gap, path_text) = if path_budget == 0 {
+        (String::new(), String::new())
+    } else {
+        let clipped = clip_middle(&display_path, path_budget);
+        let gap_len = width
+            .saturating_sub(used)
+            .saturating_sub(UnicodeWidthStr::width(clipped.as_str()));
+        (" ".repeat(gap_len), clipped)
+    };
+
+    if is_selected {
+        let style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        return Line::styled(
+            format!("{marker}{star}{name}{gap}{path_text}{badge}"),
+            style,
+        );
+    }
+    let mut spans = vec![
+        Span::raw(marker.to_string()),
+        Span::styled(
+            star.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(name.to_string()),
+        Span::raw(gap),
+        Span::styled(path_text, Style::default().add_modifier(Modifier::DIM)),
+    ];
+    if !badge.is_empty() {
+        spans.push(Span::styled(
+            badge,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn clip_middle(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -2542,7 +2752,7 @@ mod tests {
             user_search_mode: SearchMode::Precise,
             fuzzy_query: String::new(),
             named_projects: Vec::new(),
-            project_hosts: HashMap::new(),
+            project_meta: HashMap::new(),
             filtered_stale: false,
             just_descended: false,
             tilde_compose_armed: false,
@@ -4797,16 +5007,18 @@ mod tests {
         assert!(result.is_empty(), "should not match path: {result:?}");
     }
 
-    // ── Project → host binding ──────────────────────────────────
+    // ── Project metadata lookup ─────────────────────────────────
     //
-    // `build_project_hosts` is the lookup `confirm` consults at commit
-    // time to upgrade `Spawn` → `PrepareHostThenSpawn`. The unit tests
-    // below cover the construction (only entries with a non-empty
-    // `host` make it in, and tilde-expansion matches the wildmenu's
-    // emitted strings) and the emission path through `confirm` itself.
+    // `build_project_meta` is the unified lookup the modal consults
+    // for both commit-time host upgrades (`confirm` reads `host`) and
+    // render-time row swaps (`wildmenu_row` reads `name` + `host`).
+    // The unit tests below cover the construction (every named
+    // project gets an entry; only non-empty `host` fields land in the
+    // `host` slot; tilde-expansion matches the wildmenu's emitted
+    // strings) and the emission path through `confirm` itself.
 
     #[test]
-    fn build_project_hosts_skips_local_only_entries() {
+    fn build_project_meta_collapses_missing_or_empty_host_to_none() {
         let projects = vec![
             NamedProject {
                 name: "local-only".to_string(),
@@ -4819,15 +5031,17 @@ mod tests {
                 host: Some(String::new()),
             },
         ];
-        let map = build_project_hosts(&projects);
-        assert!(
-            map.is_empty(),
-            "neither None nor empty-string host should bind: {map:?}",
-        );
+        let map = build_project_meta(&projects);
+        let p = map.get("/local/p").unwrap();
+        let q = map.get("/local/q").unwrap();
+        assert_eq!(p.name, "local-only");
+        assert!(p.host.is_none(), "missing host must collapse to None");
+        assert_eq!(q.name, "explicit-empty");
+        assert!(q.host.is_none(), "empty-string host must collapse to None");
     }
 
     #[test]
-    fn build_project_hosts_keys_by_literal_path_for_host_bound_entries() {
+    fn build_project_meta_keys_by_literal_path_for_host_bound_entries() {
         // Host-bound entries are keyed by the literal `np.path` (NOT
         // local-expanded) so the lookup matches what `score_fuzzy`
         // emits into the wildmenu and what the runtime later hands to
@@ -4847,14 +5061,17 @@ mod tests {
                 host: Some("devpod-2".to_string()),
             },
         ];
-        let map = build_project_hosts(&projects);
-        assert_eq!(map.get("/work/code").map(String::as_str), Some("devpod-1"));
+        let map = build_project_meta(&projects);
         assert_eq!(
-            map.get("~/dotfiles").map(String::as_str),
+            map.get("/work/code").and_then(|m| m.host.as_deref()),
+            Some("devpod-1"),
+        );
+        assert_eq!(
+            map.get("~/dotfiles").and_then(|m| m.host.as_deref()),
             Some("devpod-2"),
             "host-bound entries must key by the literal path, not the \
              local-expanded one — the remote daemon would never see \
-             `/Users/...` as a valid cwd. Got map = {map:?}",
+             `/Users/...` as a valid cwd.",
         );
     }
 
@@ -4936,6 +5153,443 @@ mod tests {
             result.first().map(PathBuf::from),
             Some(home.join(".dotfiles")),
             "local-only project must surface the locally-expanded path: {result:?}",
+        );
+    }
+
+    // ── Saved-project wildmenu rendering ─────────────────────────
+    //
+    // The wildmenu renders saved projects (`[[spawn.projects]]`) with
+    // a `★ name  …  ~/path` row instead of the bare path that auto-
+    // discovered indexed dirs use. The tilde-collapse helper and the
+    // span layout produced by `named_project_row` are covered below
+    // (the lookup that drives the swap is exercised through the
+    // `build_project_meta_*` and `wildmenu_row_*` tests above).
+
+    #[test]
+    fn build_project_meta_carries_name_for_both_local_and_host_bound() {
+        let projects = vec![
+            NamedProject {
+                name: "abs-local".to_string(),
+                path: "/work/abs".to_string(),
+                host: None,
+            },
+            NamedProject {
+                name: "tilde-host-bound".to_string(),
+                path: "~/projects/x".to_string(),
+                host: Some("devpod-go".to_string()),
+            },
+        ];
+        let map = build_project_meta(&projects);
+        let local = map.get("/work/abs").unwrap();
+        let remote = map.get("~/projects/x").unwrap();
+        assert_eq!(local.name, "abs-local");
+        assert!(local.host.is_none());
+        assert_eq!(remote.name, "tilde-host-bound");
+        assert_eq!(remote.host.as_deref(), Some("devpod-go"));
+    }
+
+    #[test]
+    fn build_project_meta_first_wins_on_duplicate_path() {
+        let projects = vec![
+            NamedProject {
+                name: "first".to_string(),
+                path: "/work/dup".to_string(),
+                host: None,
+            },
+            NamedProject {
+                name: "second".to_string(),
+                path: "/work/dup".to_string(),
+                host: None,
+            },
+        ];
+        let map = build_project_meta(&projects);
+        assert_eq!(
+            map.get("/work/dup").map(|m| m.name.as_str()),
+            Some("first"),
+            "config-order tiebreaker keeps the first matching entry: {map:?}",
+        );
+    }
+
+    #[test]
+    fn tilde_collapse_replaces_home_prefix() {
+        let Some(home_os) = std::env::var_os("HOME") else {
+            panic!("HOME unset; test cannot run in this env");
+        };
+        let home = home_os.to_string_lossy().into_owned();
+        let path = format!("{home}/Workbench/codemux");
+        assert_eq!(tilde_collapse(&path), "~/Workbench/codemux");
+        assert_eq!(tilde_collapse(&home), "~");
+    }
+
+    #[test]
+    fn tilde_collapse_passes_through_unrelated_paths() {
+        // /tmp can't be HOME on any machine running this test; if HOME
+        // ever pointed there, the previous test would already be
+        // surfacing it. Path that doesn't share the HOME prefix must
+        // come back unchanged so absolute remote-bound paths render
+        // verbatim.
+        assert_eq!(tilde_collapse("/tmp/work"), "/tmp/work");
+        assert_eq!(tilde_collapse("/"), "/");
+        assert_eq!(tilde_collapse(""), "");
+    }
+
+    #[test]
+    fn tilde_collapse_with_home_returns_input_when_home_unset_or_empty() {
+        // The wildmenu wrapper falls back to the bare path when `$HOME`
+        // is missing or empty so the row stays legible — host-bound
+        // candidates already arrive as literal `~/...` strings; local
+        // candidates without HOME just render absolute. Direct test
+        // against the inner helper because process-env mutation is
+        // unsafe across test threads.
+        assert_eq!(
+            tilde_collapse_with_home("/Users/x/codemux", None),
+            "/Users/x/codemux",
+        );
+        assert_eq!(
+            tilde_collapse_with_home("/Users/x/codemux", Some("")),
+            "/Users/x/codemux",
+        );
+    }
+
+    #[test]
+    fn tilde_collapse_with_home_replaces_explicit_home_prefix() {
+        assert_eq!(
+            tilde_collapse_with_home("/synthetic/home/proj", Some("/synthetic/home")),
+            "~/proj",
+        );
+        assert_eq!(
+            tilde_collapse_with_home("/synthetic/home", Some("/synthetic/home")),
+            "~",
+        );
+        // Sibling whose absolute path *starts with* the HOME string but
+        // isn't actually under HOME (no `/` separator) — must NOT be
+        // collapsed; that would falsely rewrite `/synthetic/home2` as
+        // `~2`. The strip-prefix-then-strip-`/` chain catches this.
+        assert_eq!(
+            tilde_collapse_with_home("/synthetic/home2", Some("/synthetic/home")),
+            "/synthetic/home2",
+        );
+    }
+
+    #[test]
+    fn named_project_row_unselected_lays_out_star_name_dim_path() {
+        let row = named_project_row("codemux", "/Users/x/codemux", None, false, 60);
+        let spans: Vec<&str> = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        // Marker, star, name, gap (whitespace), path.
+        assert_eq!(spans[0], "   ", "marker is 3 spaces when unselected");
+        assert_eq!(spans[1], "★ ", "star + space");
+        assert_eq!(spans[2], "codemux", "name verbatim");
+        assert!(
+            spans[3].chars().all(|c| c == ' ') && !spans[3].is_empty(),
+            "gap is whitespace-only padding (got {:?})",
+            spans[3],
+        );
+        // Path span content varies with HOME but must end in /codemux.
+        assert!(
+            spans[4].ends_with("/codemux"),
+            "path span must end in the project's leaf (got {:?})",
+            spans[4],
+        );
+        // Path span carries the DIM modifier; the star carries Yellow+BOLD.
+        assert!(
+            row.spans[1].style.add_modifier.contains(Modifier::BOLD),
+            "star must be bold for emphasis",
+        );
+        assert!(
+            row.spans[4].style.add_modifier.contains(Modifier::DIM),
+            "path must render dim",
+        );
+    }
+
+    #[test]
+    fn named_project_row_appends_host_badge_when_bound() {
+        let row = named_project_row("codemux", "~/codemux", Some("devpod-go"), false, 60);
+        let last = row
+            .spans
+            .last()
+            .unwrap_or_else(|| panic!("row must have at least one span"));
+        assert_eq!(last.content.as_ref(), "  @devpod-go");
+        assert!(
+            last.style.add_modifier.contains(Modifier::DIM),
+            "host badge must render dim so it doesn't compete with the name",
+        );
+    }
+
+    #[test]
+    fn named_project_row_omits_badge_when_local() {
+        let row = named_project_row("codemux", "/Users/x/codemux", None, false, 60);
+        for span in &row.spans {
+            assert!(
+                !span.content.starts_with("  @"),
+                "no host badge expected on local saved projects (got {:?})",
+                span.content,
+            );
+        }
+    }
+
+    #[test]
+    fn named_project_row_selected_collapses_to_single_styled_line() {
+        // Selected rows render as one span with the cyan-bg highlight —
+        // uniform background reads as "this is the active pick" without
+        // competing colors. Mirrors `precise_search_row`.
+        let row = named_project_row("codemux", "/Users/x/codemux", Some("devpod-go"), true, 60);
+        assert_eq!(
+            row.spans.len(),
+            1,
+            "selected row must collapse to a single styled span: {:?}",
+            row.spans,
+        );
+        // `Line::styled` puts the style on the line itself, not on the
+        // single span — same shape as precise_search_row's selected
+        // branch.
+        assert_eq!(row.style.bg, Some(Color::Cyan));
+        let text = &row.spans[0].content;
+        assert!(text.starts_with(" ▸ ★ codemux"), "got {text:?}");
+        assert!(text.ends_with("@devpod-go"), "got {text:?}");
+    }
+
+    #[test]
+    fn named_project_row_drops_path_when_width_is_too_tight() {
+        // 22 columns: marker(3) + "★ "(2) + "codemux"(7) + "  @devpod-go"(12) = 24
+        // → no room for path. Falls back to keeping star+name+badge legible.
+        let row = named_project_row("codemux", "/Users/x/codemux", Some("devpod-go"), false, 22);
+        let path_span_present = row
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::DIM) && s.content.contains('/'));
+        assert!(
+            !path_span_present,
+            "tight-width row should drop the path entirely instead of clobbering the badge",
+        );
+    }
+
+    #[test]
+    fn named_project_row_uses_terminal_columns_for_wide_glyph_names() {
+        // A CJK name takes 2 terminal columns per character — using
+        // chars().count() instead of UnicodeWidthStr::width() would
+        // under-count the budget by half and overflow the row. This
+        // test pins the column-aware accounting: with width=20 and
+        // a 4-char name (8 columns), marker(3) + "★ "(2) + name(8)
+        // + " "(min gap) = 14 columns minimum. The remaining ~6
+        // columns either hold a short clipped path or fall to the
+        // empty-path branch — either way nothing should overflow.
+        let row = named_project_row("こんにちは", "/Users/x/proj", None, false, 20);
+        // Unselected layout: spans = [marker, star, name, gap, path].
+        // Reconstruct the rendered text and assert column width.
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        let cols = UnicodeWidthStr::width(text.as_str());
+        assert!(
+            cols <= 20,
+            "row width must respect terminal columns: text={text:?}, cols={cols}",
+        );
+    }
+
+    /// Build a `WildmenuRowContext` matching fuzzy + path mode, the
+    /// only mode where saved-project rows surface in the real render.
+    fn fuzzy_path_ctx(width: usize) -> WildmenuRowContext {
+        WildmenuRowContext {
+            width,
+            zone: Zone::Path,
+            fuzzy: true,
+            precise_search: false,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn wildmenu_row_routes_named_project_candidates_through_named_project_row() {
+        // Plumbing test: the wildmenu_row method must consult
+        // `project_meta` and call `named_project_row` for any
+        // candidate that has a matching saved-project entry. Without
+        // this branch the user would see a bare path, defeating the
+        // whole feature.
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.filtered = vec!["/Users/x/codemux".to_string()];
+        m.project_meta.insert(
+            "/Users/x/codemux".to_string(),
+            NamedProjectMeta {
+                name: "codemux".to_string(),
+                host: None,
+            },
+        );
+        m.selected = None;
+        let row = m.wildmenu_row("/Users/x/codemux", 0, &fuzzy_path_ctx(60));
+        let star_present = row.spans.iter().any(|s| s.content.as_ref() == "★ ");
+        let name_present = row.spans.iter().any(|s| s.content.as_ref() == "codemux");
+        assert!(star_present, "expected ★ marker, got {:?}", row.spans);
+        assert!(name_present, "expected name span, got {:?}", row.spans);
+    }
+
+    #[test]
+    fn wildmenu_row_routes_unnamed_candidates_through_generic_branch() {
+        // Negative pairing: candidates without a `project_meta` entry
+        // fall through to the generic full-path row (no star, no name
+        // swap). Together with the test above this pins the lookup
+        // gate so a future refactor can't accidentally upgrade every
+        // row to the saved-project layout.
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.filtered = vec!["/work/anon".to_string()];
+        m.selected = None;
+        let row = m.wildmenu_row("/work/anon", 0, &fuzzy_path_ctx(60));
+        let collapsed: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !collapsed.contains('★'),
+            "generic row should not carry the saved-project star: {collapsed:?}",
+        );
+        assert!(
+            collapsed.contains("/work/anon"),
+            "generic fuzzy + path row must show the full candidate path: {collapsed:?}",
+        );
+    }
+
+    #[test]
+    fn wildmenu_row_routes_precise_search_through_precise_search_row() {
+        // The precise_search flag wins over the saved-project lookup —
+        // in precise mode the user is autocompleting a path they typed
+        // and expects parent/leaf rendering, not the alias swap.
+        let mut m = mb("", "/Users/x/co", Zone::Path, &[]);
+        m.filtered = vec!["/Users/x/codemux".to_string()];
+        m.project_meta.insert(
+            "/Users/x/codemux".to_string(),
+            NamedProjectMeta {
+                name: "codemux".to_string(),
+                host: None,
+            },
+        );
+        m.selected = None;
+        let ctx = WildmenuRowContext {
+            width: 60,
+            zone: Zone::Path,
+            fuzzy: false,
+            precise_search: true,
+            stale: false,
+        };
+        let row = m.wildmenu_row("/Users/x/codemux", 0, &ctx);
+        let collapsed: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !collapsed.contains('★'),
+            "precise_search must take precedence over saved-project rendering: {collapsed:?}",
+        );
+    }
+
+    #[test]
+    fn wildmenu_row_dims_named_project_when_stale_and_unselected() {
+        // Stale results (fresh fuzzy query in flight) dim every row
+        // except the selected one. The named-project branch needs the
+        // same treatment as the generic branch — without the patch
+        // call, saved-project rows would stay full-bright while the
+        // generic rows around them dim, which is visually jarring.
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.filtered = vec!["/Users/x/codemux".to_string()];
+        m.project_meta.insert(
+            "/Users/x/codemux".to_string(),
+            NamedProjectMeta {
+                name: "codemux".to_string(),
+                host: None,
+            },
+        );
+        m.selected = None;
+        let ctx = WildmenuRowContext {
+            width: 60,
+            zone: Zone::Path,
+            fuzzy: true,
+            precise_search: false,
+            stale: true,
+        };
+        let row = m.wildmenu_row("/Users/x/codemux", 0, &ctx);
+        assert!(
+            row.style.add_modifier.contains(Modifier::DIM),
+            "stale + unselected row must carry the DIM modifier on the line style: {:?}",
+            row.style,
+        );
+    }
+
+    #[test]
+    fn wildmenu_row_skips_named_lookup_when_zone_is_host() {
+        // Host-zone candidates are SSH host names, never saved-project
+        // paths — the lookup is gated on `zone == Path` so a stray
+        // entry that happened to share a host alias name wouldn't
+        // accidentally upgrade a host row to the saved-project layout.
+        let mut m = mb("", "", Zone::Host, &["devpod-go"]);
+        m.filtered = vec!["devpod-go".to_string()];
+        m.project_meta.insert(
+            "devpod-go".to_string(),
+            NamedProjectMeta {
+                name: "devpod-go".to_string(),
+                host: None,
+            },
+        );
+        m.selected = None;
+        let ctx = WildmenuRowContext {
+            width: 60,
+            zone: Zone::Host,
+            fuzzy: true,
+            precise_search: false,
+            stale: false,
+        };
+        let row = m.wildmenu_row("devpod-go", 0, &ctx);
+        let collapsed: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !collapsed.contains('★'),
+            "host-zone rows must never render the saved-project marker: {collapsed:?}",
+        );
+    }
+
+    #[test]
+    fn wildmenu_row_generic_branch_selected_row_uses_cyan_highlight() {
+        // Pins the selected-row styling on the generic (non-saved-
+        // project) branch: when a host or unindexed candidate is
+        // highlighted the line gets the modal's cyan-bg + black-fg
+        // treatment so the active pick reads from across the row.
+        let mut m = mb("", "", Zone::Host, &["devpod-go"]);
+        m.filtered = vec!["devpod-go".to_string()];
+        m.selected = Some(0);
+        let ctx = WildmenuRowContext {
+            width: 60,
+            zone: Zone::Host,
+            fuzzy: false,
+            precise_search: false,
+            stale: false,
+        };
+        let row = m.wildmenu_row("devpod-go", 0, &ctx);
+        assert_eq!(row.style.bg, Some(Color::Cyan));
+        assert_eq!(row.style.fg, Some(Color::Black));
+        assert!(
+            row.style.add_modifier.contains(Modifier::BOLD),
+            "selected row must carry the BOLD modifier: {:?}",
+            row.style,
+        );
+    }
+
+    #[test]
+    fn wildmenu_row_generic_branch_dims_unselected_when_stale() {
+        // Stale generic rows (fuzzy worker pass in flight) dim along
+        // with the saved-project rows so the wildmenu reads as
+        // uniformly "results in flight" instead of mixing bright and
+        // dim entries.
+        let mut m = mb("", "", Zone::Path, &[]);
+        m.search_mode = SearchMode::Fuzzy;
+        m.user_search_mode = SearchMode::Fuzzy;
+        m.filtered = vec!["/work/anon".to_string()];
+        m.selected = Some(99); // off-screen selection so this row is unselected
+        let ctx = WildmenuRowContext {
+            width: 60,
+            zone: Zone::Path,
+            fuzzy: true,
+            precise_search: false,
+            stale: true,
+        };
+        let row = m.wildmenu_row("/work/anon", 0, &ctx);
+        assert!(
+            row.style.add_modifier.contains(Modifier::DIM),
+            "stale + unselected generic row must carry DIM: {:?}",
+            row.style,
         );
     }
 
