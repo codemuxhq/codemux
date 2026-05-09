@@ -2,29 +2,44 @@
 
 ## Spawn
 
-### AC-001: Spawn a local agent in the inherited cwd
+### AC-001: Spawn the initial agent at launch
+
+**Given:**
+- codemux is launched from a shell whose current pwd is a valid directory.
+
+**When:**
+1. Run `codemux` with no positional argument (or `codemux <PATH>` where `<PATH>` is a valid directory).
+
+**Then:**
+- The TUI starts with one tab already in the navigator and focused; no minibuffer opens.
+- The agent's cwd is the shell's pwd, or the canonicalized `<PATH>` if one was passed (relative paths resolve against the shell's pwd).
+- The pane renders Claude's prompt screen within ~2 s.
+
+**Failure modes:**
+- **Claude binary not on `$PATH`:** the initial tab enters the `Failed` state; the pane shows a crash banner with the spawn error.
+- **Invalid `<PATH>` argument** (missing or not a directory): see AC-028; the process exits non-zero before raw mode.
+
+### AC-002: Spawn a local agent in the scratch directory
 
 **Given:**
 - codemux is running on a local terminal.
-- The shell's current pwd is a valid directory containing a `.git` checkout (so the status bar has something to render).
+- `config.toml` either does not set `[spawn] scratch_dir` (default `~/.codemux/scratch`) or sets it to a writable path.
 
 **When:**
-1. Press the prefix, then `c` (or the direct chord `Cmd+\`).
-2. Leave the host field as `local`.
-3. Leave the path field at its prefilled cwd.
-4. Press `Enter`.
+1. Press the prefix, then `c` (or the direct chord `Super+\`).
+2. Press `Enter` without typing a path.
 
 **Then:**
-- The modal closes.
+- The minibuffer at the bottom of the screen closes.
 - A new tab appears in the navigator with the focused-agent indicator on it.
+- The agent's cwd is the configured scratch directory (default `~/.codemux/scratch`), created on demand if it does not exist.
 - The pane renders Claude's prompt screen within ~2 s.
-- The model and branch segments populate within one poll cycle.
 
 **Failure modes:**
 - **Claude binary not on `$PATH`:** the new tab enters the `Failed` state; the pane shows a crash banner with the spawn error; the navigator stays interactive.
-- **Path no longer exists at confirm time** (e.g. deleted between modal open and `Enter`): modal stays open with a path-zone error; no agent slot is created.
+- **Scratch path cannot be resolved or created** (e.g. `scratch_dir` is neither absolute nor `~`-prefixed, or `mkdir -p` fails): the runtime logs a tracing diagnostic and falls back to the platform default cwd so the user still gets an agent.
 
-### AC-002: Spawn a remote agent over SSH (cold-start bootstrap)
+### AC-003: Spawn a remote agent over SSH (cold-start bootstrap)
 
 **Given:**
 - A reachable SSH host the user has never spawned an agent on (no `~/.cache/codemuxd/` on the remote).
@@ -42,15 +57,15 @@
 - A subsequent spawn on the same host skips the scp stage (daemon already cached).
 
 **Failure modes:**
-- **SSH auth fails:** modal returns to the host zone with an error; no agent slot created.
+- **SSH auth fails:** the minibuffer returns to the host zone with an error; no agent slot created.
 - **`uname` succeeds but no daemon binary is bundled for that target:** the slot enters `Failed`; the pane shows the bootstrap error verbatim.
 - **Wire-protocol version mismatch** (cached daemon is older than the local binary expects): daemon disconnects with `ERROR`; codemux re-deploys the matching daemon and retries once. If the retry still mismatches, the slot ends in `Failed`.
 - **Remote path does not exist:** daemon sends `ERROR` on attach; slot enters `Failed` with the daemon's error message.
 
-### AC-003: Path-zone wildmenu autocompletes against the focused host
+### AC-004: Path-zone wildmenu autocompletes against the focused host
 
 **Given:**
-- The spawn modal is open.
+- The spawn minibuffer is open.
 - The host zone holds a value (`local` or a committed remote host).
 
 **When:**
@@ -65,42 +80,81 @@
 - **Directory scan exceeds the cap** (1024 entries): the wildmenu shows the first 1024 and a "more results truncated" hint; the user can refine the query to narrow.
 - **Index not yet built** (fuzzy mode, fresh session): the wildmenu shows precise-mode candidates as a fallback while the index builds; `Ctrl+R` forces a rebuild.
 
-### AC-004: Saved project alias resolves through the modal
+### AC-005: Quick-switch to precise mode by typing `~` or `/`
+
+**Given:**
+- The spawn minibuffer is open in fuzzy mode (the default).
+- The path zone is focused and the typed query is empty (or the path field still holds its auto-seeded cwd).
+
+**When:**
+1. Type `~` (or a compose-key variant: `˜` U+02DC, `̃` U+0303), or type `/`.
+
+**Then:**
+- The path zone switches to precise mode for the rest of this open.
+- The path field is seeded with the user's `$HOME` (for `~`) or `/` (for `/`); for a remote host, the remote `$HOME` captured during prepare is used.
+- The wildmenu lists the seeded directory's children.
+- The user's `user_search_mode` preference is NOT changed; closing and reopening the minibuffer returns to fuzzy.
+
+**Failure modes:**
+- **`$HOME` is unset on the local side:** the field is seeded with the literal `~/`; the user can edit forward or backspace.
+
+### AC-006: Drill into a folder, then spawn at the chosen depth
+
+**Given:**
+- The spawn minibuffer is in precise mode, path zone focused.
+- The wildmenu shows one or more folder candidates.
+
+**When:**
+1. Press `Down` to highlight a folder.
+2. Press `Tab` (or `Enter`) to descend.
+3. Optionally drill again by highlighting a child and pressing `Tab` (or `Enter`).
+4. With no candidate highlighted, press `Enter` to spawn at the current path.
+
+**Then:**
+- Step 2 descends into the highlighted folder: the path field becomes the folder's path (with trailing `/`), the selection clears, and the wildmenu refreshes to list that folder's children.
+- Step 3 walks deeper.
+- Step 4 spawns the agent at the path now in the field.
+- In fuzzy mode this drilldown does NOT happen: `Tab` is a no-op, and `Enter` on a fuzzy hit applies-and-spawns in one step.
+
+**Failure modes:**
+- **Highlighted folder no longer exists at descend time** (e.g. deleted out from under): the refresh lists empty children; the user can `Backspace` out or pick a sibling.
+
+### AC-007: Saved project alias resolves through the minibuffer
 
 **Given:**
 - `config.toml` contains a `[[spawn.projects]]` entry with `name = "codemux"` and a `path = "~/workbench/repositories/codemuxhq/codemux"` (or `host = "..."`-bound).
 
 **When:**
-1. Open the spawn modal.
+1. Open the spawn minibuffer.
 2. Type `codemux` in the path zone.
 
 **Then:**
 - The named project appears at the top of the wildmenu, score-boosted above any fuzzy-matched directory.
 - Pressing `Enter` spawns the agent on the project's configured host with the project's path.
-- The host badge in the modal reflects the project's bound host.
+- The host badge in the minibuffer reflects the project's bound host.
 
 **Failure modes:**
-- **Bound host unreachable:** falls into AC-002's SSH failure modes (modal returns with error, no slot created).
-- **Path expands to a no-longer-existing directory:** modal shows a path-zone error and stays open.
+- **Bound host unreachable:** falls into AC-003's SSH failure modes (minibuffer returns with error, no slot created).
+- **Path expands to a no-longer-existing directory:** the minibuffer shows a path-zone error and stays open.
 
-### AC-005: Cancel the spawn modal
+### AC-008: Cancel the spawn minibuffer
 
 **Given:**
-- The spawn modal is open with text in either zone.
+- The spawn minibuffer is open with text in either zone.
 
 **When:**
 1. Press `Esc`.
 
 **Then:**
-- The modal closes; no agent slot is created.
+- The minibuffer closes; no agent slot is created.
 - The previously-focused agent (if any) regains focus.
-- No background work that was started by the modal (index build, host probe) blocks the close.
+- No background work that was started by the minibuffer (index build, host probe) blocks the close.
 
 ---
 
 ## Navigation
 
-### AC-006: Cycle focus between agents
+### AC-009: Cycle focus between agents
 
 **Given:**
 - Three agents are spawned: `A` (focused), `B`, `C`.
@@ -118,7 +172,7 @@
 **Failure modes:**
 - **Only one agent exists:** the chord is a no-op; the PTY does not get spurious `SIGWINCH`.
 
-### AC-007: Focus an agent by ordinal digit
+### AC-010: Focus an agent by ordinal digit
 
 **Given:**
 - Five agents are spawned in slots 1–5.
@@ -134,7 +188,7 @@
 **Failure modes:**
 - **Digit out of range** (e.g. `prefix 9` with 4 agents): the chord is a no-op; the prefix state still drops to `Idle`.
 
-### AC-008: Bounce to the previously-focused agent
+### AC-011: Bounce to the previously-focused agent
 
 **Given:**
 - Two agents `A` and `B`. The user just focused `B` from `A`.
@@ -148,7 +202,7 @@
 **Failure modes:**
 - **Only one agent exists, or no prior focus is recorded:** the chord is a no-op.
 
-### AC-009: Switcher popup picks an agent by name
+### AC-012: Switcher popup picks an agent by name
 
 **Given:**
 - Four agents spawned with distinct labels.
@@ -166,7 +220,7 @@
 **Failure modes:**
 - **No agents exist:** the popup opens with an empty list and a "no agents" hint; `Esc` dismisses.
 
-### AC-010: Toggle the navigator chrome
+### AC-013: Toggle the navigator chrome
 
 **Given:**
 - codemux launched in the default `Popup` style. Two agents are spawned.
@@ -187,7 +241,7 @@
 
 ## Agent lifecycle
 
-### AC-011: Force-close a live agent
+### AC-014: Force-close a live agent
 
 **Given:**
 - The focused agent is in the `Ready` state with an active PTY.
@@ -203,7 +257,7 @@
 **Failure modes:**
 - **Reap takes longer than the frame budget** (rare, e.g. a wedged remote SSH tunnel): the tab is removed immediately; cleanup proceeds in the background.
 
-### AC-012: Dismiss a crashed or failed agent (no-op on live)
+### AC-015: Dismiss a crashed or failed agent (no-op on live)
 
 **Given:**
 - Agent `A` is `Ready`. Agent `B` is `Failed` (bootstrap error). Agent `C` is `Crashed` (PTY died after Ready).
@@ -220,7 +274,7 @@
 
 **Failure modes:** none. The gating against `Ready` is the design, not a failure mode.
 
-### AC-013: Quit codemux cleanly
+### AC-016: Quit codemux cleanly
 
 **Given:**
 - Three agents are running, two with scrollback offset > 0.
@@ -241,7 +295,7 @@
 
 ## Scrollback
 
-### AC-014: Enter scroll mode and navigate history
+### AC-017: Enter scroll mode and navigate history
 
 **Given:**
 - The focused agent has produced enough output to fill its scrollback (default `scrollback_len` = 5000 rows).
@@ -263,7 +317,7 @@
 - **Terminal does not deliver SGR mouse events** (e.g. Apple Terminal): wheel does nothing; arrow keys still work as scroll bindings.
 - **Claude switched to the alt screen** (does not happen today, guarded by a regression test): scrollback is empty; the badge would still appear but rows don't shift. The test in `runtime::tests::scrollback_zero_len_means_no_history` exists to catch this.
 
-### AC-015: Typing snaps to live; navigation preserves scroll
+### AC-018: Typing snaps to live; navigation preserves scroll
 
 **Given:**
 - Agent `A` is scrolled back 50 lines (offset = 50).
@@ -286,7 +340,7 @@
 
 ## Mouse
 
-### AC-016: Click a tab to focus it
+### AC-019: Click a tab to focus it
 
 **Given:**
 - Three agents in the navigator. The mouse is over a tab that is not focused.
@@ -301,7 +355,7 @@
 **Failure modes:**
 - **Click misses every tab hitbox:** no-op.
 
-### AC-017: Drag a tab to reorder
+### AC-020: Drag a tab to reorder
 
 **Given:**
 - Agents `[A, B, C]`, focus on `B`.
@@ -320,7 +374,7 @@
 - **Release outside any tab hitbox:** drag cancels; no reorder.
 - **The dragged agent is reaped mid-drag:** release resolves to `None` (`agents.iter().position(|a| a.id == id)`); the gesture cancels silently.
 
-### AC-018: Drag-to-select and copy via OSC 52
+### AC-021: Drag-to-select and copy via OSC 52
 
 **Given:**
 - The terminal supports OSC 52 (iTerm2, Ghostty, Alacritty, WezTerm, Kitty; Apple Terminal does not).
@@ -345,7 +399,7 @@
 
 ## Status bar
 
-### AC-019: Configured segments render in order
+### AC-022: Configured segments render in order
 
 **Given:**
 - `config.toml` has `[ui] status_bar_segments = ["model", "worktree", "branch", "tokens", "prefix_hint"]`.
@@ -366,10 +420,10 @@
 - **Focused agent is SSH:** `model` and `branch` skip (v1 reads only the local user's settings/git, which don't reflect the remote agent's state).
 - **Statusline JSON missing** (Claude has not yet written for this agent): `tokens` renders nothing; populates after the first turn.
 
-### AC-020: Segments drop from the left under width pressure
+### AC-023: Segments drop from the left under width pressure
 
 **Given:**
-- The same config as AC-019.
+- The same config as AC-022.
 
 **When:**
 1. Resize the host terminal narrow enough that the full segment stack does not fit.
@@ -385,7 +439,7 @@
 
 ## Help
 
-### AC-021: Help screen reflects the live keymap
+### AC-024: Help screen reflects the live keymap
 
 **Given:**
 - `config.toml` rebinds `prefix` to `cmd+b` and `on_prefix.spawn_agent` to `s`.
@@ -406,7 +460,7 @@
 
 ## Daemon
 
-### AC-022: Reattach replays the screen state
+### AC-025: Reattach replays the screen state
 
 **Given:**
 - A remote agent is `Ready` on host `H`. The user has produced enough output that the visible grid is not empty.
@@ -423,13 +477,13 @@
 
 **Failure modes:**
 - **Daemon was killed between sessions:** reattach fails with `ERROR` from the bootstrap path; the slot enters `Failed`. No silent resurrection per vision principle 6 ("no surprise resurrection").
-- **Wire-protocol version mismatch on reconnect:** AC-002's mismatch failure mode applies.
+- **Wire-protocol version mismatch on reconnect:** AC-003's mismatch failure mode applies.
 
 ---
 
 ## Config and CLI
 
-### AC-023: Missing config file falls back to defaults
+### AC-026: Missing config file falls back to defaults
 
 **Given:**
 - `$XDG_CONFIG_HOME/codemux/config.toml` does not exist (and neither does `~/.config/codemux/config.toml`).
@@ -443,7 +497,7 @@
 
 **Failure modes:** none.
 
-### AC-024: Invalid config fails loud before raw mode
+### AC-027: Invalid config fails loud before raw mode
 
 **Given:**
 - `~/.config/codemux/config.toml` exists but contains malformed TOML or an invalid value (e.g. `prefix = "ctrl+nonsense"`, or an unparseable hex color in `[ui.host_colors]`).
@@ -458,7 +512,7 @@
 
 **Failure modes:** none. The loud-fail is the design.
 
-### AC-025: Invalid `[PATH]` arg fails loud before raw mode
+### AC-028: Invalid `[PATH]` arg fails loud before raw mode
 
 **Given:**
 - The user invokes `codemux /tmp/does-not-exist` or `codemux /etc/passwd`.
