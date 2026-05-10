@@ -50,7 +50,7 @@ Dependency edges:
 | Daemon supervisor, remote PTY ownership | `apps/daemon/src/lib.rs` (binary entry in `main.rs` is a thin shell) |
 | Wire protocol message types | `crates/wire/src/` |
 | SSH bootstrap / daemon tarball assembly | `crates/codemuxd-bootstrap/` (`build.rs` rebuilds the embedded tarball when `apps/daemon`, `crates/wire`, or `Cargo.lock` change) |
-| E2E test strategy and roadmap | `docs/testing.md` (TUI tests live in `apps/tui/tests/`, daemon tests in `apps/daemon/tests/`) |
+| E2E test strategy and roadmap | `docs/plans/2026-05-10--e2e-testing.md` (TUI tests live in `apps/tui/tests/`, daemon tests in `apps/daemon/tests/`) |
 
 ## Key invariants worth knowing
 
@@ -67,4 +67,4 @@ Dependency edges:
 - [`docs/003--acceptance-criteria.md`](docs/003--acceptance-criteria.md) — testable user-task specs that map onto E2E tests
 - [`docs/004--architecture.md`](docs/004--architecture.md) — stack, data model, all architecture decisions
 - [`docs/005--roadmap.md`](docs/005--roadmap.md) — lanes of upcoming work with `next:` per lane
-- [`docs/testing.md`](docs/testing.md) — testing stack, layout, invariants, and roadmap
+- [`docs/plans/`](docs/plans/) — dated implementation plans (e.g. [`2026-05-10--e2e-testing.md`](docs/plans/2026-05-10--e2e-testing.md) for the E2E test plan)
