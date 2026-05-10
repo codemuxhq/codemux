@@ -24,6 +24,10 @@ lint:
 test:
     cargo test --workspace
 
+# Review pending insta snapshots. Requires `cargo install cargo-insta` once.
+insta-review:
+    cargo insta review
+
 # Pre-push gate: format check, lint, test.
 check:
     cargo fmt --all -- --check

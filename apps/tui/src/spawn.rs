@@ -1937,6 +1937,38 @@ impl SpawnMinibuffer {
     }
 }
 
+#[cfg(test)]
+impl SpawnMinibuffer {
+    /// Build a minibuffer with the given cwd and otherwise-default
+    /// state, without invoking `open()`/`refresh()` (which would shell
+    /// out to `read_dir` and be non-deterministic in tests).
+    /// Encapsulates the field set so that adding a field doesn't break
+    /// every test fixture.
+    pub(crate) fn new_for_test(cwd: PathBuf) -> Self {
+        Self {
+            host: String::new(),
+            path: String::new(),
+            focused: Zone::Path,
+            ssh_hosts: Vec::new(),
+            filtered: Vec::new(),
+            selected: None,
+            path_mode: PathMode::Local,
+            bootstrap_view: None,
+            prepare_error: None,
+            path_origin: PathOrigin::UserTyped,
+            cwd,
+            search_mode: SearchMode::Precise,
+            user_search_mode: SearchMode::Precise,
+            fuzzy_query: String::new(),
+            named_projects: Vec::new(),
+            project_meta: HashMap::new(),
+            filtered_stale: false,
+            just_descended: false,
+            tilde_compose_armed: false,
+        }
+    }
+}
+
 /// Build the spans for one zone of the prompt.
 ///
 /// Placeholder semantics: when `value` is empty, render the full
@@ -6082,5 +6114,47 @@ mod tests {
             &mut local(),
         );
         assert_eq!(m.active_host_key(), "devpod-web");
+    }
+
+    /// ── Fast-tier snapshot harness (T0 of the E2E plan) ──────────
+    ///
+    /// Renders the spawn modal in its initial empty state into a
+    /// `ratatui::backend::TestBackend` and snapshots it via `insta`.
+    /// This is the closest fixture to "empty boot screen" that doesn't
+    /// require constructing a full `Runtime` (that's T1): on first
+    /// launch with no agents, the spawn modal is what the user sees.
+    ///
+    /// The minibuffer is built directly (not through `open()`) so the
+    /// snapshot is deterministic regardless of the test runner's cwd
+    /// and `~/.ssh/config`. `refresh()` is not called for the same
+    /// reason — it would shell out to `read_dir` on whatever the test
+    /// process inherited as cwd. Empty `filtered` exercises the
+    /// `wildmenu_view` "no matches" sentinel branch, which is the
+    /// accurate first-frame render.
+    ///
+    /// No `pub` test-helper wrapper was added to production — the test
+    /// builds `SpawnMinibuffer` through its private fields via
+    /// `super::*`, which is the whole point of an inline test module.
+    #[test]
+    fn render_empty_boot_screen_snapshot() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let m = SpawnMinibuffer::new_for_test(PathBuf::from("/test/cwd"));
+
+        // 100×30 leaves comfortable margin above the 8-row strip and
+        // is wide enough that the prompt + hint span fits on one line
+        // — narrower geometries truncate the hint and obscure the
+        // chrome regression the snapshot is meant to catch.
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let bindings = ModalBindings::default();
+        let draw_result = terminal.draw(|frame| {
+            let area = frame.area();
+            m.render(frame, area, &bindings, None);
+        });
+        assert!(draw_result.is_ok(), "draw failed: {draw_result:?}");
+
+        insta::assert_snapshot!(terminal.backend());
     }
 }

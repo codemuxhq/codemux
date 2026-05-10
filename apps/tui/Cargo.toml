@@ -57,5 +57,14 @@ tempfile.workspace = true
 # builds of `codemux` do not see this feature.
 codemux-session = { workspace = true, features = ["test-util"] }
 
+# Snapshot testing for the fast-tier render harness — see
+# `docs/plans/2026-05-10--e2e-testing.md` (T0). `insta` diffs the
+# `TestBackend`'s screen against a committed `.snap`; pending snapshots
+# are reviewed with `cargo insta review` (wired as `just insta-review`).
+# `pretty_assertions` is here for readable diffs on non-snapshot asserts
+# inside the same test surface.
+insta = "1.47.2"
+pretty_assertions = "1.4.1"
+
 [lints]
 workspace = true
