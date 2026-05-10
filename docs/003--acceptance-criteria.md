@@ -98,6 +98,15 @@
 - **Claude binary not on `$PATH`:** the new tab enters the `Failed` state; the pane shows a crash banner with the spawn error; the navigator stays interactive.
 - **Scratch path cannot be resolved or created** (e.g. `scratch_dir` is neither absolute nor `~`-prefixed, or `mkdir -p` fails): the runtime logs a tracing diagnostic and falls back to the platform default cwd so the user still gets an agent.
 
+**Tests:**
+- `apps/tui/src/spawn.rs::empty_path_with_no_selection_emits_spawn_scratch` — pins the modal's scratch-fallback emit when the user presses Enter with nothing typed/selected against a remote host.
+- `apps/tui/src/spawn.rs::empty_local_path_with_no_selection_emits_spawn_scratch` — same gesture for the local-host placeholder.
+- `apps/tui/src/spawn.rs::auto_seeded_path_with_no_selection_emits_spawn_scratch` — covers the real-world fuzzy-mode flow where the path is auto-seeded but neither typed nor picked.
+- `apps/tui/src/config.rs::spawn_scratch_dir_defaults_to_dotcodemux_scratch` — pins the default `~/.codemux/scratch` value.
+- `apps/tui/src/config.rs::expand_scratch_expands_tilde_against_home`, `expand_scratch_bare_tilde_resolves_to_home`, `expand_scratch_absolute_path_passes_through`, `expand_scratch_returns_none_for_relative_path`, `expand_scratch_returns_none_when_tilde_but_no_home` — pin the path-resolution rules.
+- `apps/tui/src/runtime.rs::resolve_remote_scratch_cwd_returns_none_when_path_unresolvable`, `resolve_remote_scratch_cwd_returns_dir_on_mkdir_success`, `resolve_remote_scratch_cwd_returns_none_on_mkdir_failure` — pin the runtime-side resolution / mkdir-on-demand behavior.
+- (uncovered: full local-spawn flow that creates the scratch dir and lands a Ready tab; failure-mode fallback to platform default cwd on resolution failure.)
+
 ### AC-003: Spawn a remote agent over SSH (cold-start bootstrap)
 
 **Given:**
@@ -123,6 +132,19 @@
 - **Wire-protocol mismatch from a current binary:** daemon sends `Message::Error{VersionMismatch}`; the client surfaces it as `Error::Handshake` and the slot enters `Failed`. There is no retry on this path. Only binary-version mismatch triggers redeploy, and only because `bootstrap_version()` is checked at the bootstrap layer.
 - **Remote path does not exist:** daemon sends `Error` on attach; slot enters `Failed` with the daemon's error message.
 
+**Tests:**
+- `crates/codemuxd-bootstrap/src/lib.rs::prepare_remote_happy_path_on_fresh_host` — pins the cold-start path: probe → tarball stage → SCP → remote build → daemon spawn against a fake `CommandRunner`.
+- `crates/codemuxd-bootstrap/src/lib.rs::prepare_remote_skips_install_when_version_matches` — pins the warm-start optimization (no `TarballStage`/`Scp`/`RemoteBuild` when versions match).
+- `crates/codemuxd-bootstrap/src/lib.rs::probe_returns_trimmed_version_on_success`, `probe_returns_none_version_when_agent_version_missing`, `probe_surfaces_spawn_failure_as_bootstrap_error`, `probe_surfaces_ssh_connection_failure_as_bootstrap_error`, `probe_surfaces_empty_stdout_as_bootstrap_error` — pin the `VersionProbe` stage outcomes.
+- `crates/codemuxd-bootstrap/src/lib.rs::scp_failure_carries_scp_stage` — pins the `Scp` failure-mode tagging.
+- `crates/codemuxd-bootstrap/src/lib.rs::remote_build_surfaces_cargo_not_found_hint`, `remote_build_surfaces_cargo_not_found_hint_on_zsh`, `remote_build_surfaces_cargo_not_found_hint_on_sh`, `remote_build_generic_failure_carries_stage`, `remote_build_uses_install_for_hardlink_safety` — pin the `RemoteBuild` failure modes including the cargo-missing diagnostic.
+- `crates/codemuxd-bootstrap/src/lib.rs::spawn_remote_daemon_propagates_remote_stderr`, `spawn_remote_daemon_rejects_quote_in_cwd`, `spawn_remote_daemon_redirects_stdin_to_devnull_and_stderr_to_sibling_file`, `spawn_remote_daemon_failure_branch_tails_both_log_and_stderr`, `spawn_remote_daemon_omits_cwd_flag_when_none`, `spawn_remote_daemon_includes_cwd_flag_when_some`, `spawn_remote_daemon_verifies_socket_appearance_post_spawn` — pin the `DaemonSpawn` stage.
+- `crates/codemuxd-bootstrap/src/lib.rs::open_ssh_tunnel_uses_absolute_remote_path_in_forward_spec`, `open_ssh_tunnel_bypasses_ssh_control_master`, `open_ssh_tunnel_sets_server_alive_opts` — pin the `SocketTunnel` stage.
+- `crates/codemuxd-bootstrap/src/lib.rs::connect_socket_times_out_with_socket_connect_stage`, `connect_socket_succeeds_against_live_socket` — pin the `SocketConnect` stage.
+- `crates/codemuxd-bootstrap/src/lib.rs::attach_socket_happy_path_against_fake_runner`, `attach_socket_expands_tilde_cwd_against_remote_home` — pin the end-of-bootstrap attach.
+- `apps/daemon/src/supervisor.rs::handshake_version_mismatch_returns_error_frame` — pins the wire-protocol-mismatch error path.
+- (uncovered: real end-to-end SSH cold-start that walks every stage indicator and surfaces a `HelloAck`-driven Ready tab.)
+
 ### AC-004: Path-zone wildmenu autocompletes against the focused host
 
 **Given:**
@@ -142,6 +164,17 @@
 - **Remote `list_dir` exceeds its cap** (`MAX_LIST_ENTRIES`): same silent truncation.
 - **Index not yet built** (fuzzy mode, fresh session): the wildmenu shows an indexer-state sentinel row (e.g. `indexing...`) instead of candidates; precise mode (`Ctrl+T`) still works synchronously. `Ctrl+R` forces a rebuild.
 
+**Tests:**
+- `apps/tui/src/spawn.rs::tab_in_path_zone_applies_highlighted_candidate` — pins Tab applying the highlighted wildmenu candidate to the path field.
+- `apps/tui/src/spawn.rs::tab_in_path_zone_with_no_selection_is_noop` — pins the no-selection no-op.
+- `apps/tui/src/spawn.rs::down_cycles_with_wrap` — pins arrow-key navigation across candidates.
+- `apps/tui/src/spawn.rs::remote_completions_populates_wildmenu_from_list_dir`, `remote_completions_filters_by_basename_prefix`, `remote_completions_filters_out_files`, `remote_completions_caches_listing_and_filters_in_process_on_narrow`, `remote_completions_re_shells_when_user_crosses_a_slash`, `remote_completions_returns_empty_on_list_dir_error`, `remote_completions_show_dot_dirs_when_prefix_starts_with_dot` — pin remote `RemoteFs::list_dir`-backed completion shape.
+- `apps/tui/src/spawn.rs::host_completions_returns_full_pool_for_empty_input`, `host_completions_with_typed_prefix_pins_local_first_when_it_matches`, `host_completions_filters_by_substring`, `host_completions_prefers_prefix_matches`, `host_completions_omits_local_when_input_does_not_match_it` — pin host-pool ranking.
+- `apps/tui/src/spawn.rs::scan_dir_filters_out_files` — pins local `read_dir`-backed completion filtering.
+- `apps/tui/src/spawn.rs::wildmenu_scroll_offset_no_selection_is_zero`, `wildmenu_scroll_offset_selection_within_window_is_zero`, `wildmenu_scroll_offset_slides_when_selection_below_window`, `wildmenu_scroll_offset_zero_usable_does_not_panic` — pin the six-row sliding-window math.
+- `crates/codemuxd-bootstrap/src/remote_fs.rs::list_dir_invokes_ssh_with_correct_flags`, `list_dir_includes_batchmode_yes`, `list_dir_truncates_at_max_list_entries`, `list_dir_rejects_path_with_single_quote` — pin the `MAX_LIST_ENTRIES` cap and SSH wiring on the remote side.
+- (uncovered: end-to-end with a real SSH ControlMaster socket.)
+
 ### AC-005: Quick-switch to precise mode by typing `~` or `/`
 
 **Given:**
@@ -159,6 +192,17 @@
 
 **Failure modes:**
 - **`$HOME` is unset on the local side:** the field is seeded with the literal `~/`; the user can edit forward or backspace.
+
+**Tests:**
+- `apps/tui/src/spawn.rs::tilde_in_fuzzy_with_empty_query_enters_navigation_at_home` — pins `~` switching from fuzzy to precise + seeding `$HOME`.
+- `apps/tui/src/spawn.rs::tilde_in_precise_with_autoseeded_path_enters_navigation_at_home` — pins the same flow when the path was auto-seeded.
+- `apps/tui/src/spawn.rs::tilde_in_precise_with_user_typed_path_is_literal` — pins that user-typed paths treat `~` as a literal char (no quick-switch).
+- `apps/tui/src/spawn.rs::combining_tilde_in_fuzzy_with_empty_query_enters_navigation_at_home` — pins the U+0303 / U+02DC compose-key variants.
+- `apps/tui/src/spawn.rs::space_after_combining_tilde_is_swallowed`, `literal_tilde_does_not_arm_compose_swallow` — pin the compose-arm follow-up gesture.
+- `apps/tui/src/spawn.rs::tilde_in_fuzzy_remote_mode_expands_to_remote_home` — pins remote `$HOME` seeding for SSH agents.
+- `apps/tui/src/spawn.rs::slash_in_fuzzy_with_empty_query_enters_navigation_at_root` — pins `/` switching modes and seeding `/`.
+- `apps/tui/src/spawn.rs::slash_in_precise_with_autoseeded_path_enters_navigation_at_root` — same for already-precise mode.
+- `apps/tui/src/spawn.rs::slash_in_precise_is_a_literal_char`, `slash_in_host_zone_is_a_literal_char_not_an_auto_switch` — pin the negative cases (no quick-switch when the field has been touched, or in the host zone).
 
 ### AC-006: Drill into a folder, then spawn at the chosen depth
 
@@ -181,6 +225,16 @@
 **Failure modes:**
 - **Highlighted folder no longer exists at descend time** (e.g. deleted out from under): the refresh lists empty children; the user can `Backspace` out or pick a sibling.
 
+**Tests:**
+- `apps/tui/src/spawn.rs::tab_descends_into_folder_in_one_step` — pins step 2 (Tab descends, selection clears, wildmenu refreshes).
+- `apps/tui/src/spawn.rs::descend_sets_just_descended_flag` — pins the post-descend visual flag.
+- `apps/tui/src/spawn.rs::next_keystroke_clears_just_descended` — pins the one-frame lifetime of that flag.
+- `apps/tui/src/spawn.rs::typing_slash_after_first_tab_also_descends` — pins the `/` keystroke as an alternative to Tab.
+- `apps/tui/src/spawn.rs::enter_with_selection_in_precise_descends` — pins Enter on a highlighted candidate descending rather than spawning.
+- `apps/tui/src/spawn.rs::enter_without_selection_in_precise_spawns` — pins the commit gesture (step 4).
+- `apps/tui/src/spawn.rs::tab_is_no_op_in_fuzzy_path_zone` — pins that Tab does not descend in fuzzy mode.
+- `apps/tui/src/spawn.rs::fuzzy_highlighted_candidate_spawns_on_enter` — pins fuzzy's apply-and-spawn-in-one-step Enter semantic.
+
 ### AC-007: Saved project alias resolves through the minibuffer
 
 **Given:**
@@ -200,6 +254,13 @@
 - **Bound host unreachable:** falls into AC-003's SSH failure modes (minibuffer returns to host zone with error, no slot created).
 - **Path expands to a directory that no longer exists:** for local spawns, the spawn proceeds and the agent's PTY inherits the parent cwd (no pre-spawn `stat`); for remote spawns, the daemon surfaces an attach error and the slot enters `Failed`.
 
+**Tests:**
+- `apps/tui/src/spawn.rs::build_project_meta_collapses_missing_or_empty_host_to_none`, `build_project_meta_keys_by_literal_path_for_host_bound_entries`, `build_project_meta_carries_name_for_both_local_and_host_bound`, `build_project_meta_first_wins_on_duplicate_path` — pin the named-project lookup table the renderer/scorer leans on.
+- `apps/tui/src/spawn.rs::host_bound_tilde_project_round_trips_as_literal_path`, `local_only_tilde_project_emits_locally_expanded_candidate` — pin the host-bound vs local resolution rules.
+- `apps/tui/src/spawn.rs::named_project_row_renders_host_badge_next_to_name`, `named_project_row_omits_badge_when_local`, `named_project_row_unselected_lays_out_star_name_dim_path`, `named_project_row_selected_applies_highlight_at_line_level` — pin the wildmenu row layout (star + name + `@host` badge).
+- `apps/tui/src/config.rs::spawn_named_projects_round_trip`, `spawn_named_project_host_round_trips`, `spawn_named_project_empty_host_normalises_to_none`, `spawn_named_project_missing_path_is_an_error` — pin config parsing.
+- (uncovered: end-to-end Enter-to-spawn ordering with the bound-host prepare path; the explicit `BOOST_NAMED = 1000` ranking against fuzzy directory hits.)
+
 ### AC-008: Cancel the spawn minibuffer
 
 **Given:**
@@ -213,6 +274,15 @@
 - Otherwise (no selection, empty path field), the minibuffer closes immediately; no agent slot is created.
 - On close, the previously-focused agent (if any) regains focus.
 - No background work that was started by the minibuffer (index build, host probe) blocks the close; the worker `Drop` impls handle their own cleanup.
+
+**Tests:**
+- `apps/tui/src/spawn.rs::esc_in_nav_mode_with_no_selection_closes_modal` — pins the immediate-close gesture.
+- `apps/tui/src/spawn.rs::esc_in_search_mode_clears_filter_chars` — pins the first-Esc-clears-filter, second-Esc-closes flow for the path zone search variant.
+- `apps/tui/src/spawn.rs::esc_in_nav_mode_with_selection_clears_selection` — pins the selection-clear-before-close gesture.
+- `apps/tui/src/spawn.rs::esc_in_host_zone_returns_to_path_with_cwd_reseeded`, `esc_in_host_zone_preserves_user_typed_path` — pin the host-zone Esc semantics (back to path, not close).
+- `apps/tui/src/spawn.rs::lock_for_bootstrap_with_esc_emits_cancel_bootstrap` — pins Esc cancelling an in-flight bootstrap.
+- `apps/tui/src/fuzzy_worker.rs::drop_disconnects_channel_and_exits_worker` — pins worker `Drop` cleanup.
+- (uncovered: the runtime-level guarantee that closing returns focus to the previously-focused agent.)
 
 ### AC-032: Spawn modal opens at the TUI startup cwd, not the focused agent's cwd
 
@@ -230,6 +300,10 @@
 
 **Failure modes:** none.
 
+**Tests:**
+- `apps/tui/src/spawn.rs::open_seeds_path_with_cwd_and_marks_auto_seeded`, `open_does_not_double_slash_when_cwd_already_ends_in_slash`, `open_precise_seeds_path_with_cwd` — pin that `SpawnMinibuffer::open(cwd, …)` seeds the path zone with the supplied cwd. The runtime always passes the TUI startup cwd to `open`; this AC's "not the focused agent's cwd" assertion is a property of the call site, which is not directly pinned.
+- (uncovered: the runtime-level call-site assertion that the cwd passed in is the startup cwd, never the focused agent's cwd.)
+
 ### AC-033: Spawn modal swallows all keystrokes while open
 
 **Given:**
@@ -246,6 +320,11 @@
 - The runtime's `dispatch_key` only runs after the modal is closed.
 
 **Failure modes:** none.
+
+**Tests:**
+- `apps/tui/src/spawn.rs::ctrl_modified_keys_are_dropped` — pins that direct chords (Ctrl+letter etc.) routed through the modal are dropped, not forwarded.
+- `apps/tui/src/spawn.rs::lock_for_bootstrap_drops_typing_keys` — pins that typing keystrokes are dropped while the modal is locked for bootstrap.
+- (uncovered: the runtime-level proof that an open modal short-circuits `dispatch_key` for prefix chord and `?`.)
 
 ### AC-045: Indexing runs in the background; input stays interactive
 
@@ -269,6 +348,16 @@
 - **Indexer panic or worker thread death:** the channel disconnects; the modal sees `IndexState::Building { count: 0 }` indefinitely. `Ctrl+R` forces a rebuild and re-spawns the worker.
 - **Remote `find` subprocess fails or hangs:** the worker thread surfaces the error via the channel; subsequent ticks transition the state and surface a wildmenu error row. The modal stays usable in precise mode.
 
+**Tests:**
+- `apps/tui/src/index_manager.rs::drain_on_building_appends_progress_batch_to_dirs`, `drain_on_refreshing_with_progress_drops_batch_and_preserves_cache`, `drain_on_building_done_ok_transitions_to_ready_and_returns_dirs`, `drain_on_refreshing_done_err_falls_back_to_cached_ready`, `drain_on_building_done_err_transitions_to_failed`, `drain_returns_none_for_settled_state`, `drain_on_refreshing_with_no_events_returns_none` — pin the manager-side state machine the runtime ticks via `try_recv`.
+- `apps/tui/src/fuzzy_worker.rs::set_index_then_query_emits_matching_result`, `query_burst_collapses_to_latest`, `query_for_unknown_host_is_dropped`, `set_index_for_new_host_clears_pending_query`, `empty_query_is_a_no_op`, `drop_disconnects_channel_and_exits_worker` — pin the off-thread fuzzy worker.
+- `apps/tui/src/index_worker.rs::cancel_during_walk_terminates_quickly` — pins that the walker drops promptly when the modal closes.
+- `apps/tui/src/index_worker.rs::progress_events_emit_during_large_walk` — pins the progress-event stream feeding the spinner/count.
+- `apps/tui/src/index_worker.rs::nonexistent_root_returns_no_roots_error`, `ignore_file_excludes_listed_dirs`, `tmpdir_with_nested_dirs_yields_all_dirs` — pin the local walker behavior.
+- `apps/tui/src/spawn.rs::ctrl_t_toggles_fuzzy_to_precise_and_seeds_cwd`, `ctrl_t_toggles_precise_to_fuzzy` — pin the `Ctrl+T` synchronous-mode escape.
+- `apps/tui/src/spawn.rs::ctrl_r_emits_refresh_index_outcome_in_fuzzy_mode` — pins `Ctrl+R` rebuild trigger.
+- (uncovered: the modal-side guarantee that keystroke handling stays interactive while the worker is running, including the "no auto-refresh on index-done; user must press one more key" rule; spinner-sentinel rendering.)
+
 ---
 
 ## Navigation
@@ -291,6 +380,13 @@
 **Failure modes:**
 - **Only one agent exists:** the chord is a no-op.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::prefix_l_via_alias_focuses_next`, `prefix_h_via_alias_focuses_prev` — pin the vim-style aliases dispatching to FocusNext / FocusPrev.
+- `apps/tui/src/runtime.rs::direct_cmd_apostrophe_focuses_next_without_arming_prefix`, `direct_cmd_semicolon_focuses_prev` — pin the direct `Cmd+'` and `Cmd+;` chords.
+- `apps/tui/src/runtime.rs::prefix_then_repeated_nav_keys_keeps_dispatching` — pins repeated nav keys staying sticky (h h h works without re-arming).
+- `apps/tui/src/keymap.rs::prefix_focus_next_aliases_all_resolve_to_focus_next`, `prefix_focus_prev_aliases_all_resolve_to_focus_prev` — pin all alias chords (`n`/`l`/`j`/Right/Down for next; `p`/`h`/`k`/Left/Up for prev).
+- (uncovered: the `NavState`-level wraparound on cycle (`A → B → C → A`) and the SIGWINCH-not-fired-on-focus-change invariant.)
+
 ### AC-010: Focus an agent by ordinal digit
 
 **Given:**
@@ -307,6 +403,13 @@
 **Failure modes:**
 - **Digit out of range** (e.g. `prefix 9` with 4 agents): the chord is a no-op, and the prefix state *stays sticky* (the runtime classifies `FocusAt(d-1)` as a nav dispatch regardless of whether the index is valid). Press `Esc` or any non-nav key to drop out.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::prefix_digit_focuses_by_one_indexed_position` — pins the 1–9 dispatch into FocusAt with one-indexed mapping.
+- `apps/tui/src/runtime.rs::prefix_zero_is_consumed_no_focus` — pins that `0` is consumed without a focus change.
+- `apps/tui/src/runtime.rs::prefix_then_digit_stays_sticky` — pins the sticky-nav behavior after a digit dispatch.
+- `apps/tui/src/runtime.rs::prefix_then_non_nav_command_exits_sticky`, `prefix_then_unbound_key_exits_sticky`, `prefix_then_esc_exits_sticky_via_unbound_path` — pin the drop-out paths.
+- (uncovered: the AC's specific failure mode — out-of-range digit (e.g. `prefix 9` with 4 agents) staying sticky.)
+
 ### AC-011: Bounce to the previously-focused agent
 
 **Given:**
@@ -320,6 +423,12 @@
 
 **Failure modes:**
 - **Only one agent exists, or no prior focus is recorded:** the chord is a no-op.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::prefix_tab_dispatches_focus_last`, `prefix_then_tab_stays_sticky` — pin the prefix+Tab → FocusLast dispatch.
+- `apps/tui/src/runtime.rs::change_focus_lets_alt_tab_bounce_via_two_calls` — pins the symmetric two-slot bounce: A→B→A→B all driven by `previous_focused`.
+- `apps/tui/src/runtime.rs::change_focus_records_previous_when_focus_moves`, `change_focus_is_a_noop_when_target_is_already_focused` — pin the `previous_focused` accounting that powers the bounce.
+- `apps/tui/src/keymap.rs::direct_binding_for_focus_last_falls_back_to_tab_when_unbound` — pins the keymap fallback for the bounce action.
 
 ### AC-012: Switcher popup picks an agent by name
 
@@ -339,6 +448,14 @@
 
 **Failure modes:** none. The popup cannot open with zero agents because the runtime returns from `event_loop` the moment `nav.agents.is_empty()` (see AC-036).
 
+**Tests:**
+- `apps/tui/src/runtime.rs::snapshot_navigator_popup` — insta snapshot of the popup overlay rendered against two agents; pins layout including the focused-row marker.
+- `apps/tui/src/runtime.rs::dismiss_clamps_open_popup_selection`, `remove_at_decrements_popup_selection_when_removing_an_earlier_index`, `remove_at_closes_popup_when_last_agent_removed` — pin the "stale highlight never focuses a removed slot" invariant when the popup is open across reaps.
+- `apps/tui/src/runtime.rs::no_overlay_active_returns_false_when_popup_open` — pins the popup-as-overlay flag.
+- `apps/tui/src/keymap.rs::popup_lookup_round_trip` — pins the popup-scope key lookup.
+- `apps/tui/src/runtime.rs::label_spans_renders_spinner_glyph_when_working`, `label_spans_omits_spinner_when_not_working`, `label_spans_renders_focused_spinner_with_reverse_style`, `label_spans_renders_host_prefix_when_provided`, `label_spans_omits_host_prefix_when_absent`, `label_spans_renders_spinner_before_host`, `label_spans_renders_attention_dot_when_unfocused_and_flagged`, `label_spans_omits_attention_dot_when_focused`, `label_spans_omits_attention_dot_when_not_flagged` — pin the row composition (spinner + host prefix + attention dot + label).
+- (uncovered: end-to-end Enter-to-focus-and-close gesture; Esc-to-close-without-changing-focus.)
+
 ### AC-013: Toggle the navigator chrome
 
 **Given:**
@@ -356,6 +473,10 @@
 **Failure modes:**
 - **Terminal too narrow for `LeftPane` to render usefully** (≤ ~50 cols): the chrome still flips, but the agent pane may render degraded; the user can flip back.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::render_left_pane_records_one_hitbox_per_agent`, `render_left_pane_hitboxes_skip_borders_and_advance_one_row_per_agent`, `render_left_pane_drops_rows_that_overflow_the_pane` — pin the LeftPane chrome layout.
+- (uncovered: the `prefix v` toggle dispatch, the SIGWINCH on chrome flip, and the `--nav left-pane` / `CODEMUX_NAV` launch-time selectors.)
+
 ### AC-034: Spawning a new agent records the prior focus as the bounce slot
 
 **Given:**
@@ -370,6 +491,11 @@
 
 **Failure modes:**
 - **There were no agents before the spawn:** `previous_focused` stays `None` after the spawn (no prior to record); `prefix Tab` is a no-op until the user manually focuses something else.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::change_focus_records_previous_when_focus_moves` — pins the `previous_focused` accounting that fires at the spawn-time `change_focus(new_idx)`.
+- `apps/tui/src/runtime.rs::change_focus_lets_alt_tab_bounce_via_two_calls` — pins that the recorded prior focus drives a subsequent FocusLast bounce.
+- (uncovered: the spawn-site call into `change_focus` itself; the no-prior-agent edge case staying `None`.)
 
 ### AC-035: Reaping the focused agent moves focus to the new tail, not to `previous_focused`
 
@@ -387,6 +513,11 @@
 **Why this is pinned:** the kill-then-clamp behavior is deliberate and tested (`kill_focused_clamps_focus_when_killing_last_tab`). It's distinct from the `prefix Tab` bounce path (AC-011), which *does* honor `previous_focused`. Pin so a future "smart" kill-focus refactor doesn't silently change behavior under a passing test suite.
 
 **Failure modes:** none.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::kill_focused_clamps_focus_when_killing_last_tab` — pins the kill-then-clamp behavior named in the AC body.
+- `apps/tui/src/runtime.rs::dismiss_removes_focused_crashed_agent_and_clamps_focus` — pins the same clamp invariant for the dismiss path.
+- `apps/tui/src/runtime.rs::dismiss_clears_previous_focused_when_it_collides_with_focused`, `dismiss_clears_stale_previous_focused`, `remove_at_clears_previous_focused_when_it_points_at_removed_slot` — pin the `previous_focused` cleanup when the removed slot equals (or invalidates) the bounce slot.
 
 ---
 
@@ -408,6 +539,14 @@
 **Failure modes:**
 - **Reap of a wedged transport** (e.g. a stuck remote SSH tunnel): `child.kill()` + `child.wait()` (or socket close) is best-effort and may block the calling thread. There is no cleanup timeout today; a fully wedged process can stall the tab removal until killed externally.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::prefix_x_dispatches_kill_agent` — pins the prefix+x dispatch into KillAgent.
+- `apps/tui/src/runtime.rs::kill_focused_removes_ready_agent` — pins that kill works on a live Ready agent (no Ready guard).
+- `apps/tui/src/runtime.rs::kill_focused_removes_failed_agent` — pins parity with terminal-state agents.
+- `apps/tui/src/runtime.rs::kill_focused_no_op_on_empty_vec` — pins the empty-list no-op.
+- `apps/tui/src/runtime.rs::kill_focused_clamps_focus_when_killing_last_tab` — pins the focus-clamp on tail removal.
+- `apps/tui/src/runtime.rs::remove_at_decrements_focused_when_removing_an_earlier_index` — pins focus following the agent across an upstream removal.
+
 ### AC-015: Dismiss a crashed or failed agent (no-op on live)
 
 **Given:**
@@ -424,6 +563,13 @@
 - Step 3 removes `C`'s tab and the frozen-at-death pane.
 
 **Failure modes:** none. The gating against `Ready` is the design, not a failure mode.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::prefix_d_dispatches_dismiss_agent` — pins the prefix+d dispatch into DismissAgent.
+- `apps/tui/src/runtime.rs::dismiss_no_op_on_focused_ready_agent` — pins step 1 (no-op on live).
+- `apps/tui/src/runtime.rs::dismiss_removes_focused_failed_agent` — pins step 2 (removes Failed).
+- `apps/tui/src/runtime.rs::dismiss_removes_focused_crashed_agent_and_clamps_focus` — pins step 3 (removes Crashed and clamps focus).
+- `apps/tui/src/runtime.rs::dismiss_leaves_empty_vec_when_last_agent_dismissed`, `dismiss_removes_crashed_zero_slot` — pin the edge cases.
 
 ### AC-016: Quit codemux cleanly
 
@@ -442,6 +588,11 @@
 **Failure modes:**
 - **`child.wait()` blocks indefinitely** on a wedged child (e.g. uninterruptible sleep). The teardown is best-effort and never panics; a stuck reap will stall the codemux process until the user kills it externally. There is no cleanup timeout today.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::prefix_q_exits` — pins the prefix+q dispatch into Exit.
+- `apps/tui/src/runtime.rs::user_can_remap_quit_to_a_different_key` — pins that the Exit dispatch follows the configured chord.
+- (uncovered: the `TerminalGuard::drop` teardown sequence (alt screen, mouse, KKP, title, stdin drain) and exit-code 0 outcome.)
+
 ### AC-036: Reaping the last agent auto-exits codemux
 
 **Given:**
@@ -459,6 +610,12 @@
 
 **Failure modes:** none.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::reap_silently_removes_clean_exit` — pins exit-0 silently shrinking the agent vec.
+- `apps/tui/src/runtime.rs::reap_clean_exit_clamps_focus_to_surviving_agent` — pins focus following the surviving agent.
+- `apps/tui/src/runtime.rs::dismiss_leaves_empty_vec_when_last_agent_dismissed` — pins the empty-vec post-condition that triggers `event_loop` exit.
+- (uncovered: the `event_loop`-level return-on-empty path and full TerminalGuard teardown.)
+
 ### AC-037: A non-zero PTY exit transitions Ready → Crashed (not silent removal)
 
 **Given:**
@@ -475,6 +632,16 @@
 By contrast, a clean `exit 0` triggers silent removal: the slot is reaped without ceremony, then AC-035 / AC-036 kicks in for focus / shutdown.
 
 **Failure modes:** none.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::reap_transitions_ready_with_dead_transport_to_crashed` — pins the Ready → Crashed transition on non-zero exit.
+- `apps/tui/src/runtime.rs::reap_leaves_alive_ready_agent_in_ready_state`, `reap_leaves_failed_agent_alone`, `reap_leaves_already_crashed_agent_alone` — pin the negative cases.
+- `apps/tui/src/runtime.rs::mark_crashed_transitions_ready_to_crashed_preserving_parser_and_exit_code` — pins parser preservation for post-crash scrollback.
+- `apps/tui/src/runtime.rs::nudge_scrollback_moves_offset_on_crashed_agent`, `snap_to_live_resets_offset_on_crashed_agent`, `jump_to_top_works_on_crashed_agent`, `is_working_returns_false_for_crashed_agent`, `title_returns_last_title_on_crashed_agent` — pin scrollback access continuing after the crash transition.
+- `apps/tui/src/runtime.rs::render_agent_pane_paints_red_banner_for_nonzero_exit_code` — pins the red crash-banner render.
+- `apps/tui/src/runtime.rs::render_agent_pane_paints_connection_lost_banner_for_minus_one` — pins the daemon-EOF (`-1`) variant.
+- `apps/tui/src/runtime.rs::render_agent_pane_falls_through_to_red_banner_for_synthetic_zero_exit` — pins the synthetic-zero (kill-by-codemux) banner case.
+- `apps/tui/src/runtime.rs::render_agent_pane_banner_uses_configured_dismiss_chord` — pins that the banner shows the rebound dismiss chord.
 
 ### AC-038: A panic restores the terminal before the report is printed
 
@@ -518,6 +685,17 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Terminal does not deliver SGR mouse events** (e.g. Apple Terminal): wheel does nothing; `PageUp`/`PageDown`/`g`/`G` arrow-style bindings still work to enter scroll mode if the user can produce the chord some other way (most users will not; wheel is the realistic entry point).
 - **`scrollback_len = 0`** (configured to disable history): the badge does not appear and the visible rows don't shift. Pinned by `runtime::tests::scrollback_zero_len_means_no_history`.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::scrollback_zero_len_means_no_history` — pins the `scrollback_len = 0` failure-mode clause named in the AC.
+- `apps/tui/src/runtime.rs::scrollback_set_back_round_trips`, `scrollback_offset_auto_bumps_when_new_rows_evict`, `scrollback_clamps_to_buffer_length_at_top`, `scrollback_state_is_per_parser` — pin the vt100 invariants codemux's scroll mode leans on.
+- `apps/tui/src/runtime.rs::nudge_scrollback_moves_offset_into_history_then_back` — pins wheel-up / PageUp navigation.
+- `apps/tui/src/runtime.rs::nudge_scrollback_saturates_at_zero_on_negative_overflow` — pins the wheel-down floor.
+- `apps/tui/src/runtime.rs::nudge_scrollback_only_touches_focused_agent`, `nudge_scrollback_no_op_on_failed_agent` — pin scope.
+- `apps/tui/src/runtime.rs::jump_to_top_clamps_to_buffer_length` — pins step 3 (`g` jumps to top).
+- `apps/tui/src/runtime.rs::snap_to_live_resets_offset_to_zero`, `snap_to_live_no_op_on_failed_agent`, `scrollback_offset_returns_zero_for_failed_agent` — pin step 4 (`G` snaps to live).
+- `apps/tui/src/runtime.rs::render_scroll_indicator` (callers); `apps/tui/src/keymap.rs::scroll_lookup_round_trip`, `scroll_defaults_cover_arrow_pgup_pgdn_g_capital_g_esc` — pin the scroll-mode keymap.
+- (uncovered: the no-SIGWINCH-fired-during-scroll invariant.)
+
 ### AC-018: Typing snaps to live; navigation preserves scroll
 
 **Given:**
@@ -537,6 +715,12 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 
 **Failure modes:** none. Both behaviors are pinned by tests in `apps/tui/src/runtime.rs`.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::snap_to_live_resets_offset_to_zero` — pins step 1 (typing snaps to live before the byte is forwarded; method-level guarantee).
+- `apps/tui/src/runtime.rs::nudge_scrollback_only_touches_focused_agent` — pins that scroll state is per-agent (step 4 returns to A's offset 50).
+- `apps/tui/src/runtime.rs::scrollback_state_is_per_parser` — pins the cross-parser independence the per-agent guarantee leans on.
+- (uncovered: the dispatch-order assertion that `snap_to_live` runs *before* the byte write at the runtime layer; the navigation-chord-non-snap path.)
+
 ### AC-039: Pasting while scrolled-back snaps to live before the bracketed-paste write
 
 **Given:**
@@ -550,6 +734,11 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - The user never pastes into a window they cannot see.
 
 **Failure modes:** none.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::snap_to_live_resets_offset_to_zero` — pins the underlying snap operation.
+- `apps/tui/src/runtime.rs::wrap_paste_emits_brackets_around_plain_text`, `wrap_paste_strips_embedded_esc_to_block_end_marker_injection` — pin the bracketed-paste payload that runs *after* the snap.
+- (uncovered: the dispatch-order assertion that `snap_to_live` runs before the paste payload is written at the runtime layer.)
 
 ---
 
@@ -570,6 +759,12 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:**
 - **Click misses every tab hitbox:** no-op.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::tab_mouse_dispatch_down_on_tab_returns_press`, `tab_mouse_dispatch_up_same_tab_is_a_click` — pin the press → release-on-same-tab click flow.
+- `apps/tui/src/runtime.rs::tab_mouse_dispatch_down_outside_tabs_returns_none`, `tab_mouse_dispatch_up_outside_tabs_cancels`, `tab_mouse_dispatch_up_with_no_press_is_none`, `tab_mouse_dispatch_non_left_buttons_are_ignored` — pin the negative cases.
+- `apps/tui/src/runtime.rs::tab_hitboxes_at_finds_recorded_rect`, `tab_hitboxes_at_misses_outside_recorded_rects`, `tab_hitboxes_clear_drops_all_recorded_rects`, `tab_hitboxes_record_rejects_zero_sized_rect` — pin the hitbox lookup that resolves clicks to agent ids (not slot indices).
+- `apps/tui/src/runtime.rs::render_status_bar_records_one_hitbox_per_agent_in_order`, `render_status_bar_hitboxes_sit_on_the_status_row_and_are_non_overlapping`, `render_status_bar_clears_stale_hitboxes_first` — pin the renderer recording the hitboxes.
+
 ### AC-020: Drag a tab to reorder
 
 **Given:**
@@ -588,6 +783,14 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:**
 - **Release outside any tab hitbox:** drag cancels; no reorder.
 - **The dragged agent is reaped mid-drag:** release resolves to `None` (`agents.iter().position(|a| a.id == id)`); the gesture cancels silently.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::tab_mouse_dispatch_up_different_tab_is_a_reorder` — pins press-on-A → release-on-C dispatching as a reorder.
+- `apps/tui/src/runtime.rs::reorder_agents_drag_right_inserts_at_destination`, `reorder_agents_drag_left_inserts_at_destination`, `reorder_agents_noop_on_self_or_out_of_range` — pin the browser-tab `remove + insert` semantics.
+- `apps/tui/src/runtime.rs::reorder_followed_by_shift_index_keeps_focus_on_the_moved_agent`, `reorder_a_non_focused_tab_past_the_focused_one_keeps_focus_pinned_to_its_agent` — pin focus identity preservation across the reorder.
+- `apps/tui/src/runtime.rs::shift_index_*` — pin the focus-following arithmetic.
+- `apps/tui/src/runtime.rs::tab_mouse_dispatch_drag_is_none_so_event_loop_keeps_state` — pins the drag-in-flight no-op until release.
+- `apps/tui/src/runtime.rs::render_left_pane_records_one_hitbox_per_agent` — pins LeftPane sharing the same hitbox path (so the gesture works in both chromes).
 
 ### AC-021: Drag-to-select and copy via OSC 52
 
@@ -610,6 +813,14 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Terminal does not support OSC 52** (e.g. Apple Terminal): the escape is silently swallowed. There is no capability probe, so codemux cannot detect this case or warn the user. Documented fallback: `⌥/Alt-drag` bypasses mouse capture so the host terminal's native selection takes over.
 - **Selection spans scrollback rows:** `contents_between` walks `visible_rows()` so scrolled-back content is included. No special-casing required.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::pane_mouse_dispatch_down_inside_pane_arms_selection`, `pane_mouse_dispatch_drag_extends_when_selection_active`, `pane_mouse_dispatch_drag_outside_pane_clamps`, `pane_mouse_dispatch_drag_without_selection_is_none`, `pane_mouse_dispatch_up_with_selection_commits`, `pane_mouse_dispatch_up_without_selection_is_none`, `pane_mouse_dispatch_down_outside_pane_returns_none`, `pane_mouse_dispatch_right_button_is_none` — pin the selection lifecycle from press through commit.
+- `apps/tui/src/runtime.rs::pane_hitbox_cell_at_translates_to_pane_relative`, `pane_hitbox_cell_at_returns_none_outside_pane`, `pane_hitbox_clamped_cell_at_clamps_to_nearest_edge`, `pane_hitbox_no_record_means_no_dispatch` — pin the cell-coordinate translation.
+- `apps/tui/src/runtime.rs::normalized_range_handles_inverted_drag`, `normalized_range_preserves_already_ordered_drag`, `row_bounds_*` — pin the selection-range math.
+- `apps/tui/src/runtime.rs::write_clipboard_to_emits_osc_52_with_base64_payload`, `write_clipboard_to_handles_empty_string_as_empty_payload`, `write_clipboard_to_round_trips_multibyte_utf8` — pin the OSC 52 payload framing.
+- `apps/tui/src/runtime.rs::vt100_contents_between_extracts_selection_substring`, `vt100_contents_between_handles_multirow_selection`, `failure_text_in_range_extracts_centered_content`, `failure_text_in_range_spans_multiple_rows`, `failure_text_in_range_returns_empty_for_pure_padding` — pin the text extraction for both Ready/Crashed and Failed agents.
+- `apps/tui/src/runtime.rs::paint_selection_if_active_flips_reversed_modifier_on_selected_cells`, `paint_selection_if_active_skips_when_agent_id_does_not_match` — pin the reverse-video render.
+
 ### AC-040: Mouse events are suppressed while an overlay is open
 
 **Given:**
@@ -625,6 +836,10 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Why this is pinned:** there is no "click outside to dismiss" behavior, no "click wildmenu candidate to select", no "click switcher row to focus". The keyboard is the sole control surface while an overlay is up. Pin so a future "let users click overlays" change is deliberate.
 
 **Failure modes:** none.
+
+**Tests:**
+- `apps/tui/src/runtime.rs::no_overlay_active_returns_true_when_nothing_open`, `no_overlay_active_returns_false_when_help_open`, `no_overlay_active_returns_false_when_popup_open` — pin the gate-check helper.
+- (uncovered: the runtime-level proof that the `Event::Mouse` branch returns early when `no_overlay_active(...)` is false; the spawn-modal-open variant of the gate.)
 
 ### AC-041: Ctrl+click on a URL hands it to the OS opener; Ctrl+hover shows underline + hand cursor
 
@@ -642,6 +857,14 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 
 **Failure modes:**
 - **Opener fails (no `xdg-open`, etc.):** the URL is copied to the clipboard and a toast confirms. (URL-open is the one place toasts are wired today; see AC-021's toast-less clipboard contrast.)
+
+**Tests:**
+- `apps/tui/src/runtime.rs::compute_hover_returns_url_under_pane_cell`, `compute_hover_returns_none_when_screen_cell_outside_pane`, `compute_hover_returns_none_when_no_url_under_cell` — pin the hover-detection at the cell level.
+- `apps/tui/src/runtime.rs::update_hover_returns_activated_on_none_to_some`, `update_hover_returns_deactivated_on_some_to_none`, `update_hover_returns_unchanged_when_active_state_unchanged`, `apply_hover_cursor_emits_pointer_on_activated_default_on_deactivated_nothing_on_unchanged` — pin the hover-state transitions and cursor-shape emission.
+- `apps/tui/src/runtime.rs::paint_hover_url_if_active_underlines_url_range_and_tints_cyan`, `paint_hover_url_if_active_skips_when_agent_id_does_not_match`, `paint_hyperlinks_post_draw_emits_osc_8_wrap_around_cell_walk`, `paint_hyperlinks_post_draw_translates_pane_offset_into_terminal_cup`, `paint_hyperlinks_post_draw_is_a_no_op_when_no_urls_present`, `paint_hyperlinks_post_draw_does_not_drop_chars_adjacent_to_url_boundaries` — pin the underline/OSC 8 render.
+- `apps/tui/src/runtime.rs::url_opener_trait_supports_recording_mock_implementations`, `project_url_open_report_opened_yields_confirm`, `project_url_open_report_failed_yields_fallback_with_error`, `url_open_toast_confirm_returns_none`, `url_open_toast_fallback_with_clipboard_success_is_warning`, `url_open_toast_fallback_with_clipboard_failure_is_error` — pin the open-or-fallback-to-clipboard policy and toast wiring.
+- `apps/tui/src/url_scan.rs::finds_https_url_and_returns_pane_relative_columns`, `covers_every_column_of_the_url`, `returns_none_for_columns_outside_url`, `trims_trailing_punctuation`, `url_in_parentheses_drops_the_close_paren`, `ignores_bare_scheme_with_no_authority`, `handles_multiple_schemes`, `out_of_bounds_target_returns_none`, `file_and_ftp_schemes_are_recognised`, `respects_terminator_chars_in_markdown_links`, `find_urls_in_screen_returns_every_url_across_rows`, `find_urls_in_screen_returns_multiple_urls_on_one_row`, `find_urls_in_screen_returns_empty_when_no_urls` — pin the URL detector.
+- (uncovered: end-to-end test against a real OS opener and a real terminal Ctrl+click. The trait + mock seam exists; the integration is what's missing.)
 
 ---
 
@@ -669,6 +892,16 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Focused agent is SSH:** `model`, `branch`, and `tokens` all skip (the worker only sets a target when the focused agent has a local cwd; remote agents never get scanned by the local worker).
 - **Statusline JSON missing** (Claude has not yet written for this agent): `tokens` renders nothing; populates after the first turn.
 
+**Tests:**
+- `apps/tui/src/status_bar/mod.rs::build_segments_default_set_is_model_tokens_worktree_branch_hint` — pins the default segment set and order.
+- `apps/tui/src/status_bar/mod.rs::render_segments_renders_all_when_space_is_ample` — pins the ` │ ` separator + ordered render on a wide terminal.
+- `apps/tui/src/status_bar/segments.rs::model_segment_shortens_anthropic_model_ids`, `model_segment_passes_through_unknown_model_names`, `model_segment_returns_none_when_model_is_unknown`, `model_segment_strips_bracketed_context_window_suffix`, `model_segment_appends_bracketed_effort_badge_when_non_default`, `model_segment_hides_effort_badge_when_medium_default`, `model_segment_hides_effort_badge_when_field_empty_or_absent` — pin the model segment.
+- `apps/tui/src/status_bar/segments.rs::worktree_segment_hides_in_main_checkout`, `worktree_segment_renders_when_cwd_differs_from_repo`, `worktree_segment_renders_when_repo_is_unknown`, `worktree_segment_returns_none_when_cwd_basename_unknown` — pin the worktree segment.
+- `apps/tui/src/status_bar/segments.rs::branch_segment_renders_when_branch_is_not_default`, `branch_segment_hides_when_branch_is_in_default_list`, `branch_segment_renders_main_when_default_list_is_empty`, `branch_segment_returns_none_when_no_branch` — pin the branch segment.
+- `apps/tui/src/status_bar/segments.rs::token_segment_returns_none_when_no_usage_yet`, `token_segment_with_percent_renders_tok_count_and_percentage`, `token_segment_compact_format_omits_percentage`, `token_segment_with_bar_renders_fixed_width_progress_bar`, `token_segment_color_threshold_yellow_at_200k`, `token_segment_color_threshold_orange_at_300k`, `token_segment_color_threshold_red_at_360k`, `token_segment_uses_cache_tokens_in_total_and_percentage`, `token_segment_trusts_reported_window_for_large_context_models` — pin the tokens segment.
+- `apps/tui/src/status_bar/segments.rs::prefix_hint_segment_renders_help_label_when_idle`, `prefix_hint_segment_renders_nav_badge_when_awaiting_command`, `prefix_hint_segment_styles_idle_text_via_span`, `prefix_hint_segment_never_returns_none` — pin the prefix-hint segment.
+- `apps/tui/src/status_bar/segments.rs::repo_segment_renders_repo_name`, `repo_segment_returns_none_when_no_repo` — pin the (opt-in) repo segment.
+
 ### AC-023: Customize the status bar via config
 
 **Given:**
@@ -690,6 +923,14 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Unknown segment ID** (e.g. `status_bar_segments = ["model", "uptime"]`): the unknown ID is logged once at startup with the list of known IDs and skipped; the rest of the list still renders. The config does NOT fail to load over a typo.
 - **Sub-config with invalid values** (e.g. malformed TOML in `[ui.segments.branch]`): falls under AC-030; the process exits non-zero before raw mode.
 
+**Tests:**
+- `apps/tui/src/status_bar/mod.rs::build_segments_skips_unknown_ids_and_warns` — pins the unknown-id-is-skipped failure mode.
+- `apps/tui/src/status_bar/mod.rs::build_segments_handles_empty_list` — pins the empty `status_bar_segments = []` disable.
+- `apps/tui/src/status_bar/mod.rs::build_segments_recognises_repo_when_user_opts_in` — pins the opt-in `repo` segment.
+- `apps/tui/src/config.rs::ui_status_bar_segments_default_includes_all_five_built_ins`, `ui_status_bar_segments_round_trips_user_override`, `ui_status_bar_segments_empty_list_disables_right_side_block` — pin config parsing for the segment list.
+- `apps/tui/src/config.rs::ui_default_branches_defaults_to_main_and_master`, `ui_default_branches_round_trips_user_override`, `ui_default_branches_empty_list_means_show_every_branch` — pin sub-config for the branch segment.
+- `apps/tui/src/config.rs::ui_segments_tokens_defaults_match_aifx_thresholds`, `ui_segments_tokens_round_trips_user_overrides`, `ui_segments_tokens_format_accepts_all_three_variants`, `ui_segments_tokens_section_is_optional`, `ui_segments_section_is_optional_and_defaults_apply` — pin sub-config for the tokens segment.
+
 ### AC-024: Segments drop from the left under width pressure
 
 **Given:**
@@ -704,6 +945,11 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - Resizing back wide re-adds the dropped segments in reverse order.
 
 **Failure modes:** none. The algorithm is deterministic.
+
+**Tests:**
+- `apps/tui/src/status_bar/mod.rs::render_segments_drops_leftmost_first_when_space_is_tight` — pins the leftmost-first drop policy.
+- `apps/tui/src/status_bar/mod.rs::render_segments_keeps_only_the_rightmost_when_space_is_very_tight` — pins that `prefix_hint` is preserved last.
+- `apps/tui/src/status_bar/mod.rs::render_segments_returns_empty_when_nothing_fits`, `render_segments_returns_empty_for_empty_segment_list`, `render_segments_skips_segments_that_render_none`, `render_segments_returns_empty_when_all_segments_yield_none` — pin the edge cases.
 
 ### AC-042: Status bar is hidden in `LeftPane` chrome
 
@@ -743,6 +989,12 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 
 **Failure modes:** none for the keymap-derived rows. They're generated from the same `Bindings` POD that the runtime dispatches against, so they cannot drift. The hardcoded literal rows (`1-9`, `wheel`, `type`, mouse gestures) *can* drift silently from real behavior; closing this would require either moving them into `Bindings` or pinning them with a snapshot test.
 
+**Tests:**
+- `apps/tui/src/runtime.rs::snapshot_help_screen` — insta snapshot of `render_help` against the default keymap on an 80×24 backend.
+- `apps/tui/src/runtime.rs::prefix_question_mark_opens_help` — pins the prefix+? dispatch into OpenHelp.
+- `apps/tui/src/keymap.rs::cmd_prefix_in_config_triggers_super_detection`, `cmd_action_in_config_triggers_super_detection`, `cmd_scroll_chord_triggers_super_detection`, `defaults_use_super_modifier_via_direct_binds`, `ctrl_only_overrides_do_not_trigger_super_detection` — pin the SUPER auto-detection that drives the help header's `cmd → super` normalization.
+- (uncovered: a snapshot of `render_help` against a *rebound* prefix to prove the live keymap is reflected, and a test that the help-screen modal swallows mouse events.)
+
 ---
 
 ## Daemon
@@ -766,6 +1018,15 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Wire-protocol mismatch on reconnect:** daemon sends `Message::Error{VersionMismatch}` (see AC-003; slot enters `Failed`, no retry on this path).
 
 **Note:** This AC pins the daemon-side contract verified by `apps/daemon/src/supervisor.rs` tests. End-to-end "quit codemux, restart, reconnect to a previously-spawned agent" requires AD-7 (P1 persistence); see AC-028.
+
+**Tests:**
+- `apps/daemon/src/supervisor.rs::snapshot_replays_screen_state_on_reattach` — pins that the first `PtyData` after `HelloAck` on a reattach contains the prior session's screen content.
+- `apps/daemon/src/supervisor.rs::snapshot_drain_avoids_duplicate_replay_of_buffered_bytes` — pins the drain-before-snapshot ordering so buffered bytes don't double-paint.
+- `apps/daemon/src/supervisor.rs::session_survives_client_disconnect_and_reattach` — pins the reattach-and-write end-to-end through a real `cat` PTY.
+- `apps/daemon/src/session.rs::take_snapshot_primary_screen_omits_alt_screen_toggle` — pins that primary-mode snapshots skip the `?1049h` toggle.
+- `apps/daemon/src/session.rs::take_snapshot_alt_screen_includes_alt_screen_toggle` — pins that alt-screen snapshots lead with `\x1b[?1049h`.
+- `apps/daemon/src/supervisor.rs::handshake_version_mismatch_returns_error_frame`, `handshake_with_non_hello_first_frame_returns_handshake_missing`, `handshake_with_eof_before_hello_returns_handshake_incomplete` — pin the failure modes around handshake.
+- `apps/daemon/src/supervisor.rs::inbound_resize_applies_to_master` — pins the geometry-resize-before-snapshot rule (Hello rows/cols flow into the master before the next attach).
 
 ### AC-028: Reattach to a remote agent across TUI restart
 
@@ -809,6 +1070,10 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:**
 - **`setsid` not on the remote `$PATH`:** the bootstrap fails at `DaemonSpawn`; the slot enters `Failed`. (The bootstrap currently assumes a POSIX `setsid` is present.)
 
+**Tests:**
+- `crates/codemuxd-bootstrap/src/lib.rs::spawn_remote_daemon_redirects_stdin_to_devnull_and_stderr_to_sibling_file` — pins the load-bearing stdio redirect that lets `setsid -f` actually detach without keeping the SSH pipes open. Without it, AC-043 silently regresses to "ssh hangs after disconnect."
+- (uncovered: end-to-end "kill the SSH ControlMaster, observe daemon survives" — needs a real sshd. The matrix preamble flags this row as uncertain.)
+
 ### AC-044: Stale daemon is killed and re-deployed on local-binary upgrade
 
 **Given:**
@@ -830,6 +1095,13 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:**
 - **The stale daemon refuses SIGTERM and SIGKILL:** the bootstrap surfaces the kill error; the new spawn fails. (Should not happen for a normal `codemuxd` process.)
 
+**Tests:**
+- `crates/codemuxd-bootstrap/src/lib.rs::spawn_remote_daemon_runs_kill_prelude_when_force_respawn` — pins the SIGTERM-then-SIGKILL prelude on force-respawn.
+- `crates/codemuxd-bootstrap/src/lib.rs::spawn_remote_daemon_omits_kill_prelude_when_not_force_respawn` — pins the negative case.
+- `crates/codemuxd-bootstrap/src/lib.rs::prepare_remote_skips_install_when_version_matches`, `prepare_remote_happy_path_on_fresh_host` — pin that the version probe drives the redeploy decision.
+- `crates/codemuxd-bootstrap/src/lib.rs::bootstrap_version_is_stable_and_well_formed`, `embedded_tarball_contains_required_files`, `bootstrap_manifest_mirrors_every_workspace_dep_used_by_daemon`, `stage_tarball_writes_embedded_bytes` — pin the version + embedded source machinery.
+- (uncovered: the runtime-side observation that a pre-existing `Ready` agent on the same host transitions to `Crashed` when the new spawn forces redeploy.)
+
 ---
 
 ## Config and CLI
@@ -850,6 +1122,13 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:**
 - **Both `$XDG_CONFIG_HOME` and `$HOME` are unset:** the lookup fails loud with `$HOME is not set; cannot resolve config path` and the process exits non-zero before raw mode. (This is the one "missing-config" path that is *not* silent. There's no other writable path the runtime can fall back to.)
 
+**Tests:**
+- `apps/tui/src/config.rs::empty_toml_yields_default_config` — pins that an empty file deserializes as defaults.
+- `apps/tui/src/config.rs::missing_ui_section_keeps_defaults`, `spawn_section_defaults_when_absent`, `ui_segments_section_is_optional_and_defaults_apply` — pin that omitted sub-sections apply defaults.
+- `apps/tui/src/config.rs::xdg_config_home_wins_when_set`, `falls_back_to_home_dot_config_on_macos_and_linux`, `empty_xdg_is_treated_as_unset`, `errors_when_neither_xdg_nor_home_is_set` — pin the lookup-path resolution and the loud-fail when neither is set.
+- `apps/tui/src/config.rs::scrollback_len_defaults_to_five_thousand` — pins the scrollback default value.
+- `apps/tui/src/keymap.rs::missing_config_returns_default_bindings` — pins that an empty `[bindings]` table yields the default `Bindings`.
+
 ### AC-030: Invalid config fails loud before raw mode
 
 **Given:**
@@ -866,6 +1145,14 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:**
 - **Unknown top-level keys are NOT errors.** `Config` is deliberately not `#[serde(deny_unknown_fields)]`; see the comment in `apps/tui/src/config.rs` trading typo-safety for forward-compat. A typo like `[bindng]` parses fine and silently binds nothing. Use `RUST_LOG=codemux=debug` to see what the deserializer accepted.
 
+**Tests:**
+- `apps/tui/src/config.rs::invalid_chord_in_config_propagates_as_a_parse_error` — pins that a malformed prefix chord exits at parse time.
+- `apps/tui/src/config.rs::unknown_top_level_key_is_an_error` — name is misleading; the test body actually `unwrap()`s the parse with an unknown table and asserts success, pinning the failure-mode "Unknown top-level keys are NOT errors." Test name is overdue for a rename.
+- `apps/tui/src/config.rs::host_colors_unknown_name_is_an_error`, `host_colors_malformed_hex_is_an_error`, `host_colors_xterm_index_out_of_range_is_an_error` — pin invalid colors propagating as parse errors.
+- `apps/tui/src/config.rs::spawn_unknown_default_mode_is_an_error`, `spawn_named_project_missing_path_is_an_error` — pin spawn-section validation.
+- `apps/tui/src/keymap.rs::invalid_chord_in_config_is_an_error`, `focus_next_array_with_an_invalid_chord_is_an_error` — pin keymap validation.
+- (uncovered: the runtime-level proof that the parse error fires *before* `enable_raw_mode`, leaving the terminal in its pre-launch state.)
+
 ### AC-031: Invalid `[PATH]` arg fails loud before raw mode
 
 **Given:**
@@ -880,3 +1167,9 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - `--nav <invalid>` fails at clap parse time with the standard `error: invalid value '<x>' for '--nav <NAV>' [possible values: left-pane, popup]`.
 
 **Failure modes:** none.
+
+**Tests:**
+- `apps/tui/src/main.rs::resolve_cwd_returns_canonicalized_directory` — pins the happy path.
+- `apps/tui/src/main.rs::resolve_cwd_errors_when_path_is_missing` — pins the missing-path failure with `invalid path` message.
+- `apps/tui/src/main.rs::resolve_cwd_errors_when_path_is_a_file` — pins the not-a-directory failure with `is not a directory` message (canonicalized path).
+- (uncovered: the `--nav <invalid>` clap-parse error and the runtime-level proof that the exit happens *before* raw mode.)
