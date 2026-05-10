@@ -78,3 +78,42 @@ fn kill_last_agent_auto_exits_codemux() {
         "expected clean exit (status 0); got {status:?}"
     );
 }
+
+/// Boot codemux against the fake agent, wait for the prompt to land,
+/// send `Ctrl+B q` (the default `Quit` chord), and assert the codemux
+/// process exits cleanly. Pins AC-016 — distinct from AC-036 above
+/// because the exit path is different: `Quit` flows through
+/// `KeyDispatch::Exit => return Ok(())` (`runtime.rs::3571`), not
+/// through the post-reap `agents.is_empty()` branch. Both routes
+/// land on the same `TerminalGuard` teardown, but the dispatch
+/// surface they exercise is independent.
+///
+/// **Why a second exit test in this file:** the kill test pins
+/// "the last agent went away, so codemux exits"; this one pins
+/// "the user explicitly asked to quit, so codemux exits". Both
+/// matter and both can regress independently — e.g. someone could
+/// remove `KeyDispatch::Exit` from the dispatcher and `prefix q`
+/// would silently no-op while AC-036 stays green.
+#[test]
+#[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
+#[serial]
+fn prefix_q_quits_codemux_cleanly() {
+    let mut handle = spawn_codemux();
+
+    let _settled = screen_eventually(
+        &mut handle,
+        |s| s.contents().contains("FAKE_AGENT_READY"),
+        Duration::from_secs(5),
+    );
+
+    // Ctrl+B = default prefix; `q` = default `Quit` chord.
+    send_keys(&mut handle, "\x02q");
+
+    let status = wait_for_exit(&mut handle, Duration::from_secs(5))
+        .expect("codemux did not exit within 5s of `Ctrl+B q`");
+
+    assert!(
+        status.success(),
+        "expected clean exit (status 0); got {status:?}"
+    );
+}

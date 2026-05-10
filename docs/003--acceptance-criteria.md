@@ -593,7 +593,8 @@
 **Tests:**
 - `apps/tui/src/runtime.rs::prefix_q_exits` — pins the prefix+q dispatch into Exit.
 - `apps/tui/src/runtime.rs::user_can_remap_quit_to_a_different_key` — pins that the Exit dispatch follows the configured chord.
-- (uncovered: the `TerminalGuard::drop` teardown sequence (alt screen, mouse, KKP, title, stdin drain) and exit-code 0 outcome.)
+- `apps/tui/tests/pty_lifecycle.rs::prefix_q_quits_codemux_cleanly` — drives `Ctrl+B q` at a live agent through a real PTY and asserts the codemux process exits 0 within a timeout. Pins the `KeyDispatch::Exit => return Ok(())` branch end-to-end and the exit-code-0 outcome. Distinct from AC-036's auto-exit-on-empty-vec path.
+- (uncovered: the `TerminalGuard::drop` teardown sequence at the byte level — alt-screen exit, mouse release, KKP pop, title restore, stdin drain.)
 
 ### AC-036: Reaping the last agent auto-exits codemux
 
