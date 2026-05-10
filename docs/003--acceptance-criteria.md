@@ -105,7 +105,8 @@
 - `apps/tui/src/config.rs::spawn_scratch_dir_defaults_to_dotcodemux_scratch` — pins the default `~/.codemux/scratch` value.
 - `apps/tui/src/config.rs::expand_scratch_expands_tilde_against_home`, `expand_scratch_bare_tilde_resolves_to_home`, `expand_scratch_absolute_path_passes_through`, `expand_scratch_returns_none_for_relative_path`, `expand_scratch_returns_none_when_tilde_but_no_home` — pin the path-resolution rules.
 - `apps/tui/src/runtime.rs::resolve_remote_scratch_cwd_returns_none_when_path_unresolvable`, `resolve_remote_scratch_cwd_returns_dir_on_mkdir_success`, `resolve_remote_scratch_cwd_returns_none_on_mkdir_failure` — pin the runtime-side resolution / mkdir-on-demand behavior.
-- (uncovered: full local-spawn flow that creates the scratch dir and lands a Ready tab; failure-mode fallback to platform default cwd on resolution failure.)
+- `apps/tui/tests/pty_spawn_action.rs::enter_in_empty_modal_spawns_second_agent_in_scratch_dir` — boots codemux against the fake agent with a config that points `scratch_dir` at a per-test tempdir, flips to LeftPane chrome, opens the spawn modal with `Ctrl+B c`, presses Enter on the empty modal, and asserts the modal closes and a second tab appears (ordinal `[2]`) alongside the initial agent. Pins the chord-to-modal-to-Enter-to-second-tab pipeline end-to-end through the real keymap and the runtime's scratch-spawn dispatch.
+- (uncovered: failure-mode fallback to platform default cwd on scratch resolution failure; assertion that the new agent's cwd is *literally* the scratch dir — the PTY test proves a tab appeared but does not introspect the spawned process's cwd.)
 
 ### AC-003: Spawn a remote agent over SSH (cold-start bootstrap)
 

@@ -122,6 +122,25 @@ pub struct CodemuxHandle {
 /// panic gives a clearer test failure than a `Result` the caller would
 /// just unwrap anyway.
 pub fn spawn_codemux() -> CodemuxHandle {
+    spawn_codemux_with_config("")
+}
+
+/// Same as [`spawn_codemux`] but with a `config.toml` written into the
+/// per-test XDG tempdir before the codemux subprocess boots.
+///
+/// Use this whenever a test needs to override defaults that the modal
+/// or runtime would otherwise resolve against the developer's real
+/// machine — e.g. `[spawn] scratch_dir` (default `~/.codemux/scratch`,
+/// which a PTY spawn test would otherwise create on the dev box).
+///
+/// `extra` is the body of the config file. Pass `""` for "no config"
+/// behavior (equivalent to [`spawn_codemux`]). The harness does not
+/// add any defaults of its own; whatever the caller passes is what
+/// codemux sees.
+///
+/// The XDG tempdir is owned by the returned handle and dropped when
+/// it drops, so the config file disappears alongside the child.
+pub fn spawn_codemux_with_config(extra: &str) -> CodemuxHandle {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -132,16 +151,11 @@ pub fn spawn_codemux() -> CodemuxHandle {
         })
         .expect("openpty");
 
-    // Build the command. `CARGO_BIN_EXE_codemux` and
-    // `CARGO_BIN_EXE_fake_agent` are populated by Cargo at compile
-    // time when the test target depends on each `[[bin]]` — the
-    // `test-fakes` feature is what makes the second one materialize.
     let codemux_bin = env!("CARGO_BIN_EXE_codemux");
     let fake_bin = env!("CARGO_BIN_EXE_fake_agent");
 
     let mut cmd = CommandBuilder::new(codemux_bin);
     cmd.env("CODEMUX_AGENT_BIN", fake_bin);
-    // Stable terminal capability surface for assertions. See doc above.
     cmd.env("TERM", "xterm-256color");
     // Empty XDG config dir: prevents the developer's
     // `~/.config/codemux/config.toml` from rebinding the prefix or any
@@ -150,6 +164,12 @@ pub fn spawn_codemux() -> CodemuxHandle {
     // when XDG is unset/empty, so this single env var fully shields
     // the spawned codemux from user-side config.
     let xdg_home = TempDir::new().expect("tempdir for XDG_CONFIG_HOME");
+    if !extra.is_empty() {
+        let codemux_subdir = xdg_home.path().join("codemux");
+        std::fs::create_dir_all(&codemux_subdir).expect("mkdir XDG/codemux");
+        std::fs::write(codemux_subdir.join("config.toml"), extra)
+            .expect("write config.toml into XDG tempdir");
+    }
     cmd.env("XDG_CONFIG_HOME", xdg_home.path());
     cmd.env_remove("RUST_LOG");
     // Cargo sets `cwd` to the package root for tests; set it
