@@ -996,6 +996,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - `apps/tui/src/runtime.rs::snapshot_help_screen` — insta snapshot of `render_help` against the default keymap on an 80×24 backend.
 - `apps/tui/src/runtime.rs::prefix_question_mark_opens_help` — pins the prefix+? dispatch into OpenHelp.
 - `apps/tui/src/keymap.rs::cmd_prefix_in_config_triggers_super_detection`, `cmd_action_in_config_triggers_super_detection`, `cmd_scroll_chord_triggers_super_detection`, `defaults_use_super_modifier_via_direct_binds`, `ctrl_only_overrides_do_not_trigger_super_detection` — pin the SUPER auto-detection that drives the help header's `cmd → super` normalization.
+- `apps/tui/tests/pty_help.rs::help_overlay_opens_and_closes_on_chord` — boots codemux in an 80x24 PTY, sends `Ctrl+B ?`, asserts the ` codemux help ` overlay block lands on screen, then sends `Esc` and asserts the overlay goes away. Pins the chord-to-overlay dispatch and the "any key closes" return path through the real keymap.
 - (uncovered: a snapshot of `render_help` against a *rebound* prefix to prove the live keymap is reflected, and a test that the help-screen modal swallows mouse events.)
 
 ---
