@@ -38,7 +38,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use tempfile::TempDir;
 
 const ROWS: u16 = 24;
@@ -280,6 +280,52 @@ where
         // exception the determinism rule allows: it is bounded, it is
         // a polling backoff, it is not a "wait for the UI to settle"
         // delay.
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Wait up to `timeout` for the spawned `codemux` process to exit on
+/// its own. Returns the exit status if the child reaps within the
+/// deadline, `None` on timeout.
+///
+/// Polls `try_wait` non-destructively so the child stays in the handle
+/// for `Drop` to reap; running `Drop` after a successful
+/// `wait_for_exit` is harmless because `kill` / `wait` on an
+/// already-reaped child are silent at the `portable_pty` layer.
+///
+/// While polling, drains the master-side byte stream into the parser.
+/// The reader thread keeps queuing during teardown (the
+/// `TerminalGuard` Drop emits `?1049l` and friends) and an unattended
+/// channel would balloon — small concern for one short test, but a
+/// real one as the slow tier grows.
+///
+/// First consumer: `pty_lifecycle::kill_last_agent_auto_exits_codemux`
+/// (AC-014 / AC-036, the kill-chord → empty-vec → return-Ok path).
+///
+/// # Panics
+///
+/// Panics if the handle's `child` slot has already been taken (only
+/// happens during `Drop`).
+pub fn wait_for_exit(handle: &mut CodemuxHandle, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Keep the reader-thread channel from filling up. Predicate
+        // matching is not the goal here, just steady drainage.
+        let _ = drain_into_parser(handle);
+
+        let child = handle
+            .child
+            .as_mut()
+            .expect("wait_for_exit called after child was taken (Drop)");
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+
+        if Instant::now() >= deadline {
+            return None;
+        }
+        // Same backoff cadence as `screen_eventually`: bounded polling,
+        // not a "wait for the UI" delay.
         thread::sleep(Duration::from_millis(5));
     }
 }

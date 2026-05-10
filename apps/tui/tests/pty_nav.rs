@@ -12,6 +12,11 @@
 #![cfg(feature = "test-fakes")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// Each `tests/*.rs` integration target compiles `mod common` as its own
+// crate; helpers consumed only by sibling test files (e.g. `wait_for_exit`,
+// used by `pty_lifecycle.rs`) trip `dead_code` here. Same allow-on-import
+// pattern as `pty_smoke.rs`.
+#[allow(dead_code)]
 mod common;
 
 use std::time::Duration;

@@ -547,6 +547,7 @@
 - `apps/tui/src/runtime.rs::kill_focused_no_op_on_empty_vec` — pins the empty-list no-op.
 - `apps/tui/src/runtime.rs::kill_focused_clamps_focus_when_killing_last_tab` — pins the focus-clamp on tail removal.
 - `apps/tui/src/runtime.rs::remove_at_decrements_focused_when_removing_an_earlier_index` — pins focus following the agent across an upstream removal.
+- `apps/tui/tests/pty_lifecycle.rs::kill_last_agent_auto_exits_codemux` — boots codemux in an 80x24 PTY, waits for the fake agent's prompt, sends `Ctrl+B x`, and asserts codemux exits cleanly. Pins the chord-to-`KillAgent` dispatch end-to-end (and the AC-036 auto-exit-on-empty-vec path it cascades into).
 
 ### AC-015: Dismiss a crashed or failed agent (no-op on live)
 
@@ -615,7 +616,8 @@
 - `apps/tui/src/runtime.rs::reap_silently_removes_clean_exit` — pins exit-0 silently shrinking the agent vec.
 - `apps/tui/src/runtime.rs::reap_clean_exit_clamps_focus_to_surviving_agent` — pins focus following the surviving agent.
 - `apps/tui/src/runtime.rs::dismiss_leaves_empty_vec_when_last_agent_dismissed` — pins the empty-vec post-condition that triggers `event_loop` exit.
-- (uncovered: the `event_loop`-level return-on-empty path and full TerminalGuard teardown.)
+- `apps/tui/tests/pty_lifecycle.rs::kill_last_agent_auto_exits_codemux` — drives the `Ctrl+B x` chord at the only agent through a real PTY and asserts the codemux process exits 0 within a timeout. Pins the `event_loop` empty-vec → `return Ok(())` branch end-to-end. (Same test also covers AC-014.)
+- (uncovered: the full TerminalGuard teardown sequence — alt screen, KKP pop, stdin drain — at the byte level. The PTY test asserts process exit but does not parse the cleanup escape sequences emitted on the way out.)
 
 ### AC-037: A non-zero PTY exit transitions Ready → Crashed (not silent removal)
 
