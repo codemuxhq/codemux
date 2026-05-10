@@ -182,6 +182,30 @@ pub fn spawn_codemux() -> CodemuxHandle {
     }
 }
 
+/// Write `keys` to the PTY master so codemux receives them as if the
+/// user typed. Newlines are NOT implicit; pass `"\r"` or `"\n"`
+/// explicitly. ASCII control chars (e.g. `"\x02"` for Ctrl-B) work.
+///
+/// Currently unused — T3 acceptance-criteria tests will be the first
+/// consumers (spawn-modal interactions, navigation chords, lifecycle
+/// keys). The `#[allow(dead_code)]` is temporary; the first T3 commit
+/// MUST remove it.
+///
+/// # Panics
+///
+/// Panics if the master writer has been taken (only happens during
+/// `Drop`) or if the underlying write/flush fails. Both are programmer
+/// errors at this layer — see the rationale on [`spawn_codemux`].
+#[allow(dead_code)]
+pub fn send_keys(handle: &mut CodemuxHandle, keys: &str) {
+    let writer = handle
+        .writer
+        .as_mut()
+        .expect("send_keys called after writer was taken (Drop)");
+    writer.write_all(keys.as_bytes()).expect("write_all to PTY");
+    writer.flush().expect("flush PTY writer");
+}
+
 /// Drain whatever the reader thread has queued into the parser.
 /// Returns `true` if the channel is still live (more bytes may arrive),
 /// `false` if the reader has dropped its `Sender` (EOF / process gone).
