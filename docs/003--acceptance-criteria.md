@@ -13,6 +13,7 @@
   - [AC-008: Cancel the spawn minibuffer](#ac-008-cancel-the-spawn-minibuffer)
   - [AC-032: Spawn modal opens at the TUI startup cwd, not the focused agent's cwd](#ac-032-spawn-modal-opens-at-the-tui-startup-cwd-not-the-focused-agents-cwd)
   - [AC-033: Spawn modal swallows all keystrokes while open](#ac-033-spawn-modal-swallows-all-keystrokes-while-open)
+  - [AC-045: Indexing runs in the background; input stays interactive](#ac-045-indexing-runs-in-the-background-input-stays-interactive)
 - [Navigation](#navigation)
   - [AC-009: Cycle focus between agents](#ac-009-cycle-focus-between-agents)
   - [AC-010: Focus an agent by ordinal digit](#ac-010-focus-an-agent-by-ordinal-digit)
@@ -242,6 +243,28 @@
 - The runtime's `dispatch_key` only runs after the modal is closed.
 
 **Failure modes:** none.
+
+### AC-045: Indexing runs in the background; input stays interactive
+
+**Given:**
+- The spawn modal is open in fuzzy mode, against either a local host or a remote host whose per-host index is not yet built.
+- The indexer worker is running on its own thread (local: `index_worker.rs` walks via `read_dir`; remote: `index_worker.rs` walks via `RemoteFs` over the SSH `ControlMaster` socket).
+
+**When:**
+1. The user types into the path zone while the index is still building.
+2. The user presses `Ctrl+T` to switch to precise mode.
+3. The index finishes building mid-typing.
+
+**Then:**
+- The keystroke handler runs on every press regardless of indexer state. The path zone keeps accepting characters; `Backspace` works; `Ctrl+T` toggles modes; `Esc` cancels.
+- While building, the wildmenu shows a spinner sentinel (e.g. `⠋ indexing...`, or `⠋ indexing... {count} dirs` once the worker reports progress). No fuzzy candidates appear, even if the partial index would match.
+- Precise mode (Step 2) works synchronously: it bypasses the index and uses `read_dir` (local) or `RemoteFs::list_dir` (remote) directly. Candidates appear immediately, even while fuzzy is still building.
+- The runtime drains indexer events via `index_mgr.tick()` once per ~50ms frame using `try_recv()`; this never blocks `dispatch_key`.
+- When the index finishes (Step 3), the wildmenu does NOT auto-refresh the current query. The user must press one more keystroke (any character or `Backspace`) for the new index to populate the wildmenu. The dimmed "stale" wildmenu persists until then.
+
+**Failure modes:**
+- **Indexer panic or worker thread death:** the channel disconnects; the modal sees `IndexState::Building { count: 0 }` indefinitely. `Ctrl+R` forces a rebuild and re-spawns the worker.
+- **Remote `find` subprocess fails or hangs:** the worker thread surfaces the error via the channel; subsequent ticks transition the state and surface a wildmenu error row. The modal stays usable in precise mode.
 
 ---
 
