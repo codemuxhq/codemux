@@ -525,6 +525,7 @@
 - `apps/tui/src/runtime.rs::kill_focused_clamps_focus_when_killing_last_tab` — pins the kill-then-clamp behavior named in the AC body.
 - `apps/tui/src/runtime.rs::dismiss_removes_focused_crashed_agent_and_clamps_focus` — pins the same clamp invariant for the dismiss path.
 - `apps/tui/src/runtime.rs::dismiss_clears_previous_focused_when_it_collides_with_focused`, `dismiss_clears_stale_previous_focused`, `remove_at_clears_previous_focused_when_it_points_at_removed_slot` — pin the `previous_focused` cleanup when the removed slot equals (or invalidates) the bounce slot.
+- `apps/tui/tests/pty_reap.rs::reap_focused_agent_clamps_to_new_tail_not_previous_focused` — boots codemux, spawns three agents via the scratch modal flow, shuffles focus so that `previous_focused` points to slot 1 (NOT slot 2, the new tail after removal), kills the focused tail agent with `prefix x`, and asserts focus lands on `[2]` (new tail) rather than `[1]` (the `previous_focused` slot). Pins the clamp-not-bounce invariant end-to-end and is the only test in the suite that distinguishes the two paths -- previous unit tests pin the mechanism but cannot prove the resolution order when the two pointers diverge.
 
 ---
 
