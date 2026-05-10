@@ -12,7 +12,6 @@
 //! parallel-safe.
 
 #![cfg(feature = "test-fakes")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 // Sibling test files (e.g. `pty_lifecycle.rs`) consume helpers this
 // file doesn't (`wait_for_exit`); same allow-on-import pattern as

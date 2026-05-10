@@ -1,0 +1,14 @@
+# Workspace-wide Clippy configuration.
+#
+# `unwrap_used` and `expect_used` are denied at the workspace level
+# (see each crate's `#![deny(clippy::unwrap_used, clippy::expect_used)]`
+# or the workspace lint table). Production code must propagate errors
+# via `Result` / `color-eyre`. Tests are different: panicking IS the
+# failure signal, and `expect("...")` gives a far better error than
+# `?` could.
+#
+# These two flags carve out the test allowance centrally instead of
+# scattering `#![allow(...)]` at the top of every integration test
+# file. The lints still fire on production code paths.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

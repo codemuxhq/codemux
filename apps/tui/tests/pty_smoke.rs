@@ -22,7 +22,6 @@
 //!   negotiation if it ever lands) without buying coverage.
 
 #![cfg(feature = "test-fakes")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 // Each `tests/*.rs` integration target compiles `mod common` as its own
 // crate, so helpers used only from *other* test files (e.g. `send_keys`,

@@ -10,7 +10,6 @@
 //! because the PTY harness is not safe to run in parallel.
 
 #![cfg(feature = "test-fakes")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 // Each `tests/*.rs` integration target compiles `mod common` as its own
 // crate; helpers consumed only by sibling test files (e.g. `wait_for_exit`,

@@ -31,6 +31,13 @@
 //!   behind that feature at the test file level (`#![cfg(...)]`); the
 //!   `env!` here would fail the build with the feature off.
 
+// Test helpers panic on setup failure; `expect("...")` gives the
+// clearest possible failure message before any assertion runs. The
+// workspace `clippy.toml` enables `allow-unwrap-in-tests` /
+// `allow-expect-in-tests`, but those flags only cover `#[test]` /
+// `#[cfg(test)]` scopes — free-floating helpers in an integration
+// test crate fall outside the carve-out, so the allow stays at
+// file scope here.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{Read, Write};
