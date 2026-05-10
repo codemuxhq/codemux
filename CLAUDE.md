@@ -34,7 +34,7 @@ Dependency edges:
 - `session → shared-kernel`
 - `wire → nothing`
 
-**Never** any TUI-rendering dep (ratatui, tui-term, crossterm) outside `apps/tui`. Architecture rationale lives in `docs/architecture.md` (AD-1 through AD-28).
+**Never** any TUI-rendering dep (ratatui, tui-term, crossterm) outside `apps/tui`. Architecture rationale lives in `docs/004--architecture.md` (AD-1 through AD-29).
 
 ## Where things live
 
@@ -65,7 +65,7 @@ Dependency edges:
 - [`docs/001--vision.md`](docs/001--vision.md) — what codemux is and the eight UX principles
 - [`docs/002--scenarios.md`](docs/002--scenarios.md) — the four concrete workflows it's designed for
 - [`docs/003--acceptance-criteria.md`](docs/003--acceptance-criteria.md) — testable user-task specs that map onto E2E tests
-- [`docs/architecture.md`](docs/architecture.md) — stack, data model, all architecture decisions
+- [`docs/004--architecture.md`](docs/004--architecture.md) — stack, data model, all architecture decisions
 - [`docs/roadmap.md`](docs/roadmap.md) — phased plan, ship criteria, explicit non-milestones
 - [`docs/codemuxd-stages.md`](docs/codemuxd-stages.md) — live tracker for the AD-3 daemon build-out (Stages 0–5)
 - [`docs/testing.md`](docs/testing.md) — testing stack, layout, invariants, and roadmap

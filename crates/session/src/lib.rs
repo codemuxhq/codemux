@@ -2,7 +2,7 @@
 //!
 //! P0 surface: domain types only. The agent lifecycle service and
 //! persistence land alongside their first real caller — see
-//! `docs/architecture.md` "Deferred ideas" for the planned shape.
+//! `docs/004--architecture.md` "Deferred ideas" for the planned shape.
 //!
 //! Stage 3 of the codemuxd build-out adds [`AgentTransport`], the seam
 //! between the runtime and the per-agent PTY. The local variant ports

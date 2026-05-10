@@ -21,7 +21,7 @@ Not user-facing. Proves the plumbing works.
 The minimum to stop reaching for tmux.
 
 **Scope**
-- Navigator — shape (Option A vs Option B, per `docs/architecture.md`) decided during this phase
+- Navigator — shape (Option A vs Option B, per `docs/004--architecture.md`) decided during this phase
 - Spawn local agents
 - Spawn SSH agents via `codemuxd` (AD-3) — small per-host Rust daemon shipped with codemux, deployed on first connect
 - Per-agent metadata: status dot (running / idle / needs-input / dead), pwd or repo name, host

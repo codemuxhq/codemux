@@ -1,9 +1,9 @@
 # Architecture
 
 This document is the canonical map of how codemux is built. The first half
-describes the system as it exists today (workspace layout, dependency rules,
-data model, runtime flow). The second half is the Architecture Decision
-Records — the durable rationale for *why* it is built this way, with rejected
+describes the system as it exists today: workspace layout, dependency rules,
+data model, runtime flow. The second half is the Architecture Decision
+Records, the durable rationale for *why* it is built this way, with rejected
 alternatives kept in writing so we don't relitigate them.
 
 If you only have two minutes, read [At a glance](#at-a-glance) and skim the
@@ -135,7 +135,7 @@ Forbidden:
 - Any cycle between component crates.
 
 **Carve-out: `apps/daemon` depends on `vt100`.** `vt100` is technically a
-TUI-adjacent dep, but the daemon is not a TUI — it's a byte shuttle that
+TUI-adjacent dep, but the daemon is not a TUI. It's a byte shuttle that
 needs a pure VT parser to mirror the child's screen for replay-on-attach
 ([AD-26](#ad-26--daemon-owns-a-session-scoped-vt100-parser-for-snapshot-replay)).
 This is the only sanctioned exception to "no TUI deps outside `apps/tui`".
@@ -154,15 +154,15 @@ AgentTransport ::= Local(LocalPty) | SshDaemon(SshDaemonPty)
 AgentStatus ::= Starting | Running | Idle | NeedsInput | Dead
 ```
 
-- **Host** — a machine codemux can spawn Claude Code on. `local` uses direct
+- **Host**: a machine codemux can spawn Claude Code on. `local` uses direct
   fork. `ssh` uses `ssh_target` to reach the remote `codemuxd`.
-- **Agent** — a logical workspace. Persists across PTY deaths and app restarts
+- **Agent**: a logical workspace. Persists across PTY deaths and app restarts
   once persistence lands ([AD-7](#ad-7--state-is-a-single-sqlite-file-via-rusqlite),
   deferred). Killing a PTY does not delete the agent.
-- **AgentTransport** — closed sum type the runtime uses to drive a PTY
+- **AgentTransport**: closed sum type the runtime uses to drive a PTY
   without knowing whether it's local or remote-via-daemon. New transports
   are an enum-variant change, not a trait-object explosion.
-- **IDs** — `HostId`, `AgentId`, `GroupId` are `Arc<str>` newtypes in
+- **IDs**: `HostId`, `AgentId`, `GroupId` are `Arc<str>` newtypes in
   `shared-kernel`, cheap to clone through channels.
 
 ## Runtime architecture
@@ -176,7 +176,7 @@ Everything in the TUI hangs off a single event loop in
 2. Reap dead transports (`AgentTransport::try_wait` returning `Some(code)`).
 3. Apply pending state transitions (in-flight SSH bootstrap progress,
    focus changes, popup state).
-4. Call `render_frame` — this is where tab hitboxes are recorded inline
+4. Call `render_frame`. This is where tab hitboxes are recorded inline
    by the renderer for later mouse resolution
    ([AD-27](#ad-27--tab-affordances-on-the-captured-mouse-stream)).
 5. Dispatch each event from the buffer.
@@ -202,7 +202,7 @@ KeyEvent ──► dispatch_key ──► either an Action (consumed by codemux)
 backed by a `Bindings` POD loaded from `config.toml`. Direct binds win first;
 the prefix is sticky for nav moves so a single `Ctrl-B` lets you cycle focus
 without re-pressing it. The same `Bindings` table generates the help screen
-and the prefix-hint segment — single source of truth
+and the prefix-hint segment, a single source of truth
 ([AD-24](#ad-24--keymap-registry-as-pod-config-is-a-plain-old-data-structure)).
 
 ### Local agent output path
@@ -239,7 +239,7 @@ The daemon's reader feeds each PTY chunk to the parser AND the outbound
 channel under one lock acquisition (atomic process+send). On reattach,
 `Session::take_snapshot` drains the channel under the same lock, encodes
 the mirrored screen via `vt100::Screen::state_formatted`, and emits the
-result as the **first `PtyData` frame** after the handshake — so the
+result as the **first `PtyData` frame** after the handshake, so the
 client's parser ends up byte-equivalent to the daemon's
 ([AD-26](#ad-26--daemon-owns-a-session-scoped-vt100-parser-for-snapshot-replay)).
 
@@ -248,11 +248,11 @@ client's parser ends up byte-equivalent to the daemon's
 The SSH path is split into two phases so the spawn modal can pause for
 folder selection between them:
 
-1. **`prepare_remote`** — probe the remote `codemuxd` version; if missing
+1. **`prepare_remote`**: probe the remote `codemuxd` version; if missing
    or stale, scp the embedded tarball and remote-build. The tarball is
    assembled at compile time by `crates/codemuxd-bootstrap/build.rs` from
    `apps/daemon` + `crates/wire` + workspace files.
-2. **`attach_agent`** — spawn the daemon, open an `ssh -L` unix-socket
+2. **`attach_agent`**: spawn the daemon, open an `ssh -L` unix-socket
    tunnel, do the wire `Hello`/`HelloAck` handshake, and return an
    `AgentTransport::SshDaemon` to the runtime.
 
@@ -294,33 +294,33 @@ for the "no local daemon, one minimal remote daemon" framing.
 | 28 | Wire encoder vs readline-shortcut adapter (split layers)           | Accepted                            |
 | 29 | Status-bar segments are a closed set of built-ins, selected by config | Accepted                         |
 
-Numbering gaps (4, 9) are intentional — those slots were used for ideas
+Numbering gaps (4, 9) are intentional. Those slots were used for ideas
 that were absorbed into other ADs before being written up. Renumbering
 would break links from code comments and commit messages.
 
 ADRs are written in a fixed shape:
 
-- **Status** — `Accepted`, `Deferred (Phase X)`, or `Superseded by AD-N`. Add
+- **Status**: `Accepted`, `Deferred (Phase X)`, or `Superseded by AD-N`. Add
   amendment dates inline when the body has been revised.
-- **Context** — what problem we are solving and why now.
-- **Decision** — what we chose, with enough specificity that someone reading
+- **Context**: what problem we are solving and why now.
+- **Decision**: what we chose, with enough specificity that someone reading
   only this entry can implement it.
-- **Consequences** — what this commits us to. Both good and bad.
-- **Rejected alternatives** — paths considered and why we did not take them.
+- **Consequences**: what this commits us to. Both good and bad.
+- **Rejected alternatives**: paths considered and why we did not take them.
   Kept in writing so we don't relitigate.
-- **Carve-outs** — explicit exceptions that survive the rule, only present
+- **Carve-outs**: explicit exceptions that survive the rule, only present
   where they apply.
 
 ---
 
 ### AD-1 — Host the PTY, do not semantically parse Claude Code
 
-**Status:** Accepted (2026-01) — amended 2026-04 (settings.json carve-out for
+**Status:** Accepted (2026-01), amended 2026-04 (settings.json carve-out for
 `agent_meta_worker`), amended 2026-04 (statusline IPC carve-out for token
 usage).
 
 **Context.** codemux needs to *display* Claude Code's UI without understanding
-it. Claude Code's terminal UI changes frequently — approval prompts,
+it. Claude Code's terminal UI changes frequently: approval prompts,
 permission flows, tool call rendering, status badges. A multiplexer that
 re-parses any of that becomes a chase that loses every release cycle.
 
@@ -356,7 +356,7 @@ exist because no out-of-band channel exists for the data they need:
    `/model` switches in the active agent). `settings.json` is a
    single-writer global file that updates immediately on `/model`, so
    the bug class disappears. The trade-off is that model+effort are now
-   global rather than per-agent — but `/model` itself updates a global
+   global rather than per-agent, but `/model` itself updates a global
    file, so the per-agent illusion was never really there.
 2. **`statusline_ipc` consumes the per-agent statusline JSON snapshot.**
    We inject `statusLine.command` into the spawned Claude session's
@@ -410,10 +410,10 @@ through `ssh -L`.
 `codemuxd` is a pure byte shuttle: PTY ownership, unix socket, signal and
 resize forwarding, and a `vt100` mirror for replay-on-attach
 ([AD-26](#ad-26--daemon-owns-a-session-scoped-vt100-parser-for-snapshot-replay)).
-It knows nothing about Claude Code (AD-1 still holds — no semantic parsing).
+It knows nothing about Claude Code (AD-1 still holds, no semantic parsing).
 
-`crates/session` defines `AgentTransport` as an **enum**, not a trait —
-variants are closed and known at compile time:
+`crates/session` defines `AgentTransport` as an **enum**, not a trait.
+Variants are closed and known at compile time:
 
 ```rust
 #[non_exhaustive]
@@ -430,7 +430,7 @@ for the enum-vs-`Box<dyn>` rationale.
 **Wire protocol.** Length-prefixed binary frames (PTY data is binary; JSON
 would force base64 on 99% of traffic). Message types: `Hello`/`HelloAck`
 (with version), `PtyData`, `Resize`, `Signal`, `ChildExited`, `Ping`/`Pong`,
-`Error`. Strict version negotiation — mismatch disconnects, local re-deploys
+`Error`. Strict version negotiation: mismatch disconnects, local re-deploys
 the matching daemon, no shimming. Protocol is the artifact to design
 carefully; the implementation is replaceable.
 
@@ -438,7 +438,7 @@ carefully; the implementation is replaceable.
 connect: detect target via `uname`, check `~/.cache/codemuxd/agent.version`,
 scp + build from the embedded tarball if absent or stale. Subsequent
 connects are zero-cost. The bootstrap is split into `prepare_remote`
-(stages 1–4) and `attach_agent` (stages 5–7) so the spawn modal can pause
+(stages 1-4) and `attach_agent` (stages 5-7) so the spawn modal can pause
 for folder selection between them.
 
 **Filesystem per host.**
@@ -455,7 +455,7 @@ shipping and version-negotiating a per-target binary on first connect.
   surface (signal handling, terminfo, scriptable UI) leaks into our error
   modes.
 - *`dtach`.* Small, well-understood C; would ship faster. Disqualified by
-  abandoned upstream (no release since 2016) — when a PTY/signal edge case
+  abandoned upstream (no release since 2016): when a PTY/signal edge case
   bites a load-bearing dependency, no path to a fix exists.
 - *Multi-attach (multiple clients per agent socket).* codemux is single-user;
   "second observer" is not on the roadmap. Single client keeps the daemon
@@ -468,13 +468,13 @@ shipping and version-negotiating a per-target binary on first connect.
 
 ### AD-5 — Local codemux is a single Rust process; SSH outward, `codemuxd` inward
 
-**Status:** Accepted (2026-01) — amended 2026-03 (the "no daemon on remote
+**Status:** Accepted (2026-01), amended 2026-03 (the "no daemon on remote
 hosts" constraint is retired now that AD-3 is in place).
 
 **Context.** codemux is a personal tool with one user. A client/server split
 on the local machine would be pure ceremony.
 
-**Decision.** The local codemux binary is single-process — no client/server
+**Decision.** The local codemux binary is single-process: no client/server
 split, no local daemon. All TUI, navigation, transport, and persistence
 live in one process. SSH is the outbound transport for remote PTYs. A
 small per-host daemon (`codemuxd`, AD-3) holds remote PTYs.
@@ -504,7 +504,7 @@ workflow. Building our own diff view is a rabbit hole.
 **Decision (sketch).** A right-side panel that runs `git diff` on the focused
 agent's cwd and renders the result with `syntect` for syntax highlighting.
 One-keystroke "open in `$EDITOR`" for deep review. No staging, no
-annotations — viewing only.
+annotations: viewing only.
 
 **Rejected alternatives.**
 - *Tail JSONL transcripts and render diffs from tool calls.* Violates AD-1.
@@ -525,7 +525,7 @@ Schema migrations via `rusqlite_migration`.
 **Rejected alternatives.**
 - *Multiple JSON/TOML files.* Race conditions on multi-write, no migration
   story.
-- *A "real" database (sled, redb, postgres).* Single-user pre-alpha tool —
+- *A "real" database (sled, redb, postgres).* Single-user pre-alpha tool;
   SQLite is the boring correct answer.
 
 ---
@@ -537,7 +537,7 @@ Schema migrations via `rusqlite_migration`.
 **Context.** The TUI has no network surface. Authentication is moot.
 
 **Decision.** No auth. Revisit only if a P4 phone view ever happens, which
-would need a control socket and a thin frontend — a meaningful re-spec,
+would need a control socket and a thin frontend, a meaningful re-spec,
 not a small feature.
 
 ---
@@ -569,7 +569,7 @@ a VT parser. We want them to compose with minimal glue.
 
 - **`ratatui`** for chrome (status bar, navigator, popup overlays, spawn
   modal).
-- **`tui-term`** widget for nested PTY rendering — drops into a ratatui
+- **`tui-term`** widget for nested PTY rendering. Drops into a ratatui
   `Rect` with zero glue.
 - **`vt100`** underneath `tui-term` for VT parsing.
 
@@ -578,7 +578,7 @@ cleanly. Note that `ratatui 0.30.0` is itself a workspace split
 (`ratatui-core`, `ratatui-widgets`, `ratatui-crossterm`, `ratatui-macros`);
 the top-level `ratatui` crate re-exports the lot.
 
-**Fallback.** **`alacritty_terminal`** — if OSC 8 (hyperlinks), full SGR
+**Fallback.** **`alacritty_terminal`**. If OSC 8 (hyperlinks), full SGR
 mouse modes, or alt-screen edge cases start to bite, swap the terminal
 backend. Contained refactor, not an architectural change. Direct precedent:
 `egui_term`, `gpui-terminal`, and `missiond-core` all chose
@@ -670,7 +670,7 @@ renaming anything.
 
 **Decision.** `apps/tui/` ships crate `codemux-tui`, binary `codemux`.
 `apps/daemon/` ships crate `codemux-daemon`, binary `codemuxd`. Each is
-a thin shell over a library entry point — `apps/daemon/src/lib.rs` is
+a thin shell over a library entry point: `apps/daemon/src/lib.rs` is
 the supervisor entry, `apps/daemon/src/main.rs` is one function that
 parses argv and calls into the lib. This makes integration tests
 in-process driveable (`apps/daemon/tests/`).
@@ -795,7 +795,7 @@ diverge on a shared dep, and lint configurations drift.
 at the root. Member crates inherit with `{ workspace = true }`.
 
 **Versioning policy.** **Caret-range in `Cargo.toml`, exact resolution in
-`Cargo.lock`** — per the Cargo idiom. Do not use `=X.Y.Z` in the manifest;
+`Cargo.lock`**, per the Cargo idiom. Do not use `=X.Y.Z` in the manifest;
 it blocks `cargo update` from pulling security patches.
 
 **Lints.** Shared lints in `[workspace.lints]`. Rust edition 2024, Cargo
@@ -882,7 +882,7 @@ the keymap as the single source of truth.
 back to `$HOME/.config/codemux/config.toml`. XDG on every Unix, including
 macOS: the `directories`/`dirs` crates default to
 `~/Library/Application Support/` on macOS, which is the Apple GUI
-convention and the wrong place for a CLI tool — modern CLIs (gh, git,
+convention and the wrong place for a CLI tool. Modern CLIs (gh, git,
 helix, kubectl, alacritty, ripgrep) all settled on `~/.config/`
 regardless of platform; we follow suit. The config is loaded once at
 startup into a `Config` POD and passed by reference into `runtime::run`.
@@ -903,7 +903,7 @@ vocabulary.
 config file = exit non-zero with a readable error before the TUI starts.
 Per CLI guidelines, silent fallback would be worse than refusing to start.
 
-**Help screen.** Generated from the same `Bindings` POD — single source
+**Help screen.** Generated from the same `Bindings` POD: single source
 of truth for behaviour and documentation.
 
 **Cmd / Super support via auto-detected Kitty Keyboard Protocol.** macOS
@@ -943,7 +943,7 @@ The implementation rests on three observations and one deliberate trade-off.
 
 **Observation 1: Claude Code stays on the primary screen.** Verified by
 PTY-probing the initial output for the alt-screen DEC modes (`?1049h`,
-`?47h`, `?1047h`) — none appear, only `?2004h` (bracketed paste) and
+`?47h`, `?1047h`); none appear, only `?2004h` (bracketed paste) and
 `?25l` (cursor hide). This matters because vt100's alternate-grid is
 hardcoded to `scrollback_len: 0` and would never collect history; only
 the primary grid does. We're lucky here, and the test
@@ -956,7 +956,7 @@ same content stays under the user's gaze. We never store an offset in
 `RuntimeAgent`; we read `screen.scrollback()` and call
 `screen_mut().set_scrollback(cur ± delta)` per wheel tick. Per-agent
 state is implicit in each agent's `Parser`, which means switching focus
-**preserves** scroll position — coming back to a scrolled-back agent
+**preserves** scroll position: coming back to a scrolled-back agent
 shows it where you left it. This is intentional; do not "fix" it.
 
 **Observation 3: tui-term renders scrollback automatically.**
@@ -969,7 +969,7 @@ floating "scroll mode" indicator badge.
 strip would force a PTY `SIGWINCH` on every scroll-mode entry/exit, and
 Claude redrawing its full UI on every transition would be much worse UX
 than the alternative. Instead the indicator is a floating widget painted
-via `Clear` + `Paragraph` over the bottom-right of the agent pane —
+via `Clear` + `Paragraph` over the bottom-right of the agent pane. It
 costs ~22 cells of overlap during scroll mode, gains zero `SIGWINCH`
 churn.
 
@@ -979,7 +979,7 @@ succeeding. `EnableMouseCapture` (`?1006h` SGR mouse) is what makes
 translated to ↑/↓ arrows by the host terminal's `alternateScroll`
 behavior. Side effect: terminal-native click-and-drag selection requires
 holding ⌥/Alt to bypass capture. **Apple Terminal does not deliver SGR
-mouse events**; scroll won't work there. Explicit non-goal — codemux
+mouse events**; scroll won't work there. Explicit non-goal: codemux
 works with iTerm2, Alacritty, Ghostty, Wezterm, Kitty.
 
 **Selection is implemented in-app, not handed to the terminal.** Because
@@ -994,12 +994,12 @@ documented as the fallback for terminals without OSC 52 (Apple Terminal,
 locked-down corp environments). Selection state is per-frame and
 per-focused-agent: a tab switch, agent reap, or terminal resize clears
 it. Same single-pane, single-selection model as tmux's
-`copy-mode-mouse`. Gestures in v1 are drag-only — no double-click word
+`copy-mode-mouse`. Gestures in v1 are drag-only: no double-click word
 or shift-extend; both are deferred until they're asked for.
 
 **Scroll mode is non-sticky for typing.** Bytes that would have been
-forwarded to Claude — typing real text, control sequences, anything the
-dispatcher returns as `KeyDispatch::Forward` — first snap the focused
+forwarded to Claude (typing real text, control sequences, anything the
+dispatcher returns as `KeyDispatch::Forward`) first snap the focused
 agent back to the live view (`set_scrollback(0)`), so what you type
 isn't echoed into a window you can't see. **Navigation chords preserve
 scroll**: pressing the prefix, a direct nav bind, or hitting digit-1..9
@@ -1016,13 +1016,13 @@ leaves the agent you just left exactly where you scrolled it.
 **Context.** `codemuxd` exists for session continuity: the PTY child
 outlives any single client connection, so a user can close their TUI,
 walk away, and reattach later to the same Claude. The wire protocol
-carries *new* PTY bytes from daemon to client — but the screen state
+carries *new* PTY bytes from daemon to client, but the screen state
 that came before the reattach lived only in Claude's memory and the
 disconnected client's vt100 buffer. On reconnect a new client got a
 fresh empty parser; an idle Claude (sitting at its prompt, no SIGWINCH
 because the geometry hadn't changed) emitted nothing, and the screen
 stayed blank until the user typed something that forced Claude to
-redraw. Same session, different visible state — exactly what session
+redraw. Same session, different visible state, exactly what session
 continuity was supposed to prevent.
 
 **Decision.** The daemon mirrors the child's terminal in its own
@@ -1048,8 +1048,8 @@ per 8 KiB read, which is invisible against the syscall cost.
 
 **2. Snapshot lives in `Session`, not `conn`** (`apps/daemon/src/session.rs`,
 `take_snapshot`). The connection adapter (`conn::run_io_loops`) only
-deals with sockets, framing, and the inbound/outbound thread scope —
-it never touches `vt100`, the `?1049h` toggle, or `state_formatted`.
+deals with sockets, framing, and the inbound/outbound thread scope.
+It never touches `vt100`, the `?1049h` toggle, or `state_formatted`.
 That domain knowledge belongs with the parser, which lives in
 `Session`. `Session::attach` is the orchestrator: it calls
 `conn::perform_handshake` to read the `Hello`, resizes the master to
@@ -1064,7 +1064,7 @@ thread blocks during this; once released, any new chunks land in the
 parser AND `rx` and the freshly-spawned outbound loop forwards them.
 The order at the client is therefore unambiguous: snapshot first,
 post-snapshot live bytes after, no overlap. The master resize sits
-*outside* the parser lock — it's a `TIOCSWINSZ` ioctl independent of
+*outside* the parser lock. It's a `TIOCSWINSZ` ioctl independent of
 the parser, and stalling the reader on it would needlessly delay
 in-flight chunks.
 
@@ -1076,12 +1076,12 @@ otherwise have its alt-buffer content clear-and-painted onto the
 client's primary buffer, which is wrong on attach (visible content
 lands on the wrong half) and worse on the child's next mode toggle
 (the misplaced content lingers when the child switches back). For
-primary-mode sessions we deliberately omit the toggle — the client
+primary-mode sessions we deliberately omit the toggle, since the client
 parser starts in primary, so a no-op switch just adds bytes.
 
-**Carve-outs.** This is a **structural** parsing of Claude's output —
+**Carve-outs.** This is a **structural** parsing of Claude's output:
 escape-sequence reproduction (cursor positions, attribute runs, mode
-flags) — not interpretation of Claude's UI semantics. AD-1 is unbroken
+flags), not interpretation of Claude's UI semantics. AD-1 is unbroken
 in spirit: there is no reading of "is this a prompt", "is this a tool
 call", "what is the assistant doing"; the parser is downstream of
 every byte and treats them all the same way it would any VT-compatible
@@ -1093,7 +1093,7 @@ handle parser-state things like attribute carries across line wraps.
 **The daemon's parser uses `scrollback_len: 0`** because the TUI client
 already owns the scrollback buffer (AD-25). Duplicating it on the
 daemon side would double the memory footprint of every remote session
-for no gain — the client only needs the visible grid restored on
+for no gain. The client only needs the visible grid restored on
 reconnect; history is already in its own parser.
 
 ---
@@ -1108,7 +1108,7 @@ and codemux already captures the mouse stream
 mouse section). The runtime sees `MouseEventKind::Down/Up/Drag` instead
 of letting the terminal own them. With the events already in hand,
 leaving them unbound would have meant the user has to lift their hand
-off the trackpad and reach for `Ctrl-B 1..9` to switch agents — for a
+off the trackpad and reach for `Ctrl-B 1..9` to switch agents. For a
 multiplexer whose whole job is fast switching, that is a pointless
 detour.
 
@@ -1116,7 +1116,7 @@ detour.
 
 - **Click on a tab focuses it** (no prefix).
 - **Drag a tab onto another's slot reorders the agents** in browser-tab
-  semantics — `Vec::remove(from) + insert(to)`, not swap. Same gesture
+  semantics: `Vec::remove(from) + insert(to)`, not swap. Same gesture
   in both nav styles: the bottom strip in Popup mode and the left nav
   rows in LeftPane mode are both clickable.
 
@@ -1141,7 +1141,7 @@ still resolves the gesture correctly: the event loop runs
 `agents.iter().position(|a| a.id == id)` at the moment of the mutation,
 returning `None` (and silently cancelling) if the agent is gone. An
 index-based press would have silently re-targeted to a different agent
-in the same slot — the kind of fragility the identity boundary exists
+in the same slot, the kind of fragility the identity boundary exists
 to prevent. The renderer/dispatcher seam is also pure-functional:
 `tab_mouse_dispatch` returns `Option<TabMouseDispatch>` (variants
 `PressTab(AgentId)` / `Click(AgentId)` / `Reorder { from, to }` /
@@ -1157,13 +1157,13 @@ Release outcomes:
 - released outside any tab → cancel
 
 Crossterm only fires `Drag` on motion, so a same-cell down→up is a clean
-click with no intervening drag — the same code path serves both gestures.
+click with no intervening drag; the same code path serves both gestures.
 
 **Cost.** Captured clicks and drags can no longer reach the terminal for
 native text selection over the tab strip. The `⌥/Option-drag` escape
 hatch (iTerm2, Ghostty, Alacritty, WezTerm, Kitty) bypasses mouse capture
 per-drag and is documented in the help screen alongside the new `click` /
-`drag` lines. Apple Terminal does not deliver SGR mouse anyway — neither
+`drag` lines. Apple Terminal does not deliver SGR mouse anyway, so neither
 tab gestures nor scroll work there. Same explicit non-goal as AD-25.
 
 ---
@@ -1178,16 +1178,16 @@ opinions into what should be a pure VT100/ANSI encoder.
 
 **Decision.** Two named functions in `apps/tui/src/runtime.rs`:
 
-1. **`encode_terminal_key`** — pure VT100 / ANSI key encoder. Maps
+1. **`encode_terminal_key`**: pure VT100 / ANSI key encoder. Maps
    `Backspace → DEL`, `Up → ESC[A`, `Char('a') → 'a'`, etc. The only
    modifier branching it does is `Ctrl-letter → 0x01..0x1A`, because
    that's protocol (Ctrl-C *is* 0x03), not opinion. No GUI-style
    modifier ever changes the output here. Tests pin this invariant
    explicitly: `encode_terminal_key(Backspace, SUPER)` must equal
-   `encode_terminal_key(Backspace, NONE)` — both `vec![0x7f]`.
-2. **`translate_readline_shortcut`** — the deliberately opinionated
+   `encode_terminal_key(Backspace, NONE)`, both `vec![0x7f]`.
+2. **`translate_readline_shortcut`**: the deliberately opinionated
    adapter that bridges GUI-style chords (Cmd+Backspace, Shift+Enter,
-   Ctrl+Backspace, …) to readline byte sequences:
+   Ctrl+Backspace, ...) to readline byte sequences:
    `Cmd+Backspace → Ctrl+U` (unix-line-discard),
    `Ctrl/Alt+Backspace → Meta+DEL` (unix-word-rubout),
    `(Shift|Alt|Ctrl|Cmd)+Enter → Meta+Enter` (newline-in-input).
@@ -1199,7 +1199,7 @@ fallback. Wire bytes leaving the function are byte-identical to the
 previous combined implementation; the change is purely structural.
 
 **Why split.** The architecture-guide review (NLM, 2026-04-28) flagged
-the previous combined function as a Leaky Abstraction — the byte
+the previous combined function as a Leaky Abstraction. The byte
 encoder was carrying GUI-flavored opinions about what `Cmd+Backspace`
 or `Shift+Enter` "should" mean, and a reader of the encoder had no
 way to tell where the protocol stopped and the opinion started. The
@@ -1212,7 +1212,7 @@ why."
 
 **Why opinionated translation, not raw modifier passthrough.** Claude
 (and every readline-style TUI input we target) speaks the universal
-readline byte vocabulary — `Ctrl+U`, `Meta+DEL`, `Meta+Enter` — but
+readline byte vocabulary (`Ctrl+U`, `Meta+DEL`, `Meta+Enter`) but
 not the Kitty Keyboard Protocol's CSI-u extended encoding for
 modified non-character keys. Passing `Cmd+Backspace` through verbatim
 via CSI-u would land literal escape garbage in Claude's input. So the
@@ -1224,7 +1224,7 @@ entire point of the layer existing.
 (a) be a recognized GUI convention with no ambiguity (Cmd+Right for
 end-of-line, Cmd+A for select-all, etc.), (b) have a well-known
 readline byte sequence on the receiving end, and (c) the destination
-must be readline-style input — not a vt100 application that
+must be readline-style input, not a vt100 application that
 interprets the raw chord differently. Anything violating (c) belongs
 in the encoder, not here.
 
@@ -1233,7 +1233,7 @@ layer is *protocol bridging*, not user policy. `Bindings` (AD-24) maps
 key chords to application intents (`SpawnAgent`, `FocusNext`); it is
 the right home for "what should codemux do when I press X". The
 shortcut adapter answers "what bytes does a readline-style child
-process expect when the user expresses delete-line intent" — a
+process expect when the user expresses delete-line intent", a
 separate layer with a separate vocabulary. If a future user wants to
 remap `Cmd+Backspace` to send something other than `Ctrl+U`, the
 shape now makes that an additive change (introduce a
@@ -1261,11 +1261,11 @@ left-to-right; under width pressure, segments are dropped from the
 
 The plumbing lives in `apps/tui/src/status_bar/`:
 
-- `mod.rs` — the `StatusSegment` trait, `SegmentCtx` POD, the
+- `mod.rs`: the `StatusSegment` trait, `SegmentCtx` POD, the
   right-to-left drop algorithm in `render_segments`, and the
   `build_segments(&ids)` registry that maps config strings to built-in
   implementations.
-- `segments.rs` — the built-in segments. Each is a stateless unit
+- `segments.rs`: the built-in segments. Each is a stateless unit
   struct that reads its data off `SegmentCtx` and returns
   `Some(Line)` or `None` (skip silently).
 
@@ -1278,7 +1278,7 @@ automatically.
 **Consequences.** Three things we get from the closed-set discipline:
 
 1. **No subprocess on the render hot path.** A shell-out segment would
-   invoke `sh -c` per refresh per segment per agent — expensive and a
+   invoke `sh -c` per refresh per segment per agent: expensive and a
    stutter risk.
 2. **Typed contract.** Each segment owns its style decisions in one
    place. A typo in a built-in ID is a clippy-flagged literal mismatch;
@@ -1290,8 +1290,8 @@ automatically.
 
 **Drop-from-the-left rationale.** The user's primary cue (the prefix-key
 hint) lives at the right edge today. Keeping the existing visual anchor
-stable across narrow terminals — and letting newly-added segments
-degrade gracefully on small screens — was the design goal. Segments
+stable across narrow terminals (and letting newly-added segments
+degrade gracefully on small screens) was the design goal. Segments
 stack up to the left of the hint, and when a 60-cell terminal can't
 fit `model: opus-4-7 │ repo: codemux │ codemux:main │ ctrl+b ? for help`,
 the user still sees `ctrl+b ? for help` and the focused agent's tab,
@@ -1315,7 +1315,7 @@ amended prose for the bounded-exception scope.
 
 ## Open questions
 
-Triaged from earlier drafts. These are not ADRs — they're flagged
+Triaged from earlier drafts. These are not ADRs; they're flagged
 unknowns for future decisions.
 
 - **Notification content and granularity.** P2 via
@@ -1327,13 +1327,13 @@ unknowns for future decisions.
   being asked.
 - **Cross-host file-edits cache.** Accepted pain. `ssh <host> -- git diff`
   on focus change, cached per agent. If it becomes slow enough to bother,
-  revisit — possibly a tiny `git-diff-watcher` helper on remote hosts.
+  revisit, possibly a tiny `git-diff-watcher` helper on remote hosts.
 - **Handoff / export.** Deferred. Low-frequency need; revisit if the use
   case becomes real.
 - **Multi-window / detach-pane.** Deferred. TUI makes this meaningfully
   harder than the GUI path would have.
 - **Phone / iPad access.** P4 maybe. Would require a control socket and
-  a thin web frontend — a meaningful re-spec, not a small feature.
+  a thin web frontend, a meaningful re-spec, not a small feature.
 - **Devpod auth / host setup wizard.** Deferred. Today: manual per-host
   login flow. Revisit post-P3.
 - **Color and accessibility.** P1 concern. Status signal uses shape +

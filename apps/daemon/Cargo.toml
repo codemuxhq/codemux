@@ -30,7 +30,7 @@ color-eyre.workspace = true
 # remote child's screen so a new client attach can replay state via
 # `Screen::state_formatted` instead of waiting for the child to redraw.
 # vt100 is otherwise a TUI-side dep; this is the one carve-out (see
-# AD on "daemon owns a session-scoped parser" in docs/architecture.md).
+# AD on "daemon owns a session-scoped parser" in docs/004--architecture.md).
 vt100.workspace = true
 
 [dev-dependencies]

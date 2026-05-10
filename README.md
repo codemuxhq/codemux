@@ -75,7 +75,7 @@ This works in **Ghostty, Kitty, WezTerm, recent Alacritty, Foot, and partially i
 - [`docs/001--vision.md`](docs/001--vision.md) — what codemux is and why
 - [`docs/002--scenarios.md`](docs/002--scenarios.md) — the concrete workflows it's designed for
 - [`docs/003--acceptance-criteria.md`](docs/003--acceptance-criteria.md) — testable user-task specs that map onto E2E tests
-- [`docs/architecture.md`](docs/architecture.md) — stack, data model, architecture decisions
+- [`docs/004--architecture.md`](docs/004--architecture.md) — stack, data model, architecture decisions
 - [`docs/roadmap.md`](docs/roadmap.md) — phased plan, ship criteria, non-milestones
 
 ## License

@@ -38,7 +38,7 @@
 //! Claude Code's documented configuration / callback contracts, not
 //! its rendered TUI output. Bounded to the focused local agent, fed
 //! by [`crate::agent_meta_worker`]. See AD-1's amended prose in
-//! `docs/architecture.md`.
+//! `docs/004--architecture.md`.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};

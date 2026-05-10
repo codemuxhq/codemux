@@ -43,7 +43,7 @@ use crate::runtime::PrefixState;
 /// reasoning effort level. Both fields are read by
 /// [`crate::agent_meta_worker`] from `~/.claude/settings.json` —
 /// the only architecturally-sanctioned place to peek at claude
-/// state, see AD-1's amended prose in `docs/architecture.md`.
+/// state, see AD-1's amended prose in `docs/004--architecture.md`.
 ///
 /// Display:
 ///

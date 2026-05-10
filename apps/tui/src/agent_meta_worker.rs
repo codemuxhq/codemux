@@ -39,7 +39,7 @@
 //! `AgentId`) and is written by Claude Code's own statusLine callback
 //! — see `apps/tui/src/statusline_ipc.rs` for the on-disk layout
 //! and the spawn-time settings injection. See AD-1's amended prose
-//! in `docs/architecture.md`.
+//! in `docs/004--architecture.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -482,7 +482,7 @@ fn apply_control(
 /// transcripts) — a `/model` switch in one agent could appear to do
 /// nothing because the worker was scanning a different session's
 /// transcript. settings.json is a single-writer global file that
-/// updates immediately on `/model`. See AD-1 in `docs/architecture.md`.
+/// updates immediately on `/model`. See AD-1 in `docs/004--architecture.md`.
 #[must_use]
 pub fn current_model_and_effort() -> Option<ModelEffort> {
     let home = std::env::var_os("HOME")?;
