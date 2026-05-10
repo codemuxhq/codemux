@@ -69,8 +69,21 @@ fn enter_in_empty_modal_spawns_second_agent_in_scratch_dir() {
     // Scratch tempdir held in the test so it outlives the codemux child.
     // Path is absolute, which `expand_scratch` accepts as-is.
     let scratch = TempDir::new().expect("scratch tempdir");
-    let scratch_path = scratch.path().to_string_lossy().into_owned();
-    let config = format!("[spawn]\nscratch_dir = \"{scratch_path}\"\n");
+    // `to_str().expect(...)` over `to_string_lossy()`: if the tempdir
+    // path is somehow not valid UTF-8 (vanishingly unlikely on a
+    // standard Linux test runner, but real on weird FS configs), we
+    // want a loud test failure rather than a silently-corrupted path
+    // smuggled into the spawned codemux's config.
+    let scratch_path = scratch
+        .path()
+        .to_str()
+        .expect("scratch tempdir path must be valid UTF-8");
+    // `{:?}` formatting on `&str` produces a TOML-compatible quoted
+    // string with `"` and `\` properly escaped. Hand-built
+    // `"\"{path}\""` would break on either character — Linux tempdir
+    // paths are alphanumeric in practice, but escaping defensively is
+    // a one-character fix.
+    let config = format!("[spawn]\nscratch_dir = {scratch_path:?}\n");
 
     let mut handle = spawn_codemux_with_config(&config);
 
