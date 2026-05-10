@@ -411,7 +411,8 @@
 - `apps/tui/src/runtime.rs::prefix_zero_is_consumed_no_focus` — pins that `0` is consumed without a focus change.
 - `apps/tui/src/runtime.rs::prefix_then_digit_stays_sticky` — pins the sticky-nav behavior after a digit dispatch.
 - `apps/tui/src/runtime.rs::prefix_then_non_nav_command_exits_sticky`, `prefix_then_unbound_key_exits_sticky`, `prefix_then_esc_exits_sticky_via_unbound_path` — pin the drop-out paths.
-- (uncovered: the AC's specific failure mode — out-of-range digit (e.g. `prefix 9` with 4 agents) staying sticky.)
+- `apps/tui/tests/pty_digit.rs::prefix_digit_focuses_by_ordinal_and_ignores_out_of_range` — boots codemux, spawns a second agent via the scratch flow, sends `Ctrl+B 1 2 5 0` (sticky prefix), and asserts focus moves to `[1]`, back to `[2]`, then ignores out-of-range `5` (only two agents) and reserved `0`. Pins the chord-to-`FocusAt` dispatch, the one-indexed mapping, the `idx < len` runtime guard, the reserved-zero `Consume` path, AND the sticky-prefix-stays-armed invariant for `FocusAt` end-to-end.
+- (uncovered: assertion that the sticky state SURVIVES an out-of-range digit, i.e. the next bare digit still dispatches — `prefix_then_digit_stays_sticky` covers the unit path but not the rendered surface.)
 
 ### AC-011: Bounce to the previously-focused agent
 
