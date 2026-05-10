@@ -286,7 +286,18 @@ fn read_pid(path: &Path) -> Result<u32, Error> {
 /// retry above. The worst case is a spurious reap of a pid file that
 /// just got abandoned — the original daemon is already gone in that
 /// race, so re-binding is correct.
+///
+/// Values outside the kernel's positive `pid_t` range (`> i32::MAX`)
+/// are short-circuited to `false`: they cannot name a live process on
+/// any Unix the daemon supports. This guard also dodges a procps-ng
+/// `kill(1)` quirk where `4294967295` parses as the signed `-1`
+/// broadcast sentinel — `kill(-1, 0)` returns success for any user
+/// with at least one signalable process, and we'd misread that as a
+/// live holder.
 fn pid_alive(pid: u32) -> bool {
+    if pid > i32::MAX as u32 {
+        return false;
+    }
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
