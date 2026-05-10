@@ -282,7 +282,8 @@
 - `apps/tui/src/spawn.rs::esc_in_host_zone_returns_to_path_with_cwd_reseeded`, `esc_in_host_zone_preserves_user_typed_path` — pin the host-zone Esc semantics (back to path, not close).
 - `apps/tui/src/spawn.rs::lock_for_bootstrap_with_esc_emits_cancel_bootstrap` — pins Esc cancelling an in-flight bootstrap.
 - `apps/tui/src/fuzzy_worker.rs::drop_disconnects_channel_and_exits_worker` — pins worker `Drop` cleanup.
-- (uncovered: the runtime-level guarantee that closing returns focus to the previously-focused agent.)
+- `apps/tui/tests/pty_spawn.rs::esc_in_spawn_modal_closes_the_modal` — boots codemux in an 80x24 PTY, sends `Ctrl+B c` to open the modal, asserts the `@local` host-placeholder span appears, sends `Esc`, asserts the modal chrome goes away. Pins the chord-to-open-to-Esc-closes pipeline end-to-end through the real keymap.
+- (uncovered: the runtime-level guarantee that closing returns focus to the previously-focused agent — would need a multi-agent fixture; deferred until spawn-from-modal lands as a PTY test.)
 
 ### AC-032: Spawn modal opens at the TUI startup cwd, not the focused agent's cwd
 
