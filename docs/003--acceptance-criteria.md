@@ -75,6 +75,9 @@
 - **Claude binary not on `$PATH`:** the spawn error propagates out of `runtime::run`; the process exits non-zero before raw mode with the error on stderr. (`Failed` state is reserved for SSH bootstrap errors, not for local spawn failures.)
 - **Invalid `<PATH>` argument** (missing or not a directory): see AC-031; the process exits non-zero before raw mode.
 
+**Tests:**
+- `apps/tui/tests/pty_smoke.rs::fake_agent_prompt_renders` — boots codemux against the `fake_agent` stub and asserts its prompt renders. Covers the `pane renders` Then-clause; does not yet cover the failure modes (Claude binary missing, invalid PATH).
+
 ### AC-002: Spawn a local agent in the scratch directory
 
 **Given:**
