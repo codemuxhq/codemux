@@ -387,7 +387,8 @@
 - `apps/tui/src/runtime.rs::direct_cmd_apostrophe_focuses_next_without_arming_prefix`, `direct_cmd_semicolon_focuses_prev` — pin the direct `Cmd+'` and `Cmd+;` chords.
 - `apps/tui/src/runtime.rs::prefix_then_repeated_nav_keys_keeps_dispatching` — pins repeated nav keys staying sticky (h h h works without re-arming).
 - `apps/tui/src/keymap.rs::prefix_focus_next_aliases_all_resolve_to_focus_next`, `prefix_focus_prev_aliases_all_resolve_to_focus_prev` — pin all alias chords (`n`/`l`/`j`/Right/Down for next; `p`/`h`/`k`/Left/Up for prev).
-- (uncovered: the `NavState`-level wraparound on cycle (`A → B → C → A`) and the SIGWINCH-not-fired-on-focus-change invariant.)
+- `apps/tui/tests/pty_focus.rs::prefix_n_cycles_focus_between_two_agents` — boots codemux, spawns a second agent via the scratch flow, sends `Ctrl+B n` then a bare `n` (relying on sticky prefix mode), and asserts the LeftPane focus indicator (`> [N]`) moves 2 -> 1 -> 2. Pins the chord-to-FocusNext dispatch, the wraparound (`% nav.agents.len()`), AND the sticky-prefix-stays-armed invariant end-to-end.
+- (uncovered: SIGWINCH-not-fired-on-focus-change invariant.)
 
 ### AC-010: Focus an agent by ordinal digit
 
