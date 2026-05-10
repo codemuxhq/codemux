@@ -6157,4 +6157,27 @@ mod tests {
 
         insta::assert_snapshot!(terminal.backend());
     }
+
+    /// Companion to `render_empty_boot_screen_snapshot` at the smallest
+    /// standard terminal geometry (80×24). Locks the chrome-under-width-
+    /// pressure path: the hint span on the prompt row is wider than 80
+    /// cells, so the renderer must clip it gracefully. A regression that
+    /// stops clipping (or clips wrong) shows up here first.
+    #[test]
+    fn snapshot_spawn_modal_default() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let m = SpawnMinibuffer::new_for_test(PathBuf::from("/test/cwd"));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let bindings = ModalBindings::default();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                m.render(frame, area, &bindings, None);
+            })
+            .unwrap();
+        insta::assert_snapshot!(terminal.backend());
+    }
 }

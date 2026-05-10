@@ -1,0 +1,29 @@
+---
+source: apps/tui/src/runtime.rs
+assertion_line: 10934
+expression: terminal.backend()
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                    ┌ switch agent ────────────────────────┐                    "
+"                    │> [1] host · a                        │                    "
+"                    │  [2] host · b                        │                    "
+"                    │                                      │                    "
+"                    │                                      │                    "
+"                    │                                      │                    "
+"              ssh pr│                                      │used)               "
+"                    │                                      │                    "
+"                    │                                      │                    "
+"                    │                                      │                    "
+"                    │                                      │                    "
+"                    │                                      │                    "
+"                    │                                      │                    "
+"                    └──────────────────────────────────────┘                    "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" 1 host · a  │  2 host · b                                                      "

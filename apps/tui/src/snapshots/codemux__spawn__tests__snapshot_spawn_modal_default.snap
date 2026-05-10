@@ -1,0 +1,29 @@
+---
+source: apps/tui/src/spawn.rs
+assertion_line: 6181
+expression: terminal.backend()
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"────────────────────────────────────────────────────────────────────────────────"
+" (no matches — Enter spawns at literal path)                                    "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"spawn: @local : <cwd>  [tab complete · ctrl+t fuzzy · @ host · down pick · enter"

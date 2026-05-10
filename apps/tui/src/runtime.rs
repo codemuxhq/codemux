@@ -10873,4 +10873,70 @@ mod tests {
         );
         assert!(agents[0].branch.is_none());
     }
+
+    // ---- T1 fast-tier chrome snapshots ----
+    //
+    // One snapshot per top-level chrome surface (help screen, navigator
+    // popup). These pin the rendered cell grid so any unintended chrome
+    // change — header copy, layout shift, popup framing — fails loud
+    // before commit. The spawn modal has its own snapshot in
+    // `spawn.rs::tests::render_empty_boot_screen_snapshot` (different
+    // backend size, so the rendered grid differs meaningfully).
+
+    #[test]
+    fn snapshot_help_screen() {
+        // 80x24 — the smallest standard terminal we target. The help
+        // popup is sized to fit this geometry (see render_help's
+        // centered_rect_with_size call), so any clipping regression
+        // shows up here first.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let bindings = Bindings::default();
+        terminal
+            .draw(|frame| {
+                render_help(frame, frame.area(), &bindings);
+            })
+            .unwrap();
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn snapshot_navigator_popup() {
+        // Two failed agents because `failed_agent` is the only test
+        // helper that builds a RuntimeAgent without a live PTY parser
+        // (the Ready arm needs a vt100 parser fed real bytes). Failed
+        // agents render through render_failure_pane; the popup overlay
+        // on top is what this snapshot is really pinning.
+        let agents = vec![failed_agent("a"), failed_agent("b")];
+        let bindings = Bindings::default();
+        // Derive `dismiss_label` from the same source the production
+        // render path uses (runtime.rs:3950). Hard-coding `"d"` would
+        // tightly couple the snapshot to the current default binding;
+        // if `dismiss_agent` ever changes, this test should reflect it
+        // automatically rather than silently keep a stale snapshot.
+        let dismiss_label = bindings.on_prefix.dismiss_agent.to_string();
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_popup_style(
+                    frame,
+                    frame.area(),
+                    &agents,
+                    0,
+                    PopupState::Open { selection: 0 },
+                    &bindings,
+                    PrefixState::Idle,
+                    &dismiss_label,
+                    AnimationPhase::default(),
+                    &ChromeStyle::default(),
+                    &mut TabHitboxes::default(),
+                    &mut PaneHitbox::default(),
+                    PaneOverlay::default(),
+                    &[],
+                );
+            })
+            .unwrap();
+        insta::assert_snapshot!(terminal.backend());
+    }
 }

@@ -1,0 +1,29 @@
+---
+source: apps/tui/src/runtime.rs
+assertion_line: 10900
+expression: terminal.backend()
+---
+"        ┌ codemux help ────────────────────────────────────────────────┐        "
+"        │prefix:  ctrl+b                                               │        "
+"        │                                                              │        "
+"        │direct (no prefix):                                           │        "
+"        │  super+\     open the spawn modal                            │        "
+"        │  super+'     focus the next agent                            │        "
+"        │  super+;     focus the previous agent                        │        "
+"        │  tab         bounce to the previously-focused agent          │        "
+"        │                                                              │        "
+"        │in prefix mode:                                               │        "
+"        │  q           exit codemux                                    │        "
+"        │  c           open the spawn modal                            │        "
+"        │  n           focus the next agent                            │        "
+"        │  p           focus the previous agent                        │        "
+"        │  tab         bounce to the previously-focused agent          │        "
+"        │  v           toggle navigator style                          │        "
+"        │  w           open the agent switcher popup                   │        "
+"        │  d           dismiss the focused crashed/failed agent        │        "
+"        │  x           force-close the focused agent (live too)        │        "
+"        │  ?           show this help                                  │        "
+"        │  1-9         focus agent by one-indexed position             │        "
+"        │                                                              │        "
+"        │in agent switcher popup:                                      │        "
+"        └──────────────────────────────────────────────────────────────┘        "
