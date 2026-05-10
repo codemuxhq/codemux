@@ -6,7 +6,7 @@ Personal tool. No external deadline. Lanes are independent — pick what hurts m
 
 | Lane | Up next | Note |
 |---|---|---|
-| [Foundations](#foundations) | Persistence (AD-7) | Agents need to survive app restart |
+| [Foundations](#foundations) | E2E test harness | — |
 | [Review workflow](#review-workflow) | Diff panel | Needs vision amendment (P5, AD-6) |
 | [Navigation](#navigation) | Vim keys everywhere | — |
 | [Sessions](#sessions) | Save & archive | — |
@@ -16,10 +16,10 @@ Personal tool. No external deadline. Lanes are independent — pick what hurts m
 
 ## Foundations
 
-- Persistence (AD-7) — agents survive app restart
 - E2E test harness over the AC index
+- Persistence (AD-7) — agents survive app restart
 
-`next:` persistence
+`next:` E2E test harness
 
 ## Review workflow
 
