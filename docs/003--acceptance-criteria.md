@@ -432,6 +432,7 @@
 - `apps/tui/src/runtime.rs::change_focus_lets_alt_tab_bounce_via_two_calls` — pins the symmetric two-slot bounce: A→B→A→B all driven by `previous_focused`.
 - `apps/tui/src/runtime.rs::change_focus_records_previous_when_focus_moves`, `change_focus_is_a_noop_when_target_is_already_focused` — pin the `previous_focused` accounting that powers the bounce.
 - `apps/tui/src/keymap.rs::direct_binding_for_focus_last_falls_back_to_tab_when_unbound` — pins the keymap fallback for the bounce action.
+- `apps/tui/tests/pty_bounce.rs::prefix_tab_bounces_focus_between_two_agents` — boots codemux, spawns a second agent via the scratch flow, sends `Ctrl+B Tab Tab` (sticky prefix, one chord arming + two `FocusLast` fires), and asserts focus oscillates `2 → 1 → 2` via the LeftPane `> [N]` indicator. Pins the chord-to-`FocusLast` dispatch, the `previous_focused`-driven symmetric bounce, AND the sticky-prefix-stays-armed invariant for `FocusLast` end-to-end.
 
 ### AC-012: Switcher popup picks an agent by name
 
