@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use clap::{Parser, Subcommand};
+use codemux_session::BinaryAgentSpawner;
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::layer::SubscriberExt;
@@ -56,6 +57,20 @@ struct Cli {
     /// normal use.
     #[arg(long, short = 'l', env = "CODEMUX_LOG")]
     log: bool,
+
+    /// Path to the agent binary. Defaults to `claude` (resolved via
+    /// `$PATH`). Override with `--agent-bin` or `CODEMUX_AGENT_BIN`;
+    /// the env var is the seam the E2E harness uses to point codemux at
+    /// the in-tree `fake_agent` instead of the real `claude`. Read at
+    /// the clap parse boundary only — production code never reaches
+    /// for `std::env::var`.
+    #[arg(
+        long,
+        value_name = "BIN",
+        env = "CODEMUX_AGENT_BIN",
+        default_value = "claude"
+    )]
+    agent_bin: PathBuf,
 
     /// Hidden IPC subcommands. The default `codemux [PATH]` invocation
     /// stays a positional-only path; subcommands kick in only when
@@ -126,7 +141,20 @@ fn main() -> Result<()> {
         Some(p) => resolve_cwd(p)?,
         None => std::env::current_dir().wrap_err("read current working directory")?,
     };
-    runtime::run(cli.nav, &config, &initial_cwd, cli.log.then_some(&tail))
+    // Construct the production spawner once, here at the composition
+    // root, so the runtime depends on the `AgentSpawner` port rather
+    // than on `BinaryAgentSpawner` directly. Tests substitute their
+    // own binary via `CODEMUX_AGENT_BIN`, which clap resolved into
+    // `cli.agent_bin` above — `BinaryAgentSpawner` then invokes
+    // whatever the test pointed at.
+    let agent_spawner = BinaryAgentSpawner::new(cli.agent_bin);
+    runtime::run(
+        cli.nav,
+        &config,
+        &initial_cwd,
+        cli.log.then_some(&tail),
+        &agent_spawner,
+    )
 }
 
 /// Canonicalize `path` and verify it's a directory. Returns a clean

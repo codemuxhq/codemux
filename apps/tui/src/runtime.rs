@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
-use codemux_session::AgentTransport;
+use codemux_session::{AgentSpawner, AgentTransport, SpawnRequest};
 use codemux_shared_kernel::AgentId;
 use codemuxd_bootstrap::{PreparedHost, RealRunner, RemoteFs};
 use color_eyre::Result;
@@ -1171,6 +1171,7 @@ pub fn run(
     config: &Config,
     initial_cwd: &Path,
     log_tail: Option<&LogTail>,
+    agent_spawner: &dyn AgentSpawner,
 ) -> Result<()> {
     tracing::info!(?initial_cwd, "codemux starting (nav={nav_style:?})");
 
@@ -1178,6 +1179,7 @@ pub fn run(
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
 
     let initial = spawn_local_agent(
+        agent_spawner,
         AgentId::new("agent-1"),
         "agent-1".into(),
         Some(initial_cwd),
@@ -1283,6 +1285,7 @@ pub fn run(
         log_tail,
         initial_cwd,
         &ctx,
+        agent_spawner,
     )
 }
 
@@ -1391,7 +1394,15 @@ fn tick_fuzzy_dispatch(
 /// normally — `--settings` overrides only the `statusLine` field for
 /// this single Claude invocation. See `apps/tui/src/statusline_ipc.rs`
 /// for the schema and the AD-1 carve-out rationale.
+// Eight args (one over clippy's default 7): the spawner port plus seven
+// distinct facts (identity, cwd, geometry, scrollback, tokens cfg) with
+// no natural pairing. `cwd`/`rows`/`cols`/`label` each get used twice
+// (once in the `SpawnRequest`, once in the returned `RuntimeAgent`), so
+// bundling them into a second struct would shuffle the duplication, not
+// remove it.
+#[allow(clippy::too_many_arguments)]
 fn spawn_local_agent(
+    spawner: &dyn AgentSpawner,
     id: AgentId,
     label: String,
     cwd: Option<&Path>,
@@ -1402,7 +1413,14 @@ fn spawn_local_agent(
 ) -> Result<RuntimeAgent> {
     let statusline_path = crate::statusline_ipc::statusline_path_for(&id);
     let args = build_claude_args(&statusline_path, tokens_cfg);
-    let transport = AgentTransport::spawn_local(label.clone(), cwd, &args, rows, cols)
+    let transport = spawner
+        .spawn(SpawnRequest {
+            label: label.clone(),
+            cwd,
+            args: &args,
+            rows,
+            cols,
+        })
         .wrap_err("spawn local agent")?;
     let repo = cwd.and_then(repo_name::resolve_local);
     Ok(RuntimeAgent::ready(
@@ -2570,6 +2588,9 @@ struct RuntimeContext<'a> {
     segments: &'a [Box<dyn StatusSegment>],
 }
 
+// `agent_spawner` is a separate parameter (not bundled into
+// `RuntimeContext`) because only `spawn_local_agent` consumes it —
+// keeping it out of the per-frame context preserves cohesion.
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agents: Vec<RuntimeAgent>,
@@ -2577,6 +2598,7 @@ fn event_loop(
     log_tail: Option<&LogTail>,
     initial_cwd: &Path,
     ctx: &RuntimeContext<'_>,
+    agent_spawner: &dyn AgentSpawner,
 ) -> Result<()> {
     // Long, but it is the central event loop and breaks naturally into
     // sequential phases (drain / reap / render / dispatch). Pulling each
@@ -3254,6 +3276,7 @@ fn event_loop(
                                     Some(Path::new(&path))
                                 };
                                 match spawn_local_agent(
+                                    agent_spawner,
                                     id,
                                     label,
                                     cwd_path,
@@ -3342,6 +3365,7 @@ fn event_loop(
                                 let id = AgentId::new(label.clone());
                                 let cwd = resolve_local_scratch_cwd(spawn_config);
                                 match spawn_local_agent(
+                                    agent_spawner,
                                     id,
                                     label,
                                     cwd.as_deref(),

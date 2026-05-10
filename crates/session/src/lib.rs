@@ -13,7 +13,9 @@
 
 pub mod domain;
 pub mod error;
+pub mod spawner;
 pub mod transport;
 
 pub use error::Error;
+pub use spawner::{AgentSpawner, BinaryAgentSpawner, SpawnRequest};
 pub use transport::{AgentTransport, LocalPty, SshDaemonPty};

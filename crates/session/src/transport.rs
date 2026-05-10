@@ -73,33 +73,6 @@ pub enum AgentTransport {
 }
 
 impl AgentTransport {
-    /// Spawn the agent in a local PTY. Hardcodes `claude` as the agent
-    /// binary — that's the product purpose. Tests construct
-    /// [`LocalPty`] directly with a different command.
-    ///
-    /// `label` is purely advisory; it appears in tracing breadcrumbs so
-    /// a multi-agent log is easy to follow.
-    ///
-    /// `args` are forwarded verbatim to the `claude` invocation. The
-    /// runtime uses this to inject `--settings '<json>'` overrides
-    /// (statusLine wiring, etc.) without baking codemux/Claude-specific
-    /// JSON into this vendor-neutral transport crate. Pass `&[]` when
-    /// no extra args are needed.
-    ///
-    /// # Errors
-    /// Returns [`Error::Pty`] when the kernel can't allocate a PTY, or
-    /// [`Error::Spawn`] when `claude` (or whatever command was given)
-    /// can't be launched (typically "not on PATH").
-    pub fn spawn_local(
-        label: String,
-        cwd: Option<&Path>,
-        args: &[String],
-        rows: u16,
-        cols: u16,
-    ) -> Result<Self, Error> {
-        LocalPty::spawn("claude", args, label, cwd, rows, cols).map(Self::Local)
-    }
-
     /// Drain whatever bytes the transport has buffered since the last
     /// call. Returns immediately; an empty `Vec` means "no new output
     /// right now", **not** "transport closed". Use [`Self::try_wait`] to
@@ -193,7 +166,7 @@ impl AgentTransport {
     /// reaped on `Drop` of the returned transport.
     ///
     /// # Errors
-    /// Same envelope as [`Self::spawn_local`].
+    /// Same envelope as [`LocalPty::spawn`].
     #[cfg(any(test, feature = "test-util"))]
     pub fn for_test(label: String, rows: u16, cols: u16) -> Result<Self, Error> {
         LocalPty::spawn("cat", &[], label, None, rows, cols).map(Self::Local)
@@ -206,7 +179,7 @@ impl AgentTransport {
     /// semantics; the already-exited child is reaped in `LocalPty::drop`.
     ///
     /// # Errors
-    /// Same envelope as [`Self::spawn_local`].
+    /// Same envelope as [`LocalPty::spawn`].
     #[cfg(any(test, feature = "test-util"))]
     pub fn for_test_clean_exit(label: String, rows: u16, cols: u16) -> Result<Self, Error> {
         LocalPty::spawn(
@@ -243,7 +216,7 @@ impl LocalPty {
     ///
     /// Public so tests can spawn `cat` instead of the production
     /// `claude` binary; the runtime always reaches this through
-    /// [`AgentTransport::spawn_local`].
+    /// [`crate::BinaryAgentSpawner`].
     ///
     /// # Errors
     /// Returns [`Error::Pty`] when the kernel can't allocate a PTY or
