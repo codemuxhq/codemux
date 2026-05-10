@@ -39,6 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use tempfile::TempDir;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
@@ -49,6 +50,13 @@ const COLS: u16 = 80;
 /// All fields are private — tests interact through [`spawn_codemux`]
 /// and [`screen_eventually`].
 pub struct CodemuxHandle {
+    /// Empty `XDG_CONFIG_HOME` shielding the spawned codemux from the
+    /// developer's real `~/.config/codemux/config.toml` (which would
+    /// otherwise change the default prefix-key chord, the navigator
+    /// style, and other binding-sensitive surfaces). Held here so the
+    /// dir lives as long as the child does; dropped after the child
+    /// is reaped in `Drop`.
+    _xdg_home: TempDir,
     /// Master end of the PTY. Test writes (keystrokes) go here; the
     /// reader thread holds a separate clone via `try_clone_reader`.
     master: Box<dyn MasterPty + Send>,
@@ -86,10 +94,17 @@ pub struct CodemuxHandle {
 ///   capability detection lands on a known surface (the developer's
 ///   `kitty` / `wezterm` would otherwise leak in and change the
 ///   escape sequences emitted, breaking `vt100` assertions).
-/// - `HOME` is preserved (codemux reads `~/.cache/codemux/...`); the
-///   harness deliberately does NOT redirect `HOME` to a tempdir
-///   because the runtime's log file is append-only and isolated per
-///   process — no cross-test interference.
+/// - `XDG_CONFIG_HOME` is redirected to a fresh tempdir so the
+///   developer's `~/.config/codemux/config.toml` cannot leak into the
+///   test (it would otherwise rebind the prefix key, navigator chrome,
+///   and any other binding-sensitive surface — see AC-013's
+///   `pty_nav.rs`, the first config-sensitive PTY test).
+/// - `HOME` is preserved (codemux's log path resolves under it); the
+///   harness deliberately does NOT redirect `HOME` because the
+///   runtime's log file is append-only and isolated per process — no
+///   cross-test interference. The `XDG_CONFIG_HOME` redirect already
+///   covers the config-loading concern that motivated worrying about
+///   `HOME` in the first place.
 ///
 /// # Panics
 ///
@@ -121,12 +136,14 @@ pub fn spawn_codemux() -> CodemuxHandle {
     cmd.env("CODEMUX_AGENT_BIN", fake_bin);
     // Stable terminal capability surface for assertions. See doc above.
     cmd.env("TERM", "xterm-256color");
-    // Keep the runtime out of the user's real config: production
-    // codepaths read `~/.config/codemux/config.toml`, but the test
-    // doesn't care about config — pointing `HOME` at a fresh tempdir
-    // would also work, and is the right move once we have config-
-    // sensitive PTY tests. For now, the unset `RUST_LOG` keeps logs
-    // quiet enough.
+    // Empty XDG config dir: prevents the developer's
+    // `~/.config/codemux/config.toml` from rebinding the prefix or any
+    // other binding the test exercises. `config::config_path` reads
+    // `XDG_CONFIG_HOME` first and only falls back to `$HOME/.config`
+    // when XDG is unset/empty, so this single env var fully shields
+    // the spawned codemux from user-side config.
+    let xdg_home = TempDir::new().expect("tempdir for XDG_CONFIG_HOME");
+    cmd.env("XDG_CONFIG_HOME", xdg_home.path());
     cmd.env_remove("RUST_LOG");
     // Cargo sets `cwd` to the package root for tests; set it
     // explicitly to make the harness independent of that detail.
@@ -170,6 +187,7 @@ pub fn spawn_codemux() -> CodemuxHandle {
         .expect("spawn reader thread");
 
     CodemuxHandle {
+        _xdg_home: xdg_home,
         master: pair.master,
         writer: Some(writer),
         child: Some(child),
@@ -186,17 +204,14 @@ pub fn spawn_codemux() -> CodemuxHandle {
 /// user typed. Newlines are NOT implicit; pass `"\r"` or `"\n"`
 /// explicitly. ASCII control chars (e.g. `"\x02"` for Ctrl-B) work.
 ///
-/// Currently unused — T3 acceptance-criteria tests will be the first
-/// consumers (spawn-modal interactions, navigation chords, lifecycle
-/// keys). The `#[allow(dead_code)]` is temporary; the first T3 commit
-/// MUST remove it.
+/// First consumer: `pty_nav::chrome_flips_from_popup_to_leftpane_on_prefix_v`
+/// (AC-013, the prefix-chord toggle dispatch).
 ///
 /// # Panics
 ///
 /// Panics if the master writer has been taken (only happens during
 /// `Drop`) or if the underlying write/flush fails. Both are programmer
 /// errors at this layer — see the rationale on [`spawn_codemux`].
-#[allow(dead_code)]
 pub fn send_keys(handle: &mut CodemuxHandle, keys: &str) {
     let writer = handle
         .writer

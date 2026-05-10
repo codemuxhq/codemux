@@ -475,7 +475,8 @@
 
 **Tests:**
 - `apps/tui/src/runtime.rs::render_left_pane_records_one_hitbox_per_agent`, `render_left_pane_hitboxes_skip_borders_and_advance_one_row_per_agent`, `render_left_pane_drops_rows_that_overflow_the_pane` — pin the LeftPane chrome layout.
-- (uncovered: the `prefix v` toggle dispatch, the SIGWINCH on chrome flip, and the `--nav left-pane` / `CODEMUX_NAV` launch-time selectors.)
+- `apps/tui/tests/pty_nav.rs::chrome_flips_from_popup_to_leftpane_on_prefix_v` — boots codemux in an 80x24 PTY, asserts the initial Popup chrome (no ` agents ` navigator title), sends `Ctrl+B v`, and asserts the LeftPane chrome appears (the navigator's bordered ` agents ` block lands on screen). Pins the `prefix v` dispatch path through the real keymap.
+- (uncovered: the SIGWINCH on chrome flip, the return-to-Popup on a second `prefix v`, and the `--nav left-pane` / `CODEMUX_NAV` launch-time selectors.)
 
 ### AC-034: Spawning a new agent records the prior focus as the bounce slot
 

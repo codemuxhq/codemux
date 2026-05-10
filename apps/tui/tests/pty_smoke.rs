@@ -24,6 +24,12 @@
 #![cfg(feature = "test-fakes")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+// Each `tests/*.rs` integration target compiles `mod common` as its own
+// crate, so helpers used only from *other* test files (e.g. `send_keys`,
+// consumed by `pty_nav.rs`) trip `dead_code` here. The standard Rust
+// idiom for shared test helpers is to silence dead-code on the import
+// side rather than scatter per-item allows through the helper module.
+#[allow(dead_code)]
 mod common;
 
 use std::time::Duration;
