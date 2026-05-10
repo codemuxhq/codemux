@@ -11,6 +11,26 @@ repository.workspace = true
 name = "codemux"
 path = "src/main.rs"
 
+# In-tree stub agent the E2E PTY harness points `CODEMUX_AGENT_BIN` at
+# (see `tests/common/mod.rs`). Gated behind `test-fakes` so neither
+# `cargo build --release` nor a default `cargo test` sees it; the
+# `just check-e2e` recipe enables the feature explicitly. The harness
+# resolves the binary via `env!("CARGO_BIN_EXE_fake_agent")`.
+[[bin]]
+name = "fake_agent"
+path = "tests/bin/fake_agent.rs"
+required-features = ["test-fakes"]
+
+[features]
+# Off by default. Enables the `fake_agent` test binary and gates the
+# slow-tier PTY tests in `tests/pty_*.rs` — both via
+# `#![cfg(feature = "test-fakes")]` (so the test files don't even
+# compile without the feature, since they reference the fake binary
+# through `env!`) and via `#[ignore]` so a normal `cargo test`
+# (without `--include-ignored`) skips them. See
+# `docs/plans/2026-05-10--e2e-testing.md` (T2).
+test-fakes = []
+
 [dependencies]
 codemux-session.workspace = true
 codemux-shared-kernel.workspace = true
@@ -65,6 +85,19 @@ codemux-session = { workspace = true, features = ["test-util"] }
 # inside the same test surface.
 insta = "1.47.2"
 pretty_assertions = "1.4.1"
+
+# Slow-tier PTY harness deps (see `tests/common/mod.rs`).
+# `vt100` parses the master-side byte stream into a cell grid the
+# `screen_eventually` polling helper asserts against; `serial_test`
+# guards the slow tier so terminal-size negotiation can't race when
+# multiple PTY tests run in parallel. `portable-pty` is a production
+# dep of `crates/session` (the indirect spawn path the runtime drives);
+# the harness opens its own master/slave pair directly to host the
+# spawned `codemux` subprocess, so it is declared here as a dev-dep
+# inheriting the same workspace pin — no second-source-of-truth risk.
+vt100.workspace = true
+serial_test.workspace = true
+portable-pty.workspace = true
 
 [lints]
 workspace = true

@@ -80,6 +80,13 @@ nucleo-matcher = "0.3.1"
 # Test-only: scratch directories for filesystem integration tests.
 tempfile = "3"
 
+# Test-only: serializes PTY-based E2E tests so they don't race on
+# terminal-size negotiation when run in parallel. Declared at workspace
+# scope because the daemon's T4 suite (`apps/daemon/tests/proto_*.rs`)
+# will need the same `#[serial]` attribute. See
+# `docs/plans/2026-05-10--e2e-testing.md`.
+serial_test = "3.4.0"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

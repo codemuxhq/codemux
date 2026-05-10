@@ -24,6 +24,18 @@ lint:
 test:
     cargo test --workspace
 
+# Run only the slow-tier PTY E2E suite — boots a real `codemux` binary
+# inside an 80x24 PTY against the in-tree `fake_agent` stub. Gated
+# behind `--ignored` so day-to-day `just test` stays fast. See
+# `docs/plans/2026-05-10--e2e-testing.md` (T2).
+test-e2e:
+    cargo test --workspace --features codemux-tui/test-fakes -- --ignored
+
+# Run the fast and slow tiers together. Useful for "is everything green
+# end to end" before a non-trivial change.
+test-all:
+    cargo test --workspace --features codemux-tui/test-fakes -- --include-ignored
+
 # Review pending insta snapshots. Requires `cargo install cargo-insta` once.
 insta-review:
     cargo insta review
@@ -33,3 +45,11 @@ check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
+
+# Slow-tier pre-push gate. Same shape as `check`, but with the
+# `test-fakes` feature on so clippy/tests see the PTY harness. Run
+# before merging anything that touches the spawn path or the harness.
+check-e2e:
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets --features codemux-tui/test-fakes -- -D warnings
+    cargo test --workspace --features codemux-tui/test-fakes -- --ignored
