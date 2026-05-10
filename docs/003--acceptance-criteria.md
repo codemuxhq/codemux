@@ -501,7 +501,8 @@
 **Tests:**
 - `apps/tui/src/runtime.rs::change_focus_records_previous_when_focus_moves` — pins the `previous_focused` accounting that fires at the spawn-time `change_focus(new_idx)`.
 - `apps/tui/src/runtime.rs::change_focus_lets_alt_tab_bounce_via_two_calls` — pins that the recorded prior focus drives a subsequent FocusLast bounce.
-- (uncovered: the spawn-site call into `change_focus` itself; the no-prior-agent edge case staying `None`.)
+- `apps/tui/tests/pty_spawn_bounce.rs::spawn_from_modal_records_prior_focus_so_tab_bounces_back` — boots codemux with agent 1 focused, spawns agent 2 via the scratch modal flow (which calls `change_focus(new_idx)`), then sends `Ctrl+B Tab` and asserts focus bounces back to agent 1 via the `> [N]` indicator. Pins the integration between AC-002 (spawn-from-modal) and AC-011 (bounce) end-to-end: proves the spawn flow's `change_focus` correctly records `previous_focused`, which is the side effect that makes the bounce work in the spawn-second-agent sequence.
+- (uncovered: the no-prior-agent edge case staying `None`.)
 
 ### AC-035: Reaping the focused agent moves focus to the new tail, not to `previous_focused`
 
