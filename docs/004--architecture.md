@@ -494,20 +494,26 @@ line, and conversation.
 
 ---
 
-### AD-6 — Edits panel is `git diff`, read-only
+### AD-6 — Edits panel is `git diff` with send-back annotations
 
-**Status:** Deferred (P2).
+**Status:** Deferred.
 
 **Context.** Reviewing what an unattended agent has done is a top-three
-workflow. Building our own diff view is a rabbit hole.
+workflow. Building our own diff view is a rabbit hole. A pure read-only
+one leaves the user retyping every "fix line 14" by hand.
 
 **Decision (sketch).** A right-side panel that runs `git diff` on the focused
 agent's cwd and renders the result with `syntect` for syntax highlighting.
-One-keystroke "open in `$EDITOR`" for deep review. No staging, no
-annotations: viewing only.
+One-keystroke "open in `$EDITOR`" for deep review. The user can attach
+inline annotations to ranges in the diff and push them back to the focused
+agent as a single formatted message. No automatic staging, no approval
+flow.
 
 **Rejected alternatives.**
 - *Tail JSONL transcripts and render diffs from tool calls.* Violates AD-1.
+- *Read-only diff with no send-back path.* Forces the user to copy-paste
+  feedback into the agent prompt by hand, which is the friction codemux
+  exists to remove.
 
 ---
 
