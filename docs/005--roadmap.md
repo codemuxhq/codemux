@@ -1,6 +1,18 @@
 # Roadmap
 
-Personal tool. No external deadline. Lanes are independent. Pick what hurts most. Items are listed in priority order; `next:` is the one to pick up first.
+Personal tool. No external deadline. Lanes are independent — pick what hurts most. Items inside each lane are listed in priority order; `next:` is the one to pick up first.
+
+## At a glance
+
+| Lane | Up next | Note |
+|---|---|---|
+| [Foundations](#foundations) | Persistence (AD-7) | Agents need to survive app restart |
+| [Review workflow](#review-workflow) | Diff panel | Needs vision amendment (P5, AD-6) |
+| [Navigation](#navigation) | Vim keys everywhere | — |
+| [Sessions](#sessions) | Save & archive | — |
+| [Terminal panes](#terminal-panes) | Plain local terminal tab | — |
+| [Integrations](#integrations) | Agent-agnostic spawn | Aligned with vision non-goal #7 |
+| [Scale](#scale) | Groups | Data model already in `shared-kernel` |
 
 ## Foundations
 
