@@ -56,25 +56,18 @@ fn main() {
         out.flush().unwrap();
     }
 
+    // Lock stdin once outside the loop (re-locking the global mutex on
+    // every iteration is a hot-path mistake even for a fixture).
+    // `BufRead::lines` strips the trailing `\n`; the extra `trim()`
+    // also catches `\r` from PTY canonical-mode line-discipline
+    // translation and any stray whitespace the runtime might forward
+    // during the prefix-arming dance. The exact match on `QUIT` keeps
+    // this from triggering on partial matches.
     let stdin = std::io::stdin();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(n) if n > 0 => {
-                // The PTY in canonical mode delivers a full line on
-                // `\r` (which the line discipline translates to `\n`
-                // before BufRead sees it). Trim trailing `\r\n` /
-                // `\n` and any local echo of cursor-control sequences
-                // the shell would normally suppress. The exact match
-                // on `QUIT` keeps this from triggering on partial
-                // matches or stray bytes the runtime might forward
-                // during the prefix-arming dance.
-                if line.trim() == "QUIT" {
-                    std::process::exit(42);
-                }
-            }
-            _ => break,
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim() == "QUIT" {
+            std::process::exit(42);
         }
     }
     std::process::exit(42);

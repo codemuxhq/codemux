@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::transport::{AgentTransport, LocalPty};
 
+// `Send + Sync` is forward-looking: today the runtime holds the spawner
+// as `&dyn AgentSpawner` on the main thread, but adding the bounds now
+// lets a future caller put one behind an `Arc` or move it into a worker
+// thread without a breaking-change reshuffle of the trait surface.
+
 /// Inputs for [`AgentSpawner::spawn`]. Bundles the five forwarded-
 /// to-PTY facts so the trait method takes a single argument; keeps
 /// the call sites readable and lets `spawn_local_agent` assemble the
@@ -35,7 +40,7 @@ pub struct SpawnRequest<'a> {
 /// runtime depends on this trait, not on a concrete spawner, so the
 /// E2E harness can substitute a different binary (the in-tree
 /// `fake_agent`) without forking a code path.
-pub trait AgentSpawner {
+pub trait AgentSpawner: Send + Sync {
     /// Spawn the agent and return an [`AgentTransport::Local`] wrapping
     /// the resulting PTY.
     ///
@@ -74,13 +79,15 @@ impl AgentSpawner for BinaryAgentSpawner {
             rows,
             cols,
         } = request;
-        LocalPty::spawn(&self.binary.to_string_lossy(), args, label, cwd, rows, cols)
+        // Pass the binary path as `&OsStr` so non-UTF-8 paths reach the
+        // PTY spawner verbatim; `to_string_lossy` substitutes U+FFFD and
+        // would corrupt those paths before `CommandBuilder` ever sees them.
+        LocalPty::spawn(self.binary.as_os_str(), args, label, cwd, rows, cols)
             .map(AgentTransport::Local)
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

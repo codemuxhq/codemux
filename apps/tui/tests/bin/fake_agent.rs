@@ -36,19 +36,16 @@ fn main() {
         out.flush().unwrap();
     }
 
+    // Lock stdin once outside the loop; re-locking the global stdin
+    // mutex on every iteration would acquire and release it for each
+    // line the harness sends. Discard input — the harness only feeds
+    // keystrokes to exercise the renderer, not to drive the fake. An
+    // `Err` item (controlling tty gone) is unrecoverable here and ends
+    // the loop; iterator exhaustion is the EOF signal.
     let stdin = std::io::stdin();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            // Discard input. The harness only sends keystrokes to
-            // exercise the renderer; the fake is not expected to
-            // react. Any non-zero byte count keeps the loop alive.
-            Ok(n) if n > 0 => {}
-            // Zero bytes is EOF (the harness closed the PTY master);
-            // any read error on the controlling tty is unrecoverable
-            // for a fixture this thin. Both lead to a clean exit.
-            _ => break,
+    for line in stdin.lock().lines() {
+        if line.is_err() {
+            break;
         }
     }
 }

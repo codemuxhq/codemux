@@ -64,9 +64,13 @@ pub struct CodemuxHandle {
     /// dir lives as long as the child does; dropped after the child
     /// is reaped in `Drop`.
     _xdg_home: TempDir,
-    /// Master end of the PTY. Test writes (keystrokes) go here; the
-    /// reader thread holds a separate clone via `try_clone_reader`.
-    master: Box<dyn MasterPty + Send>,
+    /// Master end of the PTY. Held purely so its `Drop` runs at
+    /// teardown (closing the master FD, releasing the kernel-side pty
+    /// pair); the reader thread already has its own clone via
+    /// `try_clone_reader`, and the writer is taken out separately.
+    /// Underscore-prefixed so dead-code analysis recognizes the
+    /// drop-only intent — same pattern as `_xdg_home`.
+    _master: Box<dyn MasterPty + Send>,
     /// Writer for the master end. Held inside an `Option` so `Drop`
     /// can take it and explicitly drop it before killing the child —
     /// dropping the writer signals EOF on the slave's stdin and lets
@@ -241,7 +245,7 @@ pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHand
 
     CodemuxHandle {
         _xdg_home: xdg_home,
-        master: pair.master,
+        _master: pair.master,
         writer: Some(writer),
         child: Some(child),
         rx,
@@ -412,9 +416,8 @@ impl Drop for CodemuxHandle {
             let _ = handle.join();
         }
 
-        // `master` drops here implicitly — closing the master FD,
-        // releasing the kernel-side pty pair.
-        // (Field is in `self`; no `take` needed.)
-        let _ = &self.master;
+        // `_master` drops here implicitly when `self` falls out of
+        // scope, closing the master FD and releasing the kernel-side
+        // pty pair.
     }
 }

@@ -19,6 +19,7 @@
 //! The enum is `#[non_exhaustive]` so external callers must add a
 //! catch-all arm when matching.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -169,7 +170,7 @@ impl AgentTransport {
     /// Same envelope as [`LocalPty::spawn`].
     #[cfg(any(test, feature = "test-util"))]
     pub fn for_test(label: String, rows: u16, cols: u16) -> Result<Self, Error> {
-        LocalPty::spawn("cat", &[], label, None, rows, cols).map(Self::Local)
+        LocalPty::spawn(OsStr::new("cat"), &[], label, None, rows, cols).map(Self::Local)
     }
 
     /// Build a transport that runs `sh -c 'exit 0'` so the child
@@ -183,7 +184,7 @@ impl AgentTransport {
     #[cfg(any(test, feature = "test-util"))]
     pub fn for_test_clean_exit(label: String, rows: u16, cols: u16) -> Result<Self, Error> {
         LocalPty::spawn(
-            "sh",
+            OsStr::new("sh"),
             &["-c".to_string(), "exit 0".to_string()],
             label,
             None,
@@ -223,14 +224,14 @@ impl LocalPty {
     /// the PTY's reader/writer can't be cloned, and [`Error::Spawn`]
     /// when `command` itself can't be launched.
     pub fn spawn(
-        command: &str,
+        command: &OsStr,
         args: &[String],
         label: String,
         cwd: Option<&Path>,
         rows: u16,
         cols: u16,
     ) -> Result<Self, Error> {
-        tracing::debug!(label, command, ?cwd, rows, cols, "spawning local PTY");
+        tracing::debug!(label, ?command, ?cwd, rows, cols, "spawning local PTY");
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -250,9 +251,10 @@ impl LocalPty {
             cmd.cwd(cwd);
         }
         let child = pair.slave.spawn_command(cmd).map_err(|e| Error::Spawn {
-            command: command.to_string(),
+            command: command.to_string_lossy().into_owned(),
             source: Box::new(std::io::Error::other(format!(
-                "spawn `{command}` (is it on PATH?): {e}"
+                "spawn `{}` (is it on PATH?): {e}",
+                command.to_string_lossy(),
             ))),
         })?;
         // Closing the slave fd on the parent side is required so the
@@ -804,7 +806,7 @@ mod tests {
     #[test]
     fn local_transport_round_trips_write_read_resize_kill() -> Result<(), Box<dyn std::error::Error>>
     {
-        let pty = LocalPty::spawn("cat", &[], "test-cat".into(), None, 24, 80)?;
+        let pty = LocalPty::spawn(OsStr::new("cat"), &[], "test-cat".into(), None, 24, 80)?;
         let mut transport = AgentTransport::Local(pty);
 
         // `cat` is line-buffered when its stdin is a TTY, so the carriage
@@ -860,7 +862,7 @@ mod tests {
     /// real signal delivery.
     #[test]
     fn local_signal_only_supports_kill() -> Result<(), Box<dyn std::error::Error>> {
-        let pty = LocalPty::spawn("cat", &[], "test-sig".into(), None, 24, 80)?;
+        let pty = LocalPty::spawn(OsStr::new("cat"), &[], "test-sig".into(), None, 24, 80)?;
         let mut transport = AgentTransport::Local(pty);
 
         for sig in [Signal::Hup, Signal::Int, Signal::Term] {
