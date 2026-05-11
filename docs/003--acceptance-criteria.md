@@ -459,7 +459,7 @@
 - `apps/tui/src/runtime.rs::no_overlay_active_returns_false_when_popup_open` — pins the popup-as-overlay flag.
 - `apps/tui/src/keymap.rs::popup_lookup_round_trip` — pins the popup-scope key lookup.
 - `apps/tui/src/runtime.rs::label_spans_renders_spinner_glyph_when_working`, `label_spans_omits_spinner_when_not_working`, `label_spans_renders_focused_spinner_with_reverse_style`, `label_spans_renders_host_prefix_when_provided`, `label_spans_omits_host_prefix_when_absent`, `label_spans_renders_spinner_before_host`, `label_spans_renders_attention_dot_when_unfocused_and_flagged`, `label_spans_omits_attention_dot_when_focused`, `label_spans_omits_attention_dot_when_not_flagged` — pin the row composition (spinner + host prefix + attention dot + label).
-- (uncovered: end-to-end Enter-to-focus-and-close gesture; Esc-to-close-without-changing-focus.)
+- `apps/tui/tests/pty_switcher.rs::prefix_w_opens_switcher_arrow_enter_confirms_and_esc_cancels` — boots codemux, spawns a second agent, sends `Ctrl+B w` to open the switcher popup, presses `Up` to move the highlight to agent 1, `Enter` to confirm; then reopens the popup to read out the new focus state (Popup chrome distinguishes focus only via ANSI reverse styling, which `vt100::Screen.contents()` strips, so the test uses the popup's own `> [N]` highlight as the focus readout). Repeats with `Esc` to assert the cancel path does NOT change focus. Pins the full open-arrow-confirm gesture, the `selection = focused` initialization, and the Esc-without-focus-change cancel path end-to-end.
 
 ### AC-013: Toggle the navigator chrome
 
