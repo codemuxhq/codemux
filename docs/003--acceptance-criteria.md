@@ -758,9 +758,9 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:** none.
 
 **Tests:**
+- `apps/tui/tests/pty_paste_snaps.rs::paste_while_scrolled_back_snaps_to_live` — PTY E2E: scrolls back via wheel, sends a bracketed-paste sequence, asserts the scroll badge disappears (proving the runtime's paste arm called `snap_to_live` before forwarding the payload).
 - `apps/tui/src/runtime.rs::snap_to_live_resets_offset_to_zero` — pins the underlying snap operation.
 - `apps/tui/src/runtime.rs::wrap_paste_emits_brackets_around_plain_text`, `wrap_paste_strips_embedded_esc_to_block_end_marker_injection` — pin the bracketed-paste payload that runs *after* the snap.
-- (uncovered: the dispatch-order assertion that `snap_to_live` runs before the paste payload is written at the runtime layer.)
 
 ---
 
