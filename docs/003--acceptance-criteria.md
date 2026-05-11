@@ -677,6 +677,9 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:**
 - **Panic during `TerminalGuard::drop` itself:** the second panic aborts the process; the terminal may end up in a corrupted state. `Drop` impls in the guard are written to be infallible (no `unwrap`/`expect`), but external state (e.g. stdout closed) could still trigger this in theory.
 
+**Tests:**
+- `apps/tui/tests/pty_panic.rs::panic_restores_terminal_before_color_eyre_report` — PTY E2E: boots codemux with the hidden `--panic-after` seam, asserts the `\x1b[?1049l` alt-screen-off byte sequence lands on the master stream BEFORE the color-eyre panic header. Pins the wrapped-panic-hook contract that AC-038 turns on.
+
 ---
 
 ## Scrollback
