@@ -141,6 +141,33 @@ pub fn spawn_codemux() -> CodemuxHandle {
 /// The XDG tempdir is owned by the returned handle and dropped when
 /// it drops, so the config file disappears alongside the child.
 pub fn spawn_codemux_with_config(extra: &str) -> CodemuxHandle {
+    spawn_codemux_with_agent_bin(env!("CARGO_BIN_EXE_fake_agent"), extra)
+}
+
+/// Boot codemux against an arbitrary agent binary path, with an
+/// optional `config.toml` body written into the per-test XDG tempdir.
+///
+/// The default flow is [`spawn_codemux`] / [`spawn_codemux_with_config`],
+/// both of which point `CODEMUX_AGENT_BIN` at the happy-path
+/// `fake_agent`. This helper is the carve-out for tests that need a
+/// different stub binary — today that means
+/// `pty_crash::agent_nonzero_exit_renders_crashed_banner` pointing at
+/// `fake_agent_crashing` to drive the Ready -> Crashed transition end
+/// to end (AC-037).
+///
+/// `agent_bin` is the absolute path to the stub binary. Callers are
+/// expected to use `env!("CARGO_BIN_EXE_<name>")` so cargo materializes
+/// the path at compile time; passing an arbitrary string here would
+/// drop the build-time guarantee that the binary actually exists.
+///
+/// `extra` follows the same contract as [`spawn_codemux_with_config`]:
+/// empty means no config file, non-empty is written verbatim into
+/// `$XDG_CONFIG_HOME/codemux/config.toml` before the subprocess boots.
+///
+/// # Panics
+///
+/// Same as [`spawn_codemux`].
+pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHandle {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -152,10 +179,9 @@ pub fn spawn_codemux_with_config(extra: &str) -> CodemuxHandle {
         .expect("openpty");
 
     let codemux_bin = env!("CARGO_BIN_EXE_codemux");
-    let fake_bin = env!("CARGO_BIN_EXE_fake_agent");
 
     let mut cmd = CommandBuilder::new(codemux_bin);
-    cmd.env("CODEMUX_AGENT_BIN", fake_bin);
+    cmd.env("CODEMUX_AGENT_BIN", agent_bin);
     cmd.env("TERM", "xterm-256color");
     // Empty XDG config dir: prevents the developer's
     // `~/.config/codemux/config.toml` from rebinding the prefix or any

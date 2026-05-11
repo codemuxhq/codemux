@@ -654,6 +654,8 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - `apps/tui/src/runtime.rs::render_agent_pane_paints_red_banner_for_nonzero_exit_code` — pins the red crash-banner render.
 - `apps/tui/src/runtime.rs::render_agent_pane_paints_connection_lost_banner_for_minus_one` — pins the daemon-EOF (`-1`) variant.
 - `apps/tui/src/runtime.rs::render_agent_pane_falls_through_to_red_banner_for_synthetic_zero_exit` — pins the synthetic-zero (kill-by-codemux) banner case.
+- `apps/tui/tests/pty_crash.rs::agent_nonzero_exit_renders_crashed_banner` — boots codemux against a new `fake_agent_crashing` stub that exits 42 on receiving the line `QUIT`, sends `QUIT\r` through the runtime's keymap forward path so the bytes reach the agent's PTY via the canonical-mode line discipline, and asserts the rendered Crashed banner contains `exit 42` AND the dismiss-chord text. Pins the reap-on-dead-transport pipeline end-to-end and proves the runtime distinguishes non-zero exits (Crashed corpse retained) from clean exits (silent removal -- see AC-036).
+- Harness side: `apps/tui/tests/bin/fake_agent_crashing.rs` is a new `[[bin]]` gated on `test-fakes`; `apps/tui/tests/common/mod.rs::spawn_codemux_with_agent_bin` extracts the bin-path parameter so future tests can swap the stub without duplicating spawn machinery.
 - `apps/tui/src/runtime.rs::render_agent_pane_banner_uses_configured_dismiss_chord` — pins that the banner shows the rebound dismiss chord.
 
 ### AC-038: A panic restores the terminal before the report is printed

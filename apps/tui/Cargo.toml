@@ -21,6 +21,20 @@ name = "fake_agent"
 path = "tests/bin/fake_agent.rs"
 required-features = ["test-fakes"]
 
+# Crashing-variant stub agent used by `tests/pty_crash.rs` to pin
+# AC-037 (Ready -> Crashed on non-zero PTY exit). Same boot prompt as
+# `fake_agent`, but exits 42 when stdin delivers the literal `QUIT`
+# line (or on EOF). Kept as a separate `[[bin]]` rather than an argv
+# flag so each fake binary stays single-purpose -- the happy-path
+# fake's behavior contract is "exit 0 on EOF, period", and conflating
+# it with a crash flag would make every existing PTY test implicitly
+# depend on the default exit-code value. Same `test-fakes` gate as
+# `fake_agent`. Resolved via `env!("CARGO_BIN_EXE_fake_agent_crashing")`.
+[[bin]]
+name = "fake_agent_crashing"
+path = "tests/bin/fake_agent_crashing.rs"
+required-features = ["test-fakes"]
+
 [features]
 # Off by default. Enables the `fake_agent` test binary and gates the
 # slow-tier PTY tests in `tests/pty_*.rs` — both via
