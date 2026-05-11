@@ -327,7 +327,7 @@
 **Tests:**
 - `apps/tui/src/spawn.rs::ctrl_modified_keys_are_dropped` — pins that direct chords (Ctrl+letter etc.) routed through the modal are dropped, not forwarded.
 - `apps/tui/src/spawn.rs::lock_for_bootstrap_drops_typing_keys` — pins that typing keystrokes are dropped while the modal is locked for bootstrap.
-- (uncovered: the runtime-level proof that an open modal short-circuits `dispatch_key` for prefix chord and `?`.)
+- `apps/tui/tests/pty_modal_suppress.rs::modal_absorbs_help_chord_and_prefix_chord_while_open` — boots codemux, opens the spawn modal, sends `?` (would normally open help via `OpenHelp` dispatch when prefix-armed) and `\x02v` (would normally flip chrome). Asserts neither side effect lands: no ` codemux help ` overlay, no ` agents ` block, modal still open (`@local` still present). Then closes the modal and re-sends `\x02v` to prove the chord ITSELF still works -- the suppression was modal-scoped, not a permanent state change. Pins the `if let Some(ui) = spawn_ui.as_mut() { ...; continue; }` short-circuit at `runtime.rs::3151-3473` end-to-end.
 
 ### AC-045: Indexing runs in the background; input stays interactive
 
