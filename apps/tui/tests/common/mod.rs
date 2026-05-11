@@ -520,7 +520,7 @@ pub fn send_mouse_wheel(handle: &mut CodemuxHandle, kind: WheelKind, x: u16, y: 
         WheelKind::Up => 64,
         WheelKind::Down => 65,
     };
-    write_sgr_mouse(handle, cb, x, y, b'M');
+    write_sgr_mouse(handle, cb, x, y, 'M');
 }
 
 /// Send a press + release pair at the given 1-based cell coordinate.
@@ -536,14 +536,14 @@ pub fn send_mouse_wheel(handle: &mut CodemuxHandle, kind: WheelKind, x: u16, y: 
 /// motion frames in between.
 pub fn send_mouse_click(handle: &mut CodemuxHandle, button: MouseButton, x: u16, y: u16) {
     let cb_press = button_to_cb(button);
-    write_sgr_mouse(handle, cb_press, x, y, b'M');
+    write_sgr_mouse(handle, cb_press, x, y, 'M');
     // Release shares the same Cb (carries the modifier bits) but is
     // distinguished by the trailing `m` -- crossterm's `parse_csi_sgr_mouse`
     // flips `Down(b)` into `Up(b)` when it sees the lowercase tail.
     // We keep the same Cb (modifiers preserved) so the runtime sees the
     // same modifier state on press and release; differing modifiers
     // across the gesture would be a misuse of the SGR surface.
-    write_sgr_mouse(handle, cb_press, x, y, b'm');
+    write_sgr_mouse(handle, cb_press, x, y, 'm');
 }
 
 /// Send a press at `from`, a motion frame at `to`, then a release at
@@ -568,9 +568,9 @@ pub fn send_mouse_drag(
 ) {
     let cb_press = button_to_cb(button);
     let cb_drag = cb_press | 0b0010_0000;
-    write_sgr_mouse(handle, cb_press, from.0, from.1, b'M');
-    write_sgr_mouse(handle, cb_drag, to.0, to.1, b'M');
-    write_sgr_mouse(handle, cb_press, to.0, to.1, b'm');
+    write_sgr_mouse(handle, cb_press, from.0, from.1, 'M');
+    write_sgr_mouse(handle, cb_drag, to.0, to.1, 'M');
+    write_sgr_mouse(handle, cb_press, to.0, to.1, 'm');
 }
 
 /// Send a single Ctrl-held motion frame at the given 1-based cell.
@@ -580,7 +580,7 @@ pub fn send_mouse_drag(
 /// Ctrl bit (16) and the motion bit (32) set: 3 | 32 | 16 = 51.
 pub fn send_mouse_ctrl_hover(handle: &mut CodemuxHandle, x: u16, y: u16) {
     // Cb = 3 (button-3 release / motion-no-button) | dragging (32) | ctrl (16)
-    write_sgr_mouse(handle, 3 | 0b0010_0000 | 0b0001_0000, x, y, b'M');
+    write_sgr_mouse(handle, 3 | 0b0010_0000 | 0b0001_0000, x, y, 'M');
 }
 
 /// Translate a [`MouseButton`] into the SGR Cb byte for a press event.
@@ -598,18 +598,14 @@ fn button_to_cb(button: MouseButton) -> u8 {
 /// Write one SGR mouse frame to the master. The trailing byte is `M`
 /// for press / wheel / motion frames and `m` for release frames; the
 /// caller picks which.
-fn write_sgr_mouse(handle: &mut CodemuxHandle, cb: u8, x: u16, y: u16, terminator: u8) {
+fn write_sgr_mouse(handle: &mut CodemuxHandle, cb: u8, x: u16, y: u16, terminator: char) {
     let writer = handle
         .writer
         .as_mut()
         .expect("write_sgr_mouse called after writer was taken (Drop)");
-    // `ESC [ < Cb ; Cx ; Cy <M|m>`. Format directly into the writer to
-    // avoid an intermediate `String` allocation per frame -- harmless
-    // for one event, but the drag helper emits three frames and the
-    // sluggish-tier reader thread is the only other contention on the
-    // master FD.
-    let frame = format!("\x1b[<{cb};{x};{y}{}", terminator as char);
-    writer.write_all(frame.as_bytes()).expect("write SGR mouse");
+    // `ESC [ < Cb ; Cx ; Cy <M|m>`, written straight to the master so the
+    // drag helper's three frames don't each round-trip through a String.
+    write!(writer, "\x1b[<{cb};{x};{y}{terminator}").expect("write SGR mouse");
     writer.flush().expect("flush SGR mouse");
 }
 
