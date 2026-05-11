@@ -805,6 +805,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **The dragged agent is reaped mid-drag:** release resolves to `None` (`agents.iter().position(|a| a.id == id)`); the gesture cancels silently.
 
 **Tests:**
+- `apps/tui/tests/pty_tab_drag.rs::drag_tab_reorders_by_remove_insert_semantics` — PTY E2E: spawns three agents, drags tab 1 to tab 3, asserts the renderer redraws in `[B, C, A]` order (insert semantics, not swap).
 - `apps/tui/src/runtime.rs::tab_mouse_dispatch_up_different_tab_is_a_reorder` — pins press-on-A → release-on-C dispatching as a reorder.
 - `apps/tui/src/runtime.rs::reorder_agents_drag_right_inserts_at_destination`, `reorder_agents_drag_left_inserts_at_destination`, `reorder_agents_noop_on_self_or_out_of_range` — pin the browser-tab `remove + insert` semantics.
 - `apps/tui/src/runtime.rs::reorder_followed_by_shift_index_keeps_focus_on_the_moved_agent`, `reorder_a_non_focused_tab_past_the_focused_one_keeps_focus_pinned_to_its_agent` — pin focus identity preservation across the reorder.
