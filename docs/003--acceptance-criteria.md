@@ -304,8 +304,8 @@
 **Failure modes:** none.
 
 **Tests:**
-- `apps/tui/src/spawn.rs::open_seeds_path_with_cwd_and_marks_auto_seeded`, `open_does_not_double_slash_when_cwd_already_ends_in_slash`, `open_precise_seeds_path_with_cwd` — pin that `SpawnMinibuffer::open(cwd, …)` seeds the path zone with the supplied cwd. The runtime always passes the TUI startup cwd to `open`; this AC's "not the focused agent's cwd" assertion is a property of the call site, which is not directly pinned.
-- (uncovered: the runtime-level call-site assertion that the cwd passed in is the startup cwd, never the focused agent's cwd.)
+- `apps/tui/src/spawn.rs::open_seeds_path_with_cwd_and_marks_auto_seeded`, `open_does_not_double_slash_when_cwd_already_ends_in_slash`, `open_precise_seeds_path_with_cwd` — pin that `SpawnMinibuffer::open(cwd, …)` seeds the path zone with the supplied cwd. The runtime always passes the TUI startup cwd to `open`; this AC's "not the focused agent's cwd" assertion is a property of the call site.
+- `apps/tui/tests/pty_modal_cwd.rs::modal_seeds_path_from_startup_cwd_not_focused_agent_cwd` — boots codemux with `[spawn] default_mode = "precise"` (so the modal auto-seeds, vs Fuzzy which opens with empty path), asserts the modal's path zone contains the startup-cwd substring `apps/tui` on first open. Then spawns a second agent at a scratch tempdir (typing the path manually with trailing `/` to skip wildmenu auto-arm, Ctrl+U to clear the auto-seeded path), reopens the modal with agent 2 focused, and asserts the path zone STILL shows `apps/tui` AND does NOT contain the scratch tempdir path. Pins the runtime call-site invariant end-to-end -- a refactor that switched the seed to the focused agent's cwd would fail the negative assertion.
 
 ### AC-033: Spawn modal swallows all keystrokes while open
 
