@@ -204,6 +204,7 @@
 - `apps/tui/src/spawn.rs::slash_in_fuzzy_with_empty_query_enters_navigation_at_root` — pins `/` switching modes and seeding `/`.
 - `apps/tui/src/spawn.rs::slash_in_precise_with_autoseeded_path_enters_navigation_at_root` — same for already-precise mode.
 - `apps/tui/src/spawn.rs::slash_in_precise_is_a_literal_char`, `slash_in_host_zone_is_a_literal_char_not_an_auto_switch` — pin the negative cases (no quick-switch when the field has been touched, or in the host zone).
+- `apps/tui/tests/pty_quick_switch.rs::tilde_or_slash_in_fuzzy_modal_switches_to_precise_mode` — boots codemux, opens the spawn modal in default Fuzzy mode (`find:  ` label visible), types `~` and asserts the label flips to `spawn: ` (Precise) AND the path is seeded with the local `$HOME` prefix. Closes the modal, reopens (asserts Fuzzy mode returns -- proving `user_search_mode` was preserved), types `/`, asserts `spawn: ` + ` : /` path seed. Pins the chord-to-mode-transition path AND the `user_search_mode` preserve invariant end-to-end through the real keymap.
 
 ### AC-006: Drill into a folder, then spawn at the chosen depth
 
