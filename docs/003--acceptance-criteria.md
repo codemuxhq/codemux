@@ -1094,8 +1094,9 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **`setsid` not on the remote `$PATH`:** the bootstrap fails at `DaemonSpawn`; the slot enters `Failed`. (The bootstrap currently assumes a POSIX `setsid` is present.)
 
 **Tests:**
+- `apps/daemon/tests/proto_setsid.rs::daemon_spawned_under_setsid_becomes_its_own_session_leader` — T4 wire-tier coverage of the testable half: spawns `codemuxd` under `setsid` (mirroring the bootstrap), reads `/proc/<pid>/stat` field 6, asserts `sid == pid` (the daemon is a session leader) and `daemon_sid != test_sid` (it actually detached from the spawning session). A future refactor that re-acquires a controlling terminal (e.g. opening `/dev/tty` in `init_tracing`) would break this assertion. Linux-only (`#[cfg(target_os = "linux")]`); on non-Linux hosts the AC is verified manually via the bootstrap's redirect test plus production behaviour.
 - `crates/codemuxd-bootstrap/src/lib.rs::spawn_remote_daemon_redirects_stdin_to_devnull_and_stderr_to_sibling_file` — pins the load-bearing stdio redirect that lets `setsid -f` actually detach without keeping the SSH pipes open. Without it, AC-043 silently regresses to "ssh hangs after disconnect."
-- (uncovered: end-to-end "kill the SSH ControlMaster, observe daemon survives" — needs a real sshd. The matrix preamble flags this row as uncertain.)
+- (manual: end-to-end "kill the SSH `ControlMaster`, observe daemon survives" — needs a real sshd. The matrix flags this as the explicit manual half of the AC.)
 
 ### AC-044: Stale daemon is killed and re-deployed on local-binary upgrade
 
