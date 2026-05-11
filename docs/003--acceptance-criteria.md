@@ -144,7 +144,8 @@
 - `crates/codemuxd-bootstrap/src/lib.rs::connect_socket_times_out_with_socket_connect_stage`, `connect_socket_succeeds_against_live_socket` — pin the `SocketConnect` stage.
 - `crates/codemuxd-bootstrap/src/lib.rs::attach_socket_happy_path_against_fake_runner`, `attach_socket_expands_tilde_cwd_against_remote_home` — pin the end-of-bootstrap attach.
 - `apps/daemon/src/supervisor.rs::handshake_version_mismatch_returns_error_frame` — pins the wire-protocol-mismatch error path.
-- (uncovered: real end-to-end SSH cold-start that walks every stage indicator and surfaces a `HelloAck`-driven Ready tab.)
+- `apps/daemon/tests/proto_smoke.rs::daemon_handshake_completes_and_spawned_agent_prompt_arrives_as_pty_data` — T4 wire-tier coverage of the daemon-side post-bootstrap surface: the spawned `codemuxd` accepts a wire connection, completes the `Hello`/`HelloAck` handshake with a non-zero `daemon_pid`, and serves the spawned agent's boot prompt as `PtyData`. This is the daemon-side half of the cold-start flow; the bootstrap unit tests above cover the SSH-prep stages.
+- (manual / uncovered: real end-to-end SSH cold-start that walks every stage indicator end-to-end via a real sshd. Standing one up with `cargo` on PATH plus a deterministic bootstrap target host is out of scope for hermetic integration tests — verified by hand against production SSH endpoints.)
 
 ### AC-004: Path-zone wildmenu autocompletes against the focused host
 
