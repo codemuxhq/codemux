@@ -838,6 +838,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Selection spans scrollback rows:** `contents_between` walks `visible_rows()` so scrolled-back content is included. No special-casing required.
 
 **Tests:**
+- `apps/tui/tests/pty_drag_select.rs::drag_inside_pane_emits_osc_52_with_selected_text` — PTY E2E: drags across the fake's prompt row, decodes the OSC 52 base64 payload off the master byte stream, asserts it matches the dragged cell range.
 - `apps/tui/src/runtime.rs::pane_mouse_dispatch_down_inside_pane_arms_selection`, `pane_mouse_dispatch_drag_extends_when_selection_active`, `pane_mouse_dispatch_drag_outside_pane_clamps`, `pane_mouse_dispatch_drag_without_selection_is_none`, `pane_mouse_dispatch_up_with_selection_commits`, `pane_mouse_dispatch_up_without_selection_is_none`, `pane_mouse_dispatch_down_outside_pane_returns_none`, `pane_mouse_dispatch_right_button_is_none` — pin the selection lifecycle from press through commit.
 - `apps/tui/src/runtime.rs::pane_hitbox_cell_at_translates_to_pane_relative`, `pane_hitbox_cell_at_returns_none_outside_pane`, `pane_hitbox_clamped_cell_at_clamps_to_nearest_edge`, `pane_hitbox_no_record_means_no_dispatch` — pin the cell-coordinate translation.
 - `apps/tui/src/runtime.rs::normalized_range_handles_inverted_drag`, `normalized_range_preserves_already_ordered_drag`, `row_bounds_*` — pin the selection-range math.
