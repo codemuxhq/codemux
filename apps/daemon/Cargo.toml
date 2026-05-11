@@ -61,6 +61,11 @@ tempfile.workspace = true
 # pretty_assertions surface used by the same suite.
 insta.workspace = true
 pretty_assertions.workspace = true
+# Shared real-sshd subprocess harness used by the SSH-leg E2E test
+# (`proto_ssh_disconnect.rs`). Lives in its own workspace crate so
+# `crates/codemuxd-bootstrap` can also depend on it from the other
+# direction without inverting the production dependency graph.
+codemux-test-ssh-harness.workspace = true
 
 [lints]
 workspace = true

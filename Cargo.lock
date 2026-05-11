@@ -260,6 +260,7 @@ name = "codemux-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "codemux-test-ssh-harness",
  "codemux-wire",
  "color-eyre",
  "crossbeam-channel",
@@ -289,6 +290,13 @@ dependencies = [
 [[package]]
 name = "codemux-shared-kernel"
 version = "0.1.0"
+
+[[package]]
+name = "codemux-test-ssh-harness"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "codemux-tui"
@@ -334,6 +342,7 @@ name = "codemuxd-bootstrap"
 version = "0.1.0"
 dependencies = [
  "codemux-session",
+ "codemux-test-ssh-harness",
  "flate2",
  "tar",
  "tempfile",

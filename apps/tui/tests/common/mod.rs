@@ -90,7 +90,7 @@ pub struct CodemuxHandle {
     /// is reaped in `Drop`.
     _xdg_home: TempDir,
     /// Per-test `HOME` redirect. Shields the spawned codemux from the
-    /// developer's real `~/.claude/settings.json` — the agent_meta
+    /// developer's real `~/.claude/settings.json` — the `agent_meta`
     /// worker reads it for the focused agent's model/effort and renders
     /// the value into the status-bar segment, which shrinks the tab
     /// strip's left area. On a developer box (with a populated
@@ -155,7 +155,7 @@ pub struct CodemuxHandle {
 ///   and any other binding-sensitive surface — see AC-013's
 ///   `pty_nav.rs`, the first config-sensitive PTY test).
 /// - `HOME` is redirected to a fresh tempdir so the developer's
-///   `~/.claude/settings.json` cannot leak in: the agent_meta worker
+///   `~/.claude/settings.json` cannot leak in: the `agent_meta` worker
 ///   reads `model`/`effortLevel` from it and renders them into the
 ///   status-bar segment, which shrinks the tab-strip area and
 ///   truncates labels mid-test (AC-020's `pty_tab_drag.rs` was the

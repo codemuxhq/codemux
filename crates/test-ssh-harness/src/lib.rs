@@ -1,4 +1,19 @@
-//! Real-`sshd`-as-subprocess harness for the SSH transport tests.
+//! Real-`sshd`-as-subprocess harness shared by the SSH-leg integration
+//! tests across the workspace.
+//!
+//! Consumers:
+//! - `apps/daemon/tests/proto_ssh_disconnect.rs` (AC-043, daemon survives
+//!   SSH `ControlMaster` kill via `setsid -f`)
+//! - `crates/codemuxd-bootstrap/tests/proto_ssh_cold_start.rs` (AC-003,
+//!   real `prepare_remote` + `attach_agent` over real `sshd`)
+//!
+//! Lives in its own workspace crate so the dependency direction matches
+//! production: the bootstrap crate's integration tests depend on this
+//! harness, not on `apps/daemon`. Otherwise the natural placement
+//! (`apps/daemon/tests/common/`) would force `crates/codemuxd-bootstrap`
+//! to depend on `apps/daemon` for tests, inverting the production graph
+//! (`apps/tui → codemuxd-bootstrap`, `crates/codemuxd-bootstrap →
+//! crates/session`, `apps/daemon → crates/wire`).
 //!
 //! Requirements (probed at module load): `sshd`, `ssh-keygen`, `ssh` on
 //! disk. `sshd` typically lives in `/usr/sbin/sshd` and is not on the
@@ -40,8 +55,9 @@
 //! their contents on drop. Nothing inside `Drop` panics — leaks are
 //! preferred over a panic-in-drop that masks the original test failure.
 
-// Test helpers panic on setup failure; allow at file scope, same
-// rationale as `common/mod.rs`.
+// Test-harness setup panics on environment failure; the messages it
+// produces are how a missing-binary or bad-permission diagnostic
+// reaches the developer. Allow at crate scope.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::Write;
@@ -143,6 +159,7 @@ impl SshTestHost {
     /// `ControlMaster` exits. The shim approach (via [`Self::bin_dir`])
     /// is for tests that drive the production bootstrap, which calls
     /// `ssh` by name.
+    #[must_use]
     pub fn ssh_command(&self) -> Command {
         let mut cmd = Command::new("/usr/bin/ssh");
         cmd.arg("-p")
@@ -164,19 +181,12 @@ impl SshTestHost {
 
 impl Drop for SshTestHost {
     fn drop(&mut self) {
-        // `.ok()` to consume the Result (per the same `clippy::pedantic`
-        // pattern as `CodemuxdHandle::drop`).
         if let Some(mut child) = self.sshd_child.take() {
             // SIGTERM first. `Child::kill` sends SIGKILL on Unix; we
             // want a polite termination so sshd closes listening
-            // sockets cleanly. Use raw libc-via-Command's nix-style
-            // shorthand: run `kill -TERM <pid>` via the kernel's
-            // signal interface through the std::os helper.
-            //
-            // The workspace's `unsafe_code = "forbid"` lint blocks
-            // `libc::kill` directly. Shelling out to `/usr/bin/kill`
-            // is the supported substitute and matches the daemon's
-            // own kill-prelude shape.
+            // sockets cleanly. The workspace's `unsafe_code = "forbid"`
+            // lint blocks `libc::kill` directly, so shell out to
+            // `/usr/bin/kill` (matches the daemon's own kill prelude).
             let pid = child.id();
             let _ = Command::new("/usr/bin/kill")
                 .arg("-TERM")
@@ -217,6 +227,15 @@ impl Drop for SshTestHost {
 /// daemon launched over ssh, where the production CLI does not yet
 /// expose a flag.
 ///
+/// `PATH` opt-in: if (and only if) the caller passes a `("PATH", ...)`
+/// entry, this helper prepends [`SshTestHost::bin_dir`] to that PATH
+/// so test-only shims dropped into `bin_dir` (e.g. AC-003's `cargo`
+/// shim or `claude` symlink) are reachable from any command run via
+/// `ssh <host> '...'`. Callers that don't need the shim path can omit
+/// the PATH key entirely and inherit sshd's default session PATH —
+/// existing absolute-path callers (`proto_ssh_disconnect.rs`,
+/// `proto_setsid.rs`) hit this branch.
+///
 /// # Panics
 ///
 /// Panics if any of `sshd`, `ssh-keygen`, or the real `ssh` binary is
@@ -225,6 +244,7 @@ impl Drop for SshTestHost {
 /// a TCP connection within [`SSHD_READY_TIMEOUT`]. All three are
 /// environment errors at this layer; a panic gives the clearest
 /// possible failure message before any test logic runs.
+#[must_use]
 pub fn spawn_sshd(env: &[(&str, &str)]) -> SshTestHost {
     require_binary(SSHD_DEFAULT_PATH);
     require_binary("/usr/bin/ssh-keygen");
@@ -242,26 +262,16 @@ pub fn spawn_sshd(env: &[(&str, &str)]) -> SshTestHost {
     let user_pub = std::fs::read_to_string(format!("{}.pub", user_key.display()))
         .expect("read generated user public key");
     let user_pub_trimmed = user_pub.trim();
-    let env_prefix = if env.is_empty() {
-        String::new()
-    } else {
-        let pairs: Vec<String> = env
-            .iter()
-            .map(|(k, v)| {
-                assert!(
-                    !k.contains('"') && !v.contains('"'),
-                    "test env var keys/values may not contain double quotes: {k:?}={v:?}",
-                );
-                assert!(
-                    !k.contains(',') && !v.contains(','),
-                    "test env var keys/values may not contain commas (ssh authorized_keys \
-                     option separator): {k:?}={v:?}",
-                );
-                format!("environment=\"{k}={v}\"")
-            })
-            .collect();
-        format!("{} ", pairs.join(","))
-    };
+
+    // Compute the shim `bin_dir` path early so it can be baked into the
+    // SSH session's PATH via env-injection. The actual `mkdir` plus
+    // ssh/scp shim install happens after sshd is up; the remote PATH is
+    // only consulted when an SSH command exec's, by which point
+    // everything is in place.
+    let shim_dir = TempDir::new().expect("tempdir for ssh shims");
+    let bin_dir = shim_dir.path().join("bin");
+
+    let env_prefix = build_env_prefix(env, &bin_dir);
     write_file_mode(
         &authorized_keys,
         &format!("{env_prefix}{user_pub_trimmed}\n"),
@@ -272,8 +282,6 @@ pub fn spawn_sshd(env: &[(&str, &str)]) -> SshTestHost {
     let config = build_sshd_config(port, &host_key, &authorized_keys);
     write_file_mode(&sshd_config, &config, 0o600);
 
-    // Validate the config before spawning — sshd's parser errors are
-    // clearer at parse time than during the accept loop.
     let validate = Command::new(SSHD_DEFAULT_PATH)
         .arg("-t")
         .arg("-f")
@@ -287,9 +295,8 @@ pub fn spawn_sshd(env: &[(&str, &str)]) -> SshTestHost {
     );
 
     // `-D` keeps sshd in the foreground (no fork), `-e` writes to
-    // stderr instead of syslog — we discard both, but the no-syslog
-    // bit is necessary in environments where syslog isn't available
-    // (containers, CI).
+    // stderr instead of syslog — the no-syslog bit is necessary in
+    // environments where syslog isn't available (containers, CI).
     let child = Command::new(SSHD_DEFAULT_PATH)
         .arg("-D")
         .arg("-e")
@@ -303,10 +310,6 @@ pub fn spawn_sshd(env: &[(&str, &str)]) -> SshTestHost {
 
     wait_for_listening(port, SSHD_READY_TIMEOUT);
 
-    // Per-test shim binaries that route ssh/scp through our
-    // `ssh_config`. See module docs for why this is the cleanest hook.
-    let shim_dir = TempDir::new().expect("tempdir for ssh shims");
-    let bin_dir = shim_dir.path().join("bin");
     std::fs::create_dir(&bin_dir).expect("mkdir shim bin dir");
     let host_alias = "codemux-test-host".to_string();
     let shim_ssh_config = shim_dir.path().join("ssh_config");
@@ -329,6 +332,45 @@ pub fn spawn_sshd(env: &[(&str, &str)]) -> SshTestHost {
         host_alias,
         sshd_child: Some(child),
     }
+}
+
+/// Build the `environment="..."` prefix for the test user's
+/// `authorized_keys` line. PATH injection is opt-in: only callers that
+/// pass a `("PATH", ...)` entry get `bin_dir` prepended onto their
+/// PATH. Callers that omit the PATH key get no PATH env at all,
+/// preserving sshd's default session PATH (the behavior existing
+/// callers like `proto_ssh_disconnect.rs` and `proto_setsid.rs`
+/// have always relied on, since they invoke binaries by absolute
+/// path).
+fn build_env_prefix(env: &[(&str, &str)], bin_dir: &Path) -> String {
+    if env.is_empty() {
+        return String::new();
+    }
+    let bin_dir_str = bin_dir.display().to_string();
+    assert!(
+        !bin_dir_str.contains('"') && !bin_dir_str.contains(','),
+        "shim bin_dir path must not contain double quote or comma (got {bin_dir_str:?})",
+    );
+    let pairs: Vec<String> = env
+        .iter()
+        .map(|(k, v)| {
+            assert!(
+                !k.contains('"') && !v.contains('"'),
+                "test env var keys/values may not contain double quotes: {k:?}={v:?}",
+            );
+            assert!(
+                !k.contains(',') && !v.contains(','),
+                "test env var keys/values may not contain commas (ssh authorized_keys \
+                 option separator): {k:?}={v:?}",
+            );
+            if *k == "PATH" {
+                format!("environment=\"PATH={bin_dir_str}:{v}\"")
+            } else {
+                format!("environment=\"{k}={v}\"")
+            }
+        })
+        .collect();
+    format!("{} ", pairs.join(","))
 }
 
 /// Write a config file for `sshd -f`. Keeps the surface minimal: pubkey

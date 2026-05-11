@@ -42,6 +42,12 @@ flate2 = "1.0"
 # bootstrap side. Without this, adding a new daemon dep silently
 # breaks the remote build (resolver fails on the unknown name).
 toml.workspace = true
+# AC-003 cold-start E2E (`tests/proto_ssh_cold_start.rs`) drives
+# `prepare_remote` + `attach_agent` against the real-sshd subprocess
+# harness. The harness lives in its own workspace crate so the
+# dependency direction matches production (this crate orchestrates the
+# daemon; nothing in `apps/daemon` depends on this crate).
+codemux-test-ssh-harness.workspace = true
 
 [lints]
 workspace = true

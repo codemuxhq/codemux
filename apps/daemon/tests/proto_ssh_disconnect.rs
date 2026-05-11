@@ -54,9 +54,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use codemux_test_ssh_harness::{SshTestHost, spawn_sshd};
 use tempfile::TempDir;
-
-use common::ssh::{SshTestHost, spawn_sshd};
 
 /// How long to wait for the pid-file to appear after the
 /// `setsid -f codemuxd` ssh command returns. The production bootstrap

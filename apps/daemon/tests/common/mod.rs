@@ -41,12 +41,6 @@
 // `apps/tui/tests/common/mod.rs`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-// SSH transport harness used by `proto_ssh_disconnect.rs` (AC-043).
-// Lives in its own submodule so the wire-only proto tests don't pull
-// `sshd` / `ssh-keygen` requirements when they don't need them; each
-// proto test selects what it imports via `use common::ssh::...`.
-pub mod ssh;
-
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

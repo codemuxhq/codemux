@@ -6,6 +6,7 @@ members = [
     "crates/codemuxd-bootstrap",
     "crates/session",
     "crates/shared-kernel",
+    "crates/test-ssh-harness",
     "crates/wire",
 ]
 
@@ -21,6 +22,7 @@ repository = "https://github.com/codemuxhq/codemux"
 codemuxd-bootstrap = { path = "crates/codemuxd-bootstrap" }
 codemux-session = { path = "crates/session" }
 codemux-shared-kernel = { path = "crates/shared-kernel" }
+codemux-test-ssh-harness = { path = "crates/test-ssh-harness" }
 codemux-wire = { path = "crates/wire" }
 
 # Error handling (AD-17)
