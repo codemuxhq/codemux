@@ -779,6 +779,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Click misses every tab hitbox:** no-op.
 
 **Tests:**
+- `apps/tui/tests/pty_tab_click.rs::click_unfocused_tab_moves_focus` — PTY E2E: synthesizes an SGR mouse click on tab 1 while tab 2 is focused, asserts the focus moves (observed via the reverse-video ordinal styling).
 - `apps/tui/src/runtime.rs::tab_mouse_dispatch_down_on_tab_returns_press`, `tab_mouse_dispatch_up_same_tab_is_a_click` — pin the press → release-on-same-tab click flow.
 - `apps/tui/src/runtime.rs::tab_mouse_dispatch_down_outside_tabs_returns_none`, `tab_mouse_dispatch_up_outside_tabs_cancels`, `tab_mouse_dispatch_up_with_no_press_is_none`, `tab_mouse_dispatch_non_left_buttons_are_ignored` — pin the negative cases.
 - `apps/tui/src/runtime.rs::tab_hitboxes_at_finds_recorded_rect`, `tab_hitboxes_at_misses_outside_recorded_rects`, `tab_hitboxes_clear_drops_all_recorded_rects`, `tab_hitboxes_record_rejects_zero_sized_rect` — pin the hitbox lookup that resolves clicks to agent ids (not slot indices).
