@@ -581,6 +581,7 @@
 - `apps/tui/src/runtime.rs::dismiss_removes_focused_failed_agent` — pins step 2 (removes Failed).
 - `apps/tui/src/runtime.rs::dismiss_removes_focused_crashed_agent_and_clamps_focus` — pins step 3 (removes Crashed and clamps focus).
 - `apps/tui/src/runtime.rs::dismiss_leaves_empty_vec_when_last_agent_dismissed`, `dismiss_removes_crashed_zero_slot` — pin the edge cases.
+- `apps/tui/tests/pty_dismiss.rs::prefix_d_dismisses_crashed_agent_and_is_noop_on_ready` — single PTY fixture exercising both branches: spawns two agents using `fake_agent_crashing`, crashes the focused one with `QUIT\r` (to exit 42), dismisses it with `prefix d` and asserts `[2]` and `exit 42` disappear. Then sends `prefix d` again with the remaining `[1]` (Ready) focused, asserts `[1]` stays (no-op on live). The liveness assertion implicitly covers AC-036: if dismiss had erroneously removed the last live agent, codemux would auto-exit and the harness would observe a disconnected channel rather than a still-rendering `[1]`.
 
 ### AC-016: Quit codemux cleanly
 
