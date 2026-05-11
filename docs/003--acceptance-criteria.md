@@ -1206,4 +1206,5 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - `apps/tui/src/main.rs::resolve_cwd_returns_canonicalized_directory` — pins the happy path.
 - `apps/tui/src/main.rs::resolve_cwd_errors_when_path_is_missing` — pins the missing-path failure with `invalid path` message.
 - `apps/tui/src/main.rs::resolve_cwd_errors_when_path_is_a_file` — pins the not-a-directory failure with `is not a directory` message (canonicalized path).
-- (uncovered: the `--nav <invalid>` clap-parse error and the runtime-level proof that the exit happens *before* raw mode.)
+- `apps/tui/tests/pty_arg_invalid.rs::invalid_path_arg_exits_before_raw_mode` — T3 PTY-tier proof that a `[PATH]` pointing at a missing absolute path exits non-zero with no `\x1b[?1049h` on the master byte stream, i.e. raw mode never engaged.
+- `apps/tui/tests/pty_arg_invalid.rs::invalid_nav_arg_exits_at_clap_parse_time` — T3 PTY-tier proof that `--nav <invalid>` exits non-zero at clap parse time with no `\x1b[?1049h` on the master byte stream, AND that clap's `invalid value` diagnostic reaches the user via the PTY.
