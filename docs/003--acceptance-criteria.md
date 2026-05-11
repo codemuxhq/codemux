@@ -360,7 +360,8 @@
 - `apps/tui/src/index_worker.rs::nonexistent_root_returns_no_roots_error`, `ignore_file_excludes_listed_dirs`, `tmpdir_with_nested_dirs_yields_all_dirs` — pin the local walker behavior.
 - `apps/tui/src/spawn.rs::ctrl_t_toggles_fuzzy_to_precise_and_seeds_cwd`, `ctrl_t_toggles_precise_to_fuzzy` — pin the `Ctrl+T` synchronous-mode escape.
 - `apps/tui/src/spawn.rs::ctrl_r_emits_refresh_index_outcome_in_fuzzy_mode` — pins `Ctrl+R` rebuild trigger.
-- (uncovered: the modal-side guarantee that keystroke handling stays interactive while the worker is running, including the "no auto-refresh on index-done; user must press one more key" rule; spinner-sentinel rendering.)
+- `apps/tui/tests/pty_indexing.rs::modal_indexing_sentinel_renders_while_path_zone_accepts_input` — synthesizes a search root with ~4000 empty subdirs (slow enough that the walker spans multiple render frames on a normal dev box), opens the spawn modal, types `xyz123` while the indexer is mid-walk, and asserts a single screen frame contains BOTH the `⠋ indexing` spinner sentinel AND the typed substring. Pins the simultaneity the AC requires: indexer running off-thread AND keystroke handler still firing -- if the indexer regressed to blocking the event loop, the typed substring would not appear within the deadline.
+- (uncovered: the "no auto-refresh on index-done; user must press one more key" rule, the Ctrl+T fuzzy<->precise mode toggle at the rendered surface, and the Ctrl+R rebuild trigger at the rendered surface.)
 
 ---
 
