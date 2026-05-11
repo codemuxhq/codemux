@@ -82,13 +82,25 @@ fn daemon_spawned_under_setsid_becomes_its_own_session_leader() {
     let socket = dir.path().join("setsid.sock");
     let socket_str = socket.to_str().expect("socket path is utf-8");
 
-    // `setsid` (no `-f`) execs the command as a new session leader and
-    // waits. With `-f`, it `fork()`s first and the parent exits
-    // immediately, which is what the bootstrap uses on the remote. For
-    // a local test we want a handle on the spawned daemon's pid; using
-    // bare `setsid` with `Stdio::null()` for the three standard fds
-    // mirrors what the remote shell ends up with after the bootstrap's
-    // `</dev/null >...stderr 2>&1` redirects.
+    // `setsid` (no `-f`) **execs** the command after creating a new
+    // session — same PID, new SID. With `-f`, it `fork()`s first and
+    // the parent exits immediately, which is what the bootstrap uses
+    // on the remote. For this test we want a handle on the running
+    // daemon's pid; `setsid` without `-f` gives us exactly that
+    // because `Command::spawn` returns a `Child` whose pid the kernel
+    // hands to the spawned process, and `setsid`'s `execvp` preserves
+    // it. (`Child::kill` therefore reaches the daemon directly — no
+    // process leak from the harness's perspective.)
+    //
+    // The idiomatic Rust alternative — `Command::pre_exec` calling
+    // `libc::setsid()` in the forked child — is off-limits: the
+    // workspace's `unsafe_code = "forbid"` lint blocks `pre_exec`'s
+    // `unsafe fn` requirement. Shelling out to the `setsid` binary is
+    // the supported substitute.
+    //
+    // `Stdio::null()` for the three standard fds mirrors what the
+    // remote shell ends up with after the bootstrap's `</dev/null
+    // >...stderr 2>&1` redirects.
     let codemuxd_bin = env!("CARGO_BIN_EXE_codemuxd");
     let fake_bin = env!("CARGO_BIN_EXE_fake_daemon_agent");
     let mut cmd = Command::new("setsid");
