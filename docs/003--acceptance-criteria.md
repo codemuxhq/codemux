@@ -980,6 +980,9 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 
 **Failure modes:** none.
 
+**Tests:**
+- `apps/tui/tests/pty_status_bar.rs::status_bar_renders_in_popup_chrome_and_hides_in_leftpane` — boots codemux, asserts the prefix-hint segment substring ` for help` is rendered in default Popup chrome (the hint is the rightmost segment and renders unconditionally in any test env). Flips to LeftPane via `prefix v`, asserts ` for help` is absent. Flips back to Popup and asserts ` for help` reappears — defending against a regression that globally no-ops the status bar (which would also pass the LeftPane assertion but for the wrong reason). Pins the structural branch in `render_frame` (the LeftPane arm never calls `render_status_bar`).
+
 ---
 
 ## Help
