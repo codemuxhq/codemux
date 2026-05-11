@@ -24,17 +24,18 @@ lint:
 test:
     cargo test --workspace
 
-# Run only the slow-tier PTY E2E suite — boots a real `codemux` binary
-# inside an 80x24 PTY against the in-tree `fake_agent` stub. Gated
-# behind `--ignored` so day-to-day `just test` stays fast. See
-# `docs/plans/2026-05-10--e2e-testing.md` (T2).
+# Run only the slow-tier E2E suite — boots a real `codemux` binary
+# inside an 80x24 PTY against the in-tree `fake_agent` stub (T3) AND a
+# real `codemuxd` subprocess against the daemon-side `fake_daemon_agent`
+# stub (T4). Gated behind `--ignored` so day-to-day `just test` stays
+# fast. See `docs/plans/2026-05-10--e2e-testing.md`.
 test-e2e:
-    cargo test --workspace --features codemux-tui/test-fakes -- --ignored
+    cargo test --workspace --features codemux-tui/test-fakes,codemux-daemon/test-fakes -- --ignored
 
 # Run the fast and slow tiers together. Useful for "is everything green
 # end to end" before a non-trivial change.
 test-all:
-    cargo test --workspace --features codemux-tui/test-fakes -- --include-ignored
+    cargo test --workspace --features codemux-tui/test-fakes,codemux-daemon/test-fakes -- --include-ignored
 
 # Review pending insta snapshots. Requires `cargo install cargo-insta` once.
 insta-review:
@@ -47,9 +48,10 @@ check:
     cargo test --workspace
 
 # Slow-tier pre-push gate. Same shape as `check`, but with the
-# `test-fakes` feature on so clippy/tests see the PTY harness. Run
-# before merging anything that touches the spawn path or the harness.
+# `test-fakes` feature on so clippy/tests see the TUI PTY harness AND
+# the daemon E2E harness. Run before merging anything that touches the
+# spawn path, the daemon protocol surface, or either harness.
 check-e2e:
     cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets --features codemux-tui/test-fakes -- -D warnings
-    cargo test --workspace --features codemux-tui/test-fakes -- --ignored
+    cargo clippy --workspace --all-targets --features codemux-tui/test-fakes,codemux-daemon/test-fakes -- -D warnings
+    cargo test --workspace --features codemux-tui/test-fakes,codemux-daemon/test-fakes -- --ignored

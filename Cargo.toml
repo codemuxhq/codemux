@@ -87,6 +87,14 @@ tempfile = "3"
 # `docs/plans/2026-05-10--e2e-testing.md`.
 serial_test = "3.4.0"
 
+# Test-only: snapshot diffing for fast-tier render asserts and
+# decoded-wire-frame asserts in the daemon E2E suite. Declared at
+# workspace scope so `apps/tui` and `apps/daemon` pull the same version
+# (mismatched insta versions risk divergent `.snap` headers).
+insta = "1.47.2"
+# Test-only: readable assertion diffs. Same workspace-pinning rationale.
+pretty_assertions = "1.4.1"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 

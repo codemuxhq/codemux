@@ -11,11 +11,31 @@ repository.workspace = true
 name = "codemuxd"
 path = "src/main.rs"
 
+# In-tree stub agent for the daemon's T4 E2E suite (see
+# `apps/daemon/tests/common/mod.rs`). Mirrors the TUI's `fake_agent`
+# binary contract — emits `FAKE_AGENT_READY> ` on boot, discards stdin
+# to EOF, exits 0 — but lives under `apps/daemon` so the daemon
+# package stays self-contained and doesn't reach across to
+# `apps/tui`'s `test-fakes` feature. Resolved via
+# `env!("CARGO_BIN_EXE_fake_daemon_agent")` once the feature is on.
+[[bin]]
+name = "fake_daemon_agent"
+path = "tests/bin/fake_daemon_agent.rs"
+required-features = ["test-fakes"]
+
 [lib]
 # Re-export the supervisor surface so integration tests (and a future Stage 4
 # in-process round-trip from the TUI) can drive the daemon without forking a
 # subprocess. The binary entry point in `main.rs` is a thin shell over `lib`.
 path = "src/lib.rs"
+
+[features]
+# Off by default. Enables the `fake_daemon_agent` test binary and gates
+# the T4 E2E suite at `apps/daemon/tests/proto_*.rs` (via
+# `#![cfg(feature = "test-fakes")]`) and via `#[ignore]` so a normal
+# `cargo test` skips them. The `just check-e2e` recipe enables the
+# feature explicitly. Mirrors the `apps/tui` `test-fakes` pattern.
+test-fakes = []
 
 [dependencies]
 codemux-wire.workspace = true
@@ -35,6 +55,12 @@ vt100.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# T4 daemon E2E suite (`apps/daemon/tests/proto_*.rs`) speaks the wire
+# protocol directly through a `UnixStream`. `codemux-wire` is already a
+# production dep above; declared here only for the dev-only insta /
+# pretty_assertions surface used by the same suite.
+insta.workspace = true
+pretty_assertions.workspace = true
 
 [lints]
 workspace = true

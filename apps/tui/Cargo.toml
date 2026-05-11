@@ -97,8 +97,8 @@ codemux-session = { workspace = true, features = ["test-util"] }
 # are reviewed with `cargo insta review` (wired as `just insta-review`).
 # `pretty_assertions` is here for readable diffs on non-snapshot asserts
 # inside the same test surface.
-insta = "1.47.2"
-pretty_assertions = "1.4.1"
+insta.workspace = true
+pretty_assertions.workspace = true
 
 # Slow-tier PTY harness deps (see `tests/common/mod.rs`).
 # `vt100` parses the master-side byte stream into a cell grid the
