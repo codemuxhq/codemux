@@ -114,59 +114,98 @@ struct TerminalGuard {
     focus_changes: bool,
 }
 
+/// Plain-data copy of [`TerminalGuard`]'s flag set. The runtime
+/// constructs one of these from the same booleans `TerminalGuard`
+/// gets initialised with, hands the copy to the panic hook (AC-038),
+/// then drops the same booleans into the live `TerminalGuard`. The
+/// shapes are intentionally identical -- both [`restore_terminal_flags`]
+/// call sites (the panic hook on the panic path, the `Drop` impl on
+/// the clean-exit path) read the same flag set and run the same
+/// sequence; skipping the matching disable when the matching enable
+/// failed avoids generating spurious sequences the terminal never
+/// opted into.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy)]
+struct TerminalGuardFlags {
+    enhanced_keyboard: bool,
+    mouse_captured: bool,
+    bracketed_paste: bool,
+    host_title_pushed: bool,
+    focus_changes: bool,
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // Best-effort cleanup. Failures here are unrecoverable (we are mid-drop
-        // and may be on a panic path); the user's terminal may already be in
-        // a degraded state, and surfacing an error would clobber whatever the
-        // panic backtrace was about to say.
-        //
-        // Drop order is the reverse of acquisition: focus changes, bracketed
-        // paste, mouse capture, then keyboard enhancement, then leave-alt-
-        // screen + raw-mode. Each is an independent escape sequence; mirroring
-        // acquisition order is the safe discipline — and skipping the matching
-        // disable when the matching enable failed avoids generating spurious
-        // sequences the terminal never opted into.
-        if self.focus_changes {
-            let _ = execute!(io::stdout(), DisableFocusChange);
-        }
-        if self.bracketed_paste {
-            let _ = execute!(io::stdout(), DisableBracketedPaste);
-        }
-        if self.mouse_captured {
-            let _ = execute!(io::stdout(), DisableMouseCapture);
-        }
-        // Reset the host mouse pointer in case we left it as a hand
-        // (in-app Ctrl+hover sets OSC 22 `pointer`; if the user kills
-        // codemux mid-hover the host inherits whatever shape we last
-        // sent). OSC 22 `default` is a no-op on terminals that don't
-        // implement the sequence.
-        let _ = io::stdout().write_all(b"\x1b]22;default\x1b\\");
-        if self.enhanced_keyboard {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
-        // Pop the host terminal title before leaving the alt-screen so
-        // the user sees their original title back on the primary
-        // screen as soon as we exit. Done before raw-mode disable so
-        // the bytes flush through the same stdout the rest of the
-        // teardown uses.
-        if self.host_title_pushed {
-            let _ = host_title::pop_title(&mut io::stdout());
-        }
-        // Drain any input bytes still buffered in stdin before raw-mode
-        // is disabled. Otherwise the parent shell reads them as raw
-        // input — leading escape sequences trip zsh's Meta-X bindings
-        // and the user lands at an "execute:" prompt with no clear way
-        // out. Done after `Pop`-ing KKP so no new escape sequences
-        // arrive while we drain.
-        while event::poll(Duration::ZERO).unwrap_or(false) {
-            if event::read().is_err() {
-                break;
-            }
-        }
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        restore_terminal_flags(TerminalGuardFlags {
+            enhanced_keyboard: self.enhanced_keyboard,
+            mouse_captured: self.mouse_captured,
+            bracketed_paste: self.bracketed_paste,
+            host_title_pushed: self.host_title_pushed,
+            focus_changes: self.focus_changes,
+        });
     }
+}
+
+/// Best-effort terminal teardown. Pulled out of [`TerminalGuard::drop`]
+/// so the panic hook (AC-038) can run the same cleanup BEFORE the
+/// color-eyre report writes to stdout -- without this seam the report
+/// lands in the middle of the alt-screen and the user sees a garbled
+/// stack trace over their last frame. Failures here are unrecoverable
+/// (we are mid-drop or mid-panic and may be on a degraded terminal),
+/// and surfacing an error would clobber the trace.
+///
+/// Drop order is the reverse of acquisition: focus changes, bracketed
+/// paste, mouse capture, then keyboard enhancement, then pop the host
+/// title, drain stdin, leave the alt-screen + raw-mode. Each is an
+/// independent escape sequence; mirroring acquisition order is the
+/// safe discipline -- and skipping the matching disable when the
+/// matching enable failed avoids generating spurious sequences the
+/// terminal never opted into.
+///
+/// Both call sites are idempotent against each other -- the panic
+/// hook runs first (AC-038), then unwinding drops `TerminalGuard`
+/// and runs this again; the second pass issues the same sequences
+/// which the terminal silently ignores at that point.
+fn restore_terminal_flags(flags: TerminalGuardFlags) {
+    if flags.focus_changes {
+        let _ = execute!(io::stdout(), DisableFocusChange);
+    }
+    if flags.bracketed_paste {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+    }
+    if flags.mouse_captured {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+    // Reset the host mouse pointer in case we left it as a hand
+    // (in-app Ctrl+hover sets OSC 22 `pointer`; if the user kills
+    // codemux mid-hover the host inherits whatever shape we last
+    // sent). OSC 22 `default` is a no-op on terminals that don't
+    // implement the sequence.
+    let _ = io::stdout().write_all(b"\x1b]22;default\x1b\\");
+    if flags.enhanced_keyboard {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
+    // Pop the host terminal title before leaving the alt-screen so
+    // the user sees their original title back on the primary
+    // screen as soon as we exit. Done before raw-mode disable so
+    // the bytes flush through the same stdout the rest of the
+    // teardown uses.
+    if flags.host_title_pushed {
+        let _ = host_title::pop_title(&mut io::stdout());
+    }
+    // Drain any input bytes still buffered in stdin before raw-mode
+    // is disabled. Otherwise the parent shell reads them as raw
+    // input — leading escape sequences trip zsh's Meta-X bindings
+    // and the user lands at an "execute:" prompt with no clear way
+    // out. Done after `Pop`-ing KKP so no new escape sequences
+    // arrive while we drain.
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        if event::read().is_err() {
+            break;
+        }
+    }
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1166,12 +1205,32 @@ struct PendingAttach {
     modal_owner: bool,
 }
 
+/// Test-only seams threaded into [`run`] from the hidden CLI flags
+/// (`--panic-after`, `--record-opens-to`). All fields are `None` in
+/// production. Bundled as a single struct so [`run`]'s signature
+/// doesn't grow per-seam; the production call site passes
+/// `TestSeams::default()` and pays nothing for the unused branches.
+#[derive(Debug, Default)]
+pub struct TestSeams {
+    /// Panic on the main thread once this many milliseconds have
+    /// elapsed since [`run`] entered the event loop. Pins AC-038 (the
+    /// `TerminalGuard` Drop runs before the color-eyre panic report
+    /// reaches stdout). See [`Cli::panic_after`].
+    pub panic_after: Option<Duration>,
+    /// Replace the production `OsUrlOpener` with a recording opener
+    /// that appends each opened URL on its own line to this file.
+    /// Pins AC-041 (Ctrl+click hands the URL to the OS opener) end-to
+    /// -end without spawning a real browser. See [`Cli::record_opens_to`].
+    pub record_opens_to: Option<PathBuf>,
+}
+
 pub fn run(
     nav_style: NavStyle,
     config: &Config,
     initial_cwd: &Path,
     log_tail: Option<&LogTail>,
     agent_spawner: &dyn AgentSpawner,
+    seams: TestSeams,
 ) -> Result<()> {
     tracing::info!(?initial_cwd, "codemux starting (nav={nav_style:?})");
 
@@ -1254,6 +1313,28 @@ pub fn run(
     // benign: it just means we won't restore the title on exit.
     let host_title_pushed = host_title::push_title(&mut io::stdout()).is_ok();
 
+    // AC-038: wrap the panic hook so any panic from this point on
+    // restores the terminal BEFORE the report is written. Without
+    // this, the color-eyre hook prints the trace mid-alt-screen and
+    // the user sees garbled escape sequences over their last frame.
+    // We snapshot the guard's flag set as a `Copy` POD before
+    // constructing the guard so the hook doesn't need to borrow the
+    // guard across the `'static` boundary `set_hook` demands; the
+    // hook fires on the panicking thread before unwinding tears down
+    // the guard, so the matching `Drop` afterwards is a no-op (the
+    // terminal-restore escapes are idempotent at that point).
+    let guard_flags = TerminalGuardFlags {
+        enhanced_keyboard,
+        mouse_captured,
+        bracketed_paste,
+        host_title_pushed,
+        focus_changes,
+    };
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_flags(guard_flags);
+        previous_hook(info);
+    }));
     let _guard = TerminalGuard {
         enhanced_keyboard,
         mouse_captured,
@@ -1286,6 +1367,7 @@ pub fn run(
         initial_cwd,
         &ctx,
         agent_spawner,
+        seams,
     )
 }
 
@@ -2282,6 +2364,53 @@ impl UrlOpener for OsUrlOpener {
     }
 }
 
+/// E2E test seam: records each opened URL on its own line into a file
+/// instead of spawning a real `open` / `xdg-open` / `start`. Wired
+/// behind [`TestSeams::record_opens_to`]; production never reaches
+/// this path. Lives in `runtime.rs` next to [`OsUrlOpener`] so the two
+/// concrete implementations of [`UrlOpener`] sit side by side.
+struct RecordingUrlOpener {
+    /// Append-target for the URL log. One URL per line, newline
+    /// terminated. The test reads this back to assert AC-041's "the
+    /// URL the user clicked is the one handed to the opener."
+    path: PathBuf,
+    /// Outcome-report channel, same shape as [`OsUrlOpener::tx`] so
+    /// the runtime's drain loop is identical for both opener variants.
+    /// The recording opener always reports `Opened` -- the test seam
+    /// is for the happy path; the failure-fallback policy is pinned
+    /// at unit level (`url_open_toast_fallback_*` tests).
+    tx: std::sync::mpsc::Sender<UrlOpenReport>,
+}
+
+impl UrlOpener for RecordingUrlOpener {
+    fn open(&self, url: &str) {
+        // Append-only write so concurrent clicks (which in practice
+        // can't happen -- the runtime is single-threaded at the event
+        // loop -- but the test seam should not be more brittle than
+        // the production opener) don't truncate each other. Errors
+        // are logged at debug only; the test that owns the recording
+        // file will fail loud on a missing URL via its own assertion.
+        let appended = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .and_then(|mut f| {
+                use std::io::Write as _;
+                writeln!(f, "{url}")
+            });
+        let outcome = match appended {
+            Ok(()) => UrlOpenOutcome::Opened,
+            Err(err) => UrlOpenOutcome::Failed {
+                error: format!("record_opens_to write failed: {err}"),
+            },
+        };
+        let _ = self.tx.send(UrlOpenReport {
+            url: url.to_string(),
+            outcome,
+        });
+    }
+}
+
 /// What the runtime should do in response to a [`UrlOpenReport`].
 /// Pure data: the runtime drives the actual side effects
 /// (clipboard write) and toast construction itself, keeping this
@@ -2591,6 +2720,16 @@ struct RuntimeContext<'a> {
 // `agent_spawner` is a separate parameter (not bundled into
 // `RuntimeContext`) because only `spawn_local_agent` consumes it —
 // keeping it out of the per-frame context preserves cohesion.
+// `TestSeams` is plumbed in as a separate parameter rather than added
+// to the otherwise `Copy` `RuntimeContext` because it owns an
+// `Option<PathBuf>` and turning the context non-`Copy` would force
+// every existing consumer to switch from value to reference -- a much
+// larger blast radius than relaxing the arg-count lint here.
+// Long, but it is the central event loop and breaks naturally into
+// sequential phases (drain / reap / render / dispatch). Pulling each
+// arm into its own helper would require threading >5 mutable references
+// through the helper and gain little.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agents: Vec<RuntimeAgent>,
@@ -2599,12 +2738,8 @@ fn event_loop(
     initial_cwd: &Path,
     ctx: &RuntimeContext<'_>,
     agent_spawner: &dyn AgentSpawner,
+    seams: TestSeams,
 ) -> Result<()> {
-    // Long, but it is the central event loop and breaks naturally into
-    // sequential phases (drain / reap / render / dispatch). Pulling each
-    // arm into its own helper would require threading >5 mutable references
-    // through the helper and gain little.
-    #![allow(clippy::too_many_lines)]
     // Destructure into bare locals so the body — which accesses each
     // of these in dozens of places — keeps reading naturally instead
     // of carrying `ctx.` everywhere. All fields are `Copy`.
@@ -2723,7 +2858,18 @@ fn event_loop(
     // real browser. The channel is unbounded — one report per click,
     // and clicks are user-paced.
     let (url_open_tx, url_open_rx) = std::sync::mpsc::channel::<UrlOpenReport>();
-    let url_opener: &dyn UrlOpener = &OsUrlOpener { tx: url_open_tx };
+    // Boxed so the production / recording variants are interchangeable
+    // behind one `&dyn UrlOpener` binding inside the event loop. The
+    // recording branch is only taken when the hidden `--record-opens-to`
+    // flag is set; production stays on the same `OsUrlOpener` path.
+    let owned_url_opener: Box<dyn UrlOpener> = match seams.record_opens_to {
+        Some(path) => Box::new(RecordingUrlOpener {
+            path,
+            tx: url_open_tx,
+        }),
+        None => Box::new(OsUrlOpener { tx: url_open_tx }),
+    };
+    let url_opener: &dyn UrlOpener = owned_url_opener.as_ref();
     let mut spawn_counter: usize = initial_count;
     // PID of this codemux invocation, used to namespace SSH daemon
     // agent_ids so a relaunch can never collide with a still-running
@@ -2758,7 +2904,26 @@ fn event_loop(
     let mut meta_worker_target: Option<AgentId> = None;
     sync_meta_worker_target(&meta_worker, &nav, &mut meta_worker_target);
 
+    // E2E test seam (`--panic-after`). Armed once with an absolute
+    // deadline so each tick is a single `Instant::now() >= deadline`
+    // check rather than a per-tick `Duration::since(start)` allocation.
+    // Production passes `None` and the entire branch compiles away to
+    // a single discriminant check per tick.
+    let panic_deadline = seams.panic_after.map(|d| start + d);
+
     loop {
+        if let Some(deadline) = panic_deadline
+            && Instant::now() >= deadline
+        {
+            // AC-038 pin: the panic must fire AFTER raw mode is on
+            // (the guard above already entered alt-screen + raw mode)
+            // so the panic-hook + unwind path actually has terminal
+            // state to restore. The message is matched on by the
+            // PTY E2E test to confirm the fault came from this seam
+            // and not some unrelated runtime bug.
+            panic!("codemux test-seam panic: --panic-after fired");
+        }
+
         // Drain URL-open outcomes from the worker threads spawned by
         // [`OsUrlOpener::open`]. Project the report into an action
         // (pure), perform any side effect here (OSC 52 clipboard

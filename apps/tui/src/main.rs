@@ -30,7 +30,7 @@ mod status_bar;
 mod statusline_ipc;
 mod toast;
 mod url_scan;
-use runtime::NavStyle;
+use runtime::{NavStyle, TestSeams};
 
 #[derive(Debug, Parser)]
 #[command(name = "codemux", version, about)]
@@ -71,6 +71,24 @@ struct Cli {
         default_value = "claude"
     )]
     agent_bin: PathBuf,
+
+    /// E2E test seam: panic on the main thread after this many
+    /// milliseconds, AFTER raw mode has been entered. Pins AC-038 (a
+    /// panic restores the terminal before the report is printed); the
+    /// harness boots codemux, the runtime arms a deadline at the top
+    /// of the event loop, and the panic fires from the next tick that
+    /// observes the deadline expired. Hidden from `--help` because it
+    /// is only useful for the slow-tier PTY tests.
+    #[arg(long, value_name = "MS", hide = true)]
+    panic_after: Option<u64>,
+
+    /// E2E test seam: when set, replaces the production `OsUrlOpener`
+    /// with a recording opener that appends each opened URL on its
+    /// own line to this file. Pins AC-041 (Ctrl+click hands the URL
+    /// to the OS opener) without actually spawning a browser. Hidden
+    /// from `--help` for the same reason as `--panic-after`.
+    #[arg(long, value_name = "PATH", hide = true)]
+    record_opens_to: Option<PathBuf>,
 
     /// Hidden IPC subcommands. The default `codemux [PATH]` invocation
     /// stays a positional-only path; subcommands kick in only when
@@ -148,12 +166,17 @@ fn main() -> Result<()> {
     // `cli.agent_bin` above — `BinaryAgentSpawner` then invokes
     // whatever the test pointed at.
     let agent_spawner = BinaryAgentSpawner::new(cli.agent_bin);
+    let seams = TestSeams {
+        panic_after: cli.panic_after.map(std::time::Duration::from_millis),
+        record_opens_to: cli.record_opens_to,
+    };
     runtime::run(
         cli.nav,
         &config,
         &initial_cwd,
         cli.log.then_some(&tail),
         &agent_spawner,
+        seams,
     )
 }
 
