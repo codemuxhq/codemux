@@ -281,6 +281,12 @@ impl WireClient {
     /// Perform the `Hello` / `HelloAck` handshake on `stream`. Returns
     /// a client ready for typed I/O.
     ///
+    /// Exposed (rather than wrapped inside `CodemuxdHandle::connect`)
+    /// so tests that need to drive a connection against a daemon they
+    /// spawned manually — AC-044's redeploy test attaches across two
+    /// `spawn_codemuxd_at` calls onto the same tempdir-scoped socket —
+    /// can reuse the same wire-protocol logic.
+    ///
     /// NLM-flagged: sets a non-zero read timeout on the underlying
     /// socket so [`Self::pump`]'s blocking read wakes every
     /// [`POLL_INTERVAL`], letting [`Self::frames_eventually`]'s
@@ -291,7 +297,7 @@ impl WireClient {
     /// Panics on transport error, handshake-frame timeout, or
     /// `HelloAck` shape mismatch — all programmer / environment errors
     /// at this layer.
-    fn handshake(mut stream: UnixStream, rows: u16, cols: u16, agent_id: &str) -> Self {
+    pub fn handshake(mut stream: UnixStream, rows: u16, cols: u16, agent_id: &str) -> Self {
         stream
             .set_read_timeout(Some(POLL_INTERVAL))
             .expect("set_read_timeout on UnixStream");

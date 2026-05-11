@@ -1120,6 +1120,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **The stale daemon refuses SIGTERM and SIGKILL:** the bootstrap surfaces the kill error; the new spawn fails. (Should not happen for a normal `codemuxd` process.)
 
 **Tests:**
+- `apps/daemon/tests/proto_redeploy.rs::killed_daemon_releases_socket_and_fresh_daemon_serves_new_session` — T4 wire-tier coverage of the protocol-layer view: spawns `codemuxd`, attaches via the wire protocol, kills the daemon with SIGTERM (mirroring the bootstrap's kill prelude), spawns a fresh `codemuxd` against the same socket path, and asserts the second `HelloAck` reports a different `daemon_pid` and that a fresh fake-agent prompt arrives. Pins that the daemon-side `reap_stale_socket` + `bind` sequence survives a SIGTERM teardown without `EADDRINUSE`.
 - `crates/codemuxd-bootstrap/src/lib.rs::spawn_remote_daemon_runs_kill_prelude_when_force_respawn` — pins the SIGTERM-then-SIGKILL prelude on force-respawn.
 - `crates/codemuxd-bootstrap/src/lib.rs::spawn_remote_daemon_omits_kill_prelude_when_not_force_respawn` — pins the negative case.
 - `crates/codemuxd-bootstrap/src/lib.rs::prepare_remote_skips_install_when_version_matches`, `prepare_remote_happy_path_on_fresh_host` — pin that the version probe drives the redeploy decision.
