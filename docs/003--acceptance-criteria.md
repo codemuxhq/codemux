@@ -1185,7 +1185,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - `apps/tui/src/config.rs::host_colors_unknown_name_is_an_error`, `host_colors_malformed_hex_is_an_error`, `host_colors_xterm_index_out_of_range_is_an_error` — pin invalid colors propagating as parse errors.
 - `apps/tui/src/config.rs::spawn_unknown_default_mode_is_an_error`, `spawn_named_project_missing_path_is_an_error` — pin spawn-section validation.
 - `apps/tui/src/keymap.rs::invalid_chord_in_config_is_an_error`, `focus_next_array_with_an_invalid_chord_is_an_error` — pin keymap validation.
-- (uncovered: the runtime-level proof that the parse error fires *before* `enable_raw_mode`, leaving the terminal in its pre-launch state.)
+- `apps/tui/tests/pty_config_invalid.rs::invalid_config_exits_before_raw_mode` — T3 PTY-tier proof that a malformed config exits non-zero with no `\x1b[?1049h` (alt-screen-on) on the master byte stream, i.e. raw mode never engaged. Mirrors the AC-038 ordering pattern in `pty_panic.rs`.
 
 ### AC-031: Invalid `[PATH]` arg fails loud before raw mode
 

@@ -502,6 +502,32 @@ where
     }
 }
 
+/// Drain the master byte log into a cloned snapshot without polling
+/// for a predicate. Use after [`wait_for_exit`] has reaped the child:
+/// at that point the byte stream is closed and finite, so a one-shot
+/// read is enough. The polling shape of [`master_bytes_eventually`]
+/// is the wrong tool for a post-mortem assertion -- repurposing it
+/// with a `|_| true` predicate works but obfuscates "I am reading a
+/// finalized log, not waiting for live bytes."
+///
+/// First consumers: `pty_config_invalid::invalid_config_exits_before_raw_mode`
+/// and `pty_arg_invalid::invalid_*_arg_exits_*` (AC-030 / AC-031), which
+/// assert the absence of `\x1b[?1049h` after the child has bailed out
+/// before raw-mode entry.
+pub fn master_bytes_snapshot(handle: &mut CodemuxHandle) -> Vec<u8> {
+    // One final drain so any bytes the reader thread had buffered but
+    // not yet pushed through the parser channel make it into the log.
+    // `drain_into_parser` runs the parser too, but that's harmless --
+    // the parser owns its own state, and the byte log is the
+    // independent source of truth this helper returns.
+    let _ = drain_into_parser(handle);
+    handle
+        .master_log
+        .lock()
+        .expect("master byte log poisoned")
+        .clone()
+}
+
 /// Send an SGR mouse wheel event at the given 1-based cell coordinate.
 ///
 /// SGR mouse format (DEC 1006, `?1006h`): `ESC [ < Cb ; Cx ; Cy M`.
