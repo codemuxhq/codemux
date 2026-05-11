@@ -46,6 +46,18 @@ name = "fake_agent_with_url"
 path = "tests/bin/fake_agent_with_url.rs"
 required-features = ["test-fakes"]
 
+# History-printing variant used by the scroll-mode PTY tests (AC-017,
+# AC-018, AC-039) to populate the focused agent's vt100 scrollback so
+# a mouse-wheel-up actually has history to scroll into. Prints 200
+# numbered `HISTORY N` lines before the boot prompt; the trailing
+# prompt is the steady-state signal the tests wait for. Single-purpose
+# pattern, same `test-fakes` gate. Resolved via
+# `env!("CARGO_BIN_EXE_fake_agent_with_history")`.
+[[bin]]
+name = "fake_agent_with_history"
+path = "tests/bin/fake_agent_with_history.rs"
+required-features = ["test-fakes"]
+
 [features]
 # Off by default. Enables the `fake_agent` test binary and gates the
 # slow-tier PTY tests in `tests/pty_*.rs` — both via
