@@ -234,6 +234,7 @@
 - `apps/tui/src/spawn.rs::typing_slash_after_first_tab_also_descends` — pins the `/` keystroke as an alternative to Tab.
 - `apps/tui/src/spawn.rs::enter_with_selection_in_precise_descends` — pins Enter on a highlighted candidate descending rather than spawning.
 - `apps/tui/src/spawn.rs::enter_without_selection_in_precise_spawns` — pins the commit gesture (step 4).
+- `apps/tui/tests/pty_drilldown.rs::tab_descends_into_folder_and_enter_spawns_at_depth` — boots codemux with `[spawn] default_mode = "precise"` and a scratch tempdir containing a known subdirectory, opens the modal, clears the auto-seeded path with `Ctrl+U`, types the tempdir path, presses `Down` to arm the wildmenu selection (Precise nav mode does not auto-arm), `Tab` to descend, asserts the path zone shows the descended folder name and the wildmenu shows the no-matches sentinel (proving we drilled into the empty leaf). Then presses `Enter` to spawn at depth, flips to `LeftPane`, asserts `[2]` appears (proving a second agent was spawned). Pins the full chord-to-descend-to-spawn pipeline end-to-end through the real keymap.
 - `apps/tui/src/spawn.rs::tab_is_no_op_in_fuzzy_path_zone` — pins that Tab does not descend in fuzzy mode.
 - `apps/tui/src/spawn.rs::fuzzy_highlighted_candidate_spawns_on_enter` — pins fuzzy's apply-and-spawn-in-one-step Enter semantic.
 
