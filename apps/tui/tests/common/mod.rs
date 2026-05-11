@@ -42,11 +42,36 @@
 
 use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use tempfile::TempDir;
+
+/// Wheel direction for [`send_mouse_wheel`]. Mirrors the two SGR mouse
+/// "buttons" 64 (up) and 65 (down) that crossterm decodes as
+/// `MouseEventKind::ScrollUp` / `ScrollDown` (see crossterm's
+/// `parse_cb`).
+#[derive(Clone, Copy, Debug)]
+pub enum WheelKind {
+    Up,
+    Down,
+}
+
+/// Mouse button for [`send_mouse_click`] / [`send_mouse_drag`].
+/// `Left { ctrl }` exposes the Ctrl modifier (SGR bit `0b0001_0000`)
+/// because Ctrl+Left is the gesture that opens a URL through the
+/// runtime's hover-and-open path (AC-041); the harness exposes it as a
+/// field on `Left` so the call sites read like the gesture they pin
+/// (`MouseButton::Left { ctrl: true }`) rather than a follow-on
+/// modifier argument every caller has to remember to set to `false`.
+#[derive(Clone, Copy, Debug)]
+pub enum MouseButton {
+    Left { ctrl: bool },
+    Middle,
+    Right,
+}
 
 const ROWS: u16 = 24;
 const COLS: u16 = 80;
@@ -89,6 +114,13 @@ pub struct CodemuxHandle {
     /// the reader thread) because `Screen` is borrowed from the parser
     /// and the predicate runs on the test thread.
     parser: vt100::Parser,
+    /// Raw bytes seen on the master side, kept independently of the
+    /// vt100 parser so tests can assert on escape sequences the parser
+    /// has already consumed (e.g. the OSC 52 clipboard write pinned by
+    /// AC-021, or the alt-screen-exit / panic-report ordering pinned
+    /// by AC-038). Appended to by the reader thread; drained for
+    /// inspection on the test thread via [`master_bytes_eventually`].
+    master_log: Arc<Mutex<Vec<u8>>>,
     /// Reader thread join handle. Kept so we can join it during `Drop`
     /// after the master is closed; without joining, the thread races
     /// the test runner's process exit and occasionally prints a
@@ -219,6 +251,8 @@ pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHand
     let mut reader = pair.master.try_clone_reader().expect("clone_reader");
 
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let master_log: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let reader_log = Arc::clone(&master_log);
     let reader_handle = thread::Builder::new()
         .name("pty-harness-reader".into())
         .spawn(move || {
@@ -233,6 +267,17 @@ pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHand
                     // `send` means the receiver is gone — the test
                     // is tearing down, so we exit too.
                     Ok(n) if n > 0 => {
+                        // Mirror the chunk into the raw byte log
+                        // before forwarding to the parser channel.
+                        // Lock contention is bounded by the number of
+                        // tests running serially (one), so the lock
+                        // is uncontended in practice. A poisoned lock
+                        // is benign here — we drop the bytes on the
+                        // floor and let the test fail loud via
+                        // `master_bytes_eventually`'s panic.
+                        if let Ok(mut log) = reader_log.lock() {
+                            log.extend_from_slice(&chunk[..n]);
+                        }
                         if tx.send(Vec::from(&chunk[..n])).is_err() {
                             break;
                         }
@@ -253,6 +298,7 @@ pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHand
         // 80x24 grid only. Tests that need scrollback can grow this
         // later; today none do.
         parser: vt100::Parser::new(ROWS, COLS, 0),
+        master_log,
         reader_handle: Some(reader_handle),
     }
 }
@@ -385,6 +431,165 @@ pub fn wait_for_exit(handle: &mut CodemuxHandle, timeout: Duration) -> Option<Ex
         // not a "wait for the UI" delay.
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Poll the raw master-side byte stream until `predicate(&[u8])`
+/// returns true OR the deadline expires.
+///
+/// Parallel to [`screen_eventually`] but exposes the byte buffer
+/// rather than the parsed `vt100::Screen`. Use when the test needs to
+/// assert on a sequence the parser already consumed -- e.g. the OSC 52
+/// clipboard write that AC-021 pins (the bytes go through vt100 as a
+/// "no-op" escape; nothing lands on the cell grid), or the alt-screen
+/// exit / panic-report ordering AC-038 pins (the byte order is the
+/// whole point).
+///
+/// Returns a cloned snapshot of the byte buffer on success so the
+/// caller can hold it without keeping the lock or borrowing `handle`.
+///
+/// # Panics
+///
+/// Panics on timeout (intentional, like `screen_eventually`).
+pub fn master_bytes_eventually<P>(
+    handle: &mut CodemuxHandle,
+    predicate: P,
+    timeout: Duration,
+) -> Vec<u8>
+where
+    P: Fn(&[u8]) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let live = drain_into_parser(handle);
+        let snapshot = handle
+            .master_log
+            .lock()
+            .expect("master byte log poisoned")
+            .clone();
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            live && Instant::now() < deadline,
+            "master_bytes_eventually: predicate did not hold within {:?}\n\
+             ----- raw master bytes ({} bytes) -----\n{}\n----- end -----",
+            timeout,
+            snapshot.len(),
+            String::from_utf8_lossy(&snapshot),
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Send an SGR mouse wheel event at the given 1-based cell coordinate.
+///
+/// SGR mouse format (DEC 1006, `?1006h`): `ESC [ < Cb ; Cx ; Cy M`.
+/// Wheel events always end with `M` (wheel has no separate release;
+/// crossterm decodes Cb=4 as `ScrollUp` and Cb=5 as `ScrollDown`,
+/// regardless of the trailing `M`/`m`).
+///
+/// `x` / `y` are 1-based screen cells -- the same coordinate space the
+/// SGR encoding speaks. The runtime's wheel handler ignores the
+/// position (wheel-anywhere scrolls the focused agent; see
+/// `runtime.rs::3677-3686`), so the harness allows callers to pass any
+/// in-bounds cell. Picking the center of the agent pane is the safest
+/// default for tests that don't care about the position.
+pub fn send_mouse_wheel(handle: &mut CodemuxHandle, kind: WheelKind, x: u16, y: u16) {
+    let cb = match kind {
+        WheelKind::Up => 64,
+        WheelKind::Down => 65,
+    };
+    write_sgr_mouse(handle, cb, x, y, b'M');
+}
+
+/// Send a press + release pair at the given 1-based cell coordinate.
+///
+/// Wired through [`MouseButton`] so the Ctrl modifier (for Ctrl+Click
+/// on a URL, AC-041) is set on the `Left` variant. The encoding is two
+/// SGR frames: a press (`M`) followed by a release (`m`); crossterm
+/// derives the released button from the trailing case (lowercase `m`
+/// means release; the Cb byte still names the button).
+///
+/// For drag-to-select, see [`send_mouse_drag`] -- a press + drag-motion
+/// stream + release is a different sequence and SGR requires explicit
+/// motion frames in between.
+pub fn send_mouse_click(handle: &mut CodemuxHandle, button: MouseButton, x: u16, y: u16) {
+    let cb_press = button_to_cb(button);
+    write_sgr_mouse(handle, cb_press, x, y, b'M');
+    // Release shares the same Cb (carries the modifier bits) but is
+    // distinguished by the trailing `m` -- crossterm's `parse_csi_sgr_mouse`
+    // flips `Down(b)` into `Up(b)` when it sees the lowercase tail.
+    // We keep the same Cb (modifiers preserved) so the runtime sees the
+    // same modifier state on press and release; differing modifiers
+    // across the gesture would be a misuse of the SGR surface.
+    write_sgr_mouse(handle, cb_press, x, y, b'm');
+}
+
+/// Send a press at `from`, a motion frame at `to`, then a release at
+/// `to`. Used by AC-020 (drag-tab-to-reorder) and AC-021
+/// (drag-to-select inside the agent pane).
+///
+/// SGR motion-with-button frames set the "dragging" bit
+/// (`0b0010_0000` = 32) in Cb; the trailing terminator is `M` (motion
+/// is a tracking event, not a release). One intermediate motion frame
+/// at the destination is enough to make the runtime see a `Drag`
+/// event; the unit tests in `runtime.rs` already pin that the
+/// commit-on-release path doesn't depend on the count of in-flight
+/// motion frames.
+///
+/// `from` / `to` are 1-based cells, matching [`send_mouse_click`] and
+/// [`send_mouse_wheel`].
+pub fn send_mouse_drag(
+    handle: &mut CodemuxHandle,
+    button: MouseButton,
+    from: (u16, u16),
+    to: (u16, u16),
+) {
+    let cb_press = button_to_cb(button);
+    let cb_drag = cb_press | 0b0010_0000;
+    write_sgr_mouse(handle, cb_press, from.0, from.1, b'M');
+    write_sgr_mouse(handle, cb_drag, to.0, to.1, b'M');
+    write_sgr_mouse(handle, cb_press, to.0, to.1, b'm');
+}
+
+/// Send a single Ctrl-held motion frame at the given 1-based cell.
+/// Drives the Ctrl+hover URL underline / cursor-shape path (AC-041)
+/// without arming a drag selection -- Cb = 3 (the "button 3 + motion"
+/// encoding crossterm decodes as `MouseEventKind::Moved`) with the
+/// Ctrl bit (16) and the motion bit (32) set: 3 | 32 | 16 = 51.
+pub fn send_mouse_ctrl_hover(handle: &mut CodemuxHandle, x: u16, y: u16) {
+    // Cb = 3 (button-3 release / motion-no-button) | dragging (32) | ctrl (16)
+    write_sgr_mouse(handle, 3 | 0b0010_0000 | 0b0001_0000, x, y, b'M');
+}
+
+/// Translate a [`MouseButton`] into the SGR Cb byte for a press event.
+/// Drag and release events reuse this Cb and twiddle the dragging
+/// bit / terminator case respectively.
+fn button_to_cb(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left { ctrl: false } => 0,
+        MouseButton::Left { ctrl: true } => 0b0001_0000,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
+
+/// Write one SGR mouse frame to the master. The trailing byte is `M`
+/// for press / wheel / motion frames and `m` for release frames; the
+/// caller picks which.
+fn write_sgr_mouse(handle: &mut CodemuxHandle, cb: u8, x: u16, y: u16, terminator: u8) {
+    let writer = handle
+        .writer
+        .as_mut()
+        .expect("write_sgr_mouse called after writer was taken (Drop)");
+    // `ESC [ < Cb ; Cx ; Cy <M|m>`. Format directly into the writer to
+    // avoid an intermediate `String` allocation per frame -- harmless
+    // for one event, but the drag helper emits three frames and the
+    // sluggish-tier reader thread is the only other contention on the
+    // master FD.
+    let frame = format!("\x1b[<{cb};{x};{y}{}", terminator as char);
+    writer.write_all(frame.as_bytes()).expect("write SGR mouse");
+    writer.flush().expect("flush SGR mouse");
 }
 
 impl Drop for CodemuxHandle {

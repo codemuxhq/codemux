@@ -18,6 +18,10 @@
 
 #![cfg(feature = "test-fakes")]
 
+// Sibling test files consume helpers this one doesn't (the SGR mouse
+// surface, the master-byte-log helper); same allow-on-import pattern
+// as `pty_smoke.rs` / `pty_nav.rs`.
+#[allow(dead_code)]
 mod common;
 
 use std::time::Duration;
