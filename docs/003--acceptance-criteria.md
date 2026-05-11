@@ -699,7 +699,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - The PTY is **not** `SIGWINCH`'d at any point during this; scroll mode never re-lays-out the child. The only sites that resize agents are terminal-resize and chrome-toggle.
 
 **Failure modes:**
-- **Terminal does not deliver SGR mouse events** (e.g. Apple Terminal): wheel does nothing; `PageUp`/`PageDown`/`g`/`G` arrow-style bindings still work to enter scroll mode if the user can produce the chord some other way (most users will not; wheel is the realistic entry point).
+- **Terminal does not deliver SGR mouse events** (e.g. Apple Terminal): wheel does nothing, and the keyboard scroll chords cannot ENTER scroll mode either. The current code gates `bindings.on_scroll.lookup` on `scrollback_offset() > 0` (`runtime.rs:3519-3535`), so arrow / PgUp / `g` / `G` only navigate WITHIN scroll mode once it's been entered. Mouse wheel is the only entry path today. Closing this gap would require either an unconditional keyboard entry binding (e.g. PgUp triggers `nudge_scrollback(page)` even at offset = 0) or accepting the AC text as aspirational. Tracked as a follow-up; the AC text below described the desired behavior, not the shipped behavior.
 - **`scrollback_len = 0`** (configured to disable history): the badge does not appear and the visible rows don't shift. Pinned by `runtime::tests::scrollback_zero_len_means_no_history`.
 
 **Tests:**
@@ -711,6 +711,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - `apps/tui/src/runtime.rs::jump_to_top_clamps_to_buffer_length` — pins step 3 (`g` jumps to top).
 - `apps/tui/src/runtime.rs::snap_to_live_resets_offset_to_zero`, `snap_to_live_no_op_on_failed_agent`, `scrollback_offset_returns_zero_for_failed_agent` — pin step 4 (`G` snaps to live).
 - `apps/tui/src/runtime.rs::render_scroll_indicator` (callers); `apps/tui/src/keymap.rs::scroll_lookup_round_trip`, `scroll_defaults_cover_arrow_pgup_pgdn_g_capital_g_esc` — pin the scroll-mode keymap.
+- **PTY E2E: blocked** -- scroll mode has no keyboard entry path in the current code (the `scrollback_offset() > 0` gate at `runtime.rs:3519-3535` requires offset to already be > 0 before any keyboard scroll chord dispatches). The PTY harness has no SGR mouse encoding, so wheel events can't be synthesized. Tracked as blocked-on-infra; resolves with either harness mouse encoding (also unlocks AC-019/020/021/040) or a code change adding a keyboard entry chord.
 - (uncovered: the no-SIGWINCH-fired-during-scroll invariant.)
 
 ### AC-018: Typing snaps to live; navigation preserves scroll
