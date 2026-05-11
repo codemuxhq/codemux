@@ -715,7 +715,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - `apps/tui/src/runtime.rs::jump_to_top_clamps_to_buffer_length` — pins step 3 (`g` jumps to top).
 - `apps/tui/src/runtime.rs::snap_to_live_resets_offset_to_zero`, `snap_to_live_no_op_on_failed_agent`, `scrollback_offset_returns_zero_for_failed_agent` — pin step 4 (`G` snaps to live).
 - `apps/tui/src/runtime.rs::render_scroll_indicator` (callers); `apps/tui/src/keymap.rs::scroll_lookup_round_trip`, `scroll_defaults_cover_arrow_pgup_pgdn_g_capital_g_esc` — pin the scroll-mode keymap.
-- **PTY E2E: blocked** -- scroll mode has no keyboard entry path in the current code (the `scrollback_offset() > 0` gate at `runtime.rs:3519-3535` requires offset to already be > 0 before any keyboard scroll chord dispatches). The PTY harness has no SGR mouse encoding, so wheel events can't be synthesized. Tracked as blocked-on-infra; resolves with either harness mouse encoding (also unlocks AC-019/020/021/040) or a code change adding a keyboard entry chord.
+- `apps/tui/tests/pty_scroll.rs::wheel_up_enters_scroll_mode_and_g_capital_snaps_to_live` — PTY E2E: with a history-fake pre-loading 200 rows of scrollback, sends SGR mouse-wheel-up events, asserts the ` ↑ scroll N · esc ` badge appears and N grows with each wheel; then `G` snaps to live and the badge disappears.
 - (uncovered: the no-SIGWINCH-fired-during-scroll invariant.)
 
 ### AC-018: Typing snaps to live; navigation preserves scroll
