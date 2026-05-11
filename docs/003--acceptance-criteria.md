@@ -738,10 +738,10 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:** none. Both behaviors are pinned by tests in `apps/tui/src/runtime.rs`.
 
 **Tests:**
+- `apps/tui/tests/pty_scroll.rs::scrollback_offset_survives_navigation_and_resets_on_typing` — PTY E2E: scrolls agent 1 back, cycles focus to agent 2 and back, asserts the offset is unchanged (navigation does NOT snap); then types a char and asserts the badge disappears (typing DOES snap).
 - `apps/tui/src/runtime.rs::snap_to_live_resets_offset_to_zero` — pins step 1 (typing snaps to live before the byte is forwarded; method-level guarantee).
 - `apps/tui/src/runtime.rs::nudge_scrollback_only_touches_focused_agent` — pins that scroll state is per-agent (step 4 returns to A's offset 50).
 - `apps/tui/src/runtime.rs::scrollback_state_is_per_parser` — pins the cross-parser independence the per-agent guarantee leans on.
-- (uncovered: the dispatch-order assertion that `snap_to_live` runs *before* the byte write at the runtime layer; the navigation-chord-non-snap path.)
 
 ### AC-039: Pasting while scrolled-back snaps to live before the bracketed-paste write
 
