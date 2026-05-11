@@ -35,6 +35,17 @@ name = "fake_agent_crashing"
 path = "tests/bin/fake_agent_crashing.rs"
 required-features = ["test-fakes"]
 
+# URL-printing variant used by `tests/pty_url_open.rs` to pin AC-041
+# (Ctrl+click hands the URL to the OS opener). Prints the boot prompt
+# followed by a known `https://...` URL so the test can target a cell
+# inside the URL with a Ctrl+click and assert the recording-opener
+# file gained that URL. Same single-purpose pattern as
+# `fake_agent_crashing`. Resolved via `env!("CARGO_BIN_EXE_fake_agent_with_url")`.
+[[bin]]
+name = "fake_agent_with_url"
+path = "tests/bin/fake_agent_with_url.rs"
+required-features = ["test-fakes"]
+
 [features]
 # Off by default. Enables the `fake_agent` test binary and gates the
 # slow-tier PTY tests in `tests/pty_*.rs` — both via

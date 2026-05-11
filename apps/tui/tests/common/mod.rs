@@ -204,6 +204,24 @@ pub fn spawn_codemux_with_config(extra: &str) -> CodemuxHandle {
 ///
 /// Same as [`spawn_codemux`].
 pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHandle {
+    spawn_codemux_with_args(agent_bin, extra, &[])
+}
+
+/// Boot codemux with arbitrary extra CLI args (in addition to the
+/// agent-bin env var and the per-test XDG config). Used by AC-038 and
+/// AC-041 PTY tests to drive the hidden `--panic-after` and
+/// `--record-opens-to` seams; production code never sees this path.
+///
+/// `extra_args` is the literal argv tail appended after `codemux`. The
+/// harness does not validate the arguments -- clap inside codemux
+/// will reject anything it doesn't recognise and exit non-zero, which
+/// the test observes as a child-process exit before its
+/// `screen_eventually` fires.
+pub fn spawn_codemux_with_args(
+    agent_bin: &str,
+    extra_config: &str,
+    extra_args: &[&str],
+) -> CodemuxHandle {
     let pty = native_pty_system();
     let pair = pty
         .openpty(PtySize {
@@ -217,6 +235,9 @@ pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHand
     let codemux_bin = env!("CARGO_BIN_EXE_codemux");
 
     let mut cmd = CommandBuilder::new(codemux_bin);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
     cmd.env("CODEMUX_AGENT_BIN", agent_bin);
     cmd.env("TERM", "xterm-256color");
     // Empty XDG config dir: prevents the developer's
@@ -226,10 +247,10 @@ pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHand
     // when XDG is unset/empty, so this single env var fully shields
     // the spawned codemux from user-side config.
     let xdg_home = TempDir::new().expect("tempdir for XDG_CONFIG_HOME");
-    if !extra.is_empty() {
+    if !extra_config.is_empty() {
         let codemux_subdir = xdg_home.path().join("codemux");
         std::fs::create_dir_all(&codemux_subdir).expect("mkdir XDG/codemux");
-        std::fs::write(codemux_subdir.join("config.toml"), extra)
+        std::fs::write(codemux_subdir.join("config.toml"), extra_config)
             .expect("write config.toml into XDG tempdir");
     }
     cmd.env("XDG_CONFIG_HOME", xdg_home.path());

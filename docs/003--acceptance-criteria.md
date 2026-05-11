@@ -859,8 +859,9 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Failure modes:** none.
 
 **Tests:**
+- `apps/tui/tests/pty_mouse_overlay_gate.rs::mouse_wheel_does_not_scroll_while_help_overlay_open` — PTY E2E: opens the help overlay, sends a wheel storm, asserts the screen contents are byte-for-byte unchanged. Pins the runtime-level proof that the `Event::Mouse` branch returns early when an overlay is up.
 - `apps/tui/src/runtime.rs::no_overlay_active_returns_true_when_nothing_open`, `no_overlay_active_returns_false_when_help_open`, `no_overlay_active_returns_false_when_popup_open` — pin the gate-check helper.
-- (uncovered: the runtime-level proof that the `Event::Mouse` branch returns early when `no_overlay_active(...)` is false; the spawn-modal-open variant of the gate.)
+- (uncovered: the spawn-modal-open variant of the gate.)
 
 ### AC-041: Ctrl+click on a URL hands it to the OS opener; Ctrl+hover shows underline + hand cursor
 
@@ -880,12 +881,13 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 - **Opener fails (no `xdg-open`, etc.):** the URL is copied to the clipboard and a toast confirms. (URL-open is the one place toasts are wired today; see AC-021's toast-less clipboard contrast.)
 
 **Tests:**
+- `apps/tui/tests/pty_url_open.rs::ctrl_click_on_url_records_open_through_seam` — PTY E2E: boots codemux with the hidden `--record-opens-to` seam pointing at a tempfile, Ctrl+hovers a URL cell (asserts the underline lands), Ctrl+clicks, then asserts the recording file gained the URL. Pins both clauses of AC-041 end-to-end.
 - `apps/tui/src/runtime.rs::compute_hover_returns_url_under_pane_cell`, `compute_hover_returns_none_when_screen_cell_outside_pane`, `compute_hover_returns_none_when_no_url_under_cell` — pin the hover-detection at the cell level.
 - `apps/tui/src/runtime.rs::update_hover_returns_activated_on_none_to_some`, `update_hover_returns_deactivated_on_some_to_none`, `update_hover_returns_unchanged_when_active_state_unchanged`, `apply_hover_cursor_emits_pointer_on_activated_default_on_deactivated_nothing_on_unchanged` — pin the hover-state transitions and cursor-shape emission.
 - `apps/tui/src/runtime.rs::paint_hover_url_if_active_underlines_url_range_and_tints_cyan`, `paint_hover_url_if_active_skips_when_agent_id_does_not_match`, `paint_hyperlinks_post_draw_emits_osc_8_wrap_around_cell_walk`, `paint_hyperlinks_post_draw_translates_pane_offset_into_terminal_cup`, `paint_hyperlinks_post_draw_is_a_no_op_when_no_urls_present`, `paint_hyperlinks_post_draw_does_not_drop_chars_adjacent_to_url_boundaries` — pin the underline/OSC 8 render.
 - `apps/tui/src/runtime.rs::url_opener_trait_supports_recording_mock_implementations`, `project_url_open_report_opened_yields_confirm`, `project_url_open_report_failed_yields_fallback_with_error`, `url_open_toast_confirm_returns_none`, `url_open_toast_fallback_with_clipboard_success_is_warning`, `url_open_toast_fallback_with_clipboard_failure_is_error` — pin the open-or-fallback-to-clipboard policy and toast wiring.
 - `apps/tui/src/url_scan.rs::finds_https_url_and_returns_pane_relative_columns`, `covers_every_column_of_the_url`, `returns_none_for_columns_outside_url`, `trims_trailing_punctuation`, `url_in_parentheses_drops_the_close_paren`, `ignores_bare_scheme_with_no_authority`, `handles_multiple_schemes`, `out_of_bounds_target_returns_none`, `file_and_ftp_schemes_are_recognised`, `respects_terminator_chars_in_markdown_links`, `find_urls_in_screen_returns_every_url_across_rows`, `find_urls_in_screen_returns_multiple_urls_on_one_row`, `find_urls_in_screen_returns_empty_when_no_urls` — pin the URL detector.
-- (uncovered: end-to-end test against a real OS opener and a real terminal Ctrl+click. The trait + mock seam exists; the integration is what's missing.)
+- (uncovered: end-to-end test against a real OS opener and a real terminal Ctrl+click -- the PTY E2E above closes this for the recording-seam variant; spawning a real `xdg-open` still requires an integration-only step.)
 
 ---
 
