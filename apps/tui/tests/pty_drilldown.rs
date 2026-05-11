@@ -79,8 +79,17 @@ use common::{screen_eventually, send_keys, spawn_codemux_with_config};
 #[serial]
 fn tab_descends_into_folder_and_enter_spawns_at_depth() {
     // Scratch tempdir held in the test so it outlives the codemux
-    // child. Mirroring `pty_modal_cwd.rs` and `pty_spawn_action.rs`.
-    let scratch = TempDir::new().expect("scratch tempdir");
+    // child. Mirroring `pty_modal_cwd.rs` and `pty_spawn_action.rs`,
+    // but anchored under `/tmp` so the rendered prompt fits in the
+    // 80-col PTY harness on macOS — the platform default `$TMPDIR`
+    // (`/var/folders/.../T/.tmpXXXXXX/`, ~60 chars) leaves no room
+    // for the trailing `drilldown_child` to be visible in the prompt
+    // zone after the descent (the assertion below requires it). On
+    // Linux `TempDir::new()` already lands under `/tmp`; on macOS
+    // `/tmp` is a symlink to `/private/tmp`, but `tempfile` returns
+    // the un-canonicalized `/tmp/.tmpXXXXXX` path here, which keeps
+    // the prompt under the 80-column ceiling.
+    let scratch = TempDir::new_in("/tmp").expect("scratch tempdir under /tmp");
     let scratch_path = scratch
         .path()
         .to_str()

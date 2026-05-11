@@ -89,6 +89,18 @@ pub struct CodemuxHandle {
     /// dir lives as long as the child does; dropped after the child
     /// is reaped in `Drop`.
     _xdg_home: TempDir,
+    /// Per-test `HOME` redirect. Shields the spawned codemux from the
+    /// developer's real `~/.claude/settings.json` — the agent_meta
+    /// worker reads it for the focused agent's model/effort and renders
+    /// the value into the status-bar segment, which shrinks the tab
+    /// strip's left area. On a developer box (with a populated
+    /// settings.json), the segment can appear mid-test and truncate
+    /// tab labels, breaking AC-020's ordinal-to-label assertion in
+    /// `pty_tab_drag.rs`. Held here so the dir lives as long as the
+    /// child does; dropped after the child is reaped. The
+    /// `~`-expansion test in `pty_quick_switch.rs` reads this path
+    /// via [`home_path`] so it asserts on the same value codemux sees.
+    home: TempDir,
     /// Master end of the PTY. Held purely so its `Drop` runs at
     /// teardown (closing the master FD, releasing the kernel-side pty
     /// pair); the reader thread already has its own clone via
@@ -142,12 +154,16 @@ pub struct CodemuxHandle {
 ///   test (it would otherwise rebind the prefix key, navigator chrome,
 ///   and any other binding-sensitive surface — see AC-013's
 ///   `pty_nav.rs`, the first config-sensitive PTY test).
-/// - `HOME` is preserved (codemux's log path resolves under it); the
-///   harness deliberately does NOT redirect `HOME` because the
-///   runtime's log file is append-only and isolated per process — no
-///   cross-test interference. The `XDG_CONFIG_HOME` redirect already
-///   covers the config-loading concern that motivated worrying about
-///   `HOME` in the first place.
+/// - `HOME` is redirected to a fresh tempdir so the developer's
+///   `~/.claude/settings.json` cannot leak in: the agent_meta worker
+///   reads `model`/`effortLevel` from it and renders them into the
+///   status-bar segment, which shrinks the tab-strip area and
+///   truncates labels mid-test (AC-020's `pty_tab_drag.rs` was the
+///   first test to surface this). The codemux runtime's log file
+///   moves into the tempdir alongside, which is harmless — each test
+///   gets a fresh log dir that the `Drop` cleans up. The `~`-expansion
+///   test in `pty_quick_switch.rs` reads `$HOME` at runtime so it
+///   picks up the redirected value automatically.
 ///
 /// # Panics
 ///
@@ -254,6 +270,12 @@ pub fn spawn_codemux_with_args(
             .expect("write config.toml into XDG tempdir");
     }
     cmd.env("XDG_CONFIG_HOME", xdg_home.path());
+    // Per-test HOME shielding: see the doc comment on `spawn_codemux`.
+    // The dir is empty — `current_model_and_effort` will fail to find
+    // `~/.claude/settings.json` and the model status segment stays
+    // hidden, leaving the tab strip's left area at full width.
+    let home = TempDir::new().expect("tempdir for HOME");
+    cmd.env("HOME", home.path());
     cmd.env_remove("RUST_LOG");
     // Cargo sets `cwd` to the package root for tests; set it
     // explicitly to make the harness independent of that detail.
@@ -311,6 +333,7 @@ pub fn spawn_codemux_with_args(
 
     CodemuxHandle {
         _xdg_home: xdg_home,
+        home,
         _master: pair.master,
         writer: Some(writer),
         child: Some(child),
@@ -343,6 +366,18 @@ pub fn send_keys(handle: &mut CodemuxHandle, keys: &str) {
         .expect("send_keys called after writer was taken (Drop)");
     writer.write_all(keys.as_bytes()).expect("write_all to PTY");
     writer.flush().expect("flush PTY writer");
+}
+
+/// Path of the per-test `HOME` redirect set on the spawned codemux's
+/// environment. Tests that need to assert on `~`-expansion behavior
+/// must read this rather than the test process's own `HOME` — the two
+/// no longer match (see the doc comment on [`spawn_codemux`] for why
+/// the harness redirects). First consumer:
+/// `pty_quick_switch::tilde_or_slash_in_fuzzy_modal_switches_to_precise_mode`,
+/// which asserts the rendered path contains the expanded `$HOME/`
+/// after typing `~`.
+pub fn home_path(handle: &CodemuxHandle) -> &std::path::Path {
+    handle.home.path()
 }
 
 /// Drain whatever the reader thread has queued into the parser.

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serial_test::serial;
 
-use common::{screen_eventually, send_keys, spawn_codemux};
+use common::{home_path, screen_eventually, send_keys, spawn_codemux};
 
 /// Open the spawn modal in default Fuzzy mode, then exercise BOTH
 /// quick-switch shortcuts (`~` and `/`) in sequence, asserting after
@@ -62,20 +62,32 @@ use common::{screen_eventually, send_keys, spawn_codemux};
 /// parts visible; each part also asserts independently before moving
 /// on, so a failure points at the specific shortcut that broke.
 ///
-/// **HOME assumption:** the harness preserves the developer's `HOME`
-/// (see `apps/tui/tests/common/mod.rs`), so the path seeded by `~`
-/// will be the expanded `$HOME/` rather than the literal `~/`
-/// fallback. We assert on the trailing `/home/` substring of the
-/// Linux home prefix — `/home/` is universally present in any
-/// developer or CI Linux home dir but not anywhere else in the modal
-/// chrome (the cwd in the path zone would also contain `/home/`, but
-/// the modal opens in Fuzzy mode with empty path so the only place
-/// `/home/` can appear post-`~`-press is the freshly seeded path).
+/// **HOME assumption:** the harness redirects the spawned codemux's
+/// `HOME` to a per-test tempdir (see `apps/tui/tests/common/mod.rs`),
+/// so `~` expansion lands at that tempdir. We read the redirected
+/// path via `home_path(&handle)` and assert the rendered path
+/// contains it as a prefix. This is cross-platform (no hardcoded
+/// `/home/` vs `/Users/`) and robust against any future change in
+/// how the harness picks the HOME location. The negative assertion
+/// in Part 2 reuses the same prefix to guard against accidental
+/// home-seeding from the `/` shortcut.
 #[test]
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn tilde_or_slash_in_fuzzy_modal_switches_to_precise_mode() {
     let mut handle = spawn_codemux();
+    // The harness redirects `HOME` to a per-test tempdir (see the doc
+    // comment on `spawn_codemux`), so the spawned codemux's `~`
+    // expansion lands there — not at the developer's real home. Read
+    // the redirected path off the handle and assert against it. This
+    // keeps the test cross-platform (no hardcoded `/home/` vs
+    // `/Users/`) and makes the assertion robust against any future
+    // change in how the harness picks the per-test HOME location.
+    let home = home_path(&handle)
+        .to_str()
+        .expect("HOME tempdir path must be valid UTF-8")
+        .to_string();
+    let home_prefix = format!("{home}/");
 
     // Steady state: fake's prompt is on screen, no modal open yet.
     // Checking both directions guards against any future change that
@@ -124,9 +136,9 @@ fn tilde_or_slash_in_fuzzy_modal_switches_to_precise_mode() {
         |s| {
             let c = s.contents();
             // Both must hold: label flipped to `spawn:` (mode is
-            // Precise) AND the path has been seeded to a `/home/...`
-            // prefix (the expanded `$HOME`).
-            c.contains("spawn:") && c.contains("/home/")
+            // Precise) AND the path has been seeded to the expanded
+            // `$HOME/` prefix.
+            c.contains("spawn:") && c.contains(&home_prefix)
         },
         Duration::from_secs(5),
     );
@@ -140,8 +152,8 @@ fn tilde_or_slash_in_fuzzy_modal_switches_to_precise_mode() {
         "expected `find:` label gone after `~`-driven switch; got:\n{after_tilde_text}",
     );
     assert!(
-        after_tilde_text.contains("/home/"),
-        "expected path seeded with $HOME prefix after `~`; got:\n{after_tilde_text}",
+        after_tilde_text.contains(&home_prefix),
+        "expected path seeded with $HOME prefix `{home_prefix}` after `~`; got:\n{after_tilde_text}",
     );
 
     // Close the modal so we can re-enter Fuzzy mode for Part 2. The
@@ -212,13 +224,13 @@ fn tilde_or_slash_in_fuzzy_modal_switches_to_precise_mode() {
     );
     // Negative assertion: the `/` shortcut seeds root, not $HOME, so
     // the home-prefix substring must NOT appear in the path zone.
-    // (`/home/` could still show up elsewhere on screen — e.g. if the
+    // (`$HOME` could still show up elsewhere on screen — e.g. if the
     // status bar ever exposed cwd — so this is a guarded check, not a
     // hard `!contains`. Today the modal is the only chrome with paths
     // on screen, so the simpler form is fine.)
     assert!(
-        !after_slash_text.contains("/home/"),
-        "expected no $HOME prefix after `/` (root seed); got:\n{after_slash_text}",
+        !after_slash_text.contains(&home_prefix),
+        "expected no $HOME prefix `{home_prefix}` after `/` (root seed); got:\n{after_slash_text}",
     );
 
     // Tidy: close the modal so Drop sees a clean state.
