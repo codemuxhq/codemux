@@ -1042,6 +1042,7 @@ By contrast, a clean `exit 0` triggers silent removal: the slot is reaped withou
 **Note:** This AC pins the daemon-side contract verified by `apps/daemon/src/supervisor.rs` tests. End-to-end "quit codemux, restart, reconnect to a previously-spawned agent" requires AD-7 (P1 persistence); see AC-028.
 
 **Tests:**
+- `apps/daemon/tests/proto_snapshot.rs::snapshot_on_reattach_includes_prior_session_screen_state` — T4 wire-level coverage: spawns the real `codemuxd` subprocess, attaches via the wire protocol, writes a marker, drops the client, reattaches with a brand-new connection, and asserts the first `PtyData` after the second `HelloAck` contains the marker. The supervisor unit tests below pin the in-process contract; this one pins the same contract through the actual binary boundary.
 - `apps/daemon/src/supervisor.rs::snapshot_replays_screen_state_on_reattach` — pins that the first `PtyData` after `HelloAck` on a reattach contains the prior session's screen content.
 - `apps/daemon/src/supervisor.rs::snapshot_drain_avoids_duplicate_replay_of_buffered_bytes` — pins the drain-before-snapshot ordering so buffered bytes don't double-paint.
 - `apps/daemon/src/supervisor.rs::session_survives_client_disconnect_and_reattach` — pins the reattach-and-write end-to-end through a real `cat` PTY.
