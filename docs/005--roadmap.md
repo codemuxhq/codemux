@@ -6,7 +6,7 @@ Personal tool. No external deadline. Lanes are independent — pick what hurts m
 
 | Lane | Up next | Note |
 |---|---|---|
-| [Foundations](#foundations) | CI setup | Build & deploy shipped via cargo-dist; crates.io + brew deferred (AD-30) |
+| [Foundations](#foundations) | Persistence (AD-7) | CI shipped (just check on linux + macos); build & deploy shipped via cargo-dist (AD-30) |
 | [Review workflow](#review-workflow) | Diff panel | Needs vision amendment (P5, AD-6) |
 | [Navigation](#navigation) | Vim keys everywhere | — |
 | [Sessions](#sessions) | Save & archive | — |
@@ -18,10 +18,10 @@ Personal tool. No external deadline. Lanes are independent — pick what hurts m
 
 - ~~[E2E test harness over the AC index](plans/2026-05-10--e2e-testing.md)~~ — shipped (AC-028 deferred on AD-7)
 - ~~Build & deploy: `codemux` / `codemuxd` binaries~~ — shipped via cargo-dist + GitHub Releases ([AD-30](004--architecture.md#ad-30--lock-step-versioning-deferred-wire-compat-github-releases-as-the-v0x-channel)); crates.io and Homebrew deferred until users ask
-- CI setup
+- ~~CI setup~~ — shipped: `just check` (fmt-check + clippy + test) runs on every PR and push to `main` across linux + macOS via `.github/workflows/ci.yml`
 - Persistence (AD-7) — agents survive app restart
 
-`next:` CI setup
+`next:` Persistence (AD-7)
 
 ## Review workflow
 
