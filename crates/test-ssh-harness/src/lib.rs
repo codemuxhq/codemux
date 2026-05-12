@@ -279,7 +279,8 @@ pub fn spawn_sshd(env: &[(&str, &str)]) -> SshTestHost {
     );
 
     let port = pick_random_local_port();
-    let config = build_sshd_config(port, &host_key, &authorized_keys);
+    let home_override = env.iter().find_map(|(k, v)| (*k == "HOME").then_some(*v));
+    let config = build_sshd_config(port, &host_key, &authorized_keys, home_override);
     write_file_mode(&sshd_config, &config, 0o600);
 
     let validate = Command::new(SSHD_DEFAULT_PATH)
@@ -380,7 +381,32 @@ fn build_env_prefix(env: &[(&str, &str)], bin_dir: &Path) -> String {
 /// `PermitUserEnvironment yes` lets the test inject env vars via
 /// `authorized_keys`. Without it, `environment="..."` lines are
 /// silently ignored.
-fn build_sshd_config(port: u16, host_key: &Path, authorized_keys: &Path) -> String {
+///
+/// `Subsystem sftp internal-sftp` is required for `scp` to work:
+/// OpenSSH 9.0+ defaults `scp` to SFTP transport (the legacy rcp-based
+/// protocol is opt-in via `-O`), so the bootstrap's `scp -B` invocation
+/// fails with `subsystem request failed on channel 0` against an sshd
+/// that has no sftp subsystem configured. `internal-sftp` is sshd's
+/// in-process implementation -- no `sftp-server` binary path to resolve
+/// across Linux/macOS, available since OpenSSH 4.9.
+///
+/// `home_override` reflects the test's `HOME` env-injection: the shell
+/// session honors `environment="HOME=..."` from `authorized_keys`, but
+/// `internal-sftp` does NOT and otherwise starts in `/etc/passwd`'s
+/// `pw_dir`. That mismatch makes a relative scp dest (`host:.cache/...`)
+/// resolve to a different parent than the one `mkdir -p ~/.cache/...`
+/// just created. Passing `-d <HOME>` aligns the two so `scp` lands in
+/// the same scratch tree the test's `ssh` commands operate on.
+fn build_sshd_config(
+    port: u16,
+    host_key: &Path,
+    authorized_keys: &Path,
+    home_override: Option<&str>,
+) -> String {
+    let sftp_subsystem = match home_override {
+        Some(home) => format!("Subsystem sftp internal-sftp -d {home}\n"),
+        None => "Subsystem sftp internal-sftp\n".to_string(),
+    };
     format!(
         "Port {port}\n\
          ListenAddress 127.0.0.1\n\
@@ -399,6 +425,7 @@ fn build_sshd_config(port: u16, host_key: &Path, authorized_keys: &Path) -> Stri
          PermitUserEnvironment yes\n\
          AcceptEnv *\n\
          AllowStreamLocalForwarding yes\n\
+         {sftp_subsystem}\
          LogLevel ERROR\n",
         host_key = host_key.display(),
         auth = authorized_keys.display(),

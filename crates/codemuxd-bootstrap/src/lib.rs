@@ -913,8 +913,17 @@ fn spawn_remote_daemon(
     let stderr_path = format!("~/.cache/codemuxd/logs/{agent_id}.stderr");
     let log_tail = shell_tail_or_fallback(&log_path, "(log file missing or unreadable)");
     let stderr_tail = shell_tail_or_fallback(&stderr_path, "(stderr file missing or unreadable)");
+    // Pre-create the runtime dirs the redirect, pid-file, and socket
+    // poll all reference. `scp_tarball` mkdirs `src/` and `remote_build`
+    // mkdirs `bin/`, but neither runs on the warm path (when the remote
+    // binary already matches `bootstrap_version`), so a first-attach on
+    // a host whose `~/.cache/codemuxd/` predates the runtime layout would
+    // fail at the `>~/.cache/codemuxd/logs/{agent_id}.stderr` redirect
+    // before the daemon ever starts. Idempotent; cheap enough to do every
+    // attach.
     let cmd = format!(
-        "{respawn_prelude}\
+        "mkdir -p ~/.cache/codemuxd/logs ~/.cache/codemuxd/sockets ~/.cache/codemuxd/pids\n\
+         {respawn_prelude}\
          setsid -f ~/.cache/codemuxd/bin/codemuxd \
          --socket ~/.cache/codemuxd/sockets/{agent_id}.sock \
          --pid-file ~/.cache/codemuxd/pids/{agent_id}.pid \
