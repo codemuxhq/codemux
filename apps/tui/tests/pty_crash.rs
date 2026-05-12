@@ -83,7 +83,7 @@ use std::time::Duration;
 
 use serial_test::serial;
 
-use common::{screen_eventually, send_keys, spawn_codemux_with_agent_bin};
+use common::{screen_eventually, send_keys, spawn_codemux_with_agent_bin, test_fake_bin};
 
 /// Boot codemux against `fake_agent_crashing`, wait for the prompt to
 /// render, send `QUIT\r` through the keymap forward path to make the
@@ -123,8 +123,8 @@ use common::{screen_eventually, send_keys, spawn_codemux_with_agent_bin};
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn agent_nonzero_exit_renders_crashed_banner() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent_crashing");
-    let mut handle = spawn_codemux_with_agent_bin(agent_bin, "");
+    let agent_bin = test_fake_bin("fake_agent_crashing");
+    let mut handle = spawn_codemux_with_agent_bin(&agent_bin, "");
 
     // Steady state: fake's prompt is on screen, no modal is open.
     screen_eventually(

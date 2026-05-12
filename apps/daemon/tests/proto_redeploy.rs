@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-use common::collect_pty_data_until;
+use common::{collect_pty_data_until, test_fake_bin};
 
 /// Spawn `codemuxd` in foreground mode at `socket`, with `Stdio::null()`
 /// for the three standard fds. Returns the running `Child`.
@@ -55,7 +55,7 @@ use common::collect_pty_data_until;
 /// the AC.
 fn spawn_codemuxd_at(socket: &Path) -> std::process::Child {
     let codemuxd_bin = env!("CARGO_BIN_EXE_codemuxd");
-    let fake_bin = env!("CARGO_BIN_EXE_fake_daemon_agent");
+    let fake_bin = test_fake_bin("fake_daemon_agent");
     let socket_str = socket.to_str().expect("socket path is utf-8");
 
     let mut cmd = Command::new(codemuxd_bin);
@@ -63,7 +63,7 @@ fn spawn_codemuxd_at(socket: &Path) -> std::process::Child {
         .arg(socket_str)
         .arg("--foreground")
         .arg("--")
-        .arg(fake_bin)
+        .arg(&fake_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

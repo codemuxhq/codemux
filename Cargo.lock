@@ -292,6 +292,10 @@ name = "codemux-shared-kernel"
 version = "0.1.0"
 
 [[package]]
+name = "codemux-test-fakes"
+version = "0.1.0"
+
+[[package]]
 name = "codemux-test-ssh-harness"
 version = "0.1.0"
 dependencies = [

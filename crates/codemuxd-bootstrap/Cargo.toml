@@ -1,11 +1,12 @@
 [package]
 name = "codemuxd-bootstrap"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+description = "codemux SSH adapter: assembles and ships the codemuxd tarball to remote hosts."
 # `build.rs` assembles the codemuxd-bootstrap tarball into OUT_DIR; the
 # crate embeds it via include_bytes!. The build script rewrites the
 # archive whenever apps/daemon, crates/wire, Cargo.lock,

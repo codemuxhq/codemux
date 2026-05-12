@@ -1,11 +1,12 @@
 [package]
 name = "codemux-session"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+description = "codemux session bounded context: agent lifecycle and AgentTransport."
 
 [dependencies]
 codemux-shared-kernel.workspace = true

@@ -1,11 +1,12 @@
 [package]
 name = "codemux-test-ssh-harness"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+description = "codemux test-only SSH harness."
 
 [dependencies]
 tempfile.workspace = true

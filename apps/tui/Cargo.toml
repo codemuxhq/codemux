@@ -1,71 +1,33 @@
 [package]
 name = "codemux-tui"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+description = "codemux: TUI multiplexer for coding-agent sessions."
+
+# `publish = false` (inherited from the workspace) hides this crate
+# from `cargo publish`, but we still ship the `codemux` binary via
+# `dist`. The opt-in below tells `dist` to treat this package as
+# distable despite `publish = false`. The slow-tier-test fake bins
+# live in `crates/test-fakes/` (which has no dist opt-in), so dist
+# only sees `codemux` here. See AD-30.
+[package.metadata.dist]
+dist = true
 
 [[bin]]
 name = "codemux"
 path = "src/main.rs"
 
-# In-tree stub agent the E2E PTY harness points `CODEMUX_AGENT_BIN` at
-# (see `tests/common/mod.rs`). Gated behind `test-fakes` so neither
-# `cargo build --release` nor a default `cargo test` sees it; the
-# `just check-e2e` recipe enables the feature explicitly. The harness
-# resolves the binary via `env!("CARGO_BIN_EXE_fake_agent")`.
-[[bin]]
-name = "fake_agent"
-path = "tests/bin/fake_agent.rs"
-required-features = ["test-fakes"]
-
-# Crashing-variant stub agent used by `tests/pty_crash.rs` to pin
-# AC-037 (Ready -> Crashed on non-zero PTY exit). Same boot prompt as
-# `fake_agent`, but exits 42 when stdin delivers the literal `QUIT`
-# line (or on EOF). Kept as a separate `[[bin]]` rather than an argv
-# flag so each fake binary stays single-purpose -- the happy-path
-# fake's behavior contract is "exit 0 on EOF, period", and conflating
-# it with a crash flag would make every existing PTY test implicitly
-# depend on the default exit-code value. Same `test-fakes` gate as
-# `fake_agent`. Resolved via `env!("CARGO_BIN_EXE_fake_agent_crashing")`.
-[[bin]]
-name = "fake_agent_crashing"
-path = "tests/bin/fake_agent_crashing.rs"
-required-features = ["test-fakes"]
-
-# URL-printing variant used by `tests/pty_url_open.rs` to pin AC-041
-# (Ctrl+click hands the URL to the OS opener). Prints the boot prompt
-# followed by a known `https://...` URL so the test can target a cell
-# inside the URL with a Ctrl+click and assert the recording-opener
-# file gained that URL. Same single-purpose pattern as
-# `fake_agent_crashing`. Resolved via `env!("CARGO_BIN_EXE_fake_agent_with_url")`.
-[[bin]]
-name = "fake_agent_with_url"
-path = "tests/bin/fake_agent_with_url.rs"
-required-features = ["test-fakes"]
-
-# History-printing variant used by the scroll-mode PTY tests (AC-017,
-# AC-018, AC-039) to populate the focused agent's vt100 scrollback so
-# a mouse-wheel-up actually has history to scroll into. Prints 200
-# numbered `HISTORY N` lines before the boot prompt; the trailing
-# prompt is the steady-state signal the tests wait for. Single-purpose
-# pattern, same `test-fakes` gate. Resolved via
-# `env!("CARGO_BIN_EXE_fake_agent_with_history")`.
-[[bin]]
-name = "fake_agent_with_history"
-path = "tests/bin/fake_agent_with_history.rs"
-required-features = ["test-fakes"]
-
 [features]
-# Off by default. Enables the `fake_agent` test binary and gates the
-# slow-tier PTY tests in `tests/pty_*.rs` — both via
-# `#![cfg(feature = "test-fakes")]` (so the test files don't even
-# compile without the feature, since they reference the fake binary
-# through `env!`) and via `#[ignore]` so a normal `cargo test`
-# (without `--include-ignored`) skips them. See
-# `docs/plans/2026-05-10--e2e-testing.md` (T2).
+# Off by default. Gates compilation of the slow-tier PTY tests in
+# `tests/pty_*.rs` (each `#![cfg(feature = "test-fakes")]`-prefixed).
+# The fake binaries those tests invoke live in `crates/test-fakes/`
+# and are unconditional there; this feature is just the gate that
+# keeps the test files (and their PTY-harness imports) out of a
+# default `cargo test` compile. See AD-30.
 test-fakes = []
 
 [dependencies]

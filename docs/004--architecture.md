@@ -293,6 +293,7 @@ for the "no local daemon, one minimal remote daemon" framing.
 | 27 | Tab affordances on the captured mouse stream                       | Accepted                            |
 | 28 | Wire encoder vs readline-shortcut adapter (split layers)           | Accepted                            |
 | 29 | Status-bar segments are a closed set of built-ins, selected by config | Accepted                         |
+| 30 | Lock-step versioning, deferred wire-compat, GitHub Releases as the v0.x channel | Accepted                |
 
 Numbering gaps (4, 9) are intentional. Those slots were used for ideas
 that were absorbed into other ADs before being written up. Renumbering
@@ -1316,6 +1317,101 @@ amended prose for the bounded-exception scope.
   would mean another inline branch in the renderer. The trait shape
   lets the renderer stay schema-agnostic and pushes per-segment
   formatting into one file per segment.
+
+---
+
+### AD-30 — Lock-step versioning, deferred wire-compat, GitHub Releases as the v0.x channel
+
+**Status:** Accepted.
+
+**Context.** v0.1.0 ships two binaries — `codemux` (TUI) and `codemuxd`
+(per-host daemon, [AD-3](#ad-3--remote-pty-container-is-codemuxd-behind-an-agenttransport-enum))
+— talking through a binary wire protocol (`crates/wire`) over an `ssh -L`
+unix tunnel. Two release questions need answers before we cut a tag: how do
+the binaries version (independently? together?), and what does "compatible"
+mean across a daemon and a TUI built on different days. The wire protocol
+is the load-bearing contract here — its frames already carry a `Hello`
+version field, and AD-3 commits to "mismatch disconnects, local re-deploys
+the matching daemon, no shimming."
+
+**Decision.**
+
+1. **Lock-step versioning.** `workspace.package.version` is a single field;
+   every crate inherits via `version.workspace = true`. The TUI and daemon
+   ship together at the same SemVer. A tag of `v0.2.0` means a v0.2.0
+   `codemux`, a v0.2.0 `codemuxd`, and a v0.2.0 `wire` kernel.
+
+   Rationale lives in two principles from Robert C. Martin's component-
+   cohesion family:
+   - **REP** (Reuse-Equivalence Principle): "the granule of reuse is the
+     granule of release." Users reuse the `codemux` + `codemuxd` pair as
+     one unit; releasing them independently fragments that pair.
+   - **CCP** (Common Closure Principle): things that change together belong
+     in the same release boundary. The wire kernel is shared; almost every
+     change to it touches both binaries; releasing them apart would make a
+     per-binary changelog lie about what shipped.
+
+   The `codemuxd-bootstrap` crate already encodes this assumption: its
+   `build.rs` rebuilds the embedded daemon tarball whenever `apps/daemon`,
+   `crates/wire`, or `Cargo.lock` change. Lock-step versioning is what
+   makes that tarball's "matched daemon" claim true on disk.
+
+2. **Deferred wire-compat for v0.x.** Through the v0.x line we make no
+   commitment that a v0.x.N TUI talks to a v0.x.M daemon for `N != M`.
+   AD-3's "mismatch disconnects, local re-deploys the matching daemon" is
+   still the answer; lock-step versioning makes that re-deploy's target
+   deterministic. Wire-compat as a contract starts at v1.0.0, together
+   with crates.io publication of `crates/wire` if/when the case for it is
+   real. Concretely: we can break wire formats freely between v0.x bumps;
+   the daemon bootstrap will re-ship the matching binary on the user's
+   next attach.
+
+3. **`crates/wire` is the shared-kernel trigger.** Any change to the wire
+   crate's public surface bumps the workspace minor (or major, post-1.0).
+   Pure documentation, internal rename, or test-only changes do not. This
+   is the same fitness-function discipline [AD-23](#ad-23--fitness-functions-for-extracting-further-crates)
+   applies to crate extraction, applied here to release cadence: the
+   answer to "does this need a version bump" is mechanical, not a judgment
+   call. Reviewer guidance: any PR touching `wire/src/` that compiles
+   requires a version line in the description ("bump to v0.2.0" or
+   "no bump, internal only").
+
+4. **GitHub Releases is the v0.x distribution channel.** `cargo-dist`
+   (axodotdev/cargo-dist, "dist" rebrand) builds and publishes per-target
+   tarballs and a `curl|sh` shell installer to GitHub Releases on every
+   tagged push. crates.io publish is deferred — every crate keeps
+   `publish = false` in `workspace.package` — because publishing pre-alpha
+   library crates we have no intent to support as third-party deps would
+   reserve names we may not want to keep and would invite issues we do
+   not have time for. Homebrew is deferred for the same reason (no users
+   asking; the shell installer covers macOS).
+
+**Consequences.** Releasing v0.2.0 is one commit
+(`workspace.package.version` bump + tag), one cargo-dist run, one GitHub
+Release. Users on the shell installer rerun the `curl|sh` and get both
+binaries in lock step. The wire crate's invariant ("changing this breaks
+compat") is enforced socially via PR review, not yet by a wire-version
+compatibility test — that test arrives when v1.0 does.
+
+**Rejected alternatives.**
+- *Independent versioning (TUI on one cadence, daemon on another).* Would
+  require a per-binary changelog, a published wire-version-compat matrix,
+  and shimming logic in the daemon. Disqualified for v0.x: the bootstrap
+  re-deploy path makes the matched-pair assumption mechanical, and the
+  shimming work is Hyrum-tax for users we don't have yet.
+- *crates.io publication in v0.x.* Reserves names we may regret, invites
+  third-party-dep issues, locks the wire crate's API before we want to
+  commit. Deferred until at least one user asks or v1.0 — whichever
+  comes first.
+- *Homebrew tap in v0.x.* Same reasoning. The shell installer is the
+  one-liner; brew is duplicate channel surface for zero added users.
+
+**Carve-outs.** `crates/test-ssh-harness` inherits the workspace version
+mechanically but is functionally a 0.0.x test fixture; its version bumping
+in lock step is bookkeeping, not a contract.
+The same applies to `crates/test-fakes`, which exists solely to back the
+slow-tier PTY/proto E2E tests; its bins are not shipped (no
+`[package.metadata.dist] dist = true`).
 
 ---
 

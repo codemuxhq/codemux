@@ -6,21 +6,48 @@ A TUI multiplexer for Claude Code agent sessions, across local and SSH hosts.
 
 P1.3 in progress. Multi-agent local works with a config-driven keymap (`Ctrl-B ?` shows the live binding list). `Ctrl-B c` opens the spawn minibuffer — a one-row prompt at the bottom of the screen with a `@host : path` structure, Tab to toggle zones, SSH-config autocomplete on the host zone, live filesystem completion on the path zone. Two navigator styles: **Popup** (default, full-screen claude + 1-row status bar + `Ctrl-B w` switcher) and **LeftPane** (always-visible left navigator). Toggle with `Ctrl-B v`. No SSH transport, no persistence yet — those are next. See [`docs/roadmap.md`](docs/roadmap.md).
 
+## Install
+
+### Shell installer (Linux, macOS)
+
+Latest release, both binaries (`codemux` + `codemuxd`):
+
+    curl --proto '=https' --tlsv1.2 -LsSf \
+      https://github.com/codemuxhq/codemux/releases/latest/download/codemux-installer.sh | sh
+
+The installer drops `codemux` and `codemuxd` into `$CARGO_HOME/bin` (or
+`~/.local/bin` if Cargo isn't installed). Re-run to upgrade.
+
+### GitHub Releases
+
+Per-target tarballs are attached to every release at
+https://github.com/codemuxhq/codemux/releases. Targets shipped:
+linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64. Both binaries
+ship in lock step (see [AD-30](docs/004--architecture.md#ad-30--lock-step-versioning-deferred-wire-compat-github-releases-as-the-v0x-channel)).
+
+### Build from source
+
+Requires the toolchain pinned in `rust-toolchain.toml`.
+
+    cargo build --release
+    target/release/codemux
+
+`claude` must be on PATH for the TUI to spawn agents. `Ctrl-B q` exits.
+`Ctrl-B ?` opens help.
+
 ## What it is
 
 One TUI window where every Claude Code agent I have running — local or on a remote SSH host — shows up as a navigable pane. Switch between them in one keystroke, see what each is doing at a glance, peek at what each one has changed without leaving the app.
 
 Personal tool. Single-user. TUI-only. Claude Code only.
 
-## Running it
+## Running from source
 
 ```
 cargo run                       # Popup navigator (default)
 cargo run -- --nav left-pane    # LeftPane navigator
 CODEMUX_NAV=left-pane cargo run # same, via env var
 ```
-
-Requires `claude` on PATH. `Ctrl-B q` exits. `Ctrl-B ?` opens help.
 
 A `justfile` wraps the common cargo invocations — `just run`, `just lint`, `just check` (fmt + lint + test). Run `just --list` to see them.
 

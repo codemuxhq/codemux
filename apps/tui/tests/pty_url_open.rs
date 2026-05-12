@@ -46,7 +46,7 @@ use tempfile::TempDir;
 
 use common::{
     MouseButton, screen_eventually, send_mouse_click, send_mouse_ctrl_hover,
-    spawn_codemux_with_args,
+    spawn_codemux_with_args, test_fake_bin,
 };
 
 const URL: &str = "https://example.com/codemux-test";
@@ -55,12 +55,12 @@ const URL: &str = "https://example.com/codemux-test";
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn ctrl_click_on_url_records_open_through_seam() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent_with_url");
+    let agent_bin = test_fake_bin("fake_agent_with_url");
     let record_dir = TempDir::new().expect("record-opens tempdir");
     let record_path = record_dir.path().join("opens.log");
     let record_arg = format!("--record-opens-to={}", record_path.display());
 
-    let mut handle = spawn_codemux_with_args(agent_bin, "", &[&record_arg]);
+    let mut handle = spawn_codemux_with_args(&agent_bin, "", &[&record_arg]);
 
     // Wait for the URL to render in the agent pane. The fake prints
     // `FAKE_AGENT_READY> https://example.com/codemux-test ` on its

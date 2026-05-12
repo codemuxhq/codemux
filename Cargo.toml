@@ -6,22 +6,30 @@ members = [
     "crates/codemuxd-bootstrap",
     "crates/session",
     "crates/shared-kernel",
+    "crates/test-fakes",
     "crates/test-ssh-harness",
     "crates/wire",
 ]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
-license = "UNLICENSED"
+license = "MIT OR Apache-2.0"
 publish = false
+description = "Personal TUI multiplexer for coding-agent sessions across local and SSH hosts."
+homepage = "https://github.com/codemuxhq/codemux"
 repository = "https://github.com/codemuxhq/codemux"
+readme = "README.md"
+keywords = ["tui", "multiplexer", "ssh", "claude", "ratatui"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 # Internal crates
 codemuxd-bootstrap = { path = "crates/codemuxd-bootstrap" }
 codemux-session = { path = "crates/session" }
 codemux-shared-kernel = { path = "crates/shared-kernel" }
+codemux-test-fakes = { path = "crates/test-fakes" }
 codemux-test-ssh-harness = { path = "crates/test-ssh-harness" }
 codemux-wire = { path = "crates/wire" }
 
@@ -115,3 +123,27 @@ opt-level = 0
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[profile.dist]
+inherits = "release"
+
+# Config for 'dist'
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Which actions to run on pull requests
+pr-run-mode = "plan"
+# Whether to install an updater program
+install-updater = false
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+
+[workspace.metadata.dist.github-custom-runners.aarch64-unknown-linux-gnu]
+runner = "ubuntu-22.04"
+host = "x86_64-unknown-linux-gnu"

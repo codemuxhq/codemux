@@ -50,6 +50,32 @@ use std::time::{Duration, Instant};
 use codemux_wire::{self as wire, Message};
 use tempfile::TempDir;
 
+/// Path to a workspace-built test fake binary by bin-name.
+///
+/// The fakes live in `crates/test-fakes` (see AD-30); we can't use
+/// `env!("CARGO_BIN_EXE_<name>")` because that env var is only set
+/// for bins in the *same* package. Instead, we resolve the workspace
+/// target dir at runtime. `cargo test --workspace` (which is what
+/// `just check-e2e` runs) ensures the bin has been built before any
+/// integration test executes.
+pub fn test_fake_bin(name: &str) -> PathBuf {
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(td).join(profile_dir()).join(name);
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // `apps/daemon` -> `apps` -> workspace root.
+    let ws_root: &Path = manifest.ancestors().nth(2).unwrap_or(manifest.as_path());
+    ws_root.join("target").join(profile_dir()).join(name)
+}
+
+fn profile_dir() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
+
 /// Polling cadence for the wire client's read + predicate-recheck loop.
 /// Matches the TUI harness's 5 ms — short enough that a 1 s deadline
 /// gets ~200 wake-ups, long enough that an idle CPU stays idle.
@@ -170,7 +196,7 @@ impl Drop for CodemuxdHandle {
 /// be spawned, or the socket doesn't appear within
 /// [`SOCKET_READY_TIMEOUT`].
 pub fn spawn_codemuxd() -> CodemuxdHandle {
-    spawn_codemuxd_with_agent(env!("CARGO_BIN_EXE_fake_daemon_agent"))
+    spawn_codemuxd_with_agent(&test_fake_bin("fake_daemon_agent"))
 }
 
 /// Spawn `codemuxd` in foreground mode against an arbitrary child
@@ -178,10 +204,11 @@ pub fn spawn_codemuxd() -> CodemuxdHandle {
 /// `clap`'s trailing `--` argv), so its boot output flows through
 /// `vt100` into the daemon's mirrored screen.
 ///
-/// `agent_bin` should be an absolute path. Callers in the same package
-/// reach for `env!("CARGO_BIN_EXE_<name>")` so cargo materializes the
-/// path at compile time.
-pub fn spawn_codemuxd_with_agent(agent_bin: &str) -> CodemuxdHandle {
+/// `agent_bin` should be an absolute path. Callers reach for
+/// [`test_fake_bin`] (which resolves the workspace target dir at
+/// runtime) so the path actually exists at the moment the daemon
+/// spawns the subprocess.
+pub fn spawn_codemuxd_with_agent(agent_bin: &Path) -> CodemuxdHandle {
     let dir = TempDir::new().expect("create tempdir for daemon socket");
     let socket = dir.path().join("codemuxd.sock");
 

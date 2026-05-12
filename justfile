@@ -55,3 +55,31 @@ check-e2e:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --features codemux-tui/test-fakes,codemux-daemon/test-fakes -- -D warnings
     cargo test --workspace --features codemux-tui/test-fakes,codemux-daemon/test-fakes -- --ignored
+
+# Build a release binary for the host target only. cargo-dist owns the
+# cross-compile matrix in CI; locally we only need the host artifact for
+# smoke tests before tagging.
+release-build:
+    cargo build --workspace --release
+
+# Print the artifact matrix the next `dist` release would produce.
+# Read-only; safe to run on any branch. Requires `dist` installed locally.
+release-plan:
+    dist plan
+
+# Tag a new release. Bumps workspace.package.version, commits, tags v$VERSION,
+# and prints the next manual step. Push is deliberate — we do not auto-push
+# tags. Usage: `just release-tag 0.2.0`. Aborts if the working tree is dirty.
+release-tag VERSION:
+    @test -z "$(git status --porcelain)" || (echo "working tree dirty; commit or stash first" && exit 1)
+    @grep -q '^version = "[0-9]' Cargo.toml || (echo "workspace.package.version not found in Cargo.toml" && exit 1)
+    sed -i.bak -E 's/^(version = )"[0-9][^"]*"/\1"{{VERSION}}"/' Cargo.toml && rm Cargo.toml.bak
+    cargo update --workspace
+    cargo check --workspace
+    git add Cargo.toml Cargo.lock
+    git commit -m "chore: release v{{VERSION}}"
+    git tag "v{{VERSION}}"
+    @echo ""
+    @echo "Tagged v{{VERSION}}. To publish:"
+    @echo "    git push origin main 'v{{VERSION}}'"
+    @echo "cargo-dist will pick up the tag and build the release."

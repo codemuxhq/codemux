@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
+use common::test_fake_bin;
+
 /// Read the session id of `pid` from `/proc/<pid>/stat`. Field 6 (1-
 /// indexed) of `stat` is `session`, the kernel-managed session id —
 /// equal to `getsid(pid)`.
@@ -102,14 +104,14 @@ fn daemon_spawned_under_setsid_becomes_its_own_session_leader() {
     // remote shell ends up with after the bootstrap's `</dev/null
     // >...stderr 2>&1` redirects.
     let codemuxd_bin = env!("CARGO_BIN_EXE_codemuxd");
-    let fake_bin = env!("CARGO_BIN_EXE_fake_daemon_agent");
+    let fake_bin = test_fake_bin("fake_daemon_agent");
     let mut cmd = Command::new("setsid");
     cmd.arg(codemuxd_bin)
         .arg("--socket")
         .arg(socket_str)
         .arg("--foreground")
         .arg("--")
-        .arg(fake_bin)
+        .arg(&fake_bin)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());

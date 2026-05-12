@@ -51,19 +51,19 @@ use std::time::Duration;
 
 use serial_test::serial;
 
-use common::{master_bytes_eventually, spawn_codemux_with_args, wait_for_exit};
+use common::{master_bytes_eventually, spawn_codemux_with_args, test_fake_bin, wait_for_exit};
 
 #[test]
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn panic_restores_terminal_before_color_eyre_report() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent");
+    let agent_bin = test_fake_bin("fake_agent");
     // 200 ms gives the runtime time to enter raw mode, render the
     // first frame, and pump a couple of ticks before the deadline
     // fires. A too-tight value risks the panic firing before
     // EnterAlternateScreen lands and AC-038's "restore the terminal"
     // becomes vacuous.
-    let mut handle = spawn_codemux_with_args(agent_bin, "", &["--panic-after=200"]);
+    let mut handle = spawn_codemux_with_args(&agent_bin, "", &["--panic-after=200"]);
 
     // Wait for both signals to appear in the master byte stream: the
     // alt-screen-off escape AND the panic header. Either could in

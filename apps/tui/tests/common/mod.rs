@@ -25,11 +25,15 @@
 //!   poison the assertions. `Drop` for [`CodemuxHandle`] kills the
 //!   child and waits for it; nothing inside `Drop` is allowed to
 //!   panic.
-//! - **The fake binary is reached via `CARGO_BIN_EXE_fake_agent`** —
-//!   Cargo materializes that env var at compile time once the
-//!   `test-fakes` feature is enabled. The whole harness is gated
-//!   behind that feature at the test file level (`#![cfg(...)]`); the
-//!   `env!` here would fail the build with the feature off.
+//! - **The fake binary is reached via [`test_fake_bin`]** —
+//!   the fakes live in `crates/test-fakes` (see AD-30), so we resolve
+//!   the workspace target dir at runtime rather than via
+//!   `env!("CARGO_BIN_EXE_<name>")` (which is only set for bins in the
+//!   *same* package). The whole harness is gated behind the
+//!   `test-fakes` feature at the test file level (`#![cfg(...)]`);
+//!   `cargo test --workspace --features ... -- --ignored` (i.e.
+//!   `just check-e2e`) builds the fake bins before any integration
+//!   test executes.
 
 // Test helpers panic on setup failure; `expect("...")` gives the
 // clearest possible failure message before any assertion runs. The
@@ -41,6 +45,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -48,6 +53,32 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use tempfile::TempDir;
+
+/// Path to a workspace-built test fake binary by bin-name.
+///
+/// The fakes live in `crates/test-fakes` (see AD-30); we can't use
+/// `env!("CARGO_BIN_EXE_<name>")` because that env var is only set
+/// for bins in the *same* package. Instead, we resolve the workspace
+/// target dir at runtime. `cargo test --workspace` (which is what
+/// `just check-e2e` runs) ensures the bin has been built before any
+/// integration test executes.
+pub fn test_fake_bin(name: &str) -> PathBuf {
+    if let Ok(td) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(td).join(profile_dir()).join(name);
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // `apps/tui` -> `apps` -> workspace root.
+    let ws_root: &Path = manifest.ancestors().nth(2).unwrap_or(manifest.as_path());
+    ws_root.join("target").join(profile_dir()).join(name)
+}
+
+fn profile_dir() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    }
+}
 
 /// Wheel direction for [`send_mouse_wheel`]. Mirrors the two SGR mouse
 /// "buttons" 64 (up) and 65 (down) that crossterm decodes as
@@ -193,7 +224,7 @@ pub fn spawn_codemux() -> CodemuxHandle {
 /// The XDG tempdir is owned by the returned handle and dropped when
 /// it drops, so the config file disappears alongside the child.
 pub fn spawn_codemux_with_config(extra: &str) -> CodemuxHandle {
-    spawn_codemux_with_agent_bin(env!("CARGO_BIN_EXE_fake_agent"), extra)
+    spawn_codemux_with_agent_bin(&test_fake_bin("fake_agent"), extra)
 }
 
 /// Boot codemux against an arbitrary agent binary path, with an
@@ -207,10 +238,10 @@ pub fn spawn_codemux_with_config(extra: &str) -> CodemuxHandle {
 /// `fake_agent_crashing` to drive the Ready -> Crashed transition end
 /// to end (AC-037).
 ///
-/// `agent_bin` is the absolute path to the stub binary. Callers are
-/// expected to use `env!("CARGO_BIN_EXE_<name>")` so cargo materializes
-/// the path at compile time; passing an arbitrary string here would
-/// drop the build-time guarantee that the binary actually exists.
+/// `agent_bin` is the absolute path to the stub binary. Callers reach
+/// for [`test_fake_bin`] (which resolves the workspace target dir at
+/// runtime) so the path actually exists at the moment the harness
+/// spawns the subprocess.
 ///
 /// `extra` follows the same contract as [`spawn_codemux_with_config`]:
 /// empty means no config file, non-empty is written verbatim into
@@ -219,7 +250,7 @@ pub fn spawn_codemux_with_config(extra: &str) -> CodemuxHandle {
 /// # Panics
 ///
 /// Same as [`spawn_codemux`].
-pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHandle {
+pub fn spawn_codemux_with_agent_bin(agent_bin: &Path, extra: &str) -> CodemuxHandle {
     spawn_codemux_with_args(agent_bin, extra, &[])
 }
 
@@ -234,7 +265,7 @@ pub fn spawn_codemux_with_agent_bin(agent_bin: &str, extra: &str) -> CodemuxHand
 /// the test observes as a child-process exit before its
 /// `screen_eventually` fires.
 pub fn spawn_codemux_with_args(
-    agent_bin: &str,
+    agent_bin: &Path,
     extra_config: &str,
     extra_args: &[&str],
 ) -> CodemuxHandle {

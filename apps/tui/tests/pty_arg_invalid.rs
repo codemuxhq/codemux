@@ -46,18 +46,18 @@ use std::time::Duration;
 
 use serial_test::serial;
 
-use common::{master_bytes_snapshot, spawn_codemux_with_args, wait_for_exit};
+use common::{master_bytes_snapshot, spawn_codemux_with_args, test_fake_bin, wait_for_exit};
 
 #[test]
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn invalid_path_arg_exits_before_raw_mode() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent");
+    let agent_bin = test_fake_bin("fake_agent");
     // Absolute path that cannot exist on a test host. `--` separates
     // any future clap flags from the positional argument so the
     // path is unambiguously the `[PATH]` arg.
     let mut handle = spawn_codemux_with_args(
-        agent_bin,
+        &agent_bin,
         "",
         &["--", "/nonexistent/codemux-invalid-path-arg-test"],
     );
@@ -83,11 +83,11 @@ fn invalid_path_arg_exits_before_raw_mode() {
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn invalid_nav_arg_exits_at_clap_parse_time() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent");
+    let agent_bin = test_fake_bin("fake_agent");
     // `wat` is not in the `NavStyle` enum's `[left-pane, popup]`
     // possible values. Clap rejects it during `Cli::parse()` and
     // exits 2 before `main`'s body runs.
-    let mut handle = spawn_codemux_with_args(agent_bin, "", &["--nav=wat"]);
+    let mut handle = spawn_codemux_with_args(&agent_bin, "", &["--nav=wat"]);
 
     let status = wait_for_exit(&mut handle, Duration::from_secs(5))
         .expect("codemux did not exit within 5s of boot with an invalid --nav arg");

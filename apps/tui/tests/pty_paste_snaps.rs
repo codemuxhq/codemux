@@ -26,6 +26,7 @@ use serial_test::serial;
 
 use common::{
     WheelKind, screen_eventually, send_keys, send_mouse_wheel, spawn_codemux_with_agent_bin,
+    test_fake_bin,
 };
 
 /// AC-039: pasting while the focused agent is scrolled back snaps
@@ -48,8 +49,8 @@ use common::{
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn paste_while_scrolled_back_snaps_to_live() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent_with_history");
-    let mut handle = spawn_codemux_with_agent_bin(agent_bin, "");
+    let agent_bin = test_fake_bin("fake_agent_with_history");
+    let mut handle = spawn_codemux_with_agent_bin(&agent_bin, "");
 
     screen_eventually(
         &mut handle,

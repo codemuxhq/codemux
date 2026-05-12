@@ -10,9 +10,13 @@
 //! harness is alive.
 //!
 //! Gating:
-//! - `#![cfg(feature = "test-fakes")]` because the harness reaches for
-//!   `env!("CARGO_BIN_EXE_fake_agent")` — without the feature, that
-//!   bin target doesn't exist and the build fails before tests run.
+//! - `#![cfg(feature = "test-fakes")]` keeps the harness imports
+//!   (`portable_pty`, `vt100`, `serial_test`) and this test file out
+//!   of a default `cargo test` compile. The fake bin itself lives in
+//!   `crates/test-fakes` (see AD-30) and is built unconditionally
+//!   whenever that crate compiles; the `just check-e2e` recipe runs
+//!   `cargo test --workspace ...` so the fake is on disk before this
+//!   test executes. See `tests/common/mod.rs::test_fake_bin`.
 //! - `#[ignore]` so a default `cargo test` (and thus `just check`)
 //!   skips it. The slow tier ships through `just check-e2e`, which
 //!   passes `--ignored`.

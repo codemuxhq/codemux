@@ -27,6 +27,7 @@ use serial_test::serial;
 
 use common::{
     WheelKind, screen_eventually, send_keys, send_mouse_wheel, spawn_codemux_with_agent_bin,
+    test_fake_bin,
 };
 
 /// AC-017: wheel-up enters scroll mode (badge appears, visible rows
@@ -42,8 +43,8 @@ use common::{
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn wheel_up_enters_scroll_mode_and_g_capital_snaps_to_live() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent_with_history");
-    let mut handle = spawn_codemux_with_agent_bin(agent_bin, "");
+    let agent_bin = test_fake_bin("fake_agent_with_history");
+    let mut handle = spawn_codemux_with_agent_bin(&agent_bin, "");
 
     // Steady state: the prompt is on screen (it's the last byte
     // written, so seeing it confirms the 200-line history has fully
@@ -147,8 +148,8 @@ fn wheel_up_enters_scroll_mode_and_g_capital_snaps_to_live() {
 #[ignore = "slow-tier PTY E2E; runs via `just check-e2e` / `just test-e2e`"]
 #[serial]
 fn scrollback_offset_survives_navigation_and_resets_on_typing() {
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent_with_history");
-    let mut handle = spawn_codemux_with_agent_bin(agent_bin, "");
+    let agent_bin = test_fake_bin("fake_agent_with_history");
+    let mut handle = spawn_codemux_with_agent_bin(&agent_bin, "");
 
     // Steady state on agent 1.
     screen_eventually(

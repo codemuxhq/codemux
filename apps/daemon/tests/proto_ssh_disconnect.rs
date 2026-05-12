@@ -28,9 +28,10 @@
 //! `apps/daemon/src/bootstrap.rs::PidFile::acquire`).
 //!
 //! Gating mirrors the other slow-tier proto tests:
-//! - `#![cfg(feature = "test-fakes")]` — the harness references
-//!   `CARGO_BIN_EXE_fake_daemon_agent`, only materialized when the
-//!   feature is on.
+//! - `#![cfg(feature = "test-fakes")]` keeps the harness imports and
+//!   this test file out of a default `cargo test` compile. The fake
+//!   bin lives in `crates/test-fakes` (see AD-30); resolved at
+//!   runtime via `common::test_fake_bin`.
 //! - `#[ignore]` — slow-tier, runs via `just check-e2e`.
 //! - Linux-only: the harness reads `/proc/<pid>` indirectly via
 //!   `kill -0` (which works on every Unix), but the production
@@ -56,6 +57,8 @@ use std::time::{Duration, Instant};
 
 use codemux_test_ssh_harness::{SshTestHost, spawn_sshd};
 use tempfile::TempDir;
+
+use common::test_fake_bin;
 
 /// How long to wait for the pid-file to appear after the
 /// `setsid -f codemuxd` ssh command returns. The production bootstrap
@@ -182,7 +185,7 @@ fn launch_daemon_under_setsid(
     log_path: &Path,
 ) {
     let codemuxd_bin = env!("CARGO_BIN_EXE_codemuxd");
-    let fake_bin = env!("CARGO_BIN_EXE_fake_daemon_agent");
+    let fake_bin = test_fake_bin("fake_daemon_agent");
     let remote_cmd = format!(
         "setsid -f {codemuxd_bin} \
          --foreground \
@@ -193,7 +196,7 @@ fn launch_daemon_under_setsid(
          -- {fake_bin} \
          </dev/null >{log}.stderr 2>&1",
         codemuxd_bin = shell_quote(codemuxd_bin),
-        fake_bin = shell_quote(fake_bin),
+        fake_bin = shell_quote_path(&fake_bin),
         socket = shell_quote_path(socket_path),
         pid = shell_quote_path(pid_path),
         log = shell_quote_path(log_path),

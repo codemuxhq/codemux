@@ -87,7 +87,7 @@ use std::time::Duration;
 use serial_test::serial;
 use tempfile::TempDir;
 
-use common::{screen_eventually, send_keys, spawn_codemux_with_agent_bin};
+use common::{screen_eventually, send_keys, spawn_codemux_with_agent_bin, test_fake_bin};
 
 /// Boot codemux with `fake_agent_crashing` as the agent binary, spawn
 /// a second agent through the modal so the navigator has two live
@@ -134,8 +134,8 @@ fn prefix_d_dismisses_crashed_agent_and_is_noop_on_ready() {
         .expect("scratch tempdir path must be valid UTF-8");
     let config = format!("[spawn]\nscratch_dir = {scratch_path:?}\n");
 
-    let agent_bin = env!("CARGO_BIN_EXE_fake_agent_crashing");
-    let mut handle = spawn_codemux_with_agent_bin(agent_bin, &config);
+    let agent_bin = test_fake_bin("fake_agent_crashing");
+    let mut handle = spawn_codemux_with_agent_bin(&agent_bin, &config);
 
     // 1. Steady state: fake's prompt is on screen, no modal yet.
     screen_eventually(

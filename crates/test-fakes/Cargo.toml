@@ -1,0 +1,38 @@
+[package]
+name = "codemux-test-fakes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+description = "codemux test-fake binaries: stub agents for the slow-tier PTY E2E suite."
+
+# Intentionally NO `[package.metadata.dist] dist = true`. cargo-dist's
+# default is to only ship packages that opt-in; this crate stays out of
+# release artifacts (its bins exist purely to back the slow-tier PTY
+# tests in apps/tui/tests/pty_*.rs and apps/daemon/tests/proto_*.rs).
+# See AD-30.
+
+[[bin]]
+name = "fake_agent"
+path = "src/bin/fake_agent.rs"
+
+[[bin]]
+name = "fake_agent_crashing"
+path = "src/bin/fake_agent_crashing.rs"
+
+[[bin]]
+name = "fake_agent_with_url"
+path = "src/bin/fake_agent_with_url.rs"
+
+[[bin]]
+name = "fake_agent_with_history"
+path = "src/bin/fake_agent_with_history.rs"
+
+[[bin]]
+name = "fake_daemon_agent"
+path = "src/bin/fake_daemon_agent.rs"
+
+[lints]
+workspace = true

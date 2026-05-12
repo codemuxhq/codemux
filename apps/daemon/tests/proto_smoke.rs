@@ -26,9 +26,12 @@
 //!    that surface is verified by hand.
 //!
 //! Gating mirrors the TUI T3 smoke test:
-//! - `#![cfg(feature = "test-fakes")]` — the harness references
-//!   `env!("CARGO_BIN_EXE_fake_daemon_agent")` which only exists when
-//!   the feature compiles the fake binary.
+//! - `#![cfg(feature = "test-fakes")]` keeps the harness imports and
+//!   this test file out of a default `cargo test` compile. The fake
+//!   bin itself lives in `crates/test-fakes` (see AD-30) and is built
+//!   unconditionally whenever that crate compiles; the `just check-e2e`
+//!   recipe runs `cargo test --workspace ...` so the fake is on disk
+//!   before this test executes. See `tests/common/mod.rs::test_fake_bin`.
 //! - `#[ignore]` — slow-tier, runs via `just test-e2e` / `just
 //!   check-e2e`.
 //! - **No** `#[serial]`: each test owns its own `TempDir`-scoped
