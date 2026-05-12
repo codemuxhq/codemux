@@ -6,7 +6,7 @@ Personal tool. No external deadline. Lanes are independent — pick what hurts m
 
 | Lane | Up next | Note |
 |---|---|---|
-| [Foundations](#foundations) | [E2E test harness](plans/2026-05-10--e2e-testing.md) | — |
+| [Foundations](#foundations) | Build & deploy | E2E harness shipped; AC-028 deferred on AD-7 |
 | [Review workflow](#review-workflow) | Diff panel | Needs vision amendment (P5, AD-6) |
 | [Navigation](#navigation) | Vim keys everywhere | — |
 | [Sessions](#sessions) | Save & archive | — |
@@ -16,13 +16,13 @@ Personal tool. No external deadline. Lanes are independent — pick what hurts m
 
 ## Foundations
 
-- [E2E test harness over the AC index](plans/2026-05-10--e2e-testing.md)
+- ~~[E2E test harness over the AC index](plans/2026-05-10--e2e-testing.md)~~ — shipped (AC-028 deferred on AD-7)
 - Build & deploy: `codemux` / `codemuxd` binaries (crates.io, etc.)
 - Publish
 - CI setup
 - Persistence (AD-7) — agents survive app restart
 
-`next:` E2E test harness
+`next:` Build & deploy
 
 ## Review workflow
 
