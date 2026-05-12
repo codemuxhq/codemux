@@ -256,21 +256,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
-name = "codemux-daemon"
+name = "codemux-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
- "codemux-test-ssh-harness",
- "codemux-wire",
+ "codemux-session",
+ "codemux-shared-kernel",
+ "codemuxd-bootstrap",
  "color-eyre",
  "crossbeam-channel",
+ "crossterm",
+ "glob",
+ "ignore",
  "insta",
+ "nucleo-matcher",
  "portable-pty",
  "pretty_assertions",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.18",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "tui-term",
+ "unicode-width",
  "vt100",
 ]
 
@@ -303,42 +316,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "codemux-tui"
-version = "0.1.0"
-dependencies = [
- "base64",
- "clap",
- "codemux-session",
- "codemux-shared-kernel",
- "codemuxd-bootstrap",
- "color-eyre",
- "crossbeam-channel",
- "crossterm",
- "glob",
- "ignore",
- "insta",
- "nucleo-matcher",
- "portable-pty",
- "pretty_assertions",
- "ratatui",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tui-term",
- "unicode-width",
- "vt100",
-]
-
-[[package]]
 name = "codemux-wire"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "codemuxd"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "codemux-test-ssh-harness",
+ "codemux-wire",
+ "color-eyre",
+ "crossbeam-channel",
+ "insta",
+ "portable-pty",
+ "pretty_assertions",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "vt100",
 ]
 
 [[package]]

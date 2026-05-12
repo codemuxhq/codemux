@@ -6,7 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "codemux shared kernel: typed ID newtypes (HostId, AgentId, GroupId)."
+# Per-crate; not inherited from the workspace.
+keywords = ["codemux", "shared-kernel", "ddd", "ids"]
+categories = ["data-structures"]
 
 [dependencies]
 

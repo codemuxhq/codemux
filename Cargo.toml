@@ -16,22 +16,32 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT OR Apache-2.0"
-publish = false
+# Crates inherit `publish = true` by default. The two test-only crates
+# (`crates/test-fakes`, `crates/test-ssh-harness`) override with an
+# explicit `publish = false` in their own manifests. See AD-31.
+publish = true
 description = "Personal TUI multiplexer for coding-agent sessions across local and SSH hosts."
 homepage = "https://github.com/codemuxhq/codemux"
 repository = "https://github.com/codemuxhq/codemux"
 readme = "README.md"
+# `keywords` and `categories` are NOT inherited from the workspace by
+# Cargo (each `[package]` declares its own). The workspace-level
+# defaults below are kept as a reference; per-crate overrides live in
+# each `apps/*/Cargo.toml` and `crates/*/Cargo.toml`.
 keywords = ["tui", "multiplexer", "ssh", "claude", "ratatui"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-# Internal crates
-codemuxd-bootstrap = { path = "crates/codemuxd-bootstrap" }
-codemux-session = { path = "crates/session" }
-codemux-shared-kernel = { path = "crates/shared-kernel" }
-codemux-test-fakes = { path = "crates/test-fakes" }
-codemux-test-ssh-harness = { path = "crates/test-ssh-harness" }
-codemux-wire = { path = "crates/wire" }
+# Internal crates. Each carries an explicit `version` so `cargo publish`
+# can replace the path with a registry constraint when uploading. The
+# version stays in lock-step with `[workspace.package].version`; the
+# `release-tag` recipe in `justfile` rewrites both in one pass.
+codemuxd-bootstrap = { path = "crates/codemuxd-bootstrap", version = "0.1.0" }
+codemux-session = { path = "crates/session", version = "0.1.0" }
+codemux-shared-kernel = { path = "crates/shared-kernel", version = "0.1.0" }
+codemux-test-fakes = { path = "crates/test-fakes", version = "0.1.0" }
+codemux-test-ssh-harness = { path = "crates/test-ssh-harness", version = "0.1.0" }
+codemux-wire = { path = "crates/wire", version = "0.1.0" }
 
 # Error handling (AD-17)
 thiserror = "2.0.18"
@@ -134,7 +144,7 @@ cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
-installers = ["shell"]
+installers = ["shell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Which actions to run on pull requests
@@ -143,6 +153,12 @@ pr-run-mode = "plan"
 install-updater = false
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
+# A GitHub repo to push Homebrew formulas to
+tap = "codemuxhq/homebrew-tap"
+# Customize the Homebrew formula name
+formula = "codemux"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
 
 [workspace.metadata.dist.github-custom-runners.aarch64-unknown-linux-gnu]
 runner = "ubuntu-22.04"

@@ -69,7 +69,7 @@ use common::{screen_eventually, send_keys, spawn_codemux_with_config};
 ///
 /// **Positive signature:** `apps/tui` — the harness passes
 /// `std::env::current_dir()` as the codemux child's cwd, which for
-/// `cargo test -p codemux-tui` is the crate root `<repo>/apps/tui`. The
+/// `cargo test -p codemux-cli` is the crate root `<repo>/apps/tui`. The
 /// trailing `apps/tui` segment is unique to that path on this repo's
 /// filesystem and, with Popup chrome, can only appear in the modal's
 /// path zone.

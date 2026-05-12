@@ -1,0 +1,63 @@
+# Publish all non-test crates to crates.io on a tagged release.
+#
+# cargo-dist v0.31's `publish-jobs` only ships built-ins for `homebrew`
+# and `npm` -- there is no built-in `cargo` publisher in this version --
+# so the crates.io leg lives in this companion workflow. Triggered on
+# the same tag pattern as `release.yml` (`v*.*.*`), so a single
+# `git push origin vX.Y.Z` fans out to GitHub Releases (release.yml),
+# the Homebrew tap (release.yml's `publish-homebrew-formula` job), and
+# crates.io (this file).
+#
+# Order matters: each crate has to be on the registry before something
+# that depends on it can resolve. The sequence below is the topological
+# order of the workspace's internal dep graph (see AD-31).
+#
+# Gated on `CARGO_REGISTRY_TOKEN`. If the secret is missing the workflow
+# fails loudly; we deliberately do not silent-skip.
+
+name: Publish crates
+permissions:
+  "contents": "read"
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        # Honors `rust-toolchain.toml` at the repo root.
+        run: rustup show
+      - name: Verify CARGO_REGISTRY_TOKEN is set
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set; refusing to publish silently."
+            exit 1
+          fi
+      # Topologically ordered. `--no-verify` skips the local rebuild
+      # before upload (cargo's own `cargo publish` would re-pack and
+      # rebuild every crate; we already know they build because of the
+      # CI workflow gating tag pushes). Internal path-deps carry an
+      # explicit `version =` constraint in `[workspace.dependencies]`
+      # so the registry-resolved upload sees the right pin.
+      - name: Publish codemux-shared-kernel
+        run: cargo publish -p codemux-shared-kernel --no-verify
+      - name: Publish codemux-wire
+        run: cargo publish -p codemux-wire --no-verify
+      - name: Publish codemux-session
+        run: cargo publish -p codemux-session --no-verify
+      - name: Publish codemuxd-bootstrap
+        run: cargo publish -p codemuxd-bootstrap --no-verify
+      - name: Publish codemuxd
+        run: cargo publish -p codemuxd --no-verify
+      - name: Publish codemux-cli
+        run: cargo publish -p codemux-cli --no-verify

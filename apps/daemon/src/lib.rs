@@ -1,4 +1,4 @@
-//! `codemux-daemon` — host-side daemon (`codemuxd`) that owns a PTY across
+//! `codemuxd` — host-side daemon (`codemuxd`) that owns a PTY across
 //! SSH disconnects.
 //!
 //! Stage 0 (commit `8dbf805`): walking skeleton — listens on a unix

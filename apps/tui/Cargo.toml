@@ -1,19 +1,24 @@
 [package]
-name = "codemux-tui"
+name = "codemux-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "codemux: TUI multiplexer for coding-agent sessions."
+# Per-crate; Cargo does not inherit `keywords` / `categories` from the
+# workspace.
+keywords = ["tui", "multiplexer", "ssh", "claude", "agent"]
+categories = ["command-line-utilities"]
 
-# `publish = false` (inherited from the workspace) hides this crate
-# from `cargo publish`, but we still ship the `codemux` binary via
-# `dist`. The opt-in below tells `dist` to treat this package as
-# distable despite `publish = false`. The slow-tier-test fake bins
-# live in `crates/test-fakes/` (which has no dist opt-in), so dist
-# only sees `codemux` here. See AD-30.
+# `publish = true` (inherited from the workspace, see AD-31) means the
+# crate goes to crates.io. The opt-in below also tells `dist` to treat
+# this package as distable. The slow-tier-test fake bins live in
+# `crates/test-fakes/` (which has no dist opt-in), so dist only sees
+# `codemux` here. See AD-30 + AD-31.
 [package.metadata.dist]
 dist = true
 

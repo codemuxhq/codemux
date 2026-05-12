@@ -6,7 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "codemux session bounded context: agent lifecycle and AgentTransport."
+# Per-crate; not inherited from the workspace.
+keywords = ["codemux", "session", "agent", "pty", "lifecycle"]
+categories = ["data-structures"]
 
 [dependencies]
 codemux-shared-kernel.workspace = true
@@ -28,7 +33,7 @@ tempfile.workspace = true
 [features]
 # Exposes a no-op `AgentTransport::for_test` constructor that backs the
 # transport with a real local PTY running `cat`. Lets downstream crates
-# (e.g. `codemux-tui`) build a `RuntimeAgent` in unit tests without a
+# (e.g. `codemux-cli`) build a `RuntimeAgent` in unit tests without a
 # `claude` binary on PATH or a per-crate seam. Always off in release
 # builds; enabled via the TUI's `[dev-dependencies]`.
 test-util = []

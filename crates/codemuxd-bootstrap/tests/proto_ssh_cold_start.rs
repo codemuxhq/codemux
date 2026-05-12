@@ -48,7 +48,7 @@
 //! test-time by walking from `CARGO_MANIFEST_DIR` to the workspace
 //! target dir and constructing `<target>/<profile>/<bin>`. The
 //! binaries are produced as a side effect of
-//! `cargo test --workspace --features codemux-daemon/test-fakes,...`,
+//! `cargo test --workspace --features codemuxd/test-fakes,...`,
 //! which is what `just check-e2e` runs. Standalone
 //! `cargo test -p codemuxd-bootstrap -- --ignored` will fail loud
 //! with a "binary not found" message pointing at the exact path; the
@@ -437,7 +437,7 @@ fn proc_state_is_dead(pid: u32) -> bool {
 /// own build profile.
 ///
 /// The binaries are produced as a side effect of
-/// `cargo test --workspace --features codemux-daemon/test-fakes,...`
+/// `cargo test --workspace --features codemuxd/test-fakes,...`
 /// which is what `just check-e2e` runs. Standalone
 /// `cargo test -p codemuxd-bootstrap -- --ignored` won't have built
 /// the daemon binaries; the assertion below fails with a message
@@ -462,7 +462,7 @@ fn workspace_target_bin(bin: &str) -> PathBuf {
          The cold-start test resolves daemon binaries by walking from \
          CARGO_MANIFEST_DIR to the workspace target dir; the binaries \
          are produced as a side effect of `cargo test --workspace --features \
-         codemux-daemon/test-fakes,...`. Run `just check-e2e` (which sets \
+         codemuxd/test-fakes,...`. Run `just check-e2e` (which sets \
          the right features at the workspace level) instead of \
          `cargo test -p codemuxd-bootstrap` directly.",
         path.display(),

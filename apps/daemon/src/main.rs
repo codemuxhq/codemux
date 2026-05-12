@@ -3,7 +3,7 @@ use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use codemux_daemon::{Cli, Supervisor, bootstrap, fs_layout};
+use codemuxd::{Cli, Supervisor, bootstrap, fs_layout};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -22,13 +22,11 @@ fn main() -> Result<()> {
 /// without losing diagnostics — `setsid -f` (Stage 4) detaches us from
 /// the controlling terminal and stderr is no longer reachable.
 ///
-/// The default filter covers both the binary (target `codemuxd`) and the
-/// library (target `codemux_daemon::*`); listing both is necessary
-/// because `EnvFilter` matches at `::`-segment boundaries, so
-/// `codemuxd` does NOT cover `codemux_daemon`.
+/// The default filter covers both the binary and the library, both of
+/// which share the `codemuxd` target name post-AD-31 crate rename.
 fn init_tracing(cli: &Cli) -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("codemuxd=info,codemux_daemon=info,warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("codemuxd=info,warn"));
 
     if cli.foreground {
         fmt().with_env_filter(filter).with_target(false).init();

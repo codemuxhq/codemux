@@ -160,7 +160,7 @@ impl AgentTransport {
     }
 
     /// Build a transport backed by a real local PTY running `cat`. Test-only
-    /// seam so downstream crates (e.g. `codemux-tui`) can construct a
+    /// seam so downstream crates (e.g. `codemux-cli`) can construct a
     /// `RuntimeAgent` without a `claude` binary on PATH and without
     /// matching on `#[non_exhaustive]` `AgentTransport` from outside this
     /// crate. The `cat` child sits on its TTY waiting for input and is
@@ -1150,7 +1150,7 @@ mod tests {
 
     /// Hand-rolled in-process daemon for SSH transport tests. Plays
     /// just enough of the wire protocol for [`SshDaemonPty`]'s tests
-    /// to exercise their paths — we don't pull in a `codemux-daemon`
+    /// to exercise their paths — we don't pull in a `codemuxd`
     /// dev-dep because the workspace's allowed-edges policy
     /// (CLAUDE.md) keeps `crates/session` deliberately thin.
     struct FakeDaemon {

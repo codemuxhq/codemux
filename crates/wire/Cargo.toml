@@ -6,7 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "codemux wire protocol: message types between codemux and codemuxd."
+# Per-crate; not inherited from the workspace.
+keywords = ["codemux", "wire", "protocol", "ipc"]
+categories = ["network-programming", "encoding"]
 
 [dependencies]
 thiserror.workspace = true

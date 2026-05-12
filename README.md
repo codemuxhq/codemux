@@ -8,22 +8,26 @@ P1.3 in progress. Multi-agent local works with a config-driven keymap (`Ctrl-B ?
 
 ## Install
 
+### crates.io
+
+    cargo install codemux-cli      # installs `codemux` (TUI)
+    cargo install codemuxd         # installs `codemuxd` (daemon)
+
+### Homebrew
+
+    brew install codemuxhq/tap/codemux
+
 ### Shell installer (Linux, macOS)
 
-Latest release, both binaries (`codemux` + `codemuxd`):
+Latest release, both binaries:
 
     curl --proto '=https' --tlsv1.2 -LsSf \
       https://github.com/codemuxhq/codemux/releases/latest/download/codemux-installer.sh | sh
 
-The installer drops `codemux` and `codemuxd` into `$CARGO_HOME/bin` (or
-`~/.local/bin` if Cargo isn't installed). Re-run to upgrade.
-
 ### GitHub Releases
 
-Per-target tarballs are attached to every release at
-https://github.com/codemuxhq/codemux/releases. Targets shipped:
-linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64. Both binaries
-ship in lock step (see [AD-30](docs/004--architecture.md#ad-30--lock-step-versioning-deferred-wire-compat-github-releases-as-the-v0x-channel)).
+Per-target tarballs at https://github.com/codemuxhq/codemux/releases.
+Targets shipped: linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64.
 
 ### Build from source
 
@@ -34,6 +38,16 @@ Requires the toolchain pinned in `rust-toolchain.toml`.
 
 `claude` must be on PATH for the TUI to spawn agents. `Ctrl-B q` exits.
 `Ctrl-B ?` opens help.
+
+### Note on the crate name
+
+The bare `codemux` crate name on crates.io belongs to a different
+project ([jellydn/zed-codemux](https://github.com/jellydn/zed-codemux)),
+which is a Zed-terminal-side multiplexer. This project's crates are
+suffixed (`codemux-cli`, `codemuxd`); the binary names are unchanged
+(`codemux` and `codemuxd`). See
+[AD-31](docs/004--architecture.md#ad-31--publish-to-cratesio-and-homebrew-supersedes-ad-30-4)
+for the rationale.
 
 ## What it is
 

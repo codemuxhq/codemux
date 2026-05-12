@@ -70,7 +70,7 @@ Cargo workspace, edition 2024, resolver 3.
 codemux/
 ├── Cargo.toml                       # [workspace], deps, lints
 ├── apps/
-│   ├── tui/                         # crate: codemux-tui, binary: codemux
+│   ├── tui/                         # crate: codemux-cli, binary: codemux
 │   │   └── src/
 │   │       ├── main.rs              # argv, tracing init, runtime::run
 │   │       ├── runtime.rs           # event loop, key dispatch, render
@@ -84,7 +84,7 @@ codemux/
 │   │       ├── fuzzy_worker.rs      # nucleo-matcher scoring thread
 │   │       └── …                    # smaller workers (git_branch,
 │   │                                #  url_scan, toast, log_tail, …)
-│   └── daemon/                      # crate: codemux-daemon, binary: codemuxd
+│   └── daemon/                      # crate: codemuxd, binary: codemuxd
 │       └── src/
 │           ├── main.rs              # thin shell: parse cli, call lib
 │           ├── lib.rs               # supervisor entry (in-process testable)
@@ -293,7 +293,8 @@ for the "no local daemon, one minimal remote daemon" framing.
 | 27 | Tab affordances on the captured mouse stream                       | Accepted                            |
 | 28 | Wire encoder vs readline-shortcut adapter (split layers)           | Accepted                            |
 | 29 | Status-bar segments are a closed set of built-ins, selected by config | Accepted                         |
-| 30 | Lock-step versioning, deferred wire-compat, GitHub Releases as the v0.x channel | Accepted                |
+| 30 | Lock-step versioning, deferred wire-compat, GitHub Releases as the v0.x channel | Accepted (amended)      |
+| 31 | Publish to crates.io and Homebrew (supersedes AD-30 §4)            | Accepted                            |
 
 Numbering gaps (4, 9) are intentional. Those slots were used for ideas
 that were absorbed into other ADs before being written up. Renumbering
@@ -675,8 +676,8 @@ crate, not five.
 technology. A future `apps/phone-view/` becomes a sibling without
 renaming anything.
 
-**Decision.** `apps/tui/` ships crate `codemux-tui`, binary `codemux`.
-`apps/daemon/` ships crate `codemux-daemon`, binary `codemuxd`. Each is
+**Decision.** `apps/tui/` ships crate `codemux-cli`, binary `codemux`.
+`apps/daemon/` ships crate `codemuxd`, binary `codemuxd`. Each is
 a thin shell over a library entry point: `apps/daemon/src/lib.rs` is
 the supervisor entry, `apps/daemon/src/main.rs` is one function that
 parses argv and calls into the lib. This makes integration tests
@@ -1322,7 +1323,7 @@ amended prose for the bounded-exception scope.
 
 ### AD-30 — Lock-step versioning, deferred wire-compat, GitHub Releases as the v0.x channel
 
-**Status:** Accepted.
+**Status:** Accepted (amended 2026-05-11); §4 superseded by [AD-31](#ad-31--publish-to-cratesio-and-homebrew-supersedes-ad-30-4).
 
 **Context.** v0.1.0 ships two binaries — `codemux` (TUI) and `codemuxd`
 (per-host daemon, [AD-3](#ad-3--remote-pty-container-is-codemuxd-behind-an-agenttransport-enum))
@@ -1376,7 +1377,7 @@ the matching daemon, no shimming."
    requires a version line in the description ("bump to v0.2.0" or
    "no bump, internal only").
 
-4. **GitHub Releases is the v0.x distribution channel.** `cargo-dist`
+4. **GitHub Releases is the v0.x distribution channel.** *(Superseded by AD-31, 2026-05-11. Original deferral text retained for context.)* `cargo-dist`
    (axodotdev/cargo-dist, "dist" rebrand) builds and publishes per-target
    tarballs and a `curl|sh` shell installer to GitHub Releases on every
    tagged push. crates.io publish is deferred — every crate keeps
@@ -1412,6 +1413,83 @@ in lock step is bookkeeping, not a contract.
 The same applies to `crates/test-fakes`, which exists solely to back the
 slow-tier PTY/proto E2E tests; its bins are not shipped (no
 `[package.metadata.dist] dist = true`).
+
+---
+
+### AD-31 — Publish to crates.io and Homebrew (supersedes AD-30 §4)
+
+**Status:** Accepted (2026-05-11). Supersedes [AD-30](#ad-30--lock-step-versioning-deferred-wire-compat-github-releases-as-the-v0x-channel) §4.
+
+**Context.** AD-30 §4 deferred crates.io and Homebrew on the rationale
+that no users were asking and pre-alpha API churn on crates.io would be
+annoying. The deferral was the conservative call at the time. Going
+public on the codemux repo flips both halves of that calculus: the
+project becomes discoverable (name-reservation cost is cheap insurance),
+and the install path needs to be the path users in this ecosystem
+already reach for (`cargo install` for Rust folks, `brew install` for
+macOS).
+
+**Decision.**
+
+1. **Publish all non-test crates to crates.io on every tagged release.**
+   - Library crates: `codemux-shared-kernel`, `codemux-wire`,
+     `codemux-session`, `codemuxd-bootstrap`.
+   - Binary crates: `codemux-cli` (binary `codemux`), `codemuxd`
+     (binary `codemuxd`).
+   - Test infrastructure stays `publish = false`: `codemux-test-fakes`,
+     `codemux-test-ssh-harness`.
+   - cargo-dist's `publish-jobs = ["homebrew"]` orchestrates the
+     Homebrew tap publish; crates.io publication is driven by each
+     crate's `publish = true` flag (default Cargo behavior) on every
+     `v*.*.*` tag push, gated on `CARGO_REGISTRY_TOKEN`.
+
+2. **Crate-name disambiguation: `codemux-cli` and `codemuxd`.** The bare
+   `codemux` name on crates.io was registered 2026-05-02 by `jellydn`
+   for `zed-codemux` (an unrelated Zed-terminal multiplexer). We suffix
+   the TUI crate as `codemux-cli` (Rust-ecosystem convention when a
+   bare name is taken: `gh-cli`, `hyperfine-cli`, etc.); the daemon
+   crate takes the bare available `codemuxd`. Binary names stay
+   `codemux` and `codemuxd` (Cargo doesn't enforce binary-name
+   uniqueness on crates.io). Users `cargo install codemux-cli` and
+   `cargo install codemuxd`.
+
+3. **Homebrew tap at `codemuxhq/homebrew-tap`.** cargo-dist
+   auto-generates a `Formula/codemux.rb` from each release and pushes
+   it to the tap repo on every tagged release, gated on
+   `HOMEBREW_TAP_TOKEN`. Users `brew install codemuxhq/tap/codemux`
+   (Homebrew core stays out of scope — the tap is the user-controlled
+   namespace).
+
+**Consequences.**
+- Crate names on crates.io are reserved permanently (yank-only, not
+  delete-able). The disambiguation above is therefore a forever
+  decision.
+- Each tagged release auto-publishes to all three channels (GitHub
+  Releases, crates.io, Homebrew tap). Failure on any channel must
+  surface loudly, not silently fall back.
+- The wire-compat deferral (AD-30 §2) gets sharper: a v0.x bump now
+  publishes a new `codemux-wire` to crates.io. Anyone depending on it
+  externally (we don't expect any pre-1.0) inherits the no-compat
+  guarantee.
+- Two new GitHub Actions secrets (`CARGO_REGISTRY_TOKEN`,
+  `HOMEBREW_TAP_TOKEN`) become load-bearing. Their absence breaks the
+  release pipeline; document this in any contributor onboarding.
+
+**Rejected alternatives.**
+- *Stick with AD-30 §4 (GitHub Releases only).* The original case was
+  "no users yet, deferred channels are cheap." Going public flips
+  that: channel surface is now an asset, not a maintenance tax.
+- *Bare `codemux` crate name (somehow get jellydn to transfer).* Not
+  realistic for two real projects sharing the name; the suffixed names
+  are the honest answer.
+- *Homebrew core (PR a formula upstream).* Homebrew core requires
+  notability metrics and is gatekept; a self-managed tap is the
+  correct shape for v0.x and almost certainly forever for a personal
+  tool.
+
+**Carve-outs.** AD-30 §1, §2, §3 (lock-step versioning, deferred
+wire-compat, `crates/wire` as the shared-kernel trigger) are unchanged.
+This ADR supersedes only §4.
 
 ---
 

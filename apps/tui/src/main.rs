@@ -236,7 +236,7 @@ fn init_tracing(tail: &log_tail::LogTail) -> Result<()> {
         .open(&path)
         .wrap_err_with(|| format!("open log file {}", path.display()))?;
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("codemux=info,codemux_tui=info,warn"));
+        .unwrap_or_else(|_| EnvFilter::new("codemux=info,codemux_cli=info,warn"));
     let file_layer = fmt::layer()
         .with_writer(Mutex::new(file))
         .with_ansi(false)
