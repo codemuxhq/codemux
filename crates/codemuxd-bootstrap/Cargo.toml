@@ -34,6 +34,12 @@ tracing.workspace = true
 # (`miniz_oxide`) so the build does not need any system libraries.
 tar = "0.4"
 flate2 = "1.0"
+# Format-preserving TOML editor. Used by `build/manifest_filter.rs`
+# to strip `[dev-dependencies]` tables from `apps/daemon/Cargo.toml`
+# as it lands in the bootstrap tarball — see that file for rationale.
+# Pinned to the same minor as the workspace's `toml` to keep the
+# parser families in lockstep.
+toml_edit = "0.25.11"
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -42,6 +48,10 @@ tempfile.workspace = true
 # Cargo doesn't share those with `cfg(test)` — re-declare here.
 tar = "0.4"
 flate2 = "1.0"
+# `tests/manifest_filter.rs` `#[path]`-includes `build/manifest_filter.rs`,
+# which depends on toml_edit. Mirrors the `[build-dependencies]` entry
+# above so the integration-test binary can compile the same helper.
+toml_edit = "0.25.11"
 # Drift check: the manifest-consistency test parses both the parent
 # workspace's `Cargo.toml` and `bootstrap-root/Cargo.toml` to verify
 # every `workspace = true` dep the daemon uses is mirrored on the

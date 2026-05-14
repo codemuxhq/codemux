@@ -19,6 +19,14 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+// Build-time helper shared with `tests/manifest_filter.rs` via the
+// same `#[path]` include. Kept outside `src/` so the lib's
+// compilation graph is not polluted with build-only code (the lib
+// never calls these helpers; a `src/`-resident copy would emit
+// `dead_code` warnings on every non-test build).
+#[path = "build/manifest_filter.rs"]
+mod manifest_filter;
+
 type DynError = Box<dyn std::error::Error>;
 
 fn main() -> Result<(), DynError> {
@@ -71,6 +79,7 @@ fn main() -> Result<(), DynError> {
     println!("cargo:rerun-if-changed={}", cargo_lock.display());
     println!("cargo:rerun-if-changed={}", toolchain.display());
     println!("cargo:rerun-if-changed={}", bootstrap_root.display());
+    println!("cargo:rerun-if-changed=build/manifest_filter.rs");
 
     Ok(())
 }
@@ -79,6 +88,13 @@ fn main() -> Result<(), DynError> {
 /// rooted at `dst_prefix`. Skips dot-directories (e.g. `.git`,
 /// `.vscode`) and any `target` build dir if one happens to live inside
 /// the tree — neither belongs in the bootstrap.
+///
+/// Any `Cargo.toml` encountered is filtered through
+/// `manifest_filter::strip_dev_deps` before being added. The
+/// bootstrap-root workspace deliberately ships only the production-
+/// dep subset (see `bootstrap-root/Cargo.toml`), so a
+/// `[dev-dependencies]` block that inherits from the live workspace
+/// would fail to resolve on the remote.
 fn bundle_dir<W: Write>(
     tar: &mut tar::Builder<W>,
     src: &Path,
@@ -87,7 +103,19 @@ fn bundle_dir<W: Write>(
     walk(src, &mut |path, rel| {
         let rel_str = rel.to_str().ok_or("non-utf8 path in source tree")?;
         let dst = format!("{dst_prefix}/{rel_str}");
-        tar.append_path_with_name(path, &dst)?;
+        if rel.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml") {
+            let raw = fs::read_to_string(path)?;
+            let stripped = manifest_filter::strip_dev_deps(&raw)?;
+            let bytes = stripped.as_bytes();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            tar.append_data(&mut header, &dst, bytes)?;
+        } else {
+            tar.append_path_with_name(path, &dst)?;
+        }
         Ok(())
     })
 }

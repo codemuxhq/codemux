@@ -35,11 +35,14 @@ members = [
 ]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
-license = "UNLICENSED"
+license = "MIT OR Apache-2.0"
 publish = false
 repository = "https://github.com/codemuxhq/codemux"
+homepage = "https://github.com/codemuxhq/codemux"
+readme = "README.md"
 
 [workspace.dependencies]
 codemux-wire = { path = "crates/wire" }
