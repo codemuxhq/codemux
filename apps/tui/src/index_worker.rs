@@ -17,8 +17,9 @@
 //! rebuild via the `RefreshIndex` keybind (default `ctrl+r`) when the
 //! user creates a new directory mid-session.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -113,8 +114,28 @@ pub enum IndexError {
     /// Every configured root failed to open (e.g. nonexistent
     /// directories, permission denied). Carries one entry per failed
     /// root with a human-readable cause.
-    #[error("no usable search roots ({} failures)", _0.len())]
+    #[error("{}", format_no_roots(_0))]
     NoRoots(Vec<RootFailure>),
+}
+
+/// Build the user-facing message for [`IndexError::NoRoots`]. Surfaces
+/// the first failure's reason because that's what the wildmenu actually
+/// shows the user — without it the message reads as a generic
+/// "no usable search roots (N failures)" and the real cause (e.g. an
+/// ssh exit-status line) only lives in debug logs. Multi-root setups
+/// hint at extra failures with a `; +N more` suffix so the user knows
+/// to check logs for the rest.
+fn format_no_roots(failures: &[RootFailure]) -> String {
+    let Some(first) = failures.first() else {
+        return "no usable search roots".to_string();
+    };
+    let extra = failures.len().saturating_sub(1);
+    let suffix = if extra == 0 {
+        String::new()
+    } else {
+        format!("; +{extra} more")
+    };
+    format!("no usable search roots: {}{suffix}", first.reason)
 }
 
 /// One root that the walker couldn't usefully process. Named struct
@@ -123,9 +144,11 @@ pub enum IndexError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RootFailure {
     pub path: PathBuf,
-    /// Always a static literal in current code; widened type would be
-    /// `Cow<'static, str>` if a dynamic reason ever lands.
-    pub reason: &'static str,
+    /// Carried as `Cow` so static reasons (`"path does not exist"`,
+    /// `"ssh spawn failed"`) stay zero-alloc while dynamic ones (e.g.
+    /// captured ssh stderr) can be attached without copying through
+    /// a `String` field everywhere.
+    pub reason: Cow<'static, str>,
 }
 
 /// Per-host metadata the runtime needs to persist a completed walk
@@ -340,7 +363,7 @@ fn run_index_walk(
         if !root.exists() {
             state.failures.push(RootFailure {
                 path: root.clone(),
-                reason: "path does not exist",
+                reason: Cow::Borrowed("path does not exist"),
             });
             continue;
         }
@@ -413,7 +436,7 @@ struct LocalWalkState {
 /// truncated the index or the user cancelled the build.
 enum LocalRootOutcome {
     Succeeded,
-    FailedWithReason(&'static str),
+    FailedWithReason(Cow<'static, str>),
     HitCap,
     Canceled,
 }
@@ -490,7 +513,7 @@ fn walk_one_local_root(
     if root_succeeded {
         LocalRootOutcome::Succeeded
     } else {
-        LocalRootOutcome::FailedWithReason("no readable entries")
+        LocalRootOutcome::FailedWithReason(Cow::Borrowed("no readable entries"))
     }
 }
 
@@ -702,14 +725,14 @@ struct RemoteWalkState {
 /// truncated the index at [`MAX_INDEX_ENTRIES`].
 enum RootOutcome {
     Succeeded,
-    FailedWithReason(&'static str),
+    FailedWithReason(Cow<'static, str>),
     HitCap,
 }
 
 /// Walk one remote root: spawn ssh+find, stream stdout, classify each
 /// line, and update `state` in place. Returns the per-root outcome
 /// for the caller's success/failure tally.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn walk_one_remote_root(
     host: &str,
     socket: &Path,
@@ -720,7 +743,9 @@ fn walk_one_remote_root(
     state: &mut RemoteWalkState,
 ) -> RootOutcome {
     let Some(find_cmd) = build_remote_find_cmd(root, markers) else {
-        return RootOutcome::FailedWithReason("unsafe path or marker (rejected pre-shell)");
+        return RootOutcome::FailedWithReason(Cow::Borrowed(
+            "unsafe path or marker (rejected pre-shell)",
+        ));
     };
     tracing::debug!(host, root = %root.display(), "remote fuzzy index: starting walk");
     let socket_str = socket.to_string_lossy().into_owned();
@@ -736,18 +761,26 @@ fn walk_one_remote_root(
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Piped (not `Stdio::null`) so a failed ssh ("Connection
+        // closed by UNKNOWN port 65535", "Permission denied
+        // (publickey)", "Control socket connect: No such file…")
+        // can be surfaced in the wildmenu instead of being collapsed
+        // into a generic "no readable entries". Drained on a helper
+        // thread so a chatty stderr can't deadlock against the
+        // stdout reader. See [`drain_stderr`] for the size cap.
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(error = %e, "remote fuzzy index: ssh spawn failed");
-            return RootOutcome::FailedWithReason("ssh spawn failed");
+            return RootOutcome::FailedWithReason(Cow::Borrowed("ssh spawn failed"));
         }
     };
     let Some(stdout) = child.stdout.take() else {
-        return RootOutcome::FailedWithReason("ssh stdout missing");
+        return RootOutcome::FailedWithReason(Cow::Borrowed("ssh stdout missing"));
     };
+    let stderr_handle = child.stderr.take().map(drain_stderr);
     let reader = BufReader::new(stdout);
     let mut root_succeeded = false;
     let mut hit_cap = false;
@@ -790,10 +823,14 @@ fn walk_one_remote_root(
         }
     }
     let status = child.wait();
+    let stderr_tail = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
     if !matches!(&status, Ok(s) if s.success()) {
         tracing::debug!(
             host,
             status = ?status,
+            stderr = %stderr_tail,
             "remote fuzzy index: find exited non-zero (results so far kept)",
         );
     }
@@ -813,8 +850,57 @@ fn walk_one_remote_root(
     } else if root_succeeded {
         RootOutcome::Succeeded
     } else {
-        RootOutcome::FailedWithReason("no readable entries")
+        RootOutcome::FailedWithReason(no_entries_reason(
+            status.ok().and_then(|s| s.code()),
+            &stderr_tail,
+        ))
     }
+}
+
+/// Compose the failure reason for a remote root that emitted zero
+/// entries. ssh's exit status by itself is uninformative (255 means
+/// "ssh died for any reason"), so we prefer the first line of stderr
+/// when present — that's where openssh writes the actually useful
+/// message ("Connection closed by UNKNOWN port 65535", "Permission
+/// denied (publickey)", "Control socket connect(...): No such file or
+/// directory"). Falls back to "ssh exit N" when stderr was empty
+/// (typical for a healthy connection that just returned no matches —
+/// e.g. an empty search root), and to the generic literal as a last
+/// resort.
+fn no_entries_reason(exit_code: Option<i32>, stderr_tail: &str) -> Cow<'static, str> {
+    let first_line = stderr_tail.lines().map(str::trim).find(|l| !l.is_empty());
+    match (first_line, exit_code) {
+        (Some(line), Some(code)) => Cow::Owned(format!("ssh exit {code}: {line}")),
+        (Some(line), None) => Cow::Owned(format!("ssh: {line}")),
+        (None, Some(code)) if code != 0 => Cow::Owned(format!("ssh exit {code} (no stderr)")),
+        _ => Cow::Borrowed("no readable entries"),
+    }
+}
+
+/// Spawn a helper thread that drains the child ssh's stderr into a
+/// bounded `String`. Bounded because a single misbehaving remote can
+/// otherwise flood us — openssh's worst-case is one error line, but
+/// the find subprocess could in theory dump kilobytes of permission-
+/// denied noise (we redirect `find`'s stderr to `/dev/null` inside the
+/// shell command, so that doesn't reach us; the cap is belt-and-
+/// suspenders). 4 KiB is enough to surface the first openssh error
+/// line plus a small amount of context.
+fn drain_stderr(mut stderr: std::process::ChildStderr) -> thread::JoinHandle<String> {
+    const CAP: usize = 4096;
+    thread::spawn(move || {
+        let mut buf = Vec::with_capacity(256);
+        let mut chunk = [0u8; 256];
+        while buf.len() < CAP {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let take = n.min(CAP - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
 }
 
 /// Convert the accumulated path list into classified [`IndexedDir`]
@@ -1319,9 +1405,79 @@ mod tests {
         match result {
             Err(IndexError::NoRoots(failures)) => {
                 assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].reason, Cow::Borrowed("path does not exist"));
             }
             other => panic!("expected NoRoots, got {other:?}"),
         }
+    }
+
+    /// The wildmenu surfaces `IndexError::NoRoots` verbatim, so the
+    /// Display impl is what the user actually sees. Guard the fact that
+    /// the first failure's reason makes it into the message — without
+    /// this the user just gets "no usable search roots" and has no way
+    /// to tell whether ssh died, find errored, or the root was empty.
+    #[test]
+    fn no_roots_display_surfaces_first_failure_reason() {
+        let err = IndexError::NoRoots(vec![RootFailure {
+            path: PathBuf::from("/home/u"),
+            reason: Cow::Borrowed("ssh exit 255: Connection closed by UNKNOWN port 65535"),
+        }]);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Connection closed by UNKNOWN"),
+            "expected the ssh stderr line in the message, got: {msg}",
+        );
+        assert!(
+            !msg.contains("more"),
+            "single-failure case must not include the `+N more` suffix"
+        );
+    }
+
+    #[test]
+    fn no_roots_display_hints_at_extra_failures() {
+        let err = IndexError::NoRoots(vec![
+            RootFailure {
+                path: PathBuf::from("/a"),
+                reason: Cow::Borrowed("path does not exist"),
+            },
+            RootFailure {
+                path: PathBuf::from("/b"),
+                reason: Cow::Borrowed("no readable entries"),
+            },
+        ]);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("+1 more"),
+            "expected `+1 more` suffix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn no_entries_reason_prefers_stderr_over_exit_code() {
+        let reason = no_entries_reason(
+            Some(255),
+            "ssh: connect to host bogus port 22: Connection refused\n",
+        );
+        assert!(reason.contains("ssh exit 255"), "got: {reason}");
+        assert!(reason.contains("Connection refused"), "got: {reason}");
+    }
+
+    #[test]
+    fn no_entries_reason_falls_back_to_exit_code_when_stderr_empty() {
+        let reason = no_entries_reason(Some(255), "");
+        assert_eq!(
+            reason,
+            Cow::<'static, str>::Owned("ssh exit 255 (no stderr)".into())
+        );
+    }
+
+    #[test]
+    fn no_entries_reason_falls_back_to_generic_on_zero_exit_and_empty_stderr() {
+        // The genuinely-empty-search-root case: ssh ran, find ran,
+        // both exited 0, nothing on stderr, just no directories
+        // matched. "no readable entries" is the right user message.
+        let reason = no_entries_reason(Some(0), "");
+        assert_eq!(reason, Cow::Borrowed("no readable entries"));
     }
 
     #[test]
