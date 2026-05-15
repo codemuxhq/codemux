@@ -334,6 +334,12 @@ impl WireClient {
             rows,
             cols,
             agent_id: agent_id.to_string(),
+            // AD-2 fields stay empty in the slow-tier E2E harness: the
+            // tests target wire-protocol and PTY-byte semantics, not
+            // the claude argv shape. Production callers always populate
+            // these via `runtime::build_claude_args`.
+            session_id: String::new(),
+            resume_session_id: None,
         };
         let hello_bytes = hello.encode().expect("encode Hello");
         stream.write_all(&hello_bytes).expect("write Hello");

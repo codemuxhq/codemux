@@ -132,6 +132,8 @@ fn cold_start_walks_every_stage_through_real_sshd_and_handshake_completes() {
         local_socket_dir: local_socket_dir.path().to_path_buf(),
         rows: 24,
         cols: 80,
+        session_id: String::new(),
+        resume_session_id: None,
     };
     let transport =
         attach_agent(&runner, &cb, &prepared, &cfg).expect("attach_agent over real sshd");
@@ -193,6 +195,8 @@ fn warm_start_skips_install_stages_when_remote_version_marker_matches() {
         local_socket_dir: local_socket_dir.path().to_path_buf(),
         rows: 24,
         cols: 80,
+        session_id: String::new(),
+        resume_session_id: None,
     };
     let first =
         attach_agent(&runner, |_| {}, &prepared, &cfg).expect("attach_agent on cold remote");

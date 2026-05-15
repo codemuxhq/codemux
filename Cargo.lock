@@ -295,6 +295,7 @@ dependencies = [
  "tracing-subscriber",
  "tui-term",
  "unicode-width",
+ "uuid",
  "vt100",
 ]
 
@@ -361,6 +362,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vt100",
 ]
 

@@ -32,11 +32,24 @@ pub enum Message {
     /// Client → daemon. First frame after connect; carries the version
     /// the client speaks plus the initial PTY geometry and the agent
     /// identifier the client wants to attach to.
+    ///
+    /// `session_id` and `resume_session_id` were added for AD-2
+    /// resume-on-focus. The wire layer treats them as opaque text — the
+    /// daemon's argv builder turns them into `--session-id <uuid>` /
+    /// `--resume <uuid>`, the literals never appear in this crate. Empty
+    /// `session_id` means "this client does not care to pin a session
+    /// id" (older clients before the AD-2 work, or test harnesses that
+    /// only exercise the framing); the daemon falls back to whichever
+    /// argv it was started with in that case. `resume_session_id =
+    /// Some(...)` is the resume-attempt marker — the daemon spawns
+    /// `claude --resume <id>` instead of fresh.
     Hello {
         protocol_version: u8,
         rows: u16,
         cols: u16,
         agent_id: String,
+        session_id: String,
+        resume_session_id: Option<String>,
     },
     /// Daemon → client, in response to `Hello`. Confirms the daemon
     /// speaks a compatible version and returns its pid (useful for
@@ -211,18 +224,27 @@ impl Message {
                 rows,
                 cols,
                 agent_id,
+                session_id,
+                resume_session_id,
             } => {
                 out.push(*protocol_version);
                 out.extend_from_slice(&rows.to_be_bytes());
                 out.extend_from_slice(&cols.to_be_bytes());
-                let id_bytes = agent_id.as_bytes();
-                // Cast: agent_id is bounded by MAX_FRAME_LEN minus header
-                // bytes; encode_to rolls back if the total exceeds
-                // MAX_FRAME_LEN, so this u32 cast is safe in practice.
-                #[allow(clippy::cast_possible_truncation)]
-                let id_len = id_bytes.len() as u32;
-                out.extend_from_slice(&id_len.to_be_bytes());
-                out.extend_from_slice(id_bytes);
+                // Length-prefixed UTF-8 string. Order matters: any new
+                // string field is appended AFTER the existing ones so
+                // older encode paths (which omit them) decode as empty
+                // / absent under the additive-field rule.
+                encode_lp_string(out, agent_id);
+                encode_lp_string(out, session_id);
+                // resume_session_id is optional. 1-byte tag: 0 = None,
+                // 1 = Some(<lp-string>).
+                match resume_session_id {
+                    None => out.push(0),
+                    Some(id) => {
+                        out.push(1);
+                        encode_lp_string(out, id);
+                    }
+                }
             }
             Self::HelloAck {
                 protocol_version,
@@ -315,8 +337,11 @@ fn decode_payload(tag: u8, payload: &[u8]) -> Result<Message, Error> {
 }
 
 fn decode_hello(payload: &[u8]) -> Result<Message, Error> {
-    // Fixed prefix: 1 (version) + 2 (rows) + 2 (cols) + 4 (agent_id_len) = 9
-    const FIXED: usize = 9;
+    // Fixed prefix: 1 (version) + 2 (rows) + 2 (cols) = 5; the trailing
+    // length-prefixed strings (agent_id, session_id) and the optional
+    // resume tag are decoded incrementally below so the post-AD-2 wire
+    // layout can grow without renumbering this constant.
+    const FIXED: usize = 5;
     if payload.len() < FIXED {
         return Err(Error::PayloadTooShort {
             message_type: "Hello",
@@ -327,23 +352,103 @@ fn decode_hello(payload: &[u8]) -> Result<Message, Error> {
     let protocol_version = payload[0];
     let rows = u16::from_be_bytes([payload[1], payload[2]]);
     let cols = u16::from_be_bytes([payload[3], payload[4]]);
-    let id_len = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
-    let id_bytes = &payload[FIXED..];
-    if id_len != id_bytes.len() {
+
+    let mut cursor = FIXED;
+    let agent_id = decode_lp_string(payload, &mut cursor, "agent_id")?;
+    let session_id = decode_lp_string(payload, &mut cursor, "session_id")?;
+    let resume_session_id = decode_optional_lp_string(payload, &mut cursor, "resume_session_id")?;
+    if cursor != payload.len() {
         return Err(Error::PayloadLengthMismatch {
-            claimed: id_len,
-            available: id_bytes.len(),
+            claimed: cursor,
+            available: payload.len(),
         });
     }
-    let agent_id = std::str::from_utf8(id_bytes)
-        .map_err(|_| Error::InvalidUtf8 { field: "agent_id" })?
-        .to_string();
     Ok(Message::Hello {
         protocol_version,
         rows,
         cols,
         agent_id,
+        session_id,
+        resume_session_id,
     })
+}
+
+/// Append a 4-byte length prefix followed by the string's UTF-8 bytes.
+/// Used by [`Message::Hello`] for `agent_id`, `session_id`, and the
+/// `Some(_)` arm of `resume_session_id`. Keeping the helper local to
+/// this module so the wire-layout invariants stay co-located with the
+/// matching decode helper below.
+fn encode_lp_string(out: &mut Vec<u8>, s: &str) {
+    let bytes = s.as_bytes();
+    // Cast: any string carried in a Hello frame is bounded by
+    // MAX_FRAME_LEN minus header bytes; encode_to rolls back the buffer
+    // if the total exceeds MAX_FRAME_LEN, so this u32 cast is safe in
+    // practice.
+    #[allow(clippy::cast_possible_truncation)]
+    let len = bytes.len() as u32;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// Read a `u32` length prefix and the following UTF-8 bytes from
+/// `payload` at `*cursor`, advancing the cursor past the consumed
+/// bytes. `field` names the field for the [`Error::InvalidUtf8`]
+/// variant — pinned `&'static str` so the error type stays cheap to
+/// construct in hot paths.
+fn decode_lp_string(
+    payload: &[u8],
+    cursor: &mut usize,
+    field: &'static str,
+) -> Result<String, Error> {
+    if payload.len() < *cursor + 4 {
+        return Err(Error::PayloadTooShort {
+            message_type: "Hello",
+            have: payload.len(),
+            need: *cursor + 4,
+        });
+    }
+    let len = u32::from_be_bytes([
+        payload[*cursor],
+        payload[*cursor + 1],
+        payload[*cursor + 2],
+        payload[*cursor + 3],
+    ]) as usize;
+    *cursor += 4;
+    if payload.len() < *cursor + len {
+        return Err(Error::PayloadLengthMismatch {
+            claimed: *cursor + len,
+            available: payload.len(),
+        });
+    }
+    let s = std::str::from_utf8(&payload[*cursor..*cursor + len])
+        .map_err(|_| Error::InvalidUtf8 { field })?
+        .to_string();
+    *cursor += len;
+    Ok(s)
+}
+
+/// Read a 1-byte tag (0 = None, 1 = Some) and conditionally a
+/// length-prefixed UTF-8 string. Mirrors the optional-string protocol
+/// pattern used by the AD-2 fields on [`Message::Hello`].
+fn decode_optional_lp_string(
+    payload: &[u8],
+    cursor: &mut usize,
+    field: &'static str,
+) -> Result<Option<String>, Error> {
+    if payload.len() < *cursor + 1 {
+        return Err(Error::PayloadTooShort {
+            message_type: "Hello",
+            have: payload.len(),
+            need: *cursor + 1,
+        });
+    }
+    let tag = payload[*cursor];
+    *cursor += 1;
+    match tag {
+        0 => Ok(None),
+        1 => Ok(Some(decode_lp_string(payload, cursor, field)?)),
+        other => Err(Error::UnknownMessageTag { tag: other }),
+    }
 }
 
 fn decode_hello_ack(payload: &[u8]) -> Result<Message, Error> {
@@ -466,6 +571,8 @@ mod tests {
             rows: 24,
             cols: 80,
             agent_id: "agent-abc-123".into(),
+            session_id: "8e3c7632-f5ad-4e8c-bcbf-960c4a7d7c7d".into(),
+            resume_session_id: None,
         })
     }
 
@@ -476,6 +583,23 @@ mod tests {
             rows: 24,
             cols: 80,
             agent_id: String::new(),
+            session_id: String::new(),
+            resume_session_id: None,
+        })
+    }
+
+    /// AD-2: the resume-on-focus path encodes `resume_session_id =
+    /// Some(<uuid>)`. The wire layer treats it as opaque text; this
+    /// just exercises the `Some` arm of the optional-string codec.
+    #[test]
+    fn roundtrip_hello_with_resume_session_id() -> Result<(), Error> {
+        roundtrip(&Message::Hello {
+            protocol_version: 1,
+            rows: 24,
+            cols: 80,
+            agent_id: "agent-1".into(),
+            session_id: "8e3c7632-f5ad-4e8c-bcbf-960c4a7d7c7d".into(),
+            resume_session_id: Some("8e3c7632-f5ad-4e8c-bcbf-960c4a7d7c7d".into()),
         })
     }
 
@@ -567,6 +691,8 @@ mod tests {
             rows: 24,
             cols: 80,
             agent_id: "abc".into(),
+            session_id: String::new(),
+            resume_session_id: None,
         }
         .encode()?;
         for n in 4..bytes.len() {
@@ -657,7 +783,11 @@ mod tests {
 
     #[test]
     fn non_utf8_agent_id_errors() {
-        let inner_len: u32 = 1 + 1 + 2 + 2 + 4 + 2;
+        // Inner len: tag(1) + version(1) + rows(2) + cols(2)
+        //          + agent_id_len(4) + agent_id_bytes(2)
+        //          + session_id_len(4) + session_id_bytes(0)
+        //          + resume_tag(1)
+        let inner_len: u32 = 1 + 1 + 2 + 2 + 4 + 2 + 4 + 1;
         let mut buf = inner_len.to_be_bytes().to_vec();
         buf.push(0x01);
         buf.push(1);
@@ -665,6 +795,10 @@ mod tests {
         buf.extend_from_slice(&80u16.to_be_bytes());
         buf.extend_from_slice(&2u32.to_be_bytes());
         buf.extend_from_slice(&[0xC3, 0x28]);
+        // Empty session_id and resume_session_id = None so the decoder
+        // reaches the agent_id UTF-8 check before any unrelated failure.
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.push(0);
         let Err(err) = try_decode(&buf) else {
             panic!("non-utf8 must error");
         };

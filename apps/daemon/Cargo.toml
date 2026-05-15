@@ -57,6 +57,12 @@ color-eyre.workspace = true
 # vt100 is otherwise a TUI-side dep; this is the one carve-out (see
 # AD on "daemon owns a session-scoped parser" in docs/004--architecture.md).
 vt100.workspace = true
+# UUIDs (AD-2 resume-on-focus). The daemon's argv builder validates the
+# session-id strings it receives from the TUI (via Hello) before passing
+# them to `claude --session-id <uuid>` / `claude --resume <uuid>`. The
+# crate is otherwise opaque to the daemon — the wire layer carries the
+# id as a plain `String`. See AD-2 in docs/004--architecture.md.
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

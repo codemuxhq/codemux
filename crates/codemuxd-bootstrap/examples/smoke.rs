@@ -46,6 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_socket_dir: socket_dir,
         rows: 24,
         cols: 80,
+        session_id: String::new(),
+        resume_session_id: None,
     };
     let mut transport = attach_agent(
         &RealRunner,

@@ -69,12 +69,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// captures it for logging and forward use; Stage 2's `Session::resize`
 /// plumbing will consume `rows`/`cols`, and Stage 4 will route on
 /// `agent_id`.
+///
+/// `session_id` / `resume_session_id` carry the opaque UUID strings
+/// added for AD-2 (resume-on-focus). The supervisor turns those into
+/// `--session-id <uuid>` or `--resume <uuid>` when it spawns claude;
+/// the wire/handshake layer never touches the literals.
 #[derive(Debug, Clone)]
 pub struct HelloInfo {
     pub protocol_version: u8,
     pub rows: u16,
     pub cols: u16,
     pub agent_id: String,
+    pub session_id: String,
+    pub resume_session_id: Option<String>,
 }
 
 /// Drive a single client connection through bidirectional framed I/O,
@@ -174,13 +181,22 @@ pub fn perform_handshake(
     }
     let hello_msg = read_one_frame(stream, handshake_buf)?;
 
-    let (protocol_version, rows, cols, agent_id) = match hello_msg {
+    let (protocol_version, rows, cols, agent_id, session_id, resume_session_id) = match hello_msg {
         Message::Hello {
             protocol_version,
             rows,
             cols,
             agent_id,
-        } => (protocol_version, rows, cols, agent_id),
+            session_id,
+            resume_session_id,
+        } => (
+            protocol_version,
+            rows,
+            cols,
+            agent_id,
+            session_id,
+            resume_session_id,
+        ),
         other => {
             return Err(Error::HandshakeMissing {
                 got_tag: other.tag(),
@@ -233,6 +249,8 @@ pub fn perform_handshake(
         rows,
         cols,
         agent_id,
+        session_id,
+        resume_session_id,
     })
 }
 

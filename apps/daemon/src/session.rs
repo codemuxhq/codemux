@@ -75,17 +75,29 @@ impl Session {
     /// disconnects, the child exits, or an I/O error occurs. **The PTY
     /// child survives** — call again with a fresh stream to re-attach.
     ///
+    /// The handshake must already have been performed against `stream`
+    /// (see [`conn::perform_handshake`]); the supervisor reads
+    /// [`HelloInfo`] up-front so it can choose claude argv (AD-2
+    /// `--session-id` / `--resume`) before the lazy session spawn. The
+    /// `handshake_buf` parameter carries any bytes the client tucked
+    /// onto the end of the `Hello` frame; they seed the inbound loop's
+    /// decode buffer so we don't drop a co-arriving `PtyData`.
+    ///
     /// The attach lifecycle splits cleanly across two responsibilities:
-    /// `Session` owns the *domain* (handshake outcome, parser state,
-    /// snapshot encoding); `conn` owns the *transport* (inbound /
-    /// outbound loops over the socket). Keeping the snapshot encoding
-    /// here means `conn` never needs to know about `vt100` or the
-    /// `?1049h` alt-screen toggle — it just gets opaque bytes to write.
-    pub fn attach(&mut self, stream: UnixStream) -> Result<(), Error> {
-        let mut handshake_buf = Vec::with_capacity(256);
-        let hello = conn::perform_handshake(&stream, &mut handshake_buf).inspect_err(|_| {
-            shutdown_best_effort(&stream, "handshake-failure shutdown failed");
-        })?;
+    /// `Session` owns the *domain* (parser state, snapshot encoding);
+    /// `conn` owns the *transport* (inbound / outbound loops over the
+    /// socket). Keeping the snapshot encoding here means `conn` never
+    /// needs to know about `vt100` or the `?1049h` alt-screen toggle —
+    /// it just gets opaque bytes to write.
+    ///
+    /// [`HelloInfo`]: crate::conn::HelloInfo
+    /// [`conn::perform_handshake`]: crate::conn::perform_handshake
+    pub fn attach_post_handshake(
+        &mut self,
+        stream: UnixStream,
+        hello: &conn::HelloInfo,
+        handshake_buf: Vec<u8>,
+    ) -> Result<(), Error> {
         tracing::info!(
             protocol_version = hello.protocol_version,
             rows = hello.rows,

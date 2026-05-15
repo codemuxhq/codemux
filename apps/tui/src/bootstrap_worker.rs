@@ -283,6 +283,16 @@ pub fn start_prepare_with_runner(runner: Box<dyn CommandRunner>, host: String) -
 /// Production calls this once the modal closes with a chosen remote
 /// path. The handle is owned by the runtime until the agent's
 /// transport is returned via `Done(Ok(_))`; dropping it cancels.
+///
+/// `session_id` / `resume_session_id` are AD-2 opaque UUID strings the
+/// runtime generates (or carries over from a persisted Dead agent).
+/// They flow through the bootstrap unchanged into the wire `Hello`,
+/// and the daemon translates them into `claude --session-id <uuid>`
+/// or `claude --resume <uuid>` at PTY-spawn time.
+// Eight args (vs clippy's default 7): each is a distinct fact at this
+// boundary; the existing six values already lack natural pairings, and
+// the new pair is a different concern again (AD-2 session-id).
+#[allow(clippy::too_many_arguments)]
 pub fn start_attach(
     prepared: PreparedHost,
     host: String,
@@ -290,6 +300,8 @@ pub fn start_attach(
     cwd: Option<PathBuf>,
     rows: u16,
     cols: u16,
+    session_id: String,
+    resume_session_id: Option<String>,
 ) -> AttachHandle {
     start_attach_with_runner(
         Box::new(RealRunner),
@@ -299,10 +311,13 @@ pub fn start_attach(
         cwd,
         rows,
         cols,
+        session_id,
+        resume_session_id,
     )
 }
 
 /// Test-friendly entry point for the attach phase.
+#[allow(clippy::too_many_arguments)]
 pub fn start_attach_with_runner(
     runner: Box<dyn CommandRunner>,
     prepared: PreparedHost,
@@ -311,6 +326,8 @@ pub fn start_attach_with_runner(
     cwd: Option<PathBuf>,
     rows: u16,
     cols: u16,
+    session_id: String,
+    resume_session_id: Option<String>,
 ) -> AttachHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded();
@@ -334,6 +351,8 @@ pub fn start_attach_with_runner(
             local_socket_dir: socket_dir,
             rows,
             cols,
+            session_id,
+            resume_session_id,
         };
         let tx_for_stage = tx.clone();
         let on_stage = move |stage: Stage| {
@@ -576,6 +595,8 @@ mod tests {
             Some(PathBuf::from("/tmp/x")),
             24,
             80,
+            "00000000-0000-4000-8000-000000000000".into(),
+            None,
         );
 
         started_rx
@@ -653,6 +674,8 @@ mod tests {
             Some(PathBuf::from("/tmp/x")),
             24,
             80,
+            "00000000-0000-4000-8000-000000000000".into(),
+            None,
         );
         started_rx
             .recv_timeout(Duration::from_secs(2))

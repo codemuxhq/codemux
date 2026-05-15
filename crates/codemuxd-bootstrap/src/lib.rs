@@ -285,6 +285,19 @@ pub struct AttachConfig {
     /// the runtime if the terminal changes during the attach.
     pub rows: u16,
     pub cols: u16,
+    /// AD-2 opaque claude session-id, carried in the wire `Hello` to
+    /// the remote daemon. The daemon translates it into
+    /// `claude --session-id <uuid>` when spawning the child. Empty
+    /// string means "don't pin one" — older clients and test harnesses
+    /// take that path. Bootstrap never inspects or validates the
+    /// value; the `--session-id` / `--resume` literals live in the
+    /// daemon's argv builder, not here (see AD-2).
+    pub session_id: String,
+    /// AD-2 opaque resume-session-id. `Some(_)` is a resume attempt:
+    /// the daemon spawns `claude --resume <uuid>` instead of fresh.
+    /// `None` is the regular new-spawn path. Pass-through only, just
+    /// like [`Self::session_id`].
+    pub resume_session_id: Option<String>,
 }
 
 /// Phase 1 of the SSH bootstrap: probe the remote and (re)install
@@ -363,6 +376,8 @@ pub fn attach_agent(
         &cfg.agent_id,
         cfg.rows,
         cfg.cols,
+        &cfg.session_id,
+        cfg.resume_session_id.as_deref(),
         Some(tunnel),
     )
     .map(AgentTransport::SshDaemon)
@@ -2238,6 +2253,8 @@ mod tests {
             local_socket_dir: socket_dir,
             rows: 24,
             cols: 80,
+            session_id: String::new(),
+            resume_session_id: None,
         };
         let (stream, mut tunnel) = attach_socket(&runner, |_| {}, &prepared, &cfg).unwrap();
         let _ = (&stream).write_all(b"x");
@@ -2278,6 +2295,8 @@ mod tests {
             local_socket_dir: socket_dir,
             rows: 24,
             cols: 80,
+            session_id: String::new(),
+            resume_session_id: None,
         };
         let (stream, mut tunnel) = attach_socket(&runner, |_| {}, &prepared, &cfg).unwrap();
         let _ = (&stream).write_all(b"x");

@@ -400,17 +400,29 @@ impl SshDaemonPty {
     /// `codemuxd-bootstrap` adapter in production; tests pass `None`
     /// to attach against an in-process socket without a tunnel.
     ///
+    /// `session_id` and `resume_session_id` are the AD-2 opaque
+    /// strings the daemon translates into `claude --session-id <uuid>`
+    /// or `claude --resume <uuid>` at session-spawn time. The transport
+    /// layer never inspects them — pass-through only.
+    ///
     /// # Errors
     /// Returns [`Error::Handshake`] for any handshake failure
     /// (timeouts, oversized frames, version mismatch, framing
     /// errors). The tunnel subprocess (if Some) is killed before
     /// returning so a failed attach doesn't leak it.
+    // Eight args (vs clippy's default 7): each is a distinct fact the
+    // caller has on hand at attach time; bundling `(session_id,
+    // resume_session_id)` would force a tiny struct that only this
+    // method uses.
+    #[allow(clippy::too_many_arguments)]
     pub fn attach(
         stream: UnixStream,
         label: String,
         agent_id: &str,
         rows: u16,
         cols: u16,
+        session_id: &str,
+        resume_session_id: Option<&str>,
         tunnel: Option<ProcessChild>,
     ) -> Result<Self, Error> {
         // `set_read_timeout(Some(_))` bounds the handshake; the framed
@@ -422,7 +434,8 @@ impl SshDaemonPty {
             tracing::debug!(label, "set_read_timeout(Some) failed pre-handshake: {e}");
         }
 
-        let result = perform_handshake(&stream, agent_id, rows, cols);
+        let result =
+            perform_handshake(&stream, agent_id, rows, cols, session_id, resume_session_id);
         let daemon_pid = match result {
             Ok(pid) => pid,
             Err(e) => {
@@ -571,17 +584,26 @@ impl Drop for SshDaemonPty {
 /// Send `Hello`, read `HelloAck`, validate the version, return the
 /// daemon's pid. All errors map to [`Error::Handshake`] so the TUI
 /// surfaces a handshake-specific hint.
+///
+/// `session_id` / `resume_session_id` are AD-2 opaque strings the
+/// daemon turns into claude argv. They live here only as Hello-frame
+/// payload — the `session` crate never interprets them and never
+/// emits the `--session-id` / `--resume` literals.
 fn perform_handshake(
     mut stream: &UnixStream,
     agent_id: &str,
     rows: u16,
     cols: u16,
+    session_id: &str,
+    resume_session_id: Option<&str>,
 ) -> Result<u32, Error> {
     let hello = Message::Hello {
         protocol_version: wire::PROTOCOL_VERSION,
         rows,
         cols,
         agent_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+        resume_session_id: resume_session_id.map(str::to_string),
     };
     let hello_bytes = hello.encode().map_err(|source| Error::Handshake {
         source: Box::new(source),
@@ -902,7 +924,8 @@ mod tests {
         let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::default());
         let stream = wait_for_connect(&sock_path);
         let mut pty =
-            SshDaemonPty::attach(stream, "test-sig".into(), "agent-0", 24, 80, None).unwrap();
+            SshDaemonPty::attach(stream, "test-sig".into(), "agent-0", 24, 80, "", None, None)
+                .unwrap();
 
         for sig in [Signal::Hup, Signal::Int, Signal::Term] {
             let Err(err) = pty.signal(sig) else {
@@ -924,8 +947,17 @@ mod tests {
         let sock_path = dir.path().join("daemon.sock");
         let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::default());
         let stream = wait_for_connect(&sock_path);
-        let pty =
-            SshDaemonPty::attach(stream, "test-handshake".into(), "agent-0", 24, 80, None).unwrap();
+        let pty = SshDaemonPty::attach(
+            stream,
+            "test-handshake".into(),
+            "agent-0",
+            24,
+            80,
+            "",
+            None,
+            None,
+        )
+        .unwrap();
         // Daemon's HelloAck carries `daemon_pid = 0xDEAD_BEEF` per the
         // FakeDaemon default. Confirm we wired that through.
         assert_eq!(pty.daemon_pid, 0xDEAD_BEEF);
@@ -941,7 +973,8 @@ mod tests {
         let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::echo());
         let stream = wait_for_connect(&sock_path);
         let mut pty =
-            SshDaemonPty::attach(stream, "test-rt".into(), "agent-0", 24, 80, None).unwrap();
+            SshDaemonPty::attach(stream, "test-rt".into(), "agent-0", 24, 80, "", None, None)
+                .unwrap();
 
         pty.write(b"hello over ssh").unwrap();
 
@@ -970,8 +1003,17 @@ mod tests {
         let sock_path = dir.path().join("daemon.sock");
         let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::kill_yields_exit(137));
         let stream = wait_for_connect(&sock_path);
-        let mut pty =
-            SshDaemonPty::attach(stream, "test-kill".into(), "agent-0", 24, 80, None).unwrap();
+        let mut pty = SshDaemonPty::attach(
+            stream,
+            "test-kill".into(),
+            "agent-0",
+            24,
+            80,
+            "",
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(pty.try_wait().is_none(), "alive immediately after attach");
         pty.kill().unwrap();
@@ -1001,8 +1043,17 @@ mod tests {
         let script = FakeDaemonScript::record_resize(Arc::clone(&recorded_resize));
         let _daemon = FakeDaemon::spawn(&sock_path, script);
         let stream = wait_for_connect(&sock_path);
-        let mut pty =
-            SshDaemonPty::attach(stream, "test-resize".into(), "agent-0", 24, 80, None).unwrap();
+        let mut pty = SshDaemonPty::attach(
+            stream,
+            "test-resize".into(),
+            "agent-0",
+            24,
+            80,
+            "",
+            None,
+            None,
+        )
+        .unwrap();
 
         pty.resize(50, 200).unwrap();
 
@@ -1034,7 +1085,8 @@ mod tests {
         let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::handshake_then_close());
         let stream = wait_for_connect(&sock_path);
         let mut pty =
-            SshDaemonPty::attach(stream, "test-eof".into(), "agent-0", 24, 80, None).unwrap();
+            SshDaemonPty::attach(stream, "test-eof".into(), "agent-0", 24, 80, "", None, None)
+                .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -1065,8 +1117,17 @@ mod tests {
         let sock_path = dir.path().join("daemon.sock");
         let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::handshake_then_silent());
         let stream = wait_for_connect(&sock_path);
-        let mut pty =
-            SshDaemonPty::attach(stream, "test-stuck".into(), "agent-0", 24, 80, None).unwrap();
+        let mut pty = SshDaemonPty::attach(
+            stream,
+            "test-stuck".into(),
+            "agent-0",
+            24,
+            80,
+            "",
+            None,
+            None,
+        )
+        .unwrap();
 
         // Push large frames until either we hit the queue-saturated
         // error or we've exceeded a sane upper bound. Each call is
@@ -1125,8 +1186,17 @@ mod tests {
         let sock_path = dir.path().join("daemon.sock");
         let _daemon = FakeDaemon::spawn(&sock_path, FakeDaemonScript::handshake_then_close());
         let stream = wait_for_connect(&sock_path);
-        let mut pty =
-            SshDaemonPty::attach(stream, "test-disconn".into(), "agent-0", 24, 80, None).unwrap();
+        let mut pty = SshDaemonPty::attach(
+            stream,
+            "test-disconn".into(),
+            "agent-0",
+            24,
+            80,
+            "",
+            None,
+            None,
+        )
+        .unwrap();
 
         // Push frames until the producer reports a `Pty` error. The
         // first call may succeed (frame queued before the writer fails)

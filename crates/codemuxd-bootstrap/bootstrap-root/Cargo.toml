@@ -57,6 +57,10 @@ portable-pty = "0.9.0"
 crossbeam-channel = "0.5.15"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 vt100 = "0.16.2"
+# AD-2 resume-on-focus: the daemon's argv builder validates incoming
+# session-id strings before passing them as `--session-id <uuid>` /
+# `--resume <uuid>` to claude. Mirrored from the parent workspace.
+uuid = { version = "1.23.1", features = ["v4"] }
 tempfile = "3"
 
 [workspace.lints.rust]

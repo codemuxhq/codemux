@@ -55,6 +55,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 use unicode_width::UnicodeWidthStr;
+use uuid::Uuid;
 use vt100::Parser;
 
 use crate::agent_meta_worker::{AgentMetaWorker, MetaEvent};
@@ -917,6 +918,32 @@ struct RuntimeAgent {
     /// at TUI start.
     rows: u16,
     cols: u16,
+    /// AD-2 claude session-id authored at spawn time. `Some(uuid)` for
+    /// agents the runtime has spawned (fresh or post-resume); `None`
+    /// only for legacy persisted rows that pre-date the AD-2 work
+    /// (those re-load as Dead with `session_id = None` and the
+    /// resume-on-focus path generates a fresh UUID before re-spawn,
+    /// rewriting the column on the next `persist_agent_status`).
+    ///
+    /// The UUID is what the persistence row keys on after the next
+    /// status transition. The runtime never displays it.
+    session_id: Option<String>,
+    /// `true` between issuing `claude --resume <uuid>` and the agent
+    /// transitioning to `Running`. Lets the reap loop distinguish
+    /// "resume attempt died before Ready" from "live agent crashed"
+    /// for the AD-2 auto-fallback. Cleared in two places:
+    ///   - on Starting → Running (a successful resume; the marker has
+    ///     served its purpose),
+    ///   - on the resume-failure auto-fallback (when we replace this
+    ///     agent's transport with a fresh-spawn argv).
+    resume_attempt: bool,
+    /// One-line, dim, no-border banner rendered above this agent's PTY
+    /// widget after an AD-2 resume failed and we auto-fell-back to a
+    /// fresh spawn. `None` is the steady state. Cleared on the first
+    /// key event delivered to this agent's pane OR on focus change
+    /// away from it (whichever comes first) so it never sticks around
+    /// after the user has acknowledged it.
+    resume_fallback_notice: Option<String>,
     state: AgentState,
 }
 
@@ -1020,6 +1047,7 @@ impl RuntimeAgent {
         rows: u16,
         cols: u16,
         scrollback_len: usize,
+        session_id: Option<String>,
     ) -> Self {
         Self {
             id,
@@ -1035,6 +1063,9 @@ impl RuntimeAgent {
             needs_attention: false,
             rows,
             cols,
+            session_id,
+            resume_attempt: false,
+            resume_fallback_notice: None,
             state: AgentState::Ready {
                 parser: Box::new(Parser::new_with_callbacks(
                     rows,
@@ -1072,6 +1103,13 @@ impl RuntimeAgent {
             needs_attention: false,
             rows,
             cols,
+            // A bootstrap failure never produced a live claude session,
+            // so there is nothing to persist or to resume from. The
+            // persistence sink writes `session_id = None` for this
+            // agent until it's dismissed.
+            session_id: None,
+            resume_attempt: false,
+            resume_fallback_notice: None,
             state: AgentState::Failed { error },
         }
     }
@@ -1104,6 +1142,7 @@ impl RuntimeAgent {
         rows: u16,
         cols: u16,
         scrollback_len: usize,
+        session_id: Option<String>,
     ) -> Self {
         let parser = Box::new(Parser::new_with_callbacks(
             rows.max(1),
@@ -1125,6 +1164,9 @@ impl RuntimeAgent {
             needs_attention: false,
             rows,
             cols,
+            session_id,
+            resume_attempt: false,
+            resume_fallback_notice: None,
             state: AgentState::Crashed {
                 parser,
                 exit_code: -1,
@@ -1305,6 +1347,19 @@ struct PendingAttach {
     /// Stored per-attach so removing a finished entry from the Vec
     /// doesn't shift indices and break a separate `modal_attach_idx`.
     modal_owner: bool,
+    /// AD-2 session-id authored by the runtime at attach kickoff. The
+    /// daemon got the same UUID via the wire `Hello` and used it to
+    /// build the claude argv. We carry it here so the eventual
+    /// `RuntimeAgent::ready` (or `failed`) carries the matching id
+    /// and `persist_agent_status` writes the right row.
+    session_id: Uuid,
+    /// `Some(uuid)` if this attach is a resume attempt for a Dead SSH
+    /// agent. The daemon turns it into `claude --resume <uuid>`; if
+    /// the resume fails (claude exits non-zero before reaching the
+    /// Running transition) the reap loop auto-falls-back via the
+    /// resume-failure detection in the event loop. `None` for fresh
+    /// SSH spawns.
+    resume_session_id: Option<Uuid>,
 }
 
 /// Test-only seams threaded into [`run`] from the hidden CLI flags
@@ -1381,6 +1436,7 @@ pub fn run(
                 pty_rows,
                 pty_cols,
                 config.scrollback_len,
+                agent.session_id,
             );
             // Best-effort write-through of the load-boundary reset.
             // Failures are logged inside `save_agent` and do not
@@ -1405,6 +1461,13 @@ pub fn run(
     // collisions.
     let initial_n = next_free_agent_n(&agents).unwrap_or(1);
     let initial_id_text = format!("agent-{initial_n}");
+    // AD-2: every fresh codemux-side spawn authors a v4 UUID. We pass
+    // it to `claude --session-id <uuid>` (via `build_claude_args`) AND
+    // stash it on the `RuntimeAgent` so the next `persist_agent_status`
+    // writes it into the SQLite row. Collision risk is per-host: per
+    // the 2026-05-15 spike, this is theoretical only and not worth
+    // defensive code.
+    let initial_session_uuid = Uuid::new_v4();
     let initial = spawn_local_agent(
         agent_spawner,
         AgentId::new(initial_id_text.clone()),
@@ -1414,6 +1477,8 @@ pub fn run(
         pty_cols,
         config.scrollback_len,
         &config.ui.segments.tokens,
+        &initial_session_uuid,
+        None,
     )?;
     // Strategy (i) from the 2026-05-15 persistence spike: the PTY
     // transition `Starting → Running` is implicit in `spawn_local_agent`
@@ -1586,11 +1651,24 @@ fn build_host_lookup(
 /// `change_focus` is a no-op when `idx == nav.focused`, so the
 /// matching persist is skipped — re-pressing the same direct-bind a
 /// few times in a row produces zero DB writes.
+///
+/// In addition: the prior-focus agent (if any) gets its
+/// [`RuntimeAgent::resume_fallback_notice`] cleared. The notice
+/// lifecycle is "show while the user is looking at this pane; clear
+/// on first key OR on focus change away" — this is the focus-change
+/// half. Mirrors the read-and-discard pattern the spawn modal uses
+/// for one-shot transient messages.
 fn focus_and_touch(nav: &mut NavState, idx: usize, persistence: &Persistence) {
     let prior = nav.focused;
     nav.change_focus(idx);
     if nav.focused == prior {
         return;
+    }
+    // AD-2: clearing the resume-fallback notice on the prior-focus
+    // agent matches the user-facing contract — the notice sticks while
+    // you're reading the pane, and disappears the moment you move on.
+    if let Some(prior_agent) = nav.agents.get_mut(prior) {
+        prior_agent.resume_fallback_notice = None;
     }
     // Persist `last_attached_at` for whatever the focus actually
     // landed on. Reading `nav.focused` after the call (rather than
@@ -1599,10 +1677,10 @@ fn focus_and_touch(nav: &mut NavState, idx: usize, persistence: &Persistence) {
     if let Some(agent) = nav.agents.get(nav.focused) {
         let status = match &agent.state {
             AgentState::Ready { .. } => AgentStatus::Running,
-            // Step 5 will turn focus-on-Dead into a resume attempt;
-            // for step 4 it's a no-op as far as the PTY goes, but we
-            // still touch `last_attached_at` so the user-visible
-            // recency surface is accurate.
+            // AD-2 resume-on-focus happens via `try_resume_on_focus`
+            // immediately after this call at the user-navigation
+            // sites. The persist here records "user looked at it"
+            // regardless of whether the resume eventually succeeds.
             AgentState::Crashed { .. } | AgentState::Failed { .. } => AgentStatus::Dead,
         };
         persist_agent_status(
@@ -1611,6 +1689,170 @@ fn focus_and_touch(nav: &mut NavState, idx: usize, persistence: &Persistence) {
             status,
             Some(std::time::SystemTime::now()),
         );
+    }
+}
+
+/// Bundle of references the [`try_resume_on_focus`] helper needs to
+/// rebuild a `RuntimeAgent` after the user focused a Dead local tab.
+/// Exists only to keep the call site signature within the project's
+/// argument-count convention.
+struct ResumeContext<'a> {
+    spawner: &'a dyn AgentSpawner,
+    tokens_cfg: &'a crate::config::TokensSegmentConfig,
+    scrollback_len: usize,
+}
+
+/// AD-2 resume-failure auto-fallback. Detection happens in the reap
+/// loop: a `resume_attempt = true` agent that crashed non-zero before
+/// reaching Running is a resume failure. This helper rebuilds the
+/// `RuntimeAgent` against a freshly-generated UUID (so the orphaned
+/// `--resume <uuid>` row gets replaced by a clean `--session-id <new>`
+/// entry on the next persist write) and sets
+/// [`RuntimeAgent::resume_fallback_notice`] so the renderer's banner
+/// helper draws the one-line warning above the pane.
+///
+/// Failure to spawn here leaves the agent in Crashed; the standard
+/// Dead-persist path then writes that through. The notice is only
+/// set on the SUCCESS branch — we don't want a "couldn't resume but
+/// also couldn't spawn fresh" double-message.
+fn try_resume_fallback(
+    nav: &mut NavState,
+    persistence: &Persistence,
+    id: &AgentId,
+    ctx: &ResumeContext<'_>,
+) {
+    let Some(idx) = nav.agents.iter().position(|a| a.id == *id) else {
+        return;
+    };
+    let agent = &nav.agents[idx];
+    let new_id = agent.id.clone();
+    let new_label = agent.label.clone();
+    let cwd = agent.cwd.clone();
+    let rows = agent.rows;
+    let cols = agent.cols;
+    let new_session_uuid = Uuid::new_v4();
+    match spawn_local_agent(
+        ctx.spawner,
+        new_id,
+        new_label,
+        cwd.as_deref(),
+        rows,
+        cols,
+        ctx.scrollback_len,
+        ctx.tokens_cfg,
+        &new_session_uuid,
+        None,
+    ) {
+        Ok(mut new_agent) => {
+            new_agent.resume_fallback_notice =
+                Some("Couldn't resume previous session; started fresh.".to_string());
+            nav.agents[idx] = new_agent;
+            // The orphan row is now overwritten by a clean Running
+            // row carrying the fresh UUID. The next persistence write
+            // anchors the new session id on disk so a *subsequent*
+            // codemux launch resumes against the right id.
+            if let Some(refreshed) = nav.agents.get(idx) {
+                persist_agent_status(
+                    persistence,
+                    refreshed,
+                    AgentStatus::Running,
+                    Some(std::time::SystemTime::now()),
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(?e, "AD-2 resume-failure fallback: spawn failed");
+        }
+    }
+}
+
+/// If the currently-focused agent is a Dead LOCAL agent, attempt to
+/// resume it by re-spawning the PTY against `claude --resume <uuid>`
+/// (when the agent carries a `session_id`) or fresh (when it doesn't —
+/// the legacy load-from-disk case before AD-2 plumbing landed).
+///
+/// On success the agent transitions Dead → Ready in-place; the
+/// parser is replaced with a fresh one (the old screen was a frozen
+/// crash banner anyway, and claude's first paint redraws the visible
+/// state). `resume_attempt` is set so the reap loop knows to treat
+/// an early non-zero exit as a resume failure and auto-fall-back.
+///
+/// SSH-backed Dead agents are NOT auto-resumed by this helper. Their
+/// revival path requires a fresh SSH bootstrap (probe + tunnel + daemon
+/// spawn), which is a multi-second async operation that doesn't fit a
+/// single keystroke; that surface lands in a later UX-polish step. For
+/// now SSH Dead tabs sit in the navigator, dismissable with `<prefix> d`.
+///
+/// `Failed` agents (bootstrap errored, never produced a live session)
+/// are also skipped — there's no session to resume from.
+fn try_resume_on_focus(nav: &mut NavState, persistence: &Persistence, ctx: &ResumeContext<'_>) {
+    let idx = nav.focused;
+    let Some(agent) = nav.agents.get(idx) else {
+        return;
+    };
+    // SSH-side resume is out of scope for this step; only act on
+    // local-Dead agents (`host == None` + `Crashed` state).
+    if agent.host.is_some() {
+        return;
+    }
+    if !matches!(agent.state, AgentState::Crashed { .. }) {
+        return;
+    }
+    let id = agent.id.clone();
+    let label = agent.label.clone();
+    let cwd = agent.cwd.clone();
+    let rows = agent.rows;
+    let cols = agent.cols;
+    // Carried session id → `--resume <uuid>`. Missing → mint a fresh
+    // UUID and treat this as a fresh spawn (legacy rows pre-AD-2).
+    let existing_uuid = agent
+        .session_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let (session_uuid, resume_uuid, is_resume) = match existing_uuid {
+        Some(uuid) => (uuid, Some(uuid), true),
+        None => (Uuid::new_v4(), None, false),
+    };
+    match spawn_local_agent(
+        ctx.spawner,
+        id,
+        label,
+        cwd.as_deref(),
+        rows,
+        cols,
+        ctx.scrollback_len,
+        ctx.tokens_cfg,
+        &session_uuid,
+        resume_uuid.as_ref(),
+    ) {
+        Ok(mut new_agent) => {
+            new_agent.resume_attempt = is_resume;
+            // Carry forward needs-attention / model-effort etc would be
+            // misleading after a fresh process; let the worker re-fill
+            // them as the new claude session boots.
+            if let Some(slot) = nav.agents.get_mut(idx) {
+                *slot = new_agent;
+            }
+            // Persistence: write through the (preserved) session_id so
+            // the row's last_attached_at is fresh AND the status
+            // transitions back to Running. If this turns out to be a
+            // resume failure, the reap loop will rewrite again.
+            if let Some(agent) = nav.agents.get(idx) {
+                persist_agent_status(
+                    persistence,
+                    agent,
+                    AgentStatus::Running,
+                    Some(std::time::SystemTime::now()),
+                );
+            }
+        }
+        Err(e) => {
+            // Couldn't spawn at all (claude not on PATH, etc.). Leave
+            // the Dead tab in place; the user keeps the dismiss
+            // affordance. Logging at warn — silent would be the
+            // anti-pattern of "I pressed a key and nothing happened".
+            tracing::warn!(?e, "AD-2 resume-on-focus: spawn failed");
+        }
     }
 }
 
@@ -1636,11 +1878,13 @@ fn persist_agent_status(
         host_id,
         label: agent.label.clone(),
         cwd: cwd_ref,
-        // step 5 will populate this; today every agent persists with
-        // `session_id = None` so resume-on-focus has nothing to
-        // attempt. The column stays nullable and the runtime stays
-        // ignorant of `--session-id` until then.
-        session_id: None,
+        // AD-2: the runtime authored a UUID at spawn time (or carried
+        // one over from a resumed Dead row). Persist it so the next
+        // codemux invocation can re-issue `claude --resume <uuid>`
+        // against the same conversation. `None` here covers the
+        // legacy / bootstrap-failure cases — see the `RuntimeAgent`
+        // docstring.
+        session_id: agent.session_id.clone(),
         status,
         last_attached_at,
     });
@@ -1777,12 +2021,24 @@ fn tick_fuzzy_dispatch(
 /// normally — `--settings` overrides only the `statusLine` field for
 /// this single Claude invocation. See `apps/tui/src/statusline_ipc.rs`
 /// for the schema and the AD-1 carve-out rationale.
-// Eight args (one over clippy's default 7): the spawner port plus seven
-// distinct facts (identity, cwd, geometry, scrollback, tokens cfg) with
-// no natural pairing. `cwd`/`rows`/`cols`/`label` each get used twice
-// (once in the `SpawnRequest`, once in the returned `RuntimeAgent`), so
-// bundling them into a second struct would shuffle the duplication, not
-// remove it.
+///
+/// `resume_session_id` selects between the AD-2 resume and fresh-spawn
+/// paths:
+///   - `None`: fresh spawn. Caller passes a freshly-generated
+///     [`Uuid`]; argv carries `--session-id <uuid>` so the session is
+///     resumable later.
+///   - `Some(uuid)`: resume attempt. Argv carries `--resume <uuid>`
+///     instead. The caller is responsible for setting
+///     `RuntimeAgent::resume_attempt` on the returned agent so the
+///     reap loop can detect a resume failure and fall back.
+///
+/// In both cases the returned agent's `session_id` field is set to
+/// `Some(uuid)` (the resumed UUID, or the freshly-generated one). The
+/// runtime never carries an empty `session_id` on a freshly-spawned
+/// agent.
+// Nine args (vs clippy's default 7): the spawner port plus eight
+// distinct facts. The new pair (`session_uuid`, `resume_session_id`) is
+// orthogonal to the rest — bundling would not help readability.
 #[allow(clippy::too_many_arguments)]
 fn spawn_local_agent(
     spawner: &dyn AgentSpawner,
@@ -1793,9 +2049,16 @@ fn spawn_local_agent(
     cols: u16,
     scrollback_len: usize,
     tokens_cfg: &crate::config::TokensSegmentConfig,
+    session_uuid: &Uuid,
+    resume_session_id: Option<&Uuid>,
 ) -> Result<RuntimeAgent> {
     let statusline_path = crate::statusline_ipc::statusline_path_for(&id);
-    let args = build_claude_args(&statusline_path, tokens_cfg);
+    let args = build_claude_args(
+        &statusline_path,
+        tokens_cfg,
+        session_uuid,
+        resume_session_id,
+    );
     let transport = spawner
         .spawn(SpawnRequest {
             label: label.clone(),
@@ -1817,35 +2080,60 @@ fn spawn_local_agent(
         rows,
         cols,
         scrollback_len,
+        Some(session_uuid.to_string()),
     ))
 }
 
 /// Build the argv slice passed to `claude` so the spawn carries the
-/// statusLine override. Returns `["--settings", "<json>"]`. The
-/// `current_exe` resolution is inside this helper (not in
+/// statusLine override AND the AD-2 session-id wiring. Returns
+/// `["--settings", "<json>", "--session-id", "<uuid>"]` for a fresh
+/// spawn, or `["--settings", "<json>", "--resume", "<uuid>"]` for a
+/// resume attempt. The two flags are mutually exclusive per Claude
+/// Code's CLI; passing both would tell `claude --resume` to additionally
+/// pin a different session id, which is not a thing.
+///
+/// The `current_exe` resolution is inside this helper (not in
 /// [`spawn_local_agent`]) so the helper can be exercised from a unit
 /// test without reaching for a process spawn.
 ///
-/// On the rare failure to resolve `current_exe()` (e.g. the binary
-/// was unlinked while running), falls back to an empty argv so the
-/// spawn proceeds without statusLine wiring rather than failing the
-/// whole agent. The token segment will simply render nothing for
-/// that agent — same shape as "agent hasn't completed its first turn
-/// yet."
+/// On the rare failure to resolve `current_exe()` (e.g. the binary was
+/// unlinked while running), falls back to an argv without statusLine
+/// wiring rather than failing the whole agent. The token segment will
+/// simply render nothing for that agent — same shape as "agent hasn't
+/// completed its first turn yet." The session-id pair is still appended
+/// in that branch so the resume path remains intact.
+///
+/// AD-2 architectural boundary: the strings `--session-id` and
+/// `--resume` ONLY appear in this function and in the daemon's
+/// `build_child_args` (see `apps/daemon/src/supervisor.rs`). Do not
+/// leak them into the wire crate, the persistence layer, the
+/// bootstrap crate, or the session crate — those layers carry the
+/// UUID as opaque text. See the 2026-05-15 persistence spike.
 fn build_claude_args(
     statusline_path: &Path,
     tokens_cfg: &crate::config::TokensSegmentConfig,
+    session_uuid: &Uuid,
+    resume_session_id: Option<&Uuid>,
 ) -> Vec<String> {
-    let Ok(bin) = std::env::current_exe() else {
+    let mut args = if let Ok(bin) = std::env::current_exe() {
+        let json = crate::statusline_ipc::build_settings_json(
+            &bin,
+            statusline_path,
+            tokens_cfg.refresh_interval_secs,
+        );
+        vec!["--settings".to_string(), json]
+    } else {
         tracing::warn!("std::env::current_exe failed; spawning claude without statusLine wiring");
-        return Vec::new();
+        Vec::new()
     };
-    let json = crate::statusline_ipc::build_settings_json(
-        &bin,
-        statusline_path,
-        tokens_cfg.refresh_interval_secs,
-    );
-    vec!["--settings".to_string(), json]
+    if let Some(resume) = resume_session_id {
+        args.push("--resume".to_string());
+        args.push(resume.to_string());
+    } else {
+        args.push("--session-id".to_string());
+        args.push(session_uuid.to_string());
+    }
+    args
 }
 
 /// Build the [`PendingAttach`] for an SSH spawn. Shared by the user-
@@ -1887,10 +2175,21 @@ fn build_remote_attach<F>(
     rows: u16,
     cols: u16,
     modal_owner: bool,
+    session_id: Uuid,
+    resume_session_id: Option<Uuid>,
     attach_factory: F,
 ) -> PendingAttach
 where
-    F: FnOnce(PreparedHost, String, String, Option<PathBuf>, u16, u16) -> AttachHandle,
+    F: FnOnce(
+        PreparedHost,
+        String,
+        String,
+        Option<PathBuf>,
+        u16,
+        u16,
+        String,
+        Option<String>,
+    ) -> AttachHandle,
 {
     let label = format!("{host}:agent-{spawn_counter}");
     let runtime_id = AgentId::new(format!("agent-{spawn_counter}"));
@@ -1930,6 +2229,8 @@ where
         cwd_path,
         rows,
         cols,
+        session_id.to_string(),
+        resume_session_id.as_ref().map(Uuid::to_string),
     );
     tracing::info!(%host, label = %label, "started SSH attach worker");
     PendingAttach {
@@ -1941,6 +2242,8 @@ where
         cols,
         handle,
         modal_owner,
+        session_id,
+        resume_session_id,
     }
 }
 
@@ -1956,7 +2259,16 @@ where
 /// returning [`crate::bootstrap_worker::AttachHandle::from_events`]).
 struct PrepareDrainCtx<'a, F>
 where
-    F: FnOnce(PreparedHost, String, String, Option<PathBuf>, u16, u16) -> AttachHandle,
+    F: FnOnce(
+        PreparedHost,
+        String,
+        String,
+        Option<PathBuf>,
+        u16,
+        u16,
+        String,
+        Option<String>,
+    ) -> AttachHandle,
 {
     prepare: &'a mut Option<PendingPrepare>,
     spawn_ui: &'a mut Option<SpawnMinibuffer>,
@@ -2024,7 +2336,16 @@ where
 // locals so the inline reads/writes stay readable.
 fn drain_prepare_events<F>(ctx: PrepareDrainCtx<'_, F>)
 where
-    F: FnOnce(PreparedHost, String, String, Option<PathBuf>, u16, u16) -> AttachHandle,
+    F: FnOnce(
+        PreparedHost,
+        String,
+        String,
+        Option<PathBuf>,
+        u16,
+        u16,
+        String,
+        Option<String>,
+    ) -> AttachHandle,
 {
     let PrepareDrainCtx {
         prepare,
@@ -2139,6 +2460,13 @@ where
                         rows,
                         cols,
                         /* modal_owner */ true,
+                        // AD-2: fresh SSH spawn from the prepare→attach
+                        // auto-flow. No resume target — that path goes
+                        // through focus-on-Dead, which assembles its
+                        // own `PendingAttach` with `resume_session_id =
+                        // Some(_)`.
+                        Uuid::new_v4(),
+                        None,
                         attach_factory,
                     );
                     if let Some(ui) = spawn_ui.as_mut() {
@@ -3339,7 +3667,7 @@ fn event_loop(
                         // immediate Resize before any frames flow.
                         let _ = transport.resize(attach.rows, attach.cols);
                         tracing::info!(label = %attach.label, "attach completed; transport ready");
-                        let agent = RuntimeAgent::ready(
+                        let mut agent = RuntimeAgent::ready(
                             attach.agent_id.clone(),
                             attach.label.clone(),
                             attach.repo.clone(),
@@ -3361,7 +3689,16 @@ fn event_loop(
                             attach.rows,
                             attach.cols,
                             scrollback_len,
+                            // AD-2: the daemon spawned claude with the
+                            // session-id we chose at attach kickoff,
+                            // either as `--session-id <uuid>` (fresh)
+                            // or `--resume <uuid>` (resume attempt).
+                            // Persist whichever UUID is now anchored
+                            // on the remote so next launch resumes
+                            // against the same conversation.
+                            Some(attach.session_id.to_string()),
                         );
+                        agent.resume_attempt = attach.resume_session_id.is_some();
                         // Strategy (i): persist only after the attach
                         // succeeded. The host row goes in first so the
                         // agent's `host_id` foreign key resolves.
@@ -3424,8 +3761,19 @@ fn event_loop(
         for agent in &mut nav.agents {
             match &mut agent.state {
                 AgentState::Ready { parser, transport } => {
+                    let mut saw_bytes = false;
                     for bytes in transport.try_read() {
+                        if !bytes.is_empty() {
+                            saw_bytes = true;
+                        }
                         parser.process(&bytes);
+                    }
+                    // AD-2: any non-empty byte from a resume-attempt
+                    // PTY is the cleanest "claude is alive and well"
+                    // signal we get. Clear the marker so a much-later
+                    // crash doesn't masquerade as a resume failure.
+                    if saw_bytes && agent.resume_attempt {
+                        agent.resume_attempt = false;
                     }
                 }
                 // No transport on Failed/Crashed — nothing to drain.
@@ -3459,12 +3807,46 @@ fn event_loop(
             // with a tab they themselves just closed.
             persistence.delete_agent(id);
         }
+        // AD-2 resume-failure detection. An agent that was a
+        // resume-attempt and crashed non-zero before reaching Running
+        // means `claude --resume <uuid>` failed (Claude pruned the
+        // session, the on-disk transcript was corrupted, etc.). The
+        // user-approved behavior is: auto-fall-back to a fresh spawn
+        // and surface a one-line warning above the pane. We do this
+        // BEFORE persisting Dead so the fallback's Running write is
+        // the last word on the row.
+        let mut resume_failures: Vec<AgentId> = Vec::new();
         for id in &reap_outcome.crashed {
+            if let Some(agent) = nav.agents.iter().find(|a| a.id == *id)
+                && agent.resume_attempt
+                && agent.host.is_none()
+            {
+                resume_failures.push(id.clone());
+            }
+        }
+        for id in &resume_failures {
+            try_resume_fallback(
+                &mut nav,
+                persistence,
+                id,
+                &ResumeContext {
+                    spawner: agent_spawner,
+                    tokens_cfg,
+                    scrollback_len,
+                },
+            );
+        }
+        for id in &reap_outcome.crashed {
+            // Skip rows we just auto-resumed — they're back in Ready
+            // and the fallback path already wrote Running through.
+            if resume_failures.contains(id) {
+                continue;
+            }
             // Ready → Crashed: persist as Dead so the next codemux
-            // launch surfaces the tab for resume-on-focus (step 5)
-            // rather than silently dropping it. Look the agent back
-            // up by id — the reap mutated the Vec in place, so the
-            // record is still there with its mutated state.
+            // launch surfaces the tab for resume-on-focus rather than
+            // silently dropping it. Look the agent back up by id —
+            // the reap mutated the Vec in place, so the record is
+            // still there with its mutated state.
             if let Some(agent) = nav.agents.iter().find(|a| a.id == *id) {
                 persist_agent_status(persistence, agent, AgentStatus::Dead, None);
             }
@@ -3793,6 +4175,10 @@ fn event_loop(
                                     cols,
                                     scrollback_len,
                                     tokens_cfg,
+                                    // AD-2: fresh user-driven local
+                                    // spawn. New UUID, no resume target.
+                                    &Uuid::new_v4(),
+                                    None,
                                 ) {
                                     Ok(agent) => {
                                         // Strategy (i) from the 2026-05-15
@@ -3852,6 +4238,13 @@ fn event_loop(
                                     rows,
                                     cols,
                                     /* modal_owner */ true,
+                                    // AD-2: fresh SSH spawn from the
+                                    // user-driven `Spawn { host, path }`
+                                    // modal path. No resume target —
+                                    // the resume-on-focus arm goes
+                                    // through a different code path.
+                                    Uuid::new_v4(),
+                                    None,
                                     start_attach,
                                 );
                                 // Re-lock the modal so the spinner
@@ -3895,6 +4288,12 @@ fn event_loop(
                                     cols,
                                     scrollback_len,
                                     tokens_cfg,
+                                    // AD-2: scratch spawn = fresh agent.
+                                    // No resume target; mint a new UUID
+                                    // here so `--session-id <uuid>` goes
+                                    // into the claude argv.
+                                    &Uuid::new_v4(),
+                                    None,
                                 ) {
                                     Ok(agent) => {
                                         // Strategy (i): same shape as the
@@ -3966,6 +4365,9 @@ fn event_loop(
                                 let repo = cwd_path
                                     .as_ref()
                                     .and_then(|p| repo_name::resolve_remote(&p.to_string_lossy()));
+                                // AD-2: scratch-flow SSH spawn = fresh
+                                // claude. New UUID, no resume target.
+                                let session_uuid = Uuid::new_v4();
                                 let handle = start_attach(
                                     prepared,
                                     host.clone(),
@@ -3973,6 +4375,8 @@ fn event_loop(
                                     cwd_path,
                                     rows,
                                     cols,
+                                    session_uuid.to_string(),
+                                    None,
                                 );
                                 tracing::info!(
                                     %host,
@@ -3989,6 +4393,8 @@ fn event_loop(
                                     cols,
                                     handle,
                                     modal_owner: true,
+                                    session_id: session_uuid,
+                                    resume_session_id: None,
                                 });
                             }
                         }
@@ -4026,6 +4432,15 @@ fn event_loop(
                             }
                             PopupAction::Confirm => {
                                 focus_and_touch(&mut nav, selection, persistence);
+                                try_resume_on_focus(
+                                    &mut nav,
+                                    persistence,
+                                    &ResumeContext {
+                                        spawner: agent_spawner,
+                                        tokens_cfg,
+                                        scrollback_len,
+                                    },
+                                );
                                 nav.popup_state = PopupState::Closed;
                             }
                             PopupAction::Cancel => {
@@ -4082,6 +4497,14 @@ fn event_loop(
                         // left.
                         if let Some(a) = nav.agents.get_mut(nav.focused) {
                             a.snap_to_live();
+                            // AD-2: a real keystroke into the pane is
+                            // the user's acknowledgement of the
+                            // resume-fallback notice — drop it before
+                            // forwarding. Matches the "clear on first
+                            // key" half of the lifecycle (the other
+                            // half is focus-change away, see
+                            // `focus_and_touch`).
+                            a.resume_fallback_notice = None;
                             match &mut a.state {
                                 AgentState::Ready { transport, .. } => {
                                     transport.write(&bytes).wrap_err("write to pty")?;
@@ -4129,6 +4552,15 @@ fn event_loop(
                     KeyDispatch::FocusNext => {
                         let next = (nav.focused + 1) % nav.agents.len();
                         focus_and_touch(&mut nav, next, persistence);
+                        try_resume_on_focus(
+                            &mut nav,
+                            persistence,
+                            &ResumeContext {
+                                spawner: agent_spawner,
+                                tokens_cfg,
+                                scrollback_len,
+                            },
+                        );
                     }
                     KeyDispatch::FocusPrev => {
                         let prev = if nav.focused == 0 {
@@ -4137,6 +4569,15 @@ fn event_loop(
                             nav.focused - 1
                         };
                         focus_and_touch(&mut nav, prev, persistence);
+                        try_resume_on_focus(
+                            &mut nav,
+                            persistence,
+                            &ResumeContext {
+                                spawner: agent_spawner,
+                                tokens_cfg,
+                                scrollback_len,
+                            },
+                        );
                     }
                     KeyDispatch::FocusLast => {
                         // Bounce. No-op if the previous slot is gone
@@ -4147,11 +4588,29 @@ fn event_loop(
                             && prev != nav.focused
                         {
                             focus_and_touch(&mut nav, prev, persistence);
+                            try_resume_on_focus(
+                                &mut nav,
+                                persistence,
+                                &ResumeContext {
+                                    spawner: agent_spawner,
+                                    tokens_cfg,
+                                    scrollback_len,
+                                },
+                            );
                         }
                     }
                     KeyDispatch::FocusAt(idx) => {
                         if idx < nav.agents.len() {
                             focus_and_touch(&mut nav, idx, persistence);
+                            try_resume_on_focus(
+                                &mut nav,
+                                persistence,
+                                &ResumeContext {
+                                    spawner: agent_spawner,
+                                    tokens_cfg,
+                                    scrollback_len,
+                                },
+                            );
                         }
                     }
                     KeyDispatch::ToggleNav => {
@@ -4316,6 +4775,15 @@ fn event_loop(
                                     mouse_press = None;
                                     if let Some(idx) = nav.agents.iter().position(|a| a.id == id) {
                                         focus_and_touch(&mut nav, idx, persistence);
+                                        try_resume_on_focus(
+                                            &mut nav,
+                                            persistence,
+                                            &ResumeContext {
+                                                spawner: agent_spawner,
+                                                tokens_cfg,
+                                                scrollback_len,
+                                            },
+                                        );
                                     }
                                 }
                                 TabMouseDispatch::Reorder { from, to } => {
@@ -4613,16 +5081,37 @@ fn render_agent_pane(
     pane_hitbox: &mut PaneHitbox,
     overlay: PaneOverlay<'_>,
 ) {
+    // AD-2 one-line resume-fallback notice. Renders as a single dim
+    // row at the top of the pane, no border. Only visible after we
+    // auto-fell-back from a failed resume attempt; cleared on first
+    // key delivered to this agent's pane OR on focus change away
+    // from it (whichever comes first). Picks the same "Constraint::
+    // Length(1)" shape used elsewhere in the runtime for thin chrome.
+    let pane_area = if let Some(notice) = agent.resume_fallback_notice.as_deref() {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(area);
+        let banner = Paragraph::new(Span::styled(
+            notice,
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Left);
+        frame.render_widget(banner, split[0]);
+        split[1]
+    } else {
+        area
+    };
     match &agent.state {
         AgentState::Ready { parser, .. } => {
             let widget = PseudoTerminal::new(parser.screen());
-            frame.render_widget(widget, area);
-            pane_hitbox.record(area, agent.id.clone());
-            paint_selection_if_active(frame, area, &agent.id, overlay.selection);
-            paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
+            frame.render_widget(widget, pane_area);
+            pane_hitbox.record(pane_area, agent.id.clone());
+            paint_selection_if_active(frame, pane_area, &agent.id, overlay.selection);
+            paint_hover_url_if_active(frame, pane_area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
             if offset > 0 {
-                render_scroll_indicator(frame, area, offset);
+                render_scroll_indicator(frame, pane_area, offset);
             } else {
                 // Project the inner PTY's cursor onto the host
                 // terminal's real cursor so OS dead-key previews
@@ -4636,10 +5125,10 @@ fn render_agent_pane(
                 // mislead. Modals (spawn / help) call
                 // `set_cursor_position` after this, overriding.
                 let (vt_row, vt_col) = parser.screen().cursor_position();
-                let cursor_x = area.x.saturating_add(vt_col);
-                let cursor_y = area.y.saturating_add(vt_row);
-                if cursor_x < area.x.saturating_add(area.width)
-                    && cursor_y < area.y.saturating_add(area.height)
+                let cursor_x = pane_area.x.saturating_add(vt_col);
+                let cursor_y = pane_area.y.saturating_add(vt_row);
+                if cursor_x < pane_area.x.saturating_add(pane_area.width)
+                    && cursor_y < pane_area.y.saturating_add(pane_area.height)
                 {
                     frame.set_cursor_position((cursor_x, cursor_y));
                 }
@@ -4651,15 +5140,15 @@ fn render_agent_pane(
             // banner overlay below tells the user the screen is
             // frozen.
             let widget = PseudoTerminal::new(parser.screen());
-            frame.render_widget(widget, area);
-            pane_hitbox.record(area, agent.id.clone());
-            paint_selection_if_active(frame, area, &agent.id, overlay.selection);
-            paint_hover_url_if_active(frame, area, &agent.id, overlay.hover);
+            frame.render_widget(widget, pane_area);
+            pane_hitbox.record(pane_area, agent.id.clone());
+            paint_selection_if_active(frame, pane_area, &agent.id, overlay.selection);
+            paint_hover_url_if_active(frame, pane_area, &agent.id, overlay.hover);
             let offset = parser.screen().scrollback();
             if offset > 0 {
-                render_scroll_indicator(frame, area, offset);
+                render_scroll_indicator(frame, pane_area, offset);
             }
-            render_crash_banner(frame, area, *exit_code, dismiss_label);
+            render_crash_banner(frame, pane_area, *exit_code, dismiss_label);
         }
         AgentState::Failed { error } => {
             // Failed panes record a hitbox and paint the selection
@@ -4669,9 +5158,9 @@ fn render_agent_pane(
             // mirror of `vt100::Screen::contents_between`) rather
             // than the parser screen.
             let host = agent.host.as_deref().unwrap_or("");
-            render_failure_pane(frame, area, host, &error.user_message());
-            pane_hitbox.record(area, agent.id.clone());
-            paint_selection_if_active(frame, area, &agent.id, overlay.selection);
+            render_failure_pane(frame, pane_area, host, &error.user_message());
+            pane_hitbox.record(pane_area, agent.id.clone());
+            paint_selection_if_active(frame, pane_area, &agent.id, overlay.selection);
         }
     }
 }
@@ -8019,6 +8508,7 @@ mod tests {
             5,
             20,
             100,
+            None,
         );
         if let AgentState::Ready { transport, .. } = &mut agent.state {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -8861,6 +9351,7 @@ mod tests {
             5,
             20,
             scrollback_len,
+            None,
         )
     }
 
@@ -10522,6 +11013,7 @@ mod tests {
             5,
             cols,
             100,
+            None,
         );
         if let AgentState::Ready { parser, .. } = &mut agent.state {
             parser.process(body);
@@ -10872,6 +11364,7 @@ mod tests {
 
     use codemuxd_bootstrap::{Error as BootstrapError, Stage as BootstrapStage};
 
+    #[allow(clippy::too_many_arguments)]
     fn fake_attach_factory(
         _prepared: PreparedHost,
         _host: String,
@@ -10879,6 +11372,8 @@ mod tests {
         _cwd: Option<PathBuf>,
         _rows: u16,
         _cols: u16,
+        _session_id: String,
+        _resume_session_id: Option<String>,
     ) -> AttachHandle {
         AttachHandle::from_events(Vec::new())
     }
@@ -10902,6 +11397,8 @@ mod tests {
             24,
             80,
             true,
+            Uuid::new_v4(),
+            None,
             fake_attach_factory,
         );
         assert_eq!(attach.label, "devpod:agent-7");
@@ -10928,6 +11425,8 @@ mod tests {
             24,
             80,
             false,
+            Uuid::new_v4(),
+            None,
             fake_attach_factory,
         );
         assert!(
@@ -11502,5 +12001,77 @@ mod tests {
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    // ---- AD-2 build_claude_args ─────────────────────────────────────
+    //
+    // Argv shape is the load-bearing contract between codemux and
+    // Claude Code's CLI. These tests pin the two cases (fresh spawn,
+    // resume) so a refactor can't silently drop the `--session-id` /
+    // `--resume` pair.
+
+    /// AD-2 fresh spawn: argv ends with `--session-id <uuid>`. We
+    /// don't pin a specific UUID (each test run gets a different one);
+    /// the regex captures the canonical 8-4-4-4-12 form, and we use
+    /// `uuid::Uuid::parse_str` to assert validity instead of a regex
+    /// crate (no dep churn).
+    #[test]
+    fn build_claude_args_fresh_spawn_appends_session_id() {
+        use std::path::Path;
+        let cfg = crate::config::TokensSegmentConfig::default();
+        let uuid = Uuid::new_v4();
+        let args = build_claude_args(Path::new("/tmp/statusline.json"), &cfg, &uuid, None);
+        // Tail two elements must be `--session-id` then a valid UUID.
+        let n = args.len();
+        assert!(
+            n >= 2,
+            "argv must have at least the AD-2 pair, got {args:?}"
+        );
+        assert_eq!(
+            args[n - 2],
+            "--session-id",
+            "second-to-last argv must be `--session-id`, got {args:?}",
+        );
+        Uuid::parse_str(&args[n - 1]).expect("last argv must parse as a UUID");
+        assert!(
+            !args.contains(&"--resume".to_string()),
+            "fresh-spawn argv must NOT contain `--resume`",
+        );
+    }
+
+    /// AD-2 resume: argv ends with `--resume <uuid>`, and `--session-id`
+    /// is absent. The two flags are mutually exclusive on Claude
+    /// Code's CLI.
+    #[test]
+    fn build_claude_args_resume_path_uses_resume_flag_only() {
+        use std::path::Path;
+        let cfg = crate::config::TokensSegmentConfig::default();
+        let fresh = Uuid::new_v4();
+        let resume = Uuid::new_v4();
+        let args = build_claude_args(
+            Path::new("/tmp/statusline.json"),
+            &cfg,
+            &fresh,
+            Some(&resume),
+        );
+        let n = args.len();
+        assert!(
+            n >= 2,
+            "argv must have at least the AD-2 pair, got {args:?}"
+        );
+        assert_eq!(
+            args[n - 2],
+            "--resume",
+            "second-to-last argv must be `--resume`, got {args:?}",
+        );
+        assert_eq!(
+            args[n - 1],
+            resume.to_string(),
+            "last argv must be the resume uuid, got {args:?}",
+        );
+        assert!(
+            !args.contains(&"--session-id".to_string()),
+            "resume argv must NOT contain `--session-id`, got {args:?}",
+        );
     }
 }
