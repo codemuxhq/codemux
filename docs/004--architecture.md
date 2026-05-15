@@ -157,8 +157,8 @@ AgentStatus ::= Starting | Running | Idle | NeedsInput | Dead
 - **Host**: a machine codemux can spawn Claude Code on. `local` uses direct
   fork. `ssh` uses `ssh_target` to reach the remote `codemuxd`.
 - **Agent**: a logical workspace. Persists across PTY deaths and app restarts
-  once persistence lands ([AD-7](#ad-7--state-is-a-single-sqlite-file-via-rusqlite),
-  deferred). Killing a PTY does not delete the agent.
+  via [AD-7](#ad-7--state-is-a-single-sqlite-file-via-rusqlite). Killing a
+  PTY does not delete the agent.
 - **AgentTransport**: closed sum type the runtime uses to drive a PTY
   without knowing whether it's local or remote-via-daemon. New transports
   are an enum-variant change, not a trait-object explosion.
@@ -521,14 +521,23 @@ flow.
 
 ### AD-7 — State is a single SQLite file via `rusqlite`
 
-**Status:** Deferred (P1). `rusqlite` is a workspace dep but currently
-unused; no schema or migrations exist yet.
+**Status:** Accepted, shipped (P1). `crates/store` owns the schema and
+migrations; `crates/session` owns the repository ports; `apps/tui`
+wires the adapter into the runtime. See
+[`docs/plans/2026-05-15--persistence-session-id-spike.md`](plans/2026-05-15--persistence-session-id-spike.md)
+for the spike that anchored the session-id flow against AD-1.
 
 **Context.** Persistence is needed for AD-2 (reattach across restarts),
 agent metadata across sessions, group tagging, and the host registry.
 
-**Decision (sketch).** Single SQLite file at `$XDG_STATE_HOME/codemux/state.db`.
-Schema migrations via `rusqlite_migration`.
+**Decision.** Single SQLite file at `$XDG_STATE_HOME/codemux/state.db`
+(falls back to `~/.local/state/codemux/state.db`). Schema migrations
+via `rusqlite_migration`. V1 schema covers `hosts`, `groups`, `agents`,
+`agent_groups`. The repository ports (`HostRepository`,
+`AgentRepository`, `GroupRepository`) live in `crates/session`; the
+SQLite adapter (`SqliteStore`) lives in `crates/store`. Agents are
+persisted only after the PTY transitions `Starting -> Running`
+(Strategy (i)) so failed spawns leave no DB residue.
 
 **Rejected alternatives.**
 - *Multiple JSON/TOML files.* Race conditions on multi-write, no migration
