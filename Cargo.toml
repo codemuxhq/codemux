@@ -6,6 +6,7 @@ members = [
     "crates/codemuxd-bootstrap",
     "crates/session",
     "crates/shared-kernel",
+    "crates/store",
     "crates/test-fakes",
     "crates/test-ssh-harness",
     "crates/wire",
@@ -39,6 +40,7 @@ categories = ["command-line-utilities", "development-tools"]
 codemuxd-bootstrap = { path = "crates/codemuxd-bootstrap", version = "0.1.0" }
 codemux-session = { path = "crates/session", version = "0.1.0" }
 codemux-shared-kernel = { path = "crates/shared-kernel", version = "0.1.0" }
+codemux-store = { path = "crates/store", version = "0.1.0" }
 codemux-test-fakes = { path = "crates/test-fakes", version = "0.1.0" }
 codemux-test-ssh-harness = { path = "crates/test-ssh-harness", version = "0.1.0" }
 codemux-wire = { path = "crates/wire", version = "0.1.0" }

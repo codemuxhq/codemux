@@ -1,0 +1,25 @@
+[package]
+name = "codemux-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "codemux persistent state: schema + migrations over rusqlite (AD-7)."
+# Per-crate; not inherited from the workspace.
+keywords = ["codemux", "persistence", "sqlite", "migrations"]
+categories = ["database"]
+
+[dependencies]
+rusqlite.workspace = true
+rusqlite_migration.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
