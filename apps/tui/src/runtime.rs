@@ -69,11 +69,13 @@ use crate::index_manager::IndexManager;
 use crate::index_worker::IndexState;
 use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction, ScrollAction};
 use crate::log_tail::LogTail;
+use crate::persistence::{self, AgentRow, Persistence, Snapshot};
 use crate::pty_title::TitleCapture;
 use crate::repo_name;
 use crate::spawn::{DirLister, HOST_PLACEHOLDER, ModalOutcome, SpawnMinibuffer};
 use crate::status_bar::{self, AgentView, SegmentCtx, StatusSegment, render_segments};
 use crate::toast::{Toast, ToastDeck, render_toast};
+use codemux_session::domain::AgentStatus;
 
 const FRAME_POLL: Duration = Duration::from_millis(50);
 const NAV_PANE_WIDTH: u16 = 25;
@@ -301,14 +303,51 @@ impl FinishTransitions {
     }
 }
 
+/// Snapshot returned by [`NavState::reap_dead_transports`] so the
+/// caller can persist the lifecycle transitions. `removed` is the
+/// set of agent ids that exited cleanly and were spliced out of the
+/// Vec (their DB rows should be deleted); `crashed` is the set that
+/// transitioned `Ready → Crashed` in place (their status should be
+/// stamped `Dead` so a future codemux can show them in the tab list).
+///
+/// Returning ids rather than `&Agent` borrows keeps the caller free
+/// to mutate `nav.agents` immediately after — the persistence calls
+/// happen on plain-data ids that no longer alias the Vec.
+#[derive(Debug, Default)]
+struct ReapOutcome {
+    removed: Vec<AgentId>,
+    crashed: Vec<AgentId>,
+}
+
 impl NavState {
     /// Build a fresh state from an initial agent vector. The first
-    /// agent (index 0) is focused.
+    /// agent (index 0) is focused. Production startup goes through
+    /// [`Self::with_focus`] so the loaded-Dead tabs don't steal initial
+    /// focus from the freshly-spawned agent; `new` stays as a
+    /// test-only convenience.
+    #[cfg(test)]
     #[must_use]
     fn new(agents: Vec<RuntimeAgent>) -> Self {
         Self {
             agents,
             focused: 0,
+            previous_focused: None,
+            popup_state: PopupState::default(),
+        }
+    }
+
+    /// Build a fresh state with focus on the given index. Used at
+    /// startup when the runtime has prepended loaded-Dead tabs in
+    /// front of the freshly-spawned initial agent and wants the
+    /// initial focus to land on the latter, not on a dead tab.
+    /// Clamps to the last index if `initial_focused` is out of range
+    /// so callers don't have to bounds-check before constructing.
+    #[must_use]
+    fn with_focus(agents: Vec<RuntimeAgent>, initial_focused: usize) -> Self {
+        let last = agents.len().saturating_sub(1);
+        Self {
+            focused: initial_focused.min(last),
+            agents,
             previous_focused: None,
             popup_state: PopupState::default(),
         }
@@ -335,7 +374,8 @@ impl NavState {
     /// highest-first so earlier removals don't shift later ones,
     /// and `remove_at` handles all surrounding focus / popup
     /// clamping.
-    fn reap_dead_transports(&mut self) {
+    fn reap_dead_transports(&mut self) -> ReapOutcome {
+        let mut outcome = ReapOutcome::default();
         let mut clean_exits: Vec<usize> = Vec::new();
         for (i, agent) in self.agents.iter_mut().enumerate() {
             if let AgentState::Ready { transport, .. } = &mut agent.state
@@ -343,14 +383,17 @@ impl NavState {
             {
                 if code == 0 {
                     clean_exits.push(i);
+                    outcome.removed.push(agent.id.clone());
                 } else {
                     agent.mark_crashed(code);
+                    outcome.crashed.push(agent.id.clone());
                 }
             }
         }
         for i in clean_exits.into_iter().rev() {
             self.remove_at(i);
         }
+        outcome
     }
 
     /// Pure query. Captures every agent's current `is_working()` plus
@@ -445,20 +488,23 @@ impl NavState {
     /// `<prefix> d` can't close a live session — the more aggressive
     /// [`Self::kill_focused`] is the chord that punches through.
     ///
-    /// Returns `true` when an agent was actually removed, so the
-    /// caller can react if needed.
-    fn dismiss_focused(&mut self) -> bool {
-        let is_dismissable = self.agents.get(self.focused).is_some_and(|a| {
-            matches!(
-                a.state,
-                AgentState::Failed { .. } | AgentState::Crashed { .. }
-            )
-        });
-        if !is_dismissable {
-            return false;
-        }
+    /// Returns the removed agent's id when one was actually removed,
+    /// `None` otherwise. The id lets the caller persist the removal
+    /// (delete the DB row) without re-walking the Vec to find what
+    /// was there a moment ago.
+    fn dismiss_focused(&mut self) -> Option<AgentId> {
+        let removed_id = self
+            .agents
+            .get(self.focused)
+            .filter(|a| {
+                matches!(
+                    a.state,
+                    AgentState::Failed { .. } | AgentState::Crashed { .. }
+                )
+            })
+            .map(|a| a.id.clone())?;
         self.remove_at(self.focused);
-        true
+        Some(removed_id)
     }
 
     /// Force-close the focused agent regardless of state. The
@@ -467,14 +513,14 @@ impl NavState {
     /// `SshDaemonPty::drop` kills the tunnel) take care of reaping
     /// the child / tunnel — no explicit `kill()` call needed here.
     ///
-    /// Returns `true` when an agent was actually removed, `false`
-    /// when called against an empty Vec.
-    fn kill_focused(&mut self) -> bool {
-        if self.focused >= self.agents.len() {
-            return false;
-        }
+    /// Returns the removed agent's id when one was actually removed,
+    /// `None` when called against an empty Vec. The id lets the caller
+    /// persist the removal (delete the DB row) without re-walking the
+    /// Vec to find what was there a moment ago.
+    fn kill_focused(&mut self) -> Option<AgentId> {
+        let removed_id = self.agents.get(self.focused).map(|a| a.id.clone())?;
         self.remove_at(self.focused);
-        true
+        Some(removed_id)
     }
 
     /// Remove the agent at `idx` and clamp every surrounding
@@ -1030,6 +1076,62 @@ impl RuntimeAgent {
         }
     }
 
+    /// Construct a `RuntimeAgent` from a persisted-DB row whose PTY
+    /// no longer exists. Used at TUI startup ([AD-7]) to surface
+    /// previously-spawned agents as Dead tabs in the navigator. The
+    /// step-5 resume-on-focus flow turns them back into live `Ready`
+    /// agents via `claude --resume <session_id>`; for step 4 they
+    /// only need to render and be dismissable.
+    ///
+    /// Modeled as `AgentState::Crashed` with the `-1` sentinel exit
+    /// code (the same code the SSH transport uses for socket-level
+    /// failures) so the existing crash-banner renderer fires without
+    /// needing a new variant. Polish for the "loaded vs crashed-mid-
+    /// session" distinction lands in step 6.
+    ///
+    /// The parser is a fresh empty grid at the agent's geometry —
+    /// there is no last frame to preserve because the PTY was gone
+    /// before this codemux invocation started.
+    ///
+    /// [AD-7]: ../../../docs/004--architecture.md
+    #[allow(clippy::too_many_arguments)]
+    fn loaded_dead(
+        id: AgentId,
+        label: String,
+        repo: Option<String>,
+        cwd: Option<PathBuf>,
+        host: Option<String>,
+        rows: u16,
+        cols: u16,
+        scrollback_len: usize,
+    ) -> Self {
+        let parser = Box::new(Parser::new_with_callbacks(
+            rows.max(1),
+            cols.max(1),
+            scrollback_len,
+            TitleCapture::default(),
+        ));
+        Self {
+            id,
+            label,
+            repo,
+            cwd,
+            host,
+            model_effort: None,
+            branch: None,
+            token_usage: None,
+            statusline_path: None,
+            last_working: false,
+            needs_attention: false,
+            rows,
+            cols,
+            state: AgentState::Crashed {
+                parser,
+                exit_code: -1,
+            },
+        }
+    }
+
     /// Current scrollback offset (`0` = live view). Returns `0` for a
     /// `Failed` agent so callers can check "is this agent in scroll
     /// mode" without matching on the state. `Crashed` agents keep
@@ -1224,6 +1326,7 @@ pub struct TestSeams {
     pub record_opens_to: Option<PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn run(
     nav_style: NavStyle,
     config: &Config,
@@ -1231,23 +1334,101 @@ pub fn run(
     log_tail: Option<&LogTail>,
     agent_spawner: &dyn AgentSpawner,
     seams: TestSeams,
+    persistence: &Persistence,
+    snapshot: Snapshot,
 ) -> Result<()> {
     tracing::info!(?initial_cwd, "codemux starting (nav={nav_style:?})");
 
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
 
+    // Hydrate previously-persisted hosts and agents BEFORE spawning
+    // the fresh initial agent. Loaded agents land as `Dead` (their
+    // PTYs are gone), the freshly-spawned agent is appended as the
+    // focused tab. Step 5 will let the user resume Dead agents via
+    // `claude --resume <session_id>`; for now they only render and
+    // are dismissable.
+    //
+    // We also write each loaded row back as `Dead` so the on-disk
+    // status matches the in-memory truth. Without this, a row last
+    // saved as `Running` (the most common case, since the previous
+    // codemux died before it could persist a clean shutdown) would
+    // re-load as `Running` on every restart and persist a stale
+    // "looks live" status across `load_snapshot` invocations.
+    let host_lookup = build_host_lookup(&snapshot.hosts);
+    let mut agents: Vec<RuntimeAgent> = snapshot
+        .agents
+        .into_iter()
+        .map(|agent| {
+            let host = host_lookup
+                .get(agent.host_id.as_str())
+                .and_then(|kind| match kind {
+                    codemux_session::domain::HostKind::Local => None,
+                    codemux_session::domain::HostKind::Ssh { target } => Some(target.clone()),
+                });
+            let cwd = if agent.cwd.as_os_str().is_empty() {
+                None
+            } else {
+                Some(agent.cwd.clone())
+            };
+            let repo = cwd.as_deref().and_then(repo_name::resolve_local);
+            let loaded = RuntimeAgent::loaded_dead(
+                agent.id,
+                agent.label,
+                repo,
+                cwd,
+                host,
+                pty_rows,
+                pty_cols,
+                config.scrollback_len,
+            );
+            // Best-effort write-through of the load-boundary reset.
+            // Failures are logged inside `save_agent` and do not
+            // block startup — losing one persistence write is
+            // preferable to refusing to start at all.
+            persist_agent_status(
+                persistence,
+                &loaded,
+                AgentStatus::Dead,
+                agent.last_attached_at,
+            );
+            loaded
+        })
+        .collect();
+
+    // Pick an id for the initial spawn that does not collide with any
+    // loaded-Dead row. Default to `agent-1` (preserves the current
+    // single-agent boot UX); if any loaded row already claims an
+    // `agent-N` id, bump past the highest seen so the fresh agent
+    // gets the next free slot. This also seeds `spawn_counter`
+    // below so subsequent modal-driven spawns keep ascending without
+    // collisions.
+    let initial_n = next_free_agent_n(&agents).unwrap_or(1);
+    let initial_id_text = format!("agent-{initial_n}");
     let initial = spawn_local_agent(
         agent_spawner,
-        AgentId::new("agent-1"),
-        "agent-1".into(),
+        AgentId::new(initial_id_text.clone()),
+        initial_id_text,
         Some(initial_cwd),
         pty_rows,
         pty_cols,
         config.scrollback_len,
         &config.ui.segments.tokens,
     )?;
-    let agents = vec![initial];
+    // Strategy (i) from the 2026-05-15 persistence spike: the PTY
+    // transition `Starting → Running` is implicit in `spawn_local_agent`
+    // returning Ok (the spawner blocks on the spawn syscall and
+    // returns only on success). Persist the agent + its local-host
+    // row now so a crash before the first frame still leaves a
+    // resumable row on disk.
+    persistence.record_local_host();
+    persist_agent_status(persistence, &initial, AgentStatus::Running, None);
+    agents.push(initial);
+    // Focus the newly-spawned agent — loaded-Dead tabs sit in front
+    // of it in the Vec but the freshly-spawned one is the one the
+    // user wants to type into. `nav.focused` defaults to 0 inside
+    // `NavState::new`, so we adjust below at construction.
+    let initial_focus = agents.len() - 1;
 
     enable_raw_mode().wrap_err("enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).wrap_err("enter alt screen")?;
@@ -1362,13 +1543,108 @@ pub fn run(
     event_loop(
         &mut terminal,
         agents,
+        initial_focus,
         nav_style,
         log_tail,
         initial_cwd,
         &ctx,
         agent_spawner,
         seams,
+        persistence,
     )
+}
+
+/// Index host id → kind for the loaded-snapshot agents. Lifted into a
+/// helper so the loaded-host fan-out at startup keeps borrowing the
+/// `Vec<Host>` immutably while building the agent rows alongside.
+fn build_host_lookup(
+    hosts: &[codemux_session::domain::Host],
+) -> std::collections::HashMap<String, codemux_session::domain::HostKind> {
+    hosts
+        .iter()
+        .map(|h| (h.id.as_str().to_string(), h.kind.clone()))
+        .collect()
+}
+
+/// Translate a `RuntimeAgent` + current status into the domain
+/// `AgentRow` and hand it to the persistence sink. Centralised so the
+/// six-or-so mutation seams in the event loop share one definition of
+/// "what does the on-disk row look like for this in-memory agent."
+///
+/// The `cwd` shape: SSH agents track their remote cwd as an opaque
+/// remote path that may not be a meaningful local `PathBuf`, and
+/// local agents may have been spawned without a cwd (`None`). When
+/// no cwd is available we persist an empty `PathBuf`; the load side
+/// treats an empty path as `None`. This keeps the column non-null
+/// (the schema constraint) without inventing a placeholder string.
+/// Change focus to `idx` and persist the newly-focused agent's
+/// `last_attached_at`. Centralised so the six focus-change sites in
+/// the event loop (`FocusNext` / `FocusPrev` / `FocusLast` / `FocusAt`,
+/// popup-confirm, tab-click, attach-completion) share one definition
+/// of "what happens when the user looks at a tab."
+///
+/// `change_focus` is a no-op when `idx == nav.focused`, so the
+/// matching persist is skipped — re-pressing the same direct-bind a
+/// few times in a row produces zero DB writes.
+fn focus_and_touch(nav: &mut NavState, idx: usize, persistence: &Persistence) {
+    let prior = nav.focused;
+    nav.change_focus(idx);
+    if nav.focused == prior {
+        return;
+    }
+    // Persist `last_attached_at` for whatever the focus actually
+    // landed on. Reading `nav.focused` after the call (rather than
+    // trusting `idx`) keeps the helper correct even if `change_focus`
+    // ever grows a clamp.
+    if let Some(agent) = nav.agents.get(nav.focused) {
+        let status = match &agent.state {
+            AgentState::Ready { .. } => AgentStatus::Running,
+            // Step 5 will turn focus-on-Dead into a resume attempt;
+            // for step 4 it's a no-op as far as the PTY goes, but we
+            // still touch `last_attached_at` so the user-visible
+            // recency surface is accurate.
+            AgentState::Crashed { .. } | AgentState::Failed { .. } => AgentStatus::Dead,
+        };
+        persist_agent_status(
+            persistence,
+            agent,
+            status,
+            Some(std::time::SystemTime::now()),
+        );
+    }
+}
+
+fn persist_agent_status(
+    persistence: &Persistence,
+    agent: &RuntimeAgent,
+    status: AgentStatus,
+    last_attached_at: Option<std::time::SystemTime>,
+) {
+    let host_id = match agent.host.as_deref() {
+        Some(target) => persistence::ssh_host_id(target),
+        None => persistence::local_host_id(),
+    };
+    let cwd_owned: PathBuf;
+    let cwd_ref: &Path = if let Some(p) = agent.cwd.as_deref() {
+        p
+    } else {
+        cwd_owned = PathBuf::new();
+        &cwd_owned
+    };
+    let row = persistence::build_agent_row(AgentRow {
+        id: agent.id.clone(),
+        host_id,
+        label: agent.label.clone(),
+        cwd: cwd_ref,
+        // step 5 will populate this; today every agent persists with
+        // `session_id = None` so resume-on-focus has nothing to
+        // attempt. The column stays nullable and the runtime stays
+        // ignorant of `--session-id` until then.
+        session_id: None,
+        status,
+        last_attached_at,
+    });
+    persistence.save_agent(&row);
 }
 
 fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16, log_strip: bool) -> (u16, u16) {
@@ -1393,6 +1669,31 @@ fn pty_size_for(style: NavStyle, term_rows: u16, term_cols: u16, log_strip: bool
 /// See the call site in `event_loop` for the full rationale.
 fn daemon_agent_id_for(tui_pid: u32, spawn_counter: usize) -> String {
     format!("agent-{tui_pid}-{spawn_counter}")
+}
+
+/// Find the smallest `N >= 1` such that no agent in `agents` has the
+/// id `agent-N`. Returns `None` when no `agent-N` id is present at
+/// all, signalling to the caller "you can start at 1." Used at
+/// startup to pick a non-colliding id for the freshly-spawned
+/// initial agent in the presence of loaded-Dead tabs.
+///
+/// Only consults the `agent-N` shape that the runtime itself
+/// generates. Daemon-namespaced ids (`agent-<pid>-N`, see
+/// [`daemon_agent_id_for`]) are deliberately skipped — they are
+/// already scoped by `tui_pid` and cannot collide with the local
+/// monotonic counter regardless of what gets loaded.
+fn next_free_agent_n(agents: &[RuntimeAgent]) -> Option<usize> {
+    let mut max_n = None;
+    for agent in agents {
+        let id = agent.id.as_str();
+        if let Some(rest) = id.strip_prefix("agent-")
+            && !rest.contains('-')
+            && let Ok(n) = rest.parse::<usize>()
+        {
+            max_n = Some(max_n.map_or(n, |m: usize| m.max(n)));
+        }
+    }
+    max_n.map(|n| n + 1)
 }
 
 /// One frame of fuzzy-worker bookkeeping for the spawn modal:
@@ -2733,12 +3034,14 @@ struct RuntimeContext<'a> {
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agents: Vec<RuntimeAgent>,
+    initial_focused: usize,
     mut nav_style: NavStyle,
     log_tail: Option<&LogTail>,
     initial_cwd: &Path,
     ctx: &RuntimeContext<'_>,
     agent_spawner: &dyn AgentSpawner,
     seams: TestSeams,
+    persistence: &Persistence,
 ) -> Result<()> {
     // Destructure into bare locals so the body — which accesses each
     // of these in dozens of places — keeps reading naturally instead
@@ -2802,7 +3105,16 @@ fn event_loop(
     let fuzzy_worker = FuzzyWorker::start();
     let mut last_pushed_index_gen: HashMap<String, u64> = HashMap::new();
     let mut last_pushed_query: HashMap<String, String> = HashMap::new();
-    let initial_count = agents.len();
+    // Seed `spawn_counter` from the highest `agent-N` id present —
+    // this includes the freshly-spawned initial agent + every loaded
+    // Dead row. A modal-driven spawn does `spawn_counter += 1;
+    // agent-{spawn_counter}`, so seeding from the max keeps the
+    // monotonic-id property across restarts without colliding with
+    // anything already in the DB.
+    let initial_count = next_free_agent_n(&agents)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(agents.len());
     // Bundle the four navigation locals (`agents`, `focused`,
     // `previous_focused`, `popup_state`) into a single owned struct.
     // Pre-`NavState` they were four separate `let mut` locals here
@@ -2810,7 +3122,7 @@ fn event_loop(
     // to take a parallel cluster of `&mut` refs — flagged in
     // architecture review as a data clump. The methods now own their
     // mutation invariants behind `&mut self`.
-    let mut nav = NavState::new(agents);
+    let mut nav = NavState::with_focus(agents, initial_focused);
     // Per-frame click hitboxes for the tab strip / nav rows. Populated
     // by the leaf renderers, consumed by the mouse handler. Cleared at
     // the top of every `render_frame` so a stale frame's geometry can
@@ -3027,7 +3339,7 @@ fn event_loop(
                         // immediate Resize before any frames flow.
                         let _ = transport.resize(attach.rows, attach.cols);
                         tracing::info!(label = %attach.label, "attach completed; transport ready");
-                        new_agents.push(RuntimeAgent::ready(
+                        let agent = RuntimeAgent::ready(
                             attach.agent_id.clone(),
                             attach.label.clone(),
                             attach.repo.clone(),
@@ -3049,10 +3361,25 @@ fn event_loop(
                             attach.rows,
                             attach.cols,
                             scrollback_len,
-                        ));
+                        );
+                        // Strategy (i): persist only after the attach
+                        // succeeded. The host row goes in first so the
+                        // agent's `host_id` foreign key resolves.
+                        persistence.record_ssh_host(&attach.host);
+                        persist_agent_status(
+                            persistence,
+                            &agent,
+                            AgentStatus::Running,
+                            Some(std::time::SystemTime::now()),
+                        );
+                        new_agents.push(agent);
                     }
                     Err(e) => {
                         tracing::error!(label = %attach.label, "attach failed: {e}");
+                        // Failed SSH attach: do NOT persist. The user
+                        // gets a Failed tab they can dismiss with
+                        // `<prefix> d`; no DB row means the next
+                        // codemux launch starts clean for this host.
                         new_agents.push(RuntimeAgent::failed(
                             attach.agent_id.clone(),
                             attach.label.clone(),
@@ -3091,7 +3418,7 @@ fn event_loop(
         nav.agents.extend(new_agents);
         if focus_new && new_count > 0 {
             let target = nav.agents.len() - 1;
-            nav.change_focus(target);
+            focus_and_touch(&mut nav, target, persistence);
         }
 
         for agent in &mut nav.agents {
@@ -3124,7 +3451,24 @@ fn event_loop(
             }
         }
 
-        nav.reap_dead_transports();
+        let reap_outcome = nav.reap_dead_transports();
+        for id in &reap_outcome.removed {
+            // Clean exit (code 0) → row goes away with the tab. The
+            // user's "claude `/quit`" is intent to retire the session;
+            // persisting Dead would clutter the next codemux launch
+            // with a tab they themselves just closed.
+            persistence.delete_agent(id);
+        }
+        for id in &reap_outcome.crashed {
+            // Ready → Crashed: persist as Dead so the next codemux
+            // launch surfaces the tab for resume-on-focus (step 5)
+            // rather than silently dropping it. Look the agent back
+            // up by id — the reap mutated the Vec in place, so the
+            // record is still there with its mutated state.
+            if let Some(agent) = nav.agents.iter().find(|a| a.id == *id) {
+                persist_agent_status(persistence, agent, AgentStatus::Dead, None);
+            }
+        }
         if nav.agents.is_empty() {
             // Reap may have shrunk the Vec via the clean-exit path.
             // The last tab going away (claude `/quit`'d) is the
@@ -3451,9 +3795,22 @@ fn event_loop(
                                     tokens_cfg,
                                 ) {
                                     Ok(agent) => {
+                                        // Strategy (i) from the 2026-05-15
+                                        // spike: persist only after the
+                                        // PTY's `Starting → Running`
+                                        // transition (here: the spawner
+                                        // returned Ok). Failed spawns
+                                        // leave no DB residue.
+                                        persistence.record_local_host();
+                                        persist_agent_status(
+                                            persistence,
+                                            &agent,
+                                            AgentStatus::Running,
+                                            Some(std::time::SystemTime::now()),
+                                        );
                                         nav.agents.push(agent);
                                         let target = nav.agents.len() - 1;
-                                        nav.change_focus(target);
+                                        focus_and_touch(&mut nav, target, persistence);
                                     }
                                     Err(e) => {
                                         tracing::error!("spawn failed: {e}");
@@ -3540,9 +3897,23 @@ fn event_loop(
                                     tokens_cfg,
                                 ) {
                                     Ok(agent) => {
+                                        // Strategy (i): same shape as the
+                                        // Spawn arm above — persist only
+                                        // on Ok. Failed local spawns are
+                                        // currently rare here (no SSH
+                                        // overhead) but the policy is
+                                        // uniform: no DB residue on
+                                        // spawn failure.
+                                        persistence.record_local_host();
+                                        persist_agent_status(
+                                            persistence,
+                                            &agent,
+                                            AgentStatus::Running,
+                                            Some(std::time::SystemTime::now()),
+                                        );
                                         nav.agents.push(agent);
                                         let target = nav.agents.len() - 1;
-                                        nav.change_focus(target);
+                                        focus_and_touch(&mut nav, target, persistence);
                                     }
                                     Err(e) => {
                                         tracing::error!("spawn failed: {e}");
@@ -3654,7 +4025,7 @@ fn event_loop(
                                 nav.popup_state = PopupState::Open { selection: prev };
                             }
                             PopupAction::Confirm => {
-                                nav.change_focus(selection);
+                                focus_and_touch(&mut nav, selection, persistence);
                                 nav.popup_state = PopupState::Closed;
                             }
                             PopupAction::Cancel => {
@@ -3757,7 +4128,7 @@ fn event_loop(
                     }
                     KeyDispatch::FocusNext => {
                         let next = (nav.focused + 1) % nav.agents.len();
-                        nav.change_focus(next);
+                        focus_and_touch(&mut nav, next, persistence);
                     }
                     KeyDispatch::FocusPrev => {
                         let prev = if nav.focused == 0 {
@@ -3765,7 +4136,7 @@ fn event_loop(
                         } else {
                             nav.focused - 1
                         };
-                        nav.change_focus(prev);
+                        focus_and_touch(&mut nav, prev, persistence);
                     }
                     KeyDispatch::FocusLast => {
                         // Bounce. No-op if the previous slot is gone
@@ -3775,12 +4146,12 @@ fn event_loop(
                             && prev < nav.agents.len()
                             && prev != nav.focused
                         {
-                            nav.change_focus(prev);
+                            focus_and_touch(&mut nav, prev, persistence);
                         }
                     }
                     KeyDispatch::FocusAt(idx) => {
                         if idx < nav.agents.len() {
-                            nav.change_focus(idx);
+                            focus_and_touch(&mut nav, idx, persistence);
                         }
                     }
                     KeyDispatch::ToggleNav => {
@@ -3800,10 +4171,14 @@ fn event_loop(
                         help_state = HelpState::Open;
                     }
                     KeyDispatch::DismissAgent => {
-                        nav.dismiss_focused();
+                        if let Some(id) = nav.dismiss_focused() {
+                            persistence.delete_agent(&id);
+                        }
                     }
                     KeyDispatch::KillAgent => {
-                        nav.kill_focused();
+                        if let Some(id) = nav.kill_focused() {
+                            persistence.delete_agent(&id);
+                        }
                     }
                 }
             }
@@ -3940,7 +4315,7 @@ fn event_loop(
                                 TabMouseDispatch::Click(id) => {
                                     mouse_press = None;
                                     if let Some(idx) = nav.agents.iter().position(|a| a.id == id) {
-                                        nav.change_focus(idx);
+                                        focus_and_touch(&mut nav, idx, persistence);
                                     }
                                 }
                                 TabMouseDispatch::Reorder { from, to } => {
@@ -7705,7 +8080,7 @@ mod tests {
 
         let removed = nav.dismiss_focused();
 
-        assert!(removed);
+        assert!(removed.is_some());
         assert_eq!(nav.agents.len(), 1);
         assert_eq!(
             nav.focused, 0,
@@ -7719,7 +8094,7 @@ mod tests {
 
         let removed = nav.dismiss_focused();
 
-        assert!(removed, "Failed must be dismissable");
+        assert!(removed.is_some(), "Failed must be dismissable");
         assert_eq!(nav.agents.len(), 1);
     }
 
@@ -7731,7 +8106,7 @@ mod tests {
         let removed = nav.dismiss_focused();
 
         assert!(
-            !removed,
+            removed.is_none(),
             "Ready must NOT be dismissable (live-session footgun)"
         );
         assert_eq!(nav.agents.len(), before);
@@ -7799,7 +8174,7 @@ mod tests {
 
         let removed = nav.dismiss_focused();
 
-        assert!(removed);
+        assert!(removed.is_some());
         assert!(
             nav.agents.is_empty(),
             "all-dismissed path leaves the Vec empty",
@@ -7823,7 +8198,7 @@ mod tests {
 
         let removed = nav.kill_focused();
 
-        assert!(removed, "kill must work on a live Ready agent");
+        assert!(removed.is_some(), "kill must work on a live Ready agent");
         assert_eq!(nav.agents.len(), 1);
         assert_eq!(nav.focused, 0);
     }
@@ -7836,7 +8211,7 @@ mod tests {
 
         let removed = nav.kill_focused();
 
-        assert!(removed);
+        assert!(removed.is_some());
         assert_eq!(nav.agents.len(), 1);
     }
 
@@ -7844,7 +8219,7 @@ mod tests {
     fn kill_focused_no_op_on_empty_vec() {
         let mut nav = NavState::new(Vec::new());
         let removed = nav.kill_focused();
-        assert!(!removed, "no agent to kill on an empty list");
+        assert!(removed.is_none(), "no agent to kill on an empty list");
     }
 
     #[test]
@@ -8014,7 +8389,7 @@ mod tests {
 
         let removed = nav.dismiss_focused();
 
-        assert!(removed);
+        assert!(removed.is_some());
         assert!(nav.agents.is_empty());
     }
 

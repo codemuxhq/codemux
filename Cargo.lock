@@ -273,6 +273,7 @@ dependencies = [
  "clap",
  "codemux-session",
  "codemux-shared-kernel",
+ "codemux-store",
  "codemuxd-bootstrap",
  "color-eyre",
  "crossbeam-channel",

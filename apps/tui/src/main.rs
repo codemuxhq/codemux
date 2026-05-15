@@ -21,6 +21,7 @@ mod index_manager;
 mod index_worker;
 mod keymap;
 mod log_tail;
+mod persistence;
 mod pty_title;
 mod repo_name;
 mod runtime;
@@ -89,6 +90,17 @@ struct Cli {
     /// from `--help` for the same reason as `--panic-after`.
     #[arg(long, value_name = "PATH", hide = true)]
     record_opens_to: Option<PathBuf>,
+
+    /// Path to the codemux state database. Defaults to
+    /// `$XDG_STATE_HOME/codemux/state.db` (or
+    /// `$HOME/.local/state/codemux/state.db` if XDG is unset). The
+    /// file and any missing parent directories are created on first
+    /// run; subsequent runs reuse the same DB so previously-spawned
+    /// agents reappear as Dead tabs in the navigator. Useful in
+    /// tests to redirect persistence at a tempfile, and for the rare
+    /// user who wants a non-XDG location.
+    #[arg(long, value_name = "PATH", env = "CODEMUX_STATE_DB")]
+    state_db: Option<PathBuf>,
 
     /// Hidden IPC subcommands. The default `codemux [PATH]` invocation
     /// stays a positional-only path; subcommands kick in only when
@@ -170,6 +182,21 @@ fn main() -> Result<()> {
         panic_after: cli.panic_after.map(std::time::Duration::from_millis),
         record_opens_to: cli.record_opens_to,
     };
+    // Open the state DB and load whatever rows are on disk BEFORE
+    // raw-mode entry. AD-7's failure-mode rule mirrors config: a
+    // missing file is fine (we just write a fresh DB on first save),
+    // but anything else (path resolution, file open, migration,
+    // initial `load_all`) must surface a readable error and exit
+    // non-zero before the terminal switches to alt-screen + raw mode.
+    let state_db_path = match cli.state_db {
+        Some(p) => p,
+        None => persistence::default_db_path().wrap_err("resolve state database path")?,
+    };
+    let persistence = persistence::Persistence::open(&state_db_path)
+        .wrap_err_with(|| format!("open state database at {}", state_db_path.display()))?;
+    let snapshot = persistence
+        .load_snapshot()
+        .wrap_err("load persisted state")?;
     runtime::run(
         cli.nav,
         &config,
@@ -177,6 +204,8 @@ fn main() -> Result<()> {
         cli.log.then_some(&tail),
         &agent_spawner,
         seams,
+        &persistence,
+        snapshot,
     )
 }
 
