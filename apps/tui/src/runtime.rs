@@ -483,8 +483,8 @@ impl NavState {
         }
     }
 
-    /// Remove the focused agent if it's in a terminal state
-    /// (`Failed` or `Crashed`) and clamp the surrounding navigation
+    /// Remove the focused agent if it's in a terminal state (`Failed`,
+    /// `Crashed`, or `Dead`) and clamp the surrounding navigation
     /// state. No-op on a `Ready` agent so a fat-finger of
     /// `<prefix> d` can't close a live session — the more aggressive
     /// [`Self::kill_focused`] is the chord that punches through.
@@ -500,7 +500,9 @@ impl NavState {
             .filter(|a| {
                 matches!(
                     a.state,
-                    AgentState::Failed { .. } | AgentState::Crashed { .. }
+                    AgentState::Failed { .. }
+                        | AgentState::Crashed { .. }
+                        | AgentState::Dead { .. }
                 )
             })
             .map(|a| a.id.clone())?;
@@ -1008,22 +1010,46 @@ enum AgentState {
         parser: Box<Parser<TitleCapture>>,
         exit_code: i32,
     },
+    /// "The agent exists in our records but has no live PTY this
+    /// session." Distinct from `Crashed`:
+    ///
+    /// - **`Crashed`** carries a real exit code from `try_wait` — the
+    ///   agent was live in this codemux invocation and died with a
+    ///   process-level signal. The renderer paints a red banner that
+    ///   names the exit code.
+    /// - **`Dead`** is the load-from-disk shape (AD-7) and the
+    ///   resume-cancelled shape. No exit code to surface; the renderer
+    ///   skips the red banner entirely in favor of a terser hint.
+    ///
+    /// Empty parser at the agent's geometry so the scrollback /
+    /// selection / hover-overlay code paths (which all match on
+    /// `screen()`) behave the same as `Crashed` — they just paint an
+    /// empty grid until the user focuses it and the resume-on-focus
+    /// flow turns it back into `Ready`.
+    ///
+    /// Pre-step-6 this state was modeled as `Crashed { exit_code: -1 }`,
+    /// which collided with the `SshDaemonPty` socket-level-failure
+    /// sentinel and made the renderer print "connection lost" against
+    /// agents that had simply been loaded from disk.
+    Dead { parser: Box<Parser<TitleCapture>> },
 }
 
 impl AgentState {
     /// Live or last-frozen vt100 screen for this agent. `Some` for
-    /// `Ready` (live PTY) and `Crashed` (frozen at moment of death so
+    /// `Ready` (live PTY), `Crashed` (frozen at moment of death so
     /// the user can still scroll back through what claude was doing
-    /// pre-crash); `None` for `Failed` because no parser was ever
-    /// constructed. Centralised here so call sites that need a screen
-    /// (selection commit, hover lookup, post-draw OSC 8 painter) don't
-    /// each repeat the same `Ready | Crashed => Some(...), Failed =>
-    /// None` match against the variant shape.
+    /// pre-crash), and `Dead` (empty grid carried for the loaded-
+    /// from-disk case so scrollback / selection paths don't need a
+    /// separate "no screen" branch); `None` for `Failed` because no
+    /// parser was ever constructed. Centralised here so call sites
+    /// that need a screen (selection commit, hover lookup, post-draw
+    /// OSC 8 painter) don't each repeat the same match against the
+    /// variant shape.
     fn screen(&self) -> Option<&vt100::Screen> {
         match self {
-            AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
-                Some(parser.screen())
-            }
+            AgentState::Ready { parser, .. }
+            | AgentState::Crashed { parser, .. }
+            | AgentState::Dead { parser } => Some(parser.screen()),
             AgentState::Failed { .. } => None,
         }
     }
@@ -1118,14 +1144,12 @@ impl RuntimeAgent {
     /// no longer exists. Used at TUI startup ([AD-7]) to surface
     /// previously-spawned agents as Dead tabs in the navigator. The
     /// step-5 resume-on-focus flow turns them back into live `Ready`
-    /// agents via `claude --resume <session_id>`; for step 4 they
-    /// only need to render and be dismissable.
+    /// agents via `claude --resume <session_id>`.
     ///
-    /// Modeled as `AgentState::Crashed` with the `-1` sentinel exit
-    /// code (the same code the SSH transport uses for socket-level
-    /// failures) so the existing crash-banner renderer fires without
-    /// needing a new variant. Polish for the "loaded vs crashed-mid-
-    /// session" distinction lands in step 6.
+    /// Modeled as [`AgentState::Dead`] — distinct from `Crashed` so the
+    /// renderer can omit the red exit-code banner. Pre-step-6 this used
+    /// `Crashed { exit_code: -1 }`, which collided with the
+    /// `SshDaemonPty` socket-level-failure sentinel.
     ///
     /// The parser is a fresh empty grid at the agent's geometry —
     /// there is no last frame to preserve because the PTY was gone
@@ -1167,10 +1191,7 @@ impl RuntimeAgent {
             session_id,
             resume_attempt: false,
             resume_fallback_notice: None,
-            state: AgentState::Crashed {
-                parser,
-                exit_code: -1,
-            },
+            state: AgentState::Dead { parser },
         }
     }
 
@@ -1188,11 +1209,12 @@ impl RuntimeAgent {
     /// into history, negative toward the live view). Saturates at zero
     /// on the bottom; `vt100::Screen::set_scrollback` clamps the top to
     /// the buffer length, so we don't need to know the cap. No-op for
-    /// `Failed` agents — they have no parser. `Crashed` agents do
-    /// have one, so they scroll normally.
+    /// `Failed` agents — they have no parser. `Crashed` and `Dead`
+    /// agents do have one, so they scroll normally.
     fn nudge_scrollback(&mut self, delta: i32) {
-        if let AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } =
-            &mut self.state
+        if let AgentState::Ready { parser, .. }
+        | AgentState::Crashed { parser, .. }
+        | AgentState::Dead { parser } = &mut self.state
         {
             let screen = parser.screen_mut();
             let next = screen.scrollback().saturating_add_signed(delta as isize);
@@ -1202,12 +1224,13 @@ impl RuntimeAgent {
 
     /// Snap back to the live view (offset = 0). Used by the
     /// `ScrollAction::ExitScroll` path and by the non-sticky "any
-    /// forwarded keystroke snaps" rule. Crashed agents have no live
-    /// view per se but the same call resets scrollback to the bottom
-    /// so the crash banner and last frame are aligned.
+    /// forwarded keystroke snaps" rule. Crashed / Dead agents have no
+    /// live view per se but the same call resets scrollback to the
+    /// bottom so the crash banner and last frame are aligned.
     fn snap_to_live(&mut self) {
-        if let AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } =
-            &mut self.state
+        if let AgentState::Ready { parser, .. }
+        | AgentState::Crashed { parser, .. }
+        | AgentState::Dead { parser } = &mut self.state
         {
             parser.screen_mut().set_scrollback(0);
         }
@@ -1218,8 +1241,9 @@ impl RuntimeAgent {
     /// top regardless of the configured `scrollback_len` — no need to
     /// thread the cap through.
     fn jump_to_top(&mut self) {
-        if let AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } =
-            &mut self.state
+        if let AgentState::Ready { parser, .. }
+        | AgentState::Crashed { parser, .. }
+        | AgentState::Dead { parser } = &mut self.state
         {
             parser.screen_mut().set_scrollback(usize::MAX);
         }
@@ -1228,26 +1252,29 @@ impl RuntimeAgent {
     /// Live OSC title from the agent's parser, if any. `None` for
     /// `Failed` agents (no parser) and for agents whose foreground
     /// process never emitted a title. Crashed agents keep returning
-    /// their last title — the renderer dims/strikes-through the tab
-    /// label separately based on state.
+    /// their last title; Dead agents have a fresh empty parser so the
+    /// callback returns `None` until they're resumed — the renderer
+    /// dims/strikes-through the tab label separately based on state.
     fn title(&self) -> Option<&str> {
         match &self.state {
-            AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => {
-                parser.callbacks().title()
-            }
+            AgentState::Ready { parser, .. }
+            | AgentState::Crashed { parser, .. }
+            | AgentState::Dead { parser } => parser.callbacks().title(),
             AgentState::Failed { .. } => None,
         }
     }
 
     /// Whether the foreground process is currently in a working
-    /// state per its OSC title. `false` for `Failed` and `Crashed`
-    /// agents — Crashed has no foreground process anymore, regardless
-    /// of what the title was at the moment of death — and `false`
-    /// for Ready agents whose title doesn't carry a status glyph.
+    /// state per its OSC title. `false` for `Failed`, `Crashed`, and
+    /// `Dead` agents — none of them have a live foreground process —
+    /// and `false` for Ready agents whose title doesn't carry a
+    /// status glyph.
     fn is_working(&self) -> bool {
         match &self.state {
             AgentState::Ready { parser, .. } => parser.callbacks().is_working(),
-            AgentState::Failed { .. } | AgentState::Crashed { .. } => false,
+            AgentState::Failed { .. } | AgentState::Crashed { .. } | AgentState::Dead { .. } => {
+                false
+            }
         }
     }
 
@@ -1317,6 +1344,32 @@ struct PendingPrepare {
     /// flow (host typed at the modal, user picks the remote path
     /// manually after prepare).
     pending_project_path: Option<String>,
+    /// AD-2 SSH-resume plumbing: when this prepare slot was created by
+    /// `try_resume_ssh_on_focus` (or the resume-fallback respawn), the
+    /// auto-spawn after prepare-Done flows into the attach with these
+    /// extra fields wired through so the resulting `PendingAttach`
+    /// inherits them:
+    ///
+    /// - `pending_resume_session_id`: `Some(uuid)` for a resume attempt
+    ///   (`claude --resume <uuid>`); `None` for a fresh respawn after a
+    ///   resume failure (`claude --session-id <new>`).
+    /// - `pending_replace_agent_id`: the Dead/Crashed slot in the nav
+    ///   Vec that the eventual Ready agent should replace in-place
+    ///   rather than getting appended as a new tab.
+    /// - `pending_resume_session_uuid`: the UUID to author into the
+    ///   fresh row (carries through to `--session-id <uuid>` for a
+    ///   respawn; equals `pending_resume_session_id` for a resume).
+    /// - `pending_resume_fallback_notice`: when `Some(_)`, surfaces a
+    ///   one-line dim banner above the resumed pane on Done(Ok).
+    ///   Reused for the SSH-resume-failure auto-fallback path so the
+    ///   user sees "Couldn't resume; started fresh."
+    ///
+    /// All four fields are `None` for the regular spawn-modal-driven
+    /// SSH flow.
+    pending_resume_session_id: Option<Uuid>,
+    pending_replace_agent_id: Option<AgentId>,
+    pending_resume_session_uuid: Option<Uuid>,
+    pending_resume_fallback_notice: Option<String>,
 }
 
 /// In-flight attach worker. The modal usually stays locked watching
@@ -1360,6 +1413,16 @@ struct PendingAttach {
     /// resume-failure detection in the event loop. `None` for fresh
     /// SSH spawns.
     resume_session_id: Option<Uuid>,
+    /// AD-2 SSH-resume plumbing: when set, on `Done(Ok)` the resulting
+    /// Ready agent replaces the Dead/Crashed slot already in the nav
+    /// Vec rather than getting appended as a new tab. `None` for the
+    /// fresh-spawn case where appending is correct.
+    replace_agent_id: Option<AgentId>,
+    /// AD-2: one-line dim banner to paint above the pane on Done(Ok).
+    /// Reused for the SSH-resume-failure auto-fallback respawn —
+    /// surfaces "Couldn't resume previous session; started fresh." on
+    /// the Ready agent that replaces the orphan.
+    resume_fallback_notice: Option<String>,
 }
 
 /// Test-only seams threaded into [`run`] from the hidden CLI flags
@@ -1681,7 +1744,9 @@ fn focus_and_touch(nav: &mut NavState, idx: usize, persistence: &Persistence) {
             // immediately after this call at the user-navigation
             // sites. The persist here records "user looked at it"
             // regardless of whether the resume eventually succeeds.
-            AgentState::Crashed { .. } | AgentState::Failed { .. } => AgentStatus::Dead,
+            AgentState::Crashed { .. } | AgentState::Failed { .. } | AgentState::Dead { .. } => {
+                AgentStatus::Dead
+            }
         };
         persist_agent_status(
             persistence,
@@ -1777,11 +1842,9 @@ fn try_resume_fallback(
 /// state). `resume_attempt` is set so the reap loop knows to treat
 /// an early non-zero exit as a resume failure and auto-fall-back.
 ///
-/// SSH-backed Dead agents are NOT auto-resumed by this helper. Their
-/// revival path requires a fresh SSH bootstrap (probe + tunnel + daemon
-/// spawn), which is a multi-second async operation that doesn't fit a
-/// single keystroke; that surface lands in a later UX-polish step. For
-/// now SSH Dead tabs sit in the navigator, dismissable with `<prefix> d`.
+/// SSH-backed Dead agents are handled by [`try_resume_ssh_on_focus`]
+/// — their revival path goes through the bootstrap worker and the
+/// spawn-modal progress UI, not the synchronous local spawner.
 ///
 /// `Failed` agents (bootstrap errored, never produced a live session)
 /// are also skipped — there's no session to resume from.
@@ -1790,12 +1853,16 @@ fn try_resume_on_focus(nav: &mut NavState, persistence: &Persistence, ctx: &Resu
     let Some(agent) = nav.agents.get(idx) else {
         return;
     };
-    // SSH-side resume is out of scope for this step; only act on
-    // local-Dead agents (`host == None` + `Crashed` state).
+    // SSH-side resume goes through `try_resume_ssh_on_focus` (different
+    // machinery — bootstrap worker + spawn-modal progress UI). This
+    // helper only acts on local-Dead agents.
     if agent.host.is_some() {
         return;
     }
-    if !matches!(agent.state, AgentState::Crashed { .. }) {
+    if !matches!(
+        agent.state,
+        AgentState::Crashed { .. } | AgentState::Dead { .. }
+    ) {
         return;
     }
     let id = agent.id.clone();
@@ -1854,6 +1921,184 @@ fn try_resume_on_focus(nav: &mut NavState, persistence: &Persistence, ctx: &Resu
             tracing::warn!(?e, "AD-2 resume-on-focus: spawn failed");
         }
     }
+}
+
+/// Bundle of references [`try_resume_ssh_on_focus`] / [`try_resume_ssh_fallback`]
+/// need to kick off an SSH bootstrap (prepare + auto-attach) tied to a
+/// specific Dead/Crashed agent slot. Mirrors [`ResumeContext`] for the
+/// SSH path — the bootstrap worker plumbing is enough state that
+/// threading the locals individually at every call site would be very
+/// noisy.
+struct SshResumeContext<'a> {
+    prepare: &'a mut Option<PendingPrepare>,
+    spawn_ui: &'a mut Option<SpawnMinibuffer>,
+    attaches: &'a mut Vec<PendingAttach>,
+    tui_pid: u32,
+    /// Local cwd seed for the throwaway [`SpawnMinibuffer`] we open in
+    /// locked-bootstrap state. Irrelevant to the resume itself
+    /// (`lock_for_bootstrap` hides the path zone behind a spinner), but
+    /// the open constructor requires a value and we'd rather pass the
+    /// runtime's `initial_cwd` than a synthetic empty path.
+    initial_cwd: &'a Path,
+}
+
+/// If the currently-focused agent is a Dead/Crashed SSH agent, kick off
+/// an SSH bootstrap that will resume the session by re-issuing
+/// `claude --resume <uuid>` on the remote daemon. Reuses the existing
+/// SSH cold-start machinery in full:
+///
+/// 1. Open the spawn modal locked for this host
+///    ([`SpawnMinibuffer::lock_for_bootstrap`]) so the spinner +
+///    stage indicator are visible while the bootstrap runs.
+/// 2. Install a [`PendingPrepare`] tagged with the resume UUID, the
+///    Dead slot's `agent_id`, and the agent's `cwd` (so the auto-spawn
+///    path in [`drain_prepare_events`] lands at the same remote
+///    directory).
+/// 3. The prepare→attach drain produces a `PendingAttach` carrying
+///    `resume_session_id = Some(uuid)`; the daemon translates that
+///    into `claude --resume <uuid>` at PTY spawn time.
+/// 4. On attach `Done(Ok)`, the resulting Ready agent **replaces**
+///    the Dead slot in-place rather than appending a new tab (see
+///    `PendingAttach::replace_agent_id` handling in the attach drain).
+///
+/// SSH agents without a `session_id` (legacy rows) fall back to a
+/// fresh spawn — same shape, no `--resume` flag, no
+/// `resume_fallback_notice`.
+///
+/// Cancellation: the user can dismiss the spawn modal (Esc /
+/// `CancelBootstrap`) at any point; the prepare / attach handles get
+/// dropped, the worker observes the cancel flag, and the Dead slot
+/// stays Dead with `session_id` intact. No DB writes happen until
+/// `Done(Ok)`.
+fn try_resume_ssh_on_focus(nav: &mut NavState, ssh: &mut SshResumeContext<'_>) {
+    let idx = nav.focused;
+    let Some(agent) = nav.agents.get(idx) else {
+        return;
+    };
+    let Some(host) = agent.host.clone() else {
+        return;
+    };
+    if !matches!(
+        agent.state,
+        AgentState::Crashed { .. } | AgentState::Dead { .. }
+    ) {
+        return;
+    }
+    // Don't double-kick: a prepare slot already targeting this agent
+    // is in flight (e.g. user mashed the focus chord). Drop the second
+    // press silently.
+    if ssh
+        .prepare
+        .as_ref()
+        .is_some_and(|p| p.pending_replace_agent_id.as_ref() == Some(&agent.id))
+    {
+        return;
+    }
+    // Resolve the resume UUID. Legacy rows pre-AD-2 may have
+    // `session_id = None`; fall through as a fresh respawn.
+    let existing_uuid = agent
+        .session_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let (session_uuid, resume_session_id) = match existing_uuid {
+        Some(uuid) => (uuid, Some(uuid)),
+        None => (Uuid::new_v4(), None),
+    };
+    // The remote cwd is opaque to the local filesystem — the path was
+    // typed at the modal in a previous session. We send it through as
+    // the stashed `pending_project_path` so the auto-spawn arm in
+    // `drain_prepare_events` lands the resumed daemon at the right
+    // directory. Empty path → `$HOME` (matches scratch-flow default).
+    let cwd_path = agent
+        .cwd
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let replace_agent_id = agent.id.clone();
+    // Replacing an existing prepare slot cancels its worker via Drop —
+    // intentional if the user re-focuses a different Dead SSH tab while
+    // a prior resume bootstrap is still in flight.
+    *ssh.prepare = Some(PendingPrepare {
+        host: host.clone(),
+        handle: start_prepare(host.clone()),
+        prepared: None,
+        remote_fs: None,
+        pending_project_path: Some(cwd_path),
+        pending_resume_session_id: resume_session_id,
+        pending_replace_agent_id: Some(replace_agent_id),
+        pending_resume_session_uuid: Some(session_uuid),
+        pending_resume_fallback_notice: None,
+    });
+    // Open the spawn modal in its locked-bootstrap state so the user
+    // sees the same spinner + stage indicator the cold-start flow
+    // shows. Dismissing it (Esc) cancels the resume.
+    let mut ui = SpawnMinibuffer::open(
+        ssh.initial_cwd,
+        crate::config::SearchMode::Precise,
+        Vec::new(),
+    );
+    ui.lock_for_bootstrap(host, Instant::now());
+    *ssh.spawn_ui = Some(ui);
+    // No new tab yet; the attach drain replaces the Dead slot in-place
+    // on `Done(Ok)`. The `attaches` Vec is referenced through `ssh` so
+    // the borrow signature matches the analogous local-resume path.
+    let _ = ssh.attaches;
+    let _ = ssh.tui_pid;
+}
+
+/// AD-2 SSH-resume-failure auto-fallback. Mirror of [`try_resume_fallback`]
+/// for the SSH path: a `resume_attempt = true` SSH agent that crashed
+/// non-zero before reaching Running re-engages the bootstrap worker for
+/// a *fresh* spawn (new UUID, no `--resume` flag) and tags the eventual
+/// Ready agent with a one-line dim banner so the user sees what
+/// happened.
+///
+/// Unlike the local fallback, this is asynchronous — the bootstrap
+/// takes ~1-2 s on a cached host, longer on a fresh one — so the spawn
+/// modal's locked-spinner state is re-engaged for the duration and the
+/// user can watch the respawn progress instead of staring at a frozen
+/// Crashed pane.
+///
+/// The Dead/Crashed slot stays in the nav Vec until the respawn
+/// completes; `replace_agent_id` then swaps the Ready agent in-place.
+fn try_resume_ssh_fallback(nav: &mut NavState, ssh: &mut SshResumeContext<'_>, id: &AgentId) {
+    let Some(idx) = nav.agents.iter().position(|a| a.id == *id) else {
+        return;
+    };
+    let agent = &nav.agents[idx];
+    let Some(host) = agent.host.clone() else {
+        return;
+    };
+    let cwd_path = agent
+        .cwd
+        .as_deref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let new_session_uuid = Uuid::new_v4();
+    *ssh.prepare = Some(PendingPrepare {
+        host: host.clone(),
+        handle: start_prepare(host.clone()),
+        prepared: None,
+        remote_fs: None,
+        pending_project_path: Some(cwd_path),
+        // Fresh respawn: NO `--resume` flag. New UUID anchors a clean
+        // `--session-id <new>` row on the next persist write.
+        pending_resume_session_id: None,
+        pending_replace_agent_id: Some(agent.id.clone()),
+        pending_resume_session_uuid: Some(new_session_uuid),
+        pending_resume_fallback_notice: Some(
+            "Couldn't resume previous session; started fresh.".to_string(),
+        ),
+    });
+    let mut ui = SpawnMinibuffer::open(
+        ssh.initial_cwd,
+        crate::config::SearchMode::Precise,
+        Vec::new(),
+    );
+    ui.lock_for_bootstrap(host, Instant::now());
+    *ssh.spawn_ui = Some(ui);
+    let _ = ssh.attaches;
+    let _ = ssh.tui_pid;
 }
 
 fn persist_agent_status(
@@ -2165,6 +2410,25 @@ fn build_claude_args(
 // to the call site. The added `attach_factory` is the test-injection
 // seam (mirrors the `start_attach` / `start_attach_with_runner` split
 // in `bootstrap_worker.rs`).
+/// Optional resume plumbing for an SSH attach. Bundled so
+/// `build_remote_attach`'s signature doesn't sprout four more
+/// positional arguments at every fresh-spawn call site that always
+/// passes `Default::default()`.
+#[derive(Default)]
+struct ResumeAttach {
+    /// `Some(uuid)` for `claude --resume <uuid>` on the remote daemon;
+    /// `None` for a fresh spawn (`claude --session-id <session_id>`).
+    resume_session_id: Option<Uuid>,
+    /// Identity of the Dead/Crashed slot to replace in-place on
+    /// `Done(Ok)`. `None` means "append as a new tab".
+    replace_agent_id: Option<AgentId>,
+    /// `Some(<msg>)` paints a one-line dim banner above the pane on
+    /// `Done(Ok)`. Used by the SSH-resume-failure auto-fallback so
+    /// the user sees "Couldn't resume previous session; started
+    /// fresh." on the Ready agent that replaces the orphan.
+    fallback_notice: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_remote_attach<F>(
     prepared: PreparedHost,
@@ -2176,7 +2440,7 @@ fn build_remote_attach<F>(
     cols: u16,
     modal_owner: bool,
     session_id: Uuid,
-    resume_session_id: Option<Uuid>,
+    resume: ResumeAttach,
     attach_factory: F,
 ) -> PendingAttach
 where
@@ -2191,6 +2455,11 @@ where
         Option<String>,
     ) -> AttachHandle,
 {
+    let ResumeAttach {
+        resume_session_id,
+        replace_agent_id,
+        fallback_notice,
+    } = resume;
     let label = format!("{host}:agent-{spawn_counter}");
     let runtime_id = AgentId::new(format!("agent-{spawn_counter}"));
     // Daemon-facing id is namespaced by the TUI's pid so a relaunch
@@ -2244,6 +2513,8 @@ where
         modal_owner,
         session_id,
         resume_session_id,
+        replace_agent_id,
+        resume_fallback_notice: fallback_notice,
     }
 }
 
@@ -2334,6 +2605,7 @@ where
 // pairing — the bundle exists for the boundary, not as a domain
 // abstraction. The function body destructures it back into bare
 // locals so the inline reads/writes stay readable.
+#[allow(clippy::too_many_lines)]
 fn drain_prepare_events<F>(ctx: PrepareDrainCtx<'_, F>)
 where
     F: FnOnce(
@@ -2451,6 +2723,21 @@ where
                     // remains.
                     *spawn_counter += 1;
                     let (rows, cols) = pty_geom;
+                    // AD-2: the prepare slot may have been seeded by
+                    // `try_resume_ssh_on_focus` (resume-on-focus) or by
+                    // `try_resume_ssh_fallback` (post-resume-failure
+                    // respawn). Both flows carry resume fields on the
+                    // slot; here we either thread them into the attach
+                    // (resume / fallback) or default to a fresh-spawn
+                    // ResumeAttach (regular `PrepareHostThenSpawn`).
+                    let session_uuid = slot
+                        .pending_resume_session_uuid
+                        .unwrap_or_else(Uuid::new_v4);
+                    let resume = ResumeAttach {
+                        resume_session_id: slot.pending_resume_session_id,
+                        replace_agent_id: slot.pending_replace_agent_id.clone(),
+                        fallback_notice: slot.pending_resume_fallback_notice.clone(),
+                    };
                     let attach = build_remote_attach(
                         prepared,
                         slot.host.clone(),
@@ -2460,13 +2747,8 @@ where
                         rows,
                         cols,
                         /* modal_owner */ true,
-                        // AD-2: fresh SSH spawn from the prepare→attach
-                        // auto-flow. No resume target — that path goes
-                        // through focus-on-Dead, which assembles its
-                        // own `PendingAttach` with `resume_session_id =
-                        // Some(_)`.
-                        Uuid::new_v4(),
-                        None,
+                        session_uuid,
+                        resume,
                         attach_factory,
                     );
                     if let Some(ui) = spawn_ui.as_mut() {
@@ -2642,7 +2924,7 @@ fn resize_agents(agents: &mut [RuntimeAgent], rows: u16, cols: u16) {
                 let _ = transport.resize(rows, cols);
                 parser.screen_mut().set_size(rows, cols);
             }
-            AgentState::Crashed { parser, .. } => {
+            AgentState::Crashed { parser, .. } | AgentState::Dead { parser } => {
                 // No transport to notify, but the parser screen still
                 // needs to track the pane size so the last frame draws
                 // correctly under the crash banner after a window resize.
@@ -2865,9 +3147,14 @@ fn commit_selection(sel: &Selection, agents: &[RuntimeAgent], pane_hitbox: &Pane
     };
     let (start, end) = normalized_range(sel.anchor, sel.head);
     let text = match &agent.state {
-        AgentState::Ready { parser, .. } | AgentState::Crashed { parser, .. } => parser
-            .screen()
-            .contents_between(start.row, start.col, end.row, end.col.saturating_add(1)),
+        AgentState::Ready { parser, .. }
+        | AgentState::Crashed { parser, .. }
+        | AgentState::Dead { parser } => parser.screen().contents_between(
+            start.row,
+            start.col,
+            end.row,
+            end.col.saturating_add(1),
+        ),
         AgentState::Failed { error } => {
             // Pane area is required to recompute the centered layout
             // — without it the cells the user clicked don't map back
@@ -3638,7 +3925,12 @@ fn event_loop(
         // the loop so we can mutate `nav.agents`, `attaches`, and
         // `spawn_ui` without borrow conflicts.
         let mut finished_attaches: Vec<usize> = Vec::new();
-        let mut new_agents: Vec<RuntimeAgent> = Vec::new();
+        // Pair: (agent_to_install, optional_replace_target). When
+        // `replace_target.is_some()`, the agent replaces an existing
+        // slot in-place (used by the SSH-resume-on-focus path so the
+        // resumed agent lands where the Dead tab was); otherwise it's
+        // appended.
+        let mut new_agents: Vec<(RuntimeAgent, Option<AgentId>)> = Vec::new();
         let mut focus_new = false;
         let mut close_modal = false;
         for (idx, attach) in attaches.iter_mut().enumerate() {
@@ -3699,6 +3991,13 @@ fn event_loop(
                             Some(attach.session_id.to_string()),
                         );
                         agent.resume_attempt = attach.resume_session_id.is_some();
+                        // AD-2: SSH-resume / SSH-resume-fallback paths
+                        // tag the attach with a one-line dim banner —
+                        // surface it on the resumed pane the same way
+                        // the local fallback path does.
+                        agent
+                            .resume_fallback_notice
+                            .clone_from(&attach.resume_fallback_notice);
                         // Strategy (i): persist only after the attach
                         // succeeded. The host row goes in first so the
                         // agent's `host_id` foreign key resolves.
@@ -3709,24 +4008,37 @@ fn event_loop(
                             AgentStatus::Running,
                             Some(std::time::SystemTime::now()),
                         );
-                        new_agents.push(agent);
+                        new_agents.push((agent, attach.replace_agent_id.clone()));
                     }
                     Err(e) => {
                         tracing::error!(label = %attach.label, "attach failed: {e}");
-                        // Failed SSH attach: do NOT persist. The user
-                        // gets a Failed tab they can dismiss with
-                        // `<prefix> d`; no DB row means the next
-                        // codemux launch starts clean for this host.
-                        new_agents.push(RuntimeAgent::failed(
-                            attach.agent_id.clone(),
-                            attach.label.clone(),
-                            attach.repo.clone(),
-                            None,
-                            attach.host.clone(),
-                            e,
-                            attach.rows,
-                            attach.cols,
-                        ));
+                        // Failed SSH attach. The resume-on-focus path
+                        // tags the attach with `replace_agent_id` so a
+                        // resume bootstrap failure leaves the Dead tab
+                        // in place (nothing changes from the user's
+                        // POV beyond the modal closing). A fresh
+                        // (non-resume) attach pushes a Failed tab so
+                        // the user can dismiss with `<prefix> d`.
+                        if attach.replace_agent_id.is_some() {
+                            tracing::info!(
+                                label = %attach.label,
+                                "SSH resume bootstrap failed; keeping Dead tab in place",
+                            );
+                        } else {
+                            new_agents.push((
+                                RuntimeAgent::failed(
+                                    attach.agent_id.clone(),
+                                    attach.label.clone(),
+                                    attach.repo.clone(),
+                                    None,
+                                    attach.host.clone(),
+                                    e,
+                                    attach.rows,
+                                    attach.cols,
+                                ),
+                                None,
+                            ));
+                        }
                     }
                 }
                 if attach.modal_owner {
@@ -3751,11 +4063,31 @@ fn event_loop(
                 attaches.swap_remove(idx);
             }
         }
-        let new_count = new_agents.len();
-        nav.agents.extend(new_agents);
-        if focus_new && new_count > 0 {
-            let target = nav.agents.len() - 1;
-            focus_and_touch(&mut nav, target, persistence);
+        let mut appended_any = false;
+        let mut last_replaced_idx: Option<usize> = None;
+        for (agent, replace_target) in new_agents {
+            if let Some(target) = replace_target
+                && let Some(slot_idx) = nav.agents.iter().position(|a| a.id == target)
+            {
+                nav.agents[slot_idx] = agent;
+                last_replaced_idx = Some(slot_idx);
+            } else {
+                nav.agents.push(agent);
+                appended_any = true;
+            }
+        }
+        if focus_new {
+            if appended_any {
+                let target = nav.agents.len() - 1;
+                focus_and_touch(&mut nav, target, persistence);
+            } else if let Some(idx) = last_replaced_idx {
+                // In-place replacement (SSH-resume / fallback respawn):
+                // leave focus on the same slot the user was already
+                // looking at. `focus_and_touch` would no-op since
+                // `nav.focused == idx` already, but call it to refresh
+                // `last_attached_at` for the persistence row.
+                focus_and_touch(&mut nav, idx, persistence);
+            }
         }
 
         for agent in &mut nav.agents {
@@ -3776,11 +4108,15 @@ fn event_loop(
                         agent.resume_attempt = false;
                     }
                 }
-                // No transport on Failed/Crashed — nothing to drain.
-                // The Crashed parser still holds the last frame, so the
-                // renderer keeps drawing it; we just don't feed it any
-                // new bytes.
-                AgentState::Failed { .. } | AgentState::Crashed { .. } => {}
+                // No transport on Failed/Crashed/Dead — nothing to
+                // drain. The Crashed parser still holds the last frame,
+                // so the renderer keeps drawing it; we just don't feed
+                // it any new bytes. Dead carries a fresh empty parser
+                // that stays empty until the resume-on-focus path
+                // promotes the agent back into Ready.
+                AgentState::Failed { .. }
+                | AgentState::Crashed { .. }
+                | AgentState::Dead { .. } => {}
             }
         }
 
@@ -3815,16 +4151,27 @@ fn event_loop(
         // and surface a one-line warning above the pane. We do this
         // BEFORE persisting Dead so the fallback's Running write is
         // the last word on the row.
-        let mut resume_failures: Vec<AgentId> = Vec::new();
+        //
+        // The local and SSH paths split here because the local fallback
+        // is synchronous (re-spawn the PTY in this frame) while the
+        // SSH fallback re-engages the bootstrap worker — a multi-
+        // second async cycle that goes through the same prepare→attach
+        // machinery as the SSH-resume-on-focus path, including the
+        // spawn-modal progress UI.
+        let mut local_resume_failures: Vec<AgentId> = Vec::new();
+        let mut ssh_resume_failures: Vec<AgentId> = Vec::new();
         for id in &reap_outcome.crashed {
             if let Some(agent) = nav.agents.iter().find(|a| a.id == *id)
                 && agent.resume_attempt
-                && agent.host.is_none()
             {
-                resume_failures.push(id.clone());
+                if agent.host.is_none() {
+                    local_resume_failures.push(id.clone());
+                } else {
+                    ssh_resume_failures.push(id.clone());
+                }
             }
         }
-        for id in &resume_failures {
+        for id in &local_resume_failures {
             try_resume_fallback(
                 &mut nav,
                 persistence,
@@ -3836,10 +4183,27 @@ fn event_loop(
                 },
             );
         }
+        for id in &ssh_resume_failures {
+            try_resume_ssh_fallback(
+                &mut nav,
+                &mut SshResumeContext {
+                    prepare: &mut prepare,
+                    spawn_ui: &mut spawn_ui,
+                    attaches: &mut attaches,
+                    tui_pid,
+                    initial_cwd,
+                },
+                id,
+            );
+        }
         for id in &reap_outcome.crashed {
-            // Skip rows we just auto-resumed — they're back in Ready
-            // and the fallback path already wrote Running through.
-            if resume_failures.contains(id) {
+            // Skip rows we just auto-resumed (local) — they're back in
+            // Ready and the fallback path already wrote Running
+            // through. SSH respawn is still in-flight; the slot is
+            // still Crashed until the attach drain replaces it, so
+            // persist Dead as the interim shape (the resumed Running
+            // write happens when the attach finishes).
+            if local_resume_failures.contains(id) {
                 continue;
             }
             // Ready → Crashed: persist as Dead so the next codemux
@@ -4117,6 +4481,10 @@ fn event_loop(
                                 prepared: None,
                                 remote_fs: None,
                                 pending_project_path: None,
+                                pending_resume_session_id: None,
+                                pending_replace_agent_id: None,
+                                pending_resume_session_uuid: None,
+                                pending_resume_fallback_notice: None,
                             });
                             ui.lock_for_bootstrap(host, Instant::now());
                         }
@@ -4135,6 +4503,10 @@ fn event_loop(
                                 prepared: None,
                                 remote_fs: None,
                                 pending_project_path: Some(path),
+                                pending_resume_session_id: None,
+                                pending_replace_agent_id: None,
+                                pending_resume_session_uuid: None,
+                                pending_resume_fallback_notice: None,
                             });
                             ui.lock_for_bootstrap(host, Instant::now());
                         }
@@ -4244,7 +4616,7 @@ fn event_loop(
                                     // the resume-on-focus arm goes
                                     // through a different code path.
                                     Uuid::new_v4(),
-                                    None,
+                                    ResumeAttach::default(),
                                     start_attach,
                                 );
                                 // Re-lock the modal so the spinner
@@ -4395,6 +4767,8 @@ fn event_loop(
                                     modal_owner: true,
                                     session_id: session_uuid,
                                     resume_session_id: None,
+                                    replace_agent_id: None,
+                                    resume_fallback_notice: None,
                                 });
                             }
                         }
@@ -4439,6 +4813,16 @@ fn event_loop(
                                         spawner: agent_spawner,
                                         tokens_cfg,
                                         scrollback_len,
+                                    },
+                                );
+                                try_resume_ssh_on_focus(
+                                    &mut nav,
+                                    &mut SshResumeContext {
+                                        prepare: &mut prepare,
+                                        spawn_ui: &mut spawn_ui,
+                                        attaches: &mut attaches,
+                                        tui_pid,
+                                        initial_cwd,
                                     },
                                 );
                                 nav.popup_state = PopupState::Closed;
@@ -4509,14 +4893,17 @@ fn event_loop(
                                 AgentState::Ready { transport, .. } => {
                                     transport.write(&bytes).wrap_err("write to pty")?;
                                 }
-                                // Drop the bytes — a Failed or Crashed
-                                // pane has no transport. tracing::trace
-                                // because this is high-volume during
-                                // typing if the user mistakes a dead
-                                // pane for a live one. The crash banner
+                                // Drop the bytes — Failed, Crashed, and
+                                // Dead panes have no transport.
+                                // tracing::trace because this is high-
+                                // volume during typing if the user
+                                // mistakes a dead pane for a live one.
+                                // The crash banner / status-bar hint
                                 // tells them to dismiss with `<prefix>
                                 // d` rather than type into the corpse.
-                                AgentState::Failed { .. } | AgentState::Crashed { .. } => {
+                                AgentState::Failed { .. }
+                                | AgentState::Crashed { .. }
+                                | AgentState::Dead { .. } => {
                                     tracing::trace!(
                                         label = %a.label,
                                         n = bytes.len(),
@@ -4561,6 +4948,16 @@ fn event_loop(
                                 scrollback_len,
                             },
                         );
+                        try_resume_ssh_on_focus(
+                            &mut nav,
+                            &mut SshResumeContext {
+                                prepare: &mut prepare,
+                                spawn_ui: &mut spawn_ui,
+                                attaches: &mut attaches,
+                                tui_pid,
+                                initial_cwd,
+                            },
+                        );
                     }
                     KeyDispatch::FocusPrev => {
                         let prev = if nav.focused == 0 {
@@ -4576,6 +4973,16 @@ fn event_loop(
                                 spawner: agent_spawner,
                                 tokens_cfg,
                                 scrollback_len,
+                            },
+                        );
+                        try_resume_ssh_on_focus(
+                            &mut nav,
+                            &mut SshResumeContext {
+                                prepare: &mut prepare,
+                                spawn_ui: &mut spawn_ui,
+                                attaches: &mut attaches,
+                                tui_pid,
+                                initial_cwd,
                             },
                         );
                     }
@@ -4597,6 +5004,16 @@ fn event_loop(
                                     scrollback_len,
                                 },
                             );
+                            try_resume_ssh_on_focus(
+                                &mut nav,
+                                &mut SshResumeContext {
+                                    prepare: &mut prepare,
+                                    spawn_ui: &mut spawn_ui,
+                                    attaches: &mut attaches,
+                                    tui_pid,
+                                    initial_cwd,
+                                },
+                            );
                         }
                     }
                     KeyDispatch::FocusAt(idx) => {
@@ -4609,6 +5026,16 @@ fn event_loop(
                                     spawner: agent_spawner,
                                     tokens_cfg,
                                     scrollback_len,
+                                },
+                            );
+                            try_resume_ssh_on_focus(
+                                &mut nav,
+                                &mut SshResumeContext {
+                                    prepare: &mut prepare,
+                                    spawn_ui: &mut spawn_ui,
+                                    attaches: &mut attaches,
+                                    tui_pid,
+                                    initial_cwd,
                                 },
                             );
                         }
@@ -4782,6 +5209,16 @@ fn event_loop(
                                                 spawner: agent_spawner,
                                                 tokens_cfg,
                                                 scrollback_len,
+                                            },
+                                        );
+                                        try_resume_ssh_on_focus(
+                                            &mut nav,
+                                            &mut SshResumeContext {
+                                                prepare: &mut prepare,
+                                                spawn_ui: &mut spawn_ui,
+                                                attaches: &mut attaches,
+                                                tui_pid,
+                                                initial_cwd,
                                             },
                                         );
                                     }
@@ -5150,6 +5587,24 @@ fn render_agent_pane(
             }
             render_crash_banner(frame, pane_area, *exit_code, dismiss_label);
         }
+        AgentState::Dead { parser } => {
+            // Same widget shape as Crashed, but without the red
+            // "exit code" banner — Dead means "the agent was loaded
+            // from disk (or its session was cancelled), so there's no
+            // real exit code to surface". A terse dim hint pinned to
+            // the top edge tells the user the pane is dormant and how
+            // to revive or close it.
+            let widget = PseudoTerminal::new(parser.screen());
+            frame.render_widget(widget, pane_area);
+            pane_hitbox.record(pane_area, agent.id.clone());
+            paint_selection_if_active(frame, pane_area, &agent.id, overlay.selection);
+            paint_hover_url_if_active(frame, pane_area, &agent.id, overlay.hover);
+            let offset = parser.screen().scrollback();
+            if offset > 0 {
+                render_scroll_indicator(frame, pane_area, offset);
+            }
+            render_dead_banner(frame, pane_area, dismiss_label);
+        }
         AgentState::Failed { error } => {
             // Failed panes record a hitbox and paint the selection
             // overlay so the user can drag-to-copy the error text.
@@ -5455,6 +5910,39 @@ fn paint_hover_url_if_active(
 /// `"d"` or `"ctrl+x"`), resolved by the orchestration layer rather
 /// than the renderer. Keeps `&Bindings` out of the render path so
 /// the renderer stays decoupled from input config.
+/// One-row dim hint pinned to the top edge of a [`AgentState::Dead`]
+/// pane. Distinct from [`render_crash_banner`]:
+///
+/// - The crash banner is a red attention-grabber: "something just
+///   broke, here's the exit code." Dead is the loaded-from-disk shape;
+///   nothing broke, the session is just dormant.
+/// - The Dead hint reads as ambient chrome (dim, no background fill)
+///   rather than as a status alert. It tells the user how to revive
+///   the session (focus it — the resume-on-focus path picks it up)
+///   and how to close the tab without reviving (`<prefix> d`).
+///
+/// `dismiss_label` is the pre-formatted dismiss-chord string (e.g.
+/// `"d"` or `"ctrl+x"`), resolved by the orchestration layer so the
+/// renderer stays decoupled from input config.
+fn render_dead_banner(frame: &mut Frame<'_>, area: Rect, dismiss_label: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let banner_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    let style = Style::default().add_modifier(Modifier::DIM);
+    let text = format!(" ~ session ended — focus to resume, {dismiss_label} to dismiss ");
+    let widget = Paragraph::new(Line::raw(text))
+        .alignment(Alignment::Left)
+        .style(style);
+    frame.render_widget(Clear, banner_area);
+    frame.render_widget(widget, banner_area);
+}
+
 fn render_crash_banner(frame: &mut Frame<'_>, area: Rect, exit_code: i32, dismiss_label: &str) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -6163,12 +6651,14 @@ fn agent_label_spans(
     // is belt-and-braces against a stale flag (the per-frame
     // transition detector already skips the focused index).
     let attention = agent.needs_attention && !focused;
+    let dead = matches!(agent.state, AgentState::Dead { .. });
     label_spans(
         agent.host.as_deref(),
         &agent_body_text(agent),
         agent.is_working(),
         attention,
         focused,
+        dead,
         phase,
         chrome,
     )
@@ -6177,21 +6667,54 @@ fn agent_label_spans(
 /// Pure-data version of [`agent_label_spans`]. The wrapper resolves
 /// per-agent state into primitives; this function does the rendering.
 /// Split so unit tests can exercise every (host / working / attention /
-/// focused) permutation without needing a real `RuntimeAgent` (which
-/// requires an `AgentTransport` to reach the working spinner branch).
+/// focused / dead) permutation without needing a real `RuntimeAgent`
+/// (which requires an `AgentTransport` to reach the working spinner
+/// branch).
+///
+/// The `dead` flag prefixes the label with a `~` and applies a DIM
+/// modifier so loaded-from-disk tabs look distinct from live ones at
+/// a glance. Crashed and Failed tabs are not marked here — their pane
+/// content already carries a red banner that tells the user what
+/// happened.
+// Five boolean flags (working / attention / focused / dead and the
+// implicit lifecycle pair). The clippy advice is to refactor into
+// two-variant enums, but each of these is an independent axis (a tab
+// can be unfocused + working + attention + dead, for example) and
+// folding any pair would obscure the orthogonality. The function is
+// pure data with a single call site per axis; the allow is targeted.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn label_spans(
     host: Option<&str>,
     body: &str,
     working: bool,
     attention: bool,
     focused: bool,
+    dead: bool,
     phase: AnimationPhase,
     chrome: &ChromeStyle,
 ) -> Vec<Span<'static>> {
-    let body_style = body_style(focused, attention, phase, chrome);
+    let base_body_style = body_style(focused, attention, phase, chrome);
+    // DIM overlay for Dead tabs so the loaded-from-disk shape reads as
+    // ambient context rather than active content. Focused-Dead keeps
+    // the reverse-video highlight (the user is on it) but layers DIM
+    // on top; unfocused-Dead just looks faded next to live siblings.
+    let body_style = if dead {
+        base_body_style.add_modifier(Modifier::DIM)
+    } else {
+        base_body_style
+    };
 
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(6);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(7);
 
+    // "~" prefix on Dead tabs is the visual cue the spec calls for
+    // (per the step-6 task: "a tilde, your call"). One leading column
+    // of static glyph reads instantly as "this tab is not live."
+    // Skipped while working (Dead agents are never working — see
+    // `RuntimeAgent::is_working`) so there's no ordering ambiguity
+    // with the spinner.
+    if dead {
+        spans.push(Span::styled("~ ", body_style));
+    }
     // Spinner is the leftmost glyph so the working cue lands in the
     // same column on every tab — host-prefixed and not — and so the
     // motion reads independent of the per-host accent next to it.
@@ -6221,6 +6744,11 @@ fn label_spans(
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else {
             chrome.host_style(host)
+        };
+        let host_style = if dead {
+            host_style.add_modifier(Modifier::DIM)
+        } else {
+            host_style
         };
         spans.push(Span::styled(format!("{host} · "), host_style));
     }
@@ -6274,8 +6802,19 @@ fn body_style(
 /// pieces are available, just `<title>` when there's no repo, just
 /// `<repo>` when there's no title, and the static `label` as the
 /// last resort.
+///
+/// For [`AgentState::Dead`] agents the body is suffixed with
+/// ` [dead]` so the focused-Dead status-bar tab carries a textual hint
+/// — the per-tab DIM + `~` prefix already render dead tabs distinctly
+/// in the strip, but the status-bar text needed an unmistakable
+/// "this agent is dormant" marker too.
 fn agent_body_text(agent: &RuntimeAgent) -> String {
-    body_text(agent.title(), agent.repo.as_deref(), &agent.label)
+    let body = body_text(agent.title(), agent.repo.as_deref(), &agent.label);
+    if matches!(agent.state, AgentState::Dead { .. }) {
+        format!("{body} [dead]")
+    } else {
+        body
+    }
 }
 
 /// Pure-data version of [`agent_body_text`]. Split out so the four
@@ -8039,6 +8578,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             phase,
             &ChromeStyle::default(),
         );
@@ -8055,6 +8595,7 @@ mod tests {
         let spans = label_spans(
             None,
             "codemux",
+            false,
             false,
             false,
             false,
@@ -8079,6 +8620,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             phase,
             &ChromeStyle::default(),
         );
@@ -8097,6 +8639,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             AnimationPhase::default(),
             &ChromeStyle::default(),
         );
@@ -8108,6 +8651,7 @@ mod tests {
         let spans = label_spans(
             None,
             "codemux",
+            false,
             false,
             false,
             false,
@@ -8132,6 +8676,7 @@ mod tests {
             Some("devpod-01"),
             "codemux",
             true,
+            false,
             false,
             false,
             phase,
@@ -8983,6 +9528,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             AnimationPhase::default(),
             &chrome,
         );
@@ -9006,6 +9552,7 @@ mod tests {
         let spans = label_spans(
             Some("random-host"),
             "claude",
+            false,
             false,
             false,
             false,
@@ -9372,6 +9919,7 @@ mod tests {
             AgentState::Ready { .. } => "Ready",
             AgentState::Failed { .. } => "Failed",
             AgentState::Crashed { .. } => "Crashed",
+            AgentState::Dead { .. } => "Dead",
         }
     }
 
@@ -9556,6 +10104,71 @@ mod tests {
             "a Crashed agent has no foreground process — never working",
         );
     }
+
+    // ── AgentState::Dead (loaded from disk) ──────────────────────
+    //
+    // The Dead variant is the load-from-disk shape: persistent rows
+    // come back as Dead tabs that can be resumed-on-focus or
+    // dismissed. Distinct from Crashed (mid-session non-zero exit)
+    // and Failed (bootstrap error), so the variant gets its own
+    // pin-down of the "behaves like Crashed for scroll/title/working
+    // but doesn't surface a fake exit code" contract.
+
+    fn loaded_dead_test_agent(session_id: Option<&str>) -> RuntimeAgent {
+        RuntimeAgent::loaded_dead(
+            AgentId::new("dead-1"),
+            "dead-1".to_string(),
+            None,
+            None,
+            None,
+            5,
+            20,
+            100,
+            session_id.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn loaded_dead_lands_in_dead_variant_not_crashed() {
+        // Pre-step-6 regression guard: `loaded_dead` used
+        // `Crashed { exit_code: -1 }` as a sentinel, which collided
+        // with the SshDaemonPty socket-level-failure code. The Dead
+        // variant must be the new shape.
+        let agent = loaded_dead_test_agent(Some("uuid"));
+        assert!(
+            matches!(agent.state, AgentState::Dead { .. }),
+            "loaded_dead must land in Dead, got variant {}",
+            state_variant_name(&agent.state),
+        );
+        assert_eq!(agent.session_id.as_deref(), Some("uuid"));
+    }
+
+    #[test]
+    fn dead_agent_is_dismissable() {
+        let mut nav = NavState::new(vec![loaded_dead_test_agent(Some("uuid"))]);
+        let removed = nav.dismiss_focused();
+        assert!(removed.is_some(), "Dead agents must be dismissable");
+        assert!(nav.agents.is_empty());
+    }
+
+    #[test]
+    fn dead_agent_is_never_working() {
+        let agent = loaded_dead_test_agent(None);
+        assert!(!agent.is_working());
+    }
+
+    #[test]
+    fn dead_agent_supports_scrollback_offset() {
+        // Even with an empty parser, the scroll path must not panic
+        // — it returns 0 because the fresh parser has no history.
+        let agent = loaded_dead_test_agent(None);
+        assert_eq!(agent.scrollback_offset(), 0);
+    }
+
+    // The TestBackend-based Dead render assertion lives below
+    // `top_row_text` (defined further down in the same tests module);
+    // see `render_agent_pane_paints_dead_banner_not_crash_banner` for
+    // the dim-hint-vs-red-banner regression guard.
 
     #[test]
     fn title_returns_last_title_on_crashed_agent() {
@@ -9924,6 +10537,59 @@ mod tests {
         assert!(
             row.contains("connection lost"),
             "minus-one banner must distinguish socket-level failure, got: {row:?}",
+        );
+    }
+
+    #[test]
+    fn render_agent_pane_paints_dead_banner_not_crash_banner() {
+        // Pre-step-6 regression guard: a loaded-Dead agent rendered
+        // as `Crashed { exit_code: -1 }`, which produced the red
+        // "connection lost" banner against agents that simply hadn't
+        // been resumed yet. The Dead variant must render its own dim
+        // session-ended hint instead and must not surface a fake exit
+        // code or the red socket-failure copy.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agent = RuntimeAgent::loaded_dead(
+            AgentId::new("dead-render"),
+            "dead-render".to_string(),
+            None,
+            None,
+            None,
+            24,
+            80,
+            100,
+            Some("uuid".to_string()),
+        );
+        terminal
+            .draw(|frame| {
+                render_agent_pane(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                    &agent,
+                    "d",
+                    &mut PaneHitbox::default(),
+                    PaneOverlay::default(),
+                );
+            })
+            .unwrap();
+        let row = top_row_text(&terminal);
+        assert!(
+            !row.contains("connection lost"),
+            "Dead must NOT render the red socket-failure banner, got: {row:?}",
+        );
+        assert!(
+            !row.contains("exit"),
+            "Dead must NOT name an exit code, got: {row:?}",
+        );
+        assert!(
+            row.contains("session ended"),
+            "Dead must render its terse session-ended hint, got: {row:?}",
         );
     }
 
@@ -11398,7 +12064,7 @@ mod tests {
             80,
             true,
             Uuid::new_v4(),
-            None,
+            ResumeAttach::default(),
             fake_attach_factory,
         );
         assert_eq!(attach.label, "devpod:agent-7");
@@ -11408,6 +12074,8 @@ mod tests {
         assert_eq!(attach.rows, 24);
         assert_eq!(attach.cols, 80);
         assert!(attach.modal_owner);
+        assert!(attach.replace_agent_id.is_none());
+        assert!(attach.resume_fallback_notice.is_none());
     }
 
     #[test]
@@ -11426,7 +12094,7 @@ mod tests {
             80,
             false,
             Uuid::new_v4(),
-            None,
+            ResumeAttach::default(),
             fake_attach_factory,
         );
         assert!(
@@ -11448,6 +12116,10 @@ mod tests {
             prepared: None,
             remote_fs: None,
             pending_project_path,
+            pending_resume_session_id: None,
+            pending_replace_agent_id: None,
+            pending_resume_session_uuid: None,
+            pending_resume_fallback_notice: None,
         }
     }
 
