@@ -318,6 +318,8 @@ version = "0.1.0"
 name = "codemux-store"
 version = "0.1.0"
 dependencies = [
+ "codemux-session",
+ "codemux-shared-kernel",
  "rusqlite",
  "rusqlite_migration",
  "tempfile",

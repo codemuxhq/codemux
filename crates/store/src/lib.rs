@@ -21,6 +21,7 @@
 //! [AD-7]: ../../../../docs/004--architecture.md
 
 mod error;
+pub mod repository;
 mod schema;
 
 use std::path::{Path, PathBuf};
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 pub use crate::error::StoreError;
+pub use crate::repository::SqliteStore;
 
 /// Subdirectory inside the state root that holds codemux's database.
 const STATE_SUBDIR: &str = "codemux";

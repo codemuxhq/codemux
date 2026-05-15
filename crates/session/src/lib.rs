@@ -13,9 +13,11 @@
 
 pub mod domain;
 pub mod error;
+pub mod repository;
 pub mod spawner;
 pub mod transport;
 
 pub use error::Error;
+pub use repository::{AgentRepository, GroupRepository, HostRepository, RepositoryError};
 pub use spawner::{AgentSpawner, BinaryAgentSpawner, SpawnRequest};
 pub use transport::{AgentTransport, LocalPty, SshDaemonPty};
