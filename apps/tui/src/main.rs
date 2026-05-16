@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use codemux_session::BinaryAgentSpawner;
 use color_eyre::Result;
 use color_eyre::eyre::WrapErr;
@@ -20,6 +20,7 @@ mod index_cache;
 mod index_manager;
 mod index_worker;
 mod keymap;
+mod launch;
 mod log_tail;
 mod persistence;
 mod pty_title;
@@ -31,11 +32,24 @@ mod status_bar;
 mod statusline_ipc;
 mod toast;
 mod url_scan;
+use launch::{LaunchError, LaunchMode};
 use runtime::{NavStyle, TestSeams};
 
 #[derive(Debug, Parser)]
 #[command(name = "codemux", version, about)]
 #[command(args_conflicts_with_subcommands = true)]
+// `--continue` and `--resume` are mutually exclusive: each is a
+// terminal launch-mode decision, and combining them would mean
+// "auto-pick the most recent AND ask the user to pick" — which is
+// nonsense. Modeling as a clap `ArgGroup` lets clap reject the
+// combination at parse time with a clean error instead of leaving
+// us to write a runtime check that fires after the terminal has
+// already been touched.
+#[command(group(
+    ArgGroup::new("launch-mode")
+        .args(["resume_continue", "resume_pick"])
+        .multiple(false)
+))]
 struct Cli {
     /// Working directory for the initial agent. Omit to inherit the
     /// shell's current pwd (the common case); pass a path to spawn the
@@ -95,12 +109,31 @@ struct Cli {
     /// `$XDG_STATE_HOME/codemux/state.db` (or
     /// `$HOME/.local/state/codemux/state.db` if XDG is unset). The
     /// file and any missing parent directories are created on first
-    /// run; subsequent runs reuse the same DB so previously-spawned
-    /// agents reappear as Dead tabs in the navigator. Useful in
+    /// run; subsequent runs reuse the same DB so persisted sessions
+    /// are available to `--continue` and `--resume`. Useful in
     /// tests to redirect persistence at a tempfile, and for the rare
     /// user who wants a non-XDG location.
     #[arg(long, value_name = "PATH", env = "CODEMUX_STATE_DB")]
     state_db: Option<PathBuf>,
+
+    /// Launch the most-recently-attached persisted session instead
+    /// of spawning a fresh agent. Mirrors `tmux attach` semantics: no
+    /// new tab, no other persisted rows hydrated into the navigator —
+    /// just the one previous session, resumed via
+    /// `claude --resume <session_id>`. If no persisted sessions
+    /// exist, falls back silently to the bare-`codemux` fresh-spawn
+    /// behavior. Mutually exclusive with `--resume`.
+    #[arg(long = "continue", short = 'c', group = "launch-mode")]
+    resume_continue: bool,
+
+    /// Print a numbered picker of every persisted session on stdout
+    /// and resume the one the user picks. Reads the selection from
+    /// stdin BEFORE the terminal enters raw mode, so the prompt
+    /// integrates with the user's normal shell scrollback. Exits
+    /// non-zero with a one-line "no saved sessions" message when the
+    /// database is empty. Mutually exclusive with `--continue`.
+    #[arg(long = "resume", short = 'r', group = "launch-mode")]
+    resume_pick: bool,
 
     /// Hidden IPC subcommands. The default `codemux [PATH]` invocation
     /// stays a positional-only path; subcommands kick in only when
@@ -177,10 +210,10 @@ fn main() -> Result<()> {
     // own binary via `CODEMUX_AGENT_BIN`, which clap resolved into
     // `cli.agent_bin` above — `BinaryAgentSpawner` then invokes
     // whatever the test pointed at.
-    let agent_spawner = BinaryAgentSpawner::new(cli.agent_bin);
+    let agent_spawner = BinaryAgentSpawner::new(cli.agent_bin.clone());
     let seams = TestSeams {
         panic_after: cli.panic_after.map(std::time::Duration::from_millis),
-        record_opens_to: cli.record_opens_to,
+        record_opens_to: cli.record_opens_to.clone(),
     };
     // Open the state DB and load whatever rows are on disk BEFORE
     // raw-mode entry. AD-7's failure-mode rule mirrors config: a
@@ -188,7 +221,7 @@ fn main() -> Result<()> {
     // but anything else (path resolution, file open, migration,
     // initial `load_all`) must surface a readable error and exit
     // non-zero before the terminal switches to alt-screen + raw mode.
-    let state_db_path = match cli.state_db {
+    let state_db_path = match cli.state_db.clone() {
         Some(p) => p,
         None => persistence::default_db_path().wrap_err("resolve state database path")?,
     };
@@ -197,6 +230,25 @@ fn main() -> Result<()> {
     let snapshot = persistence
         .load_snapshot()
         .wrap_err("load persisted state")?;
+    // Resolve the launch mode (Fresh / continue-most-recent /
+    // interactive-picker) BEFORE raw-mode entry. The picker reads
+    // from stdin and writes to stdout/stderr; raw mode and the
+    // alt-screen would garble both. Any error here flows back through
+    // color-eyre and exits non-zero with a readable message,
+    // terminal still in cooked mode.
+    let launch_mode = match resolve_launch_mode(&cli, snapshot.agents.clone()) {
+        Ok(mode) => mode,
+        // `Aborted` is the user politely declining — quiet exit, no
+        // backtrace. Anything else flows through color-eyre.
+        Err(LaunchError::Aborted) => {
+            std::process::exit(1);
+        }
+        Err(LaunchError::NoSavedSessions) => {
+            eprintln!("no saved sessions; run `codemux` to start fresh");
+            std::process::exit(1);
+        }
+        Err(err) => return Err(color_eyre::eyre::eyre!(err)),
+    };
     runtime::run(
         cli.nav,
         &config,
@@ -205,8 +257,49 @@ fn main() -> Result<()> {
         &agent_spawner,
         seams,
         &persistence,
-        snapshot,
+        &snapshot,
+        &launch_mode,
     )
+}
+
+/// Resolve the user's launch-mode intent into a [`LaunchMode`].
+///
+/// - Bare `codemux` → `LaunchMode::Fresh`.
+/// - `--continue` against an empty DB → also `LaunchMode::Fresh`
+///   (silent fallback; matches `tmux new-session -A` semantics).
+/// - `--continue` against a non-empty DB → `LaunchMode::SelectedAgent`
+///   for the most-recently-attached row.
+/// - `--resume` against an empty DB → `LaunchError::NoSavedSessions`,
+///   caller exits non-zero with a one-line stderr message.
+/// - `--resume` against a non-empty DB → interactive picker on
+///   stdout/stdin, returning the chosen `LaunchMode::SelectedAgent`
+///   or `LaunchError::Aborted` if the user backs out.
+fn resolve_launch_mode(
+    cli: &Cli,
+    agents: Vec<codemux_session::domain::Agent>,
+) -> std::result::Result<LaunchMode, LaunchError> {
+    if cli.resume_continue {
+        return Ok(
+            launch::pick_most_recent(agents).map_or(LaunchMode::Fresh, LaunchMode::SelectedAgent)
+        );
+    }
+    if cli.resume_pick {
+        let stdin = std::io::stdin();
+        let mut stdin = stdin.lock();
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let picked = launch::run_picker(
+            agents,
+            std::time::SystemTime::now(),
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+        )?;
+        return Ok(LaunchMode::SelectedAgent(picked));
+    }
+    Ok(LaunchMode::Fresh)
 }
 
 /// Canonicalize `path` and verify it's a directory. Returns a clean
@@ -315,6 +408,104 @@ mod tests {
         assert!(
             msg.contains("is not a directory"),
             "expected `is not a directory` in error, got: {msg}",
+        );
+    }
+
+    // ── launch-mode resolution ──────────────────────────────────
+    //
+    // These tests pin the tmux-style pivot behavior end-to-end at
+    // the CLI seam: parse argv into a `Cli`, hand it to
+    // `resolve_launch_mode` against a synthetic agent list, assert
+    // the resulting `LaunchMode`. The structural guarantee is that
+    // bare-`codemux` never reaches into the persisted rows even
+    // when they exist — which previously hydrated them as Dead
+    // tabs sitting behind the fresh agent.
+
+    use codemux_session::domain::{Agent, AgentStatus};
+    use codemux_shared_kernel::{AgentId, HostId};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn persisted_agent(id: &str, last_attached: Option<std::time::SystemTime>) -> Agent {
+        Agent {
+            id: AgentId::new(id),
+            host_id: HostId::new("local"),
+            label: id.to_string(),
+            cwd: PathBuf::from("/work/repo"),
+            group_ids: Vec::new(),
+            session_id: Some(format!("{id}-uuid")),
+            status: AgentStatus::Dead,
+            last_attached_at: last_attached,
+        }
+    }
+
+    fn parse_cli(argv: &[&str]) -> Cli {
+        use clap::Parser;
+        Cli::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn bare_codemux_resolves_to_fresh_even_with_persisted_rows() {
+        // The whole point of the tmux pivot: bare `codemux` MUST
+        // NOT auto-hydrate. Persisted rows are reachable only
+        // through `--continue` / `--resume`.
+        let cli = parse_cli(&["codemux"]);
+        let agents = vec![
+            persisted_agent("a1", Some(UNIX_EPOCH + Duration::from_secs(100))),
+            persisted_agent("a2", Some(UNIX_EPOCH + Duration::from_secs(200))),
+        ];
+        let mode = resolve_launch_mode(&cli, agents).unwrap();
+        assert!(
+            matches!(mode, LaunchMode::Fresh),
+            "bare codemux must resolve to Fresh, got {mode:?}",
+        );
+    }
+
+    #[test]
+    fn continue_against_empty_db_falls_back_to_fresh() {
+        // `--continue` matches `tmux new-session -A` semantics:
+        // resume if available, otherwise quietly fresh-spawn.
+        let cli = parse_cli(&["codemux", "--continue"]);
+        let mode = resolve_launch_mode(&cli, Vec::new()).unwrap();
+        assert!(
+            matches!(mode, LaunchMode::Fresh),
+            "--continue with no persisted rows must fall back to Fresh",
+        );
+    }
+
+    #[test]
+    fn continue_picks_the_most_recent_attached_agent() {
+        let cli = parse_cli(&["codemux", "--continue"]);
+        let agents = vec![
+            persisted_agent("old", Some(UNIX_EPOCH + Duration::from_secs(100))),
+            persisted_agent("newer", Some(UNIX_EPOCH + Duration::from_secs(500))),
+            persisted_agent("never", None),
+        ];
+        let mode = resolve_launch_mode(&cli, agents).unwrap();
+        match mode {
+            LaunchMode::SelectedAgent(agent) => assert_eq!(agent.id.as_str(), "newer"),
+            LaunchMode::Fresh => panic!("expected SelectedAgent(newer), got Fresh"),
+        }
+    }
+
+    #[test]
+    fn resume_against_empty_db_returns_no_saved_sessions() {
+        let cli = parse_cli(&["codemux", "--resume"]);
+        let err = resolve_launch_mode(&cli, Vec::new()).unwrap_err();
+        assert!(matches!(err, LaunchError::NoSavedSessions));
+    }
+
+    #[test]
+    fn continue_and_resume_are_mutually_exclusive_at_parse_time() {
+        // Mutual exclusion is enforced by clap's ArgGroup so we
+        // don't have to add runtime defensive code. Pin the
+        // contract here so a future refactor that drops the group
+        // can't silently re-enable the nonsense combination.
+        use clap::Parser;
+        let err = Cli::try_parse_from(["codemux", "--continue", "--resume"]).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("cannot be used with"),
+            "expected mutual-exclusion error, got: {rendered}",
         );
     }
 }

@@ -69,6 +69,7 @@ use crate::host_title;
 use crate::index_manager::IndexManager;
 use crate::index_worker::IndexState;
 use crate::keymap::{Bindings, DirectAction, ModalAction, PopupAction, PrefixAction, ScrollAction};
+use crate::launch::LaunchMode;
 use crate::log_tail::LogTail;
 use crate::persistence::{self, AgentRow, Persistence, Snapshot};
 use crate::pty_title::TitleCapture;
@@ -1453,110 +1454,24 @@ pub fn run(
     agent_spawner: &dyn AgentSpawner,
     seams: TestSeams,
     persistence: &Persistence,
-    snapshot: Snapshot,
+    snapshot: &Snapshot,
+    launch_mode: &LaunchMode,
 ) -> Result<()> {
     tracing::info!(?initial_cwd, "codemux starting (nav={nav_style:?})");
 
     let (term_cols, term_rows) = crossterm::terminal::size().wrap_err("read terminal size")?;
     let (pty_rows, pty_cols) = pty_size_for(nav_style, term_rows, term_cols, log_tail.is_some());
 
-    // Hydrate previously-persisted hosts and agents BEFORE spawning
-    // the fresh initial agent. Loaded agents land as `Dead` (their
-    // PTYs are gone), the freshly-spawned agent is appended as the
-    // focused tab. Step 5 will let the user resume Dead agents via
-    // `claude --resume <session_id>`; for now they only render and
-    // are dismissable.
-    //
-    // We also write each loaded row back as `Dead` so the on-disk
-    // status matches the in-memory truth. Without this, a row last
-    // saved as `Running` (the most common case, since the previous
-    // codemux died before it could persist a clean shutdown) would
-    // re-load as `Running` on every restart and persist a stale
-    // "looks live" status across `load_snapshot` invocations.
-    let host_lookup = build_host_lookup(&snapshot.hosts);
-    let mut agents: Vec<RuntimeAgent> = snapshot
-        .agents
-        .into_iter()
-        .map(|agent| {
-            let host = host_lookup
-                .get(agent.host_id.as_str())
-                .and_then(|kind| match kind {
-                    codemux_session::domain::HostKind::Local => None,
-                    codemux_session::domain::HostKind::Ssh { target } => Some(target.clone()),
-                });
-            let cwd = if agent.cwd.as_os_str().is_empty() {
-                None
-            } else {
-                Some(agent.cwd.clone())
-            };
-            let repo = cwd.as_deref().and_then(repo_name::resolve_local);
-            let loaded = RuntimeAgent::loaded_dead(
-                agent.id,
-                agent.label,
-                repo,
-                cwd,
-                host,
-                pty_rows,
-                pty_cols,
-                config.scrollback_len,
-                agent.session_id,
-            );
-            // Best-effort write-through of the load-boundary reset.
-            // Failures are logged inside `save_agent` and do not
-            // block startup — losing one persistence write is
-            // preferable to refusing to start at all.
-            persist_agent_status(
-                persistence,
-                &loaded,
-                AgentStatus::Dead,
-                agent.last_attached_at,
-            );
-            loaded
-        })
-        .collect();
-
-    // Pick an id for the initial spawn that does not collide with any
-    // loaded-Dead row. Default to `agent-1` (preserves the current
-    // single-agent boot UX); if any loaded row already claims an
-    // `agent-N` id, bump past the highest seen so the fresh agent
-    // gets the next free slot. This also seeds `spawn_counter`
-    // below so subsequent modal-driven spawns keep ascending without
-    // collisions.
-    let initial_n = next_free_agent_n(&agents).unwrap_or(1);
-    let initial_id_text = format!("agent-{initial_n}");
-    // AD-2: every fresh codemux-side spawn authors a v4 UUID. We pass
-    // it to `claude --session-id <uuid>` (via `build_claude_args`) AND
-    // stash it on the `RuntimeAgent` so the next `persist_agent_status`
-    // writes it into the SQLite row. Collision risk is per-host: per
-    // the 2026-05-15 spike, this is theoretical only and not worth
-    // defensive code.
-    let initial_session_uuid = Uuid::new_v4();
-    let initial = spawn_local_agent(
-        agent_spawner,
-        AgentId::new(initial_id_text.clone()),
-        initial_id_text,
-        Some(initial_cwd),
+    let (agents, initial_focus) = build_initial_agents(
+        launch_mode,
+        snapshot,
+        initial_cwd,
         pty_rows,
         pty_cols,
-        config.scrollback_len,
-        &config.ui.segments.tokens,
-        &initial_session_uuid,
-        None,
+        config,
+        agent_spawner,
+        persistence,
     )?;
-    // Strategy (i) from the 2026-05-15 persistence spike: the PTY
-    // transition `Starting → Running` is implicit in `spawn_local_agent`
-    // returning Ok (the spawner blocks on the spawn syscall and
-    // returns only on success). Persist the agent + its local-host
-    // row now so a crash before the first frame still leaves a
-    // resumable row on disk.
-    persistence.record_local_host();
-    persist_agent_status(persistence, &initial, AgentStatus::Running, None);
-    agents.push(initial);
-    // Focus the newly-spawned agent — loaded-Dead tabs sit in front
-    // of it in the Vec but the freshly-spawned one is the one the
-    // user wants to type into. `nav.focused` defaults to 0 inside
-    // `NavState::new`, so we adjust below at construction.
-    let initial_focus = agents.len() - 1;
 
     enable_raw_mode().wrap_err("enable raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).wrap_err("enter alt screen")?;
@@ -1680,6 +1595,146 @@ pub fn run(
         seams,
         persistence,
     )
+}
+
+/// Assemble the initial agent list + focus index per the
+/// user-selected [`LaunchMode`]. Pivots the launch UX between three
+/// modes — bare, `--continue`, `--resume` — without leaking the
+/// branching into the rest of [`run`]'s setup work.
+///
+/// ## Branch shape
+///
+/// - **`LaunchMode::Fresh`**: spawn a fresh `agent-1` in the user's
+///   current cwd. No persisted rows are hydrated into the tab list
+///   (tmux semantics: bare = new session). Persistence write-through
+///   still fires for the fresh agent, so subsequent runs can target
+///   it with `--continue` / `--resume`.
+/// - **`LaunchMode::SelectedAgent(agent)`**: hydrate ONLY that one
+///   persisted agent and resume it via `claude --resume <session_id>`
+///   (or fall through to a fresh-UUID spawn when the persisted row
+///   carries no `session_id` — the legacy / bootstrap-failure case).
+///   No fresh `agent-N` in addition. The single-tab UX matches what
+///   the user explicitly asked for.
+///
+/// In every branch the local-host row is recorded so the snapshot's
+/// hosts table never goes stale relative to the live agents the
+/// runtime is about to start writing.
+#[allow(clippy::too_many_arguments)]
+fn build_initial_agents(
+    launch_mode: &LaunchMode,
+    snapshot: &Snapshot,
+    initial_cwd: &Path,
+    pty_rows: u16,
+    pty_cols: u16,
+    config: &Config,
+    agent_spawner: &dyn AgentSpawner,
+    persistence: &Persistence,
+) -> Result<(Vec<RuntimeAgent>, usize)> {
+    match launch_mode {
+        LaunchMode::Fresh => {
+            // tmux semantics: bare `codemux` = fresh session. Persisted
+            // rows are deliberately NOT hydrated into the tab list.
+            // The user invoked codemux without `--continue` / `--resume`,
+            // so they get a clean single-tab boot and persisted sessions
+            // remain reachable via the explicit launch flags.
+            let initial_session_uuid = Uuid::new_v4();
+            let initial = spawn_local_agent(
+                agent_spawner,
+                AgentId::new("agent-1".to_string()),
+                "agent-1".to_string(),
+                Some(initial_cwd),
+                pty_rows,
+                pty_cols,
+                config.scrollback_len,
+                &config.ui.segments.tokens,
+                &initial_session_uuid,
+                None,
+            )?;
+            persistence.record_local_host();
+            persist_agent_status(persistence, &initial, AgentStatus::Running, None);
+            Ok((vec![initial], 0))
+        }
+        LaunchMode::SelectedAgent(agent) => {
+            // `--continue` or `--resume`: hydrate the chosen row as the
+            // sole tab. The remote-vs-local split mirrors what the old
+            // launch sequence did for loaded rows: local agents resume
+            // synchronously through `spawn_local_agent`; SSH agents
+            // fall back to a Dead tab today so the user can re-attach
+            // them through the spawn modal (the AD-2 SSH resume path
+            // is already plumbed via `try_resume_ssh_on_focus`).
+            let host_lookup = build_host_lookup(&snapshot.hosts);
+            let host = host_lookup
+                .get(agent.host_id.as_str())
+                .and_then(|kind| match kind {
+                    codemux_session::domain::HostKind::Local => None,
+                    codemux_session::domain::HostKind::Ssh { target } => Some(target.clone()),
+                });
+            let cwd = if agent.cwd.as_os_str().is_empty() {
+                None
+            } else {
+                Some(agent.cwd.clone())
+            };
+            persistence.record_local_host();
+            if host.is_some() {
+                // SSH-backed selected agent: load as Dead. Focusing
+                // it will trigger `try_resume_ssh_on_focus`, which
+                // owns the bootstrap-worker spawn dance. We can't
+                // do that synchronously here without dragging the
+                // spawn-modal UI through this code path.
+                let repo = cwd.as_deref().and_then(repo_name::resolve_local);
+                let loaded = RuntimeAgent::loaded_dead(
+                    agent.id.clone(),
+                    agent.label.clone(),
+                    repo,
+                    cwd,
+                    host,
+                    pty_rows,
+                    pty_cols,
+                    config.scrollback_len,
+                    agent.session_id.clone(),
+                );
+                persist_agent_status(
+                    persistence,
+                    &loaded,
+                    AgentStatus::Dead,
+                    agent.last_attached_at,
+                );
+                return Ok((vec![loaded], 0));
+            }
+            // Local agent: try to resume synchronously. If the row
+            // carries no `session_id` (legacy pre-AD-2 row), mint a
+            // fresh UUID and spawn clean — the user gets a working
+            // tab either way.
+            let existing_uuid = agent
+                .session_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok());
+            let (session_uuid, resume_uuid, is_resume) = match existing_uuid {
+                Some(uuid) => (uuid, Some(uuid), true),
+                None => (Uuid::new_v4(), None, false),
+            };
+            let mut resumed = spawn_local_agent(
+                agent_spawner,
+                agent.id.clone(),
+                agent.label.clone(),
+                cwd.as_deref(),
+                pty_rows,
+                pty_cols,
+                config.scrollback_len,
+                &config.ui.segments.tokens,
+                &session_uuid,
+                resume_uuid.as_ref(),
+            )?;
+            resumed.resume_attempt = is_resume;
+            persist_agent_status(
+                persistence,
+                &resumed,
+                AgentStatus::Running,
+                Some(std::time::SystemTime::now()),
+            );
+            Ok((vec![resumed], 0))
+        }
+    }
 }
 
 /// Index host id → kind for the loaded-snapshot agents. Lifted into a
@@ -10667,6 +10722,103 @@ mod tests {
         assert!(
             row.contains("ctrl+x to dismiss"),
             "banner must interpolate the supplied chord label, got: {row:?}",
+        );
+    }
+
+    // ── build_initial_agents (launch-mode pivot) ────────────────────
+    //
+    // The structural guarantee for the tmux pivot is "in
+    // `LaunchMode::Fresh`, the launch sequence MUST NOT consult
+    // `snapshot.agents`." The CLI-level resolver test in `main.rs`
+    // pins parse → LaunchMode; this test pins LaunchMode → runtime
+    // tabs. Together they fence off a regression where a future
+    // refactor re-adds `snapshot.agents.iter()` to the Fresh arm
+    // and silently restores the always-auto-hydrate behavior.
+
+    /// Fake `AgentSpawner` that returns a `cat`-backed PTY via the
+    /// `test-util` seam. Borrowed from the `reap_*` test conventions
+    /// elsewhere in this module; centralised here so the launch-mode
+    /// tests don't have to drag the `for_test` plumbing into each
+    /// case body.
+    struct FakeFreshSpawner;
+
+    impl codemux_session::AgentSpawner for FakeFreshSpawner {
+        fn spawn(
+            &self,
+            request: codemux_session::SpawnRequest<'_>,
+        ) -> Result<codemux_session::AgentTransport, codemux_session::Error> {
+            // Forward `rows` / `cols` so the resulting PTY matches
+            // the geometry the runtime believes it asked for. The
+            // label is advisory; reusing it as the `cat` label keeps
+            // tracing breadcrumbs honest if a test regresses.
+            codemux_session::AgentTransport::for_test(request.label, request.rows, request.cols)
+        }
+    }
+
+    fn persisted_agent_for_build_test(id: &str) -> codemux_session::domain::Agent {
+        codemux_session::domain::Agent {
+            id: AgentId::new(id),
+            host_id: codemux_shared_kernel::HostId::new("local"),
+            label: id.to_string(),
+            cwd: PathBuf::from("/work/repo"),
+            group_ids: Vec::new(),
+            session_id: Some(format!("{id}-uuid")),
+            status: AgentStatus::Dead,
+            last_attached_at: Some(std::time::SystemTime::UNIX_EPOCH),
+        }
+    }
+
+    #[test]
+    fn build_initial_agents_fresh_ignores_persisted_rows() {
+        // Snapshot carries TWO bogus persisted rows. The Fresh
+        // branch must produce exactly one tab — the freshly-spawned
+        // `agent-1` — and its id must be neither of the persisted
+        // ids. This is the contract that protects the tmux semantics
+        // from a regression.
+        let tmp = tempfile::tempdir().unwrap();
+        let persistence = Persistence::open(&tmp.path().join("state.db")).unwrap();
+        let snapshot = Snapshot {
+            hosts: Vec::new(),
+            agents: vec![
+                persisted_agent_for_build_test("ghost-a"),
+                persisted_agent_for_build_test("ghost-b"),
+            ],
+        };
+        let config = Config::default();
+        let spawner = FakeFreshSpawner;
+        let initial_cwd = tmp.path();
+
+        let (agents, focus) = build_initial_agents(
+            &LaunchMode::Fresh,
+            &snapshot,
+            initial_cwd,
+            5,
+            20,
+            &config,
+            &spawner,
+            &persistence,
+        )
+        .unwrap();
+
+        assert_eq!(
+            agents.len(),
+            1,
+            "Fresh launch must produce exactly one tab regardless of persisted rows; got {}",
+            agents.len(),
+        );
+        assert_eq!(focus, 0, "the freshly-spawned agent must be focused");
+        let fresh_id = agents[0].id.as_str();
+        assert_ne!(
+            fresh_id, "ghost-a",
+            "Fresh launch leaked persisted id `ghost-a` into the tab list",
+        );
+        assert_ne!(
+            fresh_id, "ghost-b",
+            "Fresh launch leaked persisted id `ghost-b` into the tab list",
+        );
+        assert!(
+            matches!(agents[0].state, AgentState::Ready { .. }),
+            "fresh agent must be Ready, not a hydrated Dead row",
         );
     }
 
